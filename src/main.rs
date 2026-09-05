@@ -204,8 +204,11 @@ impl LogApp {
         if cur == known {
             return; // 未变化
         }
-        if cur.len > known.len {
-            // 增长: 增量追加
+        if cur.head != known.head {
+            // 首块变 = 轮转/覆写 (内容换了), 即便新文件更大也全量重建
+            self.rebuild_file();
+        } else if cur.len > known.len {
+            // 同文件增长: 增量追加
             let old_line_count = self.file.line_count();
             match LogFile::append_from(&self.file, &self.path) {
                 Ok(new) => {
@@ -220,7 +223,7 @@ impl LogApp {
                 Err(e) => log::warn!("tail 追加失败: {e:#}"),
             }
         } else {
-            // 缩容/同长 mtime 变 (截断/覆写/轮转): 全量重建
+            // 同文件缩容 (截断): 全量重建
             self.rebuild_file();
         }
     }

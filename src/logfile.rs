@@ -57,13 +57,16 @@ impl OpenStats {
 ///
 /// Windows 实测 (tasks/plan.md 附录, mmap_lab): 映射存活期外部**截断被 OS 拒绝**,
 /// 真正的过期通道是 rename/delete (视图滞留旧内容)、append (增长)、
-/// overwrite (内容原位被换) —— 全部可由 len+mtime 变化检出。
+/// overwrite (内容原位被换)。len+mtime 检不出「轮转后新文件更大」(create 流派
+/// 新文件首块与旧文件不同), 故加 `head` (前 64 字节 FNV 哈希) 区分同文件增长与轮转。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStat {
     /// 文件长度。
     pub len: u64,
     /// 修改时间 (取不到为 None, 比对时 None≠Some 视为过期)。
     pub mtime: Option<SystemTime>,
+    /// 前 64 字节 FNV-1a 哈希 (区分同文件增长 vs 轮转/覆写)。
+    pub head: u64,
 }
 
 impl FileStat {
@@ -73,8 +76,23 @@ impl FileStat {
         Ok(Self {
             len: m.len(),
             mtime: m.modified().ok(),
+            head: hash_head(path)?,
         })
     }
+}
+
+/// 前 64 字节 FNV-1a 哈希 (首块指纹, 无依赖)。
+fn hash_head(path: &Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64];
+    let n = f.read(&mut buf)?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &buf[..n] {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    Ok(h)
 }
 
 /// 步进索引步长: 每 STRIDE 行记一个绝对偏移, 段内 memchr 前扫定位。
@@ -145,6 +163,7 @@ impl LogFile {
         let stat = FileStat::of(path).unwrap_or(FileStat {
             len: file_bytes,
             mtime: None,
+            head: 0, // 取不到指纹时的保守值 (与任何真实 head 必异 → 判过期)
         });
 
         let stats = OpenStats {
@@ -363,6 +382,7 @@ impl LogFile {
         let stat = FileStat::of(path).unwrap_or(FileStat {
             len: file_bytes,
             mtime: None,
+            head: 0, // 取不到指纹时的保守值 (与任何真实 head 必异 → 判过期)
         });
 
         let stats = OpenStats {
@@ -791,6 +811,24 @@ mod tests {
             cur = appended;
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_stat_head_distinguishes_rotation_with_larger_file() {
+        // create 流派轮转 + 新文件更大: 仅 len+mtime 会误判为增长, head 哈希兜住
+        let path = temp_path("rotate-larger");
+        std::fs::write(&path, b"AAAA\nBBBB\n").unwrap();
+        let lf = LogFile::open(&path).unwrap();
+        let known = lf.stat_snapshot();
+        std::fs::rename(&path, path.with_extension("rotated")).unwrap();
+        // 新文件更大且首块不同 (X 不是 A)
+        std::fs::write(&path, b"XXXX\nYYYY\nZZZZ\nWWWW\n").unwrap();
+        let cur = FileStat::of(&path).unwrap();
+        assert!(cur.len > known.len, "新文件更大 (纯 len 会误判增长)");
+        assert_ne!(cur.head, known.head, "首块不同 → 判轮转");
+        assert!(lf.is_stale(&path), "过期检出");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("rotated")).ok();
     }
 
     #[test]

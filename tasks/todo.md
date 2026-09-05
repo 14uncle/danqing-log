@@ -55,4 +55,4 @@
 - [x] 三件套绿 (55 lib + 6 bin 测试, clippy 0)
 - [x] spec-live-tail 成功判据逐条对照过单
 - [x] 人工验收清单全过 (用户「通过」)
-- [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`, 全模块)
+- [x] 进 review 阶段 (主审亲审: 1 处 Required 修复 轮转检测首块哈希; verdict Approve)
