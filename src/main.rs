@@ -19,7 +19,7 @@ mod view;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use danqing::widget::{Node, node};
@@ -31,7 +31,7 @@ use danqing::{
 use danqing_log::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
-use danqing_log::logfile::LogFile;
+use danqing_log::logfile::{FileStat, LogFile};
 use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 
 /// 空格/PageUp-Down 翻页的行数: POC 定值。正式版由组件回报视口行数。
@@ -105,6 +105,15 @@ pub(crate) struct LogApp {
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
     /// 窗口事件发送器 (粘贴走 read_clipboard 回送 IME Commit)。
     sender: Option<WindowEventSender>,
+    // ---- live-tail (T2) ----
+    /// 文件路径 (增长检测轮询用)。
+    path: PathBuf,
+    /// 跟随模式: 新行到达自动滚底 (F 键 toggle)。
+    follow: bool,
+    /// 上次 stat 轮询时刻 (250ms 节流)。
+    last_stat_poll: Instant,
+    /// 底栏提示 (截断/轮转等一次性事件)。
+    notice: Option<String>,
 }
 
 /// 应用消息。
@@ -176,6 +185,89 @@ impl LogApp {
         self.sub_rows.insert(file_line, rows);
     }
 
+    /// F 键: 跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
+    fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
+        if self.follow {
+            self.top_row = self.max_top();
+            self.selected = self.display_count().saturating_sub(1);
+        }
+        self.refresh_status();
+    }
+
+    /// 增长检测 (live-tail): 文件变长 → `append_from` 增量; 缩容/轮转 → 全量重建。
+    fn poll_growth(&mut self) {
+        let Ok(cur) = FileStat::of(&self.path) else {
+            return; // 文件暂不可读 (轮转间隙), 下轮再试
+        };
+        let known = self.file.stat_snapshot();
+        if cur == known {
+            return; // 未变化
+        }
+        if cur.len > known.len {
+            // 增长: 增量追加
+            let old_line_count = self.file.line_count();
+            match LogFile::append_from(&self.file, &self.path) {
+                Ok(new) => {
+                    self.file = Arc::new(new);
+                    self.append_filter_hits(old_line_count);
+                    if self.follow {
+                        self.top_row = self.max_top();
+                        self.selected = self.display_count().saturating_sub(1);
+                    }
+                    self.refresh_status();
+                }
+                Err(e) => log::warn!("tail 追加失败: {e:#}"),
+            }
+        } else {
+            // 缩容/同长 mtime 变 (截断/覆写/轮转): 全量重建
+            self.rebuild_file();
+        }
+    }
+
+    /// 缩容/轮转: 全量重建 + 清失效状态 (书签越界丢弃) + 状态提示。
+    fn rebuild_file(&mut self) {
+        match LogFile::open(&self.path) {
+            Ok(new) => {
+                let new_count = new.line_count();
+                self.file = Arc::new(new);
+                self.bookmarks.retain(|&l| l < new_count);
+                self.filtered = None;
+                self.filter_applied.clear();
+                self.filter_elapsed = None;
+                self.search = None;
+                self.search_query.clear();
+                self.search_pattern = None;
+                self.search_elapsed = None;
+                self.expanded = ExpandMap::new();
+                self.sub_rows.clear();
+                self.top_row = 0.0;
+                self.selected = 0;
+                self.notice = Some("文件已截断/轮转".into());
+                self.refresh_status();
+            }
+            Err(e) => log::warn!("轮转重建失败: {e:#}"),
+        }
+    }
+
+    /// 实时过滤: 增量行追加命中表 (只跑新行, 不全量重跑)。
+    fn append_filter_hits(&mut self, old_line_count: u64) {
+        if self.filter_applied.is_empty() {
+            return;
+        }
+        let Some(existing) = &self.filtered else {
+            return;
+        };
+        let clauses = jsonl::parse_query(&self.filter_applied);
+        let new_hits = jsonl::run_filter_from(&self.file, &clauses, old_line_count);
+        if new_hits.is_empty() {
+            return;
+        }
+        let mut merged = existing.as_ref().clone();
+        merged.extend(new_hits);
+        self.filtered = Some(Arc::new(merged));
+    }
+
     /// 合成底栏状态: base + 模式 + 过滤 + 搜索。
     fn refresh_status(&mut self) {
         let mut s = self.base_status.clone();
@@ -219,6 +311,12 @@ impl LogApp {
         }
         if !self.bookmarks.is_empty() {
             s.push_str(&format!(" · 书签 {}", self.bookmarks.len()));
+        }
+        if self.follow {
+            s.push_str(" · FOLLOW");
+        }
+        if let Some(n) = &self.notice {
+            s.push_str(&format!(" · {n}"));
         }
         self.status = s;
     }
@@ -390,6 +488,11 @@ impl App for LogApp {
     fn update(&mut self, msg: Msg) {
         match msg {
             Msg::ScrollRows(d) => {
+                // 用户向上滚动 → 脱离跟随 (不打扰阅读)
+                if d < 0.0 && self.follow {
+                    self.follow = false;
+                    self.refresh_status();
+                }
                 self.top_row = clamp_top(self.top_row + d, self.display_count());
                 // 方向键滚动时选中跟随首行, 底栏读数即当前位置
                 self.selected = self.top_row as u64;
@@ -410,6 +513,11 @@ impl App for LogApp {
             Msg::GotoEnd => {
                 self.top_row = self.max_top();
                 self.selected = self.display_count().saturating_sub(1);
+                // End 跳底自动恢复跟随
+                if !self.follow {
+                    self.follow = true;
+                    self.refresh_status();
+                }
             }
         }
     }
@@ -521,6 +629,11 @@ impl App for LogApp {
                         self.goto_next_bookmark();
                         return;
                     }
+                    // F = tail 跟随 toggle (原始模式; 表格模式字符键归过滤框)
+                    "f" => {
+                        self.toggle_follow();
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -608,6 +721,11 @@ impl App for LogApp {
                 self.jump_to_file_line(hit);
             }
             self.refresh_status();
+        }
+        // 增长检测 (live-tail): 250ms 节流 stat 轮询, 增长则增量追加
+        if self.last_stat_poll.elapsed() >= Duration::from_millis(250) {
+            self.last_stat_poll = Instant::now();
+            self.poll_growth();
         }
     }
 
@@ -709,6 +827,10 @@ fn run(path: &Path) -> Result<()> {
         expanded: ExpandMap::new(),
         sub_rows: std::collections::BTreeMap::new(),
         sender: None,
+        path: path.to_path_buf(),
+        follow: false,
+        last_stat_poll: Instant::now(),
+        notice: None,
     };
     app.refresh_status();
     let config = WindowConfig {

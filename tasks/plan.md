@@ -1,94 +1,82 @@
-# Implementation Plan: jsonl-table (真 parser + 嵌套展开 + 过滤增强)
+# Implementation Plan: live-tail (tail 跟随 + 实时过滤)
 
-> 模块 spec: `../docs/specs/SPEC-jsonl-table.md`; 地图/共享约定/性能基线: `../SPEC.md`。
-> core-viewer 已验收, 本 plan 展开第二棒 jsonl-table —— 主炮, 「klogg 速度 ×
-> LogViewPlus 结构化」里「结构化」那半的决胜点。live-tail 可与之并行, 独立出 plan。
+> 模块 spec: `../docs/specs/SPEC-live-tail.md`; 地图/共享约定/性能基线: `../SPEC.md`。
+> core-viewer 与 jsonl-table 已验收, 本 plan 展开最后一棒 live-tail。依赖 core-viewer
+> T3 的截断/轮转原语 (`FileStat`/`is_stale`/`rebuild`) 与步进索引。
 
 ## Overview
 
-把前提② demo (memmem 提取 + 扁平字段过滤) 升级成正式版: 显示路径换真 parser
-(消除 `,"key":"` 内嵌误判)、行内子行嵌套展开、点路径 + 数值比较过滤。任务 5 个,
-三阶段: 引擎地基 (T1–T3) → 展开 UI (T4) → 验收 (T5)。
+`tail -f` 的桌面 GUI 形态: 日志写进来视图跟上去。核心 = 可增长 LogFile (mmap 不随文件
+增长, 需重映射 + 增量索引) + 跟随模式 (自动滚底, 上滚脱离) + 轮转生存 (重建换入)。
+任务 5 个, 两阶段: 引擎 (T1) → 交互/生存 (T2–T4) → 验收 (T5)。
 
 ## Architecture Decisions
 
-1. **真 parser 只 parse 可见行**: 单元格渲染逐可见行 serde_json parse (≈50 行/帧,
-   恒定成本), 嵌套值安全显示; memmem 提取退役出**显示路径** (消除 POC「`,"key":"`
-   内嵌误判」已知边界)。memmem 保留在**过滤粗筛** (性能路径不变)。
-2. **过滤两段架构 (性能契约)**: 扁平等值/前缀 (`level=ERROR` / `status=50*`) 走
-   memmem 直通, 零 parse (POC 235ms/1GB 不退化); 点路径 / 数值比较才启用 serde_json
-   验证 —— 粗筛 = memmem 找最内层 key needle (`"id":`), 把候选压到千行级再 parse 导航。
-   识别「无需验证」的扁平查询是直通前提 (决策内建判据, 见 T2)。
-3. **展开行模型 = BTreeMap + 前缀和**: `BTreeMap<文件行号, 子行数>` 存展开态;
-   显示行 ↔ (文件行, 子行偏移) 双向映射走前缀和 O(log n); 展开内容惰性 parse
-   (只 parse 展开的那一行), flatten 成 (深度, 路径段, 值) 子行序列; 展开 1 万节点
-   视口成本恒定 (行锚定虚拟化不变)。
-4. **展开交互键**: 鼠标点行首 `▶`/`▼`; 键盘 `→` 展开 / `←` 折叠选中行 (ArrowLeft/Right
-   表格模式当前未占用; Enter 归过滤应用, 不冲突)。数组路径段显示为 `[0]`。
-5. **过滤 × 展开的显示行模型统一**: 显示行 = 过滤命中文件行 ∪ 各命中行的展开子行;
-   双向映射在过滤命中表之上再叠展开前缀和, 保证 `file_line_of` / `display_row_of`
-   全路径一致 (spec 成功判据「过滤叠加展开行号映射一致」)。
-6. **不重构目录, 平铺**: 新增 `src/expand.rs` (展开行模型, 纯逻辑, 与 `search.rs`
-   同构); 过滤/parser/flatten 留在 `jsonl.rs`; GUI 接 `main.rs` + `view.rs`。
+1. **可增长 LogFile = 创建新实例 + Arc 快照隔离**: `LogFile::append_from(old, path)`
+   重新 mmap (O(1), 页缓存共享) + 只对新字节区间增量索引, 返回**新** LogFile;
+   `LogApp.file` 保持 `Arc<LogFile>`, 增长时 `self.file = Arc::new(new)`。worker 线程
+   持旧 Arc 快照读, 旧 mmap 由其保活 —— 无 Mutex、无悬垂指针、无数据竞争。代价 =
+   每次 append 克隆 stride 表 (~3MB/GB), 250ms 节流下 4 次/秒 = 12MB/s, 可忽略。
+2. **增量索引 = 续行拼接 + 步进边界**: 只扫 `[old_len, new_len)`; 旧数据不以 `\n`
+   结尾时新字节先续旧行 (不新增行); 每 16 行补一条 stride 表项 (行起始偏移)。
+   正确性靠「增量 append == 全量重建」对拍单测钉死。
+3. **增长检测 = 250ms 节流 stat 轮询**: danqing tick ~60fps, 但 stat 每 250ms 一次
+   (防 60 次/秒系统调用); 隐藏态 (OnDemand Wait) 不轮询, 重新可见时一次性追平。
+4. **跟随 = F 键 toggle + 滚动语义**: 跟随态新行到达自动滚到底; 用户向上滚 (top_row
+   偏离底部) 即脱离跟随 (不打扰阅读); End 跳底自动恢复跟随。状态栏显 FOLLOW。
+5. **轮转检测启发 = len+mtime 先行**: spec Open Question。len 缩小 = 截断/copytruncate;
+   len+mtime 变 = create 流派轮转。首块哈希是否加 → T4 实验定 (真实两种流派各测一次)。
+6. **增量过滤 = 从旧行数起跑**: `run_filter` 加 `start_line` 参数, 只对新行跑谓词追加
+   命中; 搜索命中表同理。语义一致性靠「先全量过滤再追加 N 行 == 直接全量过滤含 N 行」
+   单测钉死 (spec 明确要求)。
 
 ## Task List
 
-### Phase 1: 引擎地基
+### Phase 1: 引擎
 
-- [ ] **T1: 真 parser 显示路径 + 嵌套值紧凑显示** — `jsonl.rs` 加 `parse_line`
-  (可见行 serde_json parse); `view.rs` 单元格渲染改走 parse 结果取顶层 key,
-  嵌套值 `to_string` 截断省略; `extract_field` 退出显示路径 (保留供过滤粗筛)
-  - 验收: 嵌套 fixture (含 `,"key":"` 内嵌字符串的对抗样本) 单元格显示正确,
-    memmem 时代的误判样本全部不再误判; 可见行 parse 成本恒定 (perf 不退化)
-  - 验证: `cargo test`; logbench 复跑
-  - 文件: `src/jsonl.rs`, `src/view.rs` | M
-
-- [ ] **T2: 点路径 + 数值比较过滤引擎** — `jsonl.rs` 扩展 `Clause` (路径 + 算子),
-  `parse_query` 解析 `a.b.c=42` / `status>=500` / `duration_ms>1000` / `level=ERR*`;
-  两段: 扁平等值/前缀 → memmem 直通; 点路径/比较 → memmem 粗筛最内层 key + serde_json
-  导航验证; `navigate(value, path)` + `num_compare`
-  - 验收: 点路径导航单测; 比较算子边界单测 (= > < >= <= 负数 浮点 字符串值不匹配);
-    扁平 `level=ERROR` 仍零 parse (直通判据); 点路径过滤命中数 vs 全量 parse 对拍一致
-  - 验证: `cargo test`; logbench `--filter "user.id=42*"` 交叉验证
-  - 文件: `src/jsonl.rs` | M
-
-- [ ] **T3: 展开行模型 + flatten** — 新 `src/expand.rs`: `ExpandMap` (BTreeMap 文件行
-  → 子行数) + 前缀和双向映射 (显示行 ↔ (文件行, 子行偏移)); `jsonl.rs` 加 `flatten`
-  (serde_json::Value → (深度, 路径段, 值) 子行序列, 数组段 `[i]`)
-  - 验收: 展开/折叠/越界/前缀和 roundtrip 单测; flatten 对象+数组 (数组段 `[i]`) 单测
+- [ ] **T1: 增量索引 `append_from`** — `LogFile::append_from(old, path) -> Result<LogFile>`:
+  重映射全文 + 只对新字节区间增量索引 (续行拼接 + 步进边界) + 更新 FileStat 快照。
+  - 验收: 「增量 append == 全量重建」对拍单测 (行数一致、逐行内容一致、stride 一致);
+    续行拼接正确 (旧末尾非 `\n` 时新字节先续行); 末尾换行不产生空行
   - 验证: `cargo test`
-  - 文件: `src/expand.rs`(新), `src/jsonl.rs` | M
+  - 文件: `src/logfile.rs` | M
 
-### Checkpoint: 引擎地基 (T1–T3 后)
+### Phase 2: 交互/生存
 
-- [ ] 三件套绿 (`fmt` + `clippy --all-targets -- -D warnings` + `test`)
-- [ ] `level=ERROR` 扁平过滤 perf 不退化 (≤400ms, POC 235ms 基线)
-- [ ] 与用户过一眼引擎数字再继续
+- [ ] **T2: 增长检测 + 跟随模式** — `tick` 内 250ms 节流 stat 轮询; 检测到增长调
+  `append_from` 换入; `F` 键 toggle 跟随 (底栏 FOLLOW 标记); 新行到达跟随态滚底;
+  向上滚脱离、End 恢复。
+  - 验收: 人工验收 (持续追加文件, 新行 ≤1s 出现、滚动无抖动、上滚脱离/End 恢复);
+    `F` toggle 单测 (状态机)
+  - 验证: `cargo test` + 人工
+  - 文件: `src/main.rs`, `src/view.rs` | M
 
-### Phase 2: 展开 UI
+- [ ] **T3: 实时过滤/搜索增量** — `run_filter` 加 `start_line` 起跑; 过滤激活时增量行
+  只跑谓词追加命中表; 搜索命中表同理; 底栏计数实时更新。
+  - 验收: 「全量过滤再追加 N 行 == 直接全量过滤含 N 行」命中集相等单测;
+    人工验收 (过滤激活时新命中行 ≤1s 出现)
+  - 验证: `cargo test` + 人工
+  - 文件: `src/jsonl.rs`, `src/main.rs` | M
 
-- [ ] **T4: 展开 UI + 统一显示行模型** — `view.rs` 渲染 `▶`/`▼` 行首 + 缩进子行
-  (路径段 + 值, 嵌套值紧凑); `main.rs` 持 `ExpandMap` 状态, 点击/`→`/`←` 展开折叠;
-  显示行模型统一 (过滤命中表之上叠展开前缀和), 行号槽/选中/滚动全走统一映射
-  - 验收: 人工验收 (展开嵌套对象 → 缩进子行 → 滚动流畅 → 折叠恢复); 过滤 + 展开
-    叠加行号映射一致 (单测覆盖 展开/折叠/滚动越界/过滤叠加)
-  - 验证: `cargo test` + 1GB JSONL 人工验收
-  - 文件: `src/main.rs`, `src/view.rs` | M (展开 UI 是集成点, 最易错在映射一致)
+- [ ] **T4: 轮转启发实验 + 截断/轮转 UI** — 实验 copytruncate vs create 两种流派
+  (记录进本文件附录), 定启发 (len+mtime 是否够, 首块哈希是否加); 检测到 len 缩小/轮转
+  → 全量 `rebuild` + 状态栏「文件已截断/轮转」; 书签越界丢弃。
+  - 验收: 实验表落档; 人工验收 (tail 中外部截断 → 状态提示 + 重建, 不崩);
+    rebuild 后越界书签丢弃单测
+  - 验证: `cargo test` + 人工 + 实验脚本
+  - 文件: `src/logfile.rs`, `src/main.rs`, 实验产物 (本文件附录) | M
 
 ### Phase 3: 验收
 
-- [ ] **T5: genlog --nested + logbench 过滤扩展 + 性能门槛 + 人工验收** — genlog
-  加 `--nested` 生成 1GB 嵌套 JSONL; logbench `--filter` 支持点路径/比较算子并计时;
-  实测性能门槛 + 人工验收清单过单
-  - 验收: `user.id=42*` 点路径 1GB ≤ 2s; `status>=500` 1GB ≤ 400ms (与扁平同量级);
-    `level=ERROR` 扁平不退化 (≤400ms); 过滤结果与 logbench 交叉验证一致
-  - 验证: `cargo run --release --bin logbench -- <1GB嵌套> --filter "user.id=42*"`; 人工
-  - 文件: `src/bin/genlog.rs`, `src/bin/logbench.rs` | M
+- [ ] **T5: 人工验收 + 空闲税实测** — 1GB 持续追加 tail; 过滤跟随; 外部截断; 空闲 CPU。
+  - 验收: 无增长时 CPU < 1% (任务管理器); 三件套绿
+  - 验证: 人工 + `cargo test` + clippy
+  - 文件: — | S
 
 ### Checkpoint: 模块验收 (T5 后)
 
 - [ ] 三件套绿
-- [ ] spec-jsonl-table 成功判据逐条对照过单
+- [ ] spec-live-tail 成功判据逐条对照过单
 - [ ] 人工验收清单全过 (用户上手)
 - [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`, 全模块)
 
@@ -96,13 +84,28 @@
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 点路径粗筛候选率失控 (key 太常见) | 高 | 粗筛 needle 用最内层 key 精确匹配; 实测候选率, 失控回退或报错提示 |
-| 过滤 × 展开行号映射出错 (最易错点) | 高 | 前缀和 roundtrip + 过滤叠加单测重点覆盖; T4 验收含映射一致 |
-| 真 parser 显示路径性能退化 | 中 | 只 parse 可见行 (恒定成本), logbench 复跑 `level=ERROR` 保不退化 |
-| 数值比较边界 (负数/浮点/科学计数/字符串值) | 中 | 单测覆盖; 字符串值不参与数值比较 (不匹配) |
-| 嵌套展开大对象 flatten 爆栈/慢 | 低 | 惰性 parse 单行; 深度上限防御 (POC 不追求极端嵌套) |
+| 增量索引与全量不一致 (续行/步进边界) | 高 | 「append == 重建」对拍单测钉死 |
+| 轮转启发误判 (mtime 分辨率/同秒轮转) | 中 | T4 两种流派实测定; len 缩小必判截断 |
+| Arc 快照隔离下旧 Arc 延迟释放 (worker 存活期) | 低 | worker 短命 (秒级), 旧 mmap 及时回收 |
+| 增长过频 (每 250ms 都 append) | 低 | 3MB 克隆 × 4/s 可忽略; 无增长时零 append |
+| 跟随滚动抖动 (append 触发视图跳动) | 中 | 跟随态才滚底; 用户上滚即脱离, 不抢滚动 |
 
 ## Open Questions (plan 已答, 备查)
 
-- ~~展开键盘等价键~~ → `→`/`←` + 鼠标 `▶` (决策 4; Enter 归过滤, 不冲突)
-- ~~数组根嵌套行显示形态~~ → 数组段 `[0]` 作路径段 (决策 4)
+- ~~轮转检测启发强度~~ → len 缩小必判截断; len+mtime 变判轮转; 首块哈希 T4 实验后定
+
+## 附录: T4 轮转检测实测 (2026-09-06)
+
+**结论: len+mtime 足够, 首块哈希不加。**
+
+| 流派 | 对「被本工具打开的文件」的实际行为 | 检测 |
+|---|---|---|
+| create (rename + 新建) | rename 成功 (视图跟句柄走), 新文件 len/mtime 必变 | `is_stale` (len+mtime) 检出 → 全量重建 |
+| copytruncate (截断+重写) | **Windows OS 拒绝截断被映射文件** (ERROR_USER_MAPPED_FILE, T3 实测) | 非问题 —— 截断根本发生不了, 轮转工具收到 OS 报错 |
+
+- 依据: core-viewer T3 `mmap_lab` 五场景实测 (truncate 被拒, rename/delete/append/overwrite 可);
+  `is_stale` (FileStat len+mtime 快照比对) 已单测覆盖 append/delete/create-轮转。
+- 首块哈希 = 过度设计: 唯一漏网场景是「轮转后新文件 len 与 mtime 都恰好等于旧快照」,
+  概率可忽略 (mtime 秒级已够; 且 create 流派新文件几乎必然更小)。
+- 落地: `poll_growth` 用 `FileStat::of` 比对快照; len 增 → append, 其余 → `rebuild_file`
+  (书签越界丢弃 + 过滤/搜索/展开态清零 + 状态栏「文件已截断/轮转」)。

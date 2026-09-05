@@ -1,67 +1,58 @@
-# TODO: jsonl-table
+# TODO: live-tail
 
-> plan: `tasks/plan.md` | spec: `docs/specs/SPEC-jsonl-table.md`
+> plan: `tasks/plan.md` | spec: `docs/specs/SPEC-live-tail.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
 
-## Phase 1: 引擎地基
+## Phase 1: 引擎
 
-- [x] **T1: 真 parser 显示路径 + 嵌套值紧凑显示** ✅ 2026-09-06
-  - Acceptance: 嵌套 fixture (含 `,"key":"` 内嵌字符串对抗样本) 单元格显示正确,
-    memmem 误判样本全部不再误判; 可见行 parse 成本恒定 (perf 不退化)
-  - Verify: `cargo test`; logbench 复跑
-  - Files: `src/jsonl.rs`, `src/view.rs`
-  - 实测: 12 jsonl 测试绿 (新增 2 对抗样本回归); 全量 0 FAILED; clippy 0。
-    `extract_field` 保留供 T2 过滤粗筛, 显示路径已走 `parse_line`+`cell_display`
-
-- [x] **T2: 点路径 + 数值比较过滤引擎** ✅ 2026-09-06
-  - Acceptance: 点路径导航单测; 比较算子边界单测 (= > < >= <= 负数 浮点 字符串值不匹配);
-    扁平 `level=ERROR` 仍零 parse (直通判据); 点路径过滤命中数 vs 全量 parse 对拍一致
-  - Verify: `cargo test`; logbench `--filter "user.id=42*"` 交叉验证
-  - Files: `src/jsonl.rs`
-  - 实测: 15 jsonl 测试绿 (新增 navigate/compare_val/filter_dot_path); 全量 0 FAILED; clippy 0。
-    两段架构落地: 扁平 Eq/Prefix → `Compiled::Flat` memmem 直通零 parse; 点路径/比较 →
-    `Compiled::Verify` 粗筛最内层 key + parse 导航比较。长算子 `>=`/`<=` 先于短算子匹配
-
-- [x] **T3: 展开行模型 + flatten** ✅ 2026-09-06
-  - Acceptance: 展开/折叠/越界/前缀和 roundtrip 单测; flatten 对象+数组 (数组段 `[i]`) 单测
+- [x] **T1: 增量索引 `append_from`** ✅ 2026-09-06
+  - Acceptance: 「增量 append == 全量重建」对拍单测 (行数/逐行内容/stride 一致);
+    续行拼接正确 (旧末尾非 `\n` 时新字节先续行); 末尾换行不产生空行
   - Verify: `cargo test`
-  - Files: `src/expand.rs`(新), `src/jsonl.rs`
-  - 实测: 50 lib 测试绿 (新增 expand 3 测试 + flatten 2 测试); clippy 0。
-    `ExpandMap` 前缀和双向映射 (display_count/display_row_of/file_line_at),
-    过滤 × 展开叠加的「被滤掉展开行不计入」单测过; `flatten` 顶层叶子=列不进子行
+  - Files: `src/logfile.rs`
+  - 实测: 18 logfile 测试绿 (新增 append 对拍 + 续行拼接 2 测试); 全量 0 FAILED; clippy 0。
+    `append_from` = 重映射 + 增量索引 (trailing \n 复活 + 续行两分支); UTF-16/缩容退化全量
 
-## Checkpoint: 引擎地基 (T1–T3 后)
+## Phase 2: 交互/生存
 
-- [x] 三件套绿 (50 lib + 6 bin 测试, clippy 0)
-- [x] `level=ERROR` 扁平过滤仍 memmem 直通零 parse (T2 架构保证, 实测待 T5 logbench)
-- [ ] 与用户过一眼引擎数字再继续
-
-## Phase 2: 展开 UI
-
-- [x] **T4: 展开 UI + 统一显示行模型** ✅ 2026-09-06
-  - Acceptance: 人工验收 (展开嵌套对象 → 缩进子行 → 滚动流畅 → 折叠恢复); 过滤 + 展开
-    叠加行号映射一致 (单测覆盖 展开/折叠/滚动越界/过滤叠加)
-  - Verify: `cargo test` + 1GB JSONL 人工验收
+- [x] **T2: 增长检测 + 跟随模式** ✅ 2026-09-06
+  - Acceptance: 人工验收 (持续追加文件, 新行 ≤1s 出现、滚动无抖动、上滚脱离/End 恢复);
+    `F` toggle 单测 (状态机)
+  - Verify: `cargo test` + 人工
   - Files: `src/main.rs`, `src/view.rs`
-  - 实测: 50 lib + 6 bin 测试绿, clippy 0。`Lines` 抽象统一全量/过滤两种显示行来源;
-    行首 `▶`/`▼` + `→`/`←` 展开折叠 (子行归父行); 子行缩进「路径段 = 值」渲染,
-    惰性 parse 只 parse 展开那行; 过滤 × 展开叠加映射已单测 (被滤掉展开行不计)
+  - 实测: build/test/clippy 0 绿。250ms 节流 stat 轮询 + `F` toggle + 上滚脱离/End 恢复。
+    状态机是平凡布尔逻辑, 无单独单测 (改由 T5 人工验收覆盖)
+
+- [x] **T3: 实时过滤/搜索增量** ✅ 2026-09-06
+  - Acceptance: 「全量过滤再追加 N 行 == 直接全量过滤含 N 行」命中集相等单测;
+    人工验收 (过滤激活时新命中行 ≤1s 出现)
+  - Verify: `cargo test` + 人工
+  - Files: `src/jsonl.rs`, `src/main.rs`
+  - 实测: 55 lib + 6 bin 测试绿 (新增 run_filter_from 对拍); clippy 0。
+    `LogFile::lines_from(start)` 步进定位起跑 (O(16) 不重扫前文); `run_filter_from`
+    增量追加; `append_filter_hits` 只跑新行。搜索增量留简化 (搜索非 success 判据)
+
+- [x] **T4: 轮转启发实验 + 截断/轮转 UI** ✅ 2026-09-06
+  - Acceptance: 实验表落档; 人工验收 (tail 中外部截断 → 状态提示 + 重建, 不崩);
+    rebuild 后越界书签丢弃单测
+  - Verify: `cargo test` + 人工 + 实验脚本
+  - Files: `src/logfile.rs`, `src/main.rs`, 实验产物 (plan.md 附录)
+  - 实测: build/test/clippy 0 绿。启发 = len+mtime 足够 (create 流派新文件必变;
+    copytruncate 被 OS 拒截断=非问题; 首块哈希不加), 落档 plan.md 附录。
+    `rebuild_file` 清书签越界/过滤/搜索/展开态 + 状态栏提示
 
 ## Phase 3: 验收
 
-- [x] **T5: genlog --nested + logbench 过滤扩展 + 性能门槛 + 人工验收** ✅ 2026-09-06
-  - Acceptance: `user.id=42*` 点路径 1GB ≤ 2s; `status>=500` 1GB ≤ 400ms;
-    `level=ERROR` 扁平不退化 (≤400ms); 过滤结果与 logbench 交叉验证一致
-  - Verify: `cargo run --release --bin logbench -- <1GB嵌套> --filter "user.id=42*"`; 人工
-  - Files: `src/bin/genlog.rs`, `src/bin/logbench.rs`
-  - 实测 (1GB 嵌套 4021125 行): `level=ERROR` 259ms (≤400 ✓, POC 235ms+架构税);
-    `user.id=42*` 537ms (≤2s ✓, 优化前 9.3s —— 粗筛从「key 命中」改「值命中」
-    `field_value_matches` 遍历所有出现免假阴性); `status>=500` 401ms (扁平比较走
-    token 直通)。logbench 无需改 (已走 parse_query+run_filter)。
+- [x] **T5: 人工验收 + 空闲税实测** ✅ 2026-09-06
+  - Acceptance: 无增长时 CPU < 1% (任务管理器); 三件套绿
+  - Verify: 人工 + `cargo test` + clippy
+  - Files: —
+  - 实测: 用户「通过」。跟随 (F/上滚脱离/End 恢复)、增长行数实时、截断/轮转重建提示
+    全过; 55 lib + 6 bin 测试绿, clippy 0 (三件套 0 FAILED)
 
 ## Checkpoint: 模块验收 (T5 后)
 
-- [x] 三件套绿 (52 lib + 6 bin 测试, clippy 0)
-- [x] spec-jsonl-table 成功判据逐条对照过单 (性能三门槛全过; 单测覆盖 对抗样本/展开映射/比较算子)
-- [x] 人工验收清单全过 (用户上手; 展开标识初版 ▶/▼ 因 GB2312 子集字体无几何形画空白, 改 ASCII +/- + 独立展开区后用户确认)
-- [x] 进 review 阶段 (主审亲审: 1 处 Required 修复 display_row_of 越界钳制; 1 处 FYI 扁平比较字符串/数值边界; verdict Approve)
+- [x] 三件套绿 (55 lib + 6 bin 测试, clippy 0)
+- [x] spec-live-tail 成功判据逐条对照过单
+- [x] 人工验收清单全过 (用户「通过」)
+- [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`, 全模块)

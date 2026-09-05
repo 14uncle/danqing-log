@@ -230,6 +230,34 @@ impl LogFile {
         }
     }
 
+    /// 从第 start_line 行起的顺序迭代器 (live-tail 增量过滤: 只扫新行, 不重扫前文)。
+    /// start_line == 0 等价 [`Self::lines`]; 越界返回空迭代器。
+    pub fn lines_from(&self, start_line: u64) -> LineIter<'_> {
+        let data = self.data.as_bytes();
+        if start_line >= self.line_count {
+            return LineIter {
+                data,
+                next: start_line,
+                start: data.len(),
+                count: self.line_count,
+            };
+        }
+        // 步进定位 start_line 的起始字节 + 段内前扫
+        let mut start = self.stride_offsets[(start_line / INDEX_STRIDE) as usize] as usize;
+        for _ in 0..(start_line % INDEX_STRIDE) {
+            match memchr::memchr(b'\n', &data[start..]) {
+                Some(p) => start += p + 1,
+                None => break,
+            }
+        }
+        LineIter {
+            data,
+            next: start_line,
+            start,
+            count: self.line_count,
+        }
+    }
+
     /// 字节偏移 → 行号: 步进表二分定段 + 段内 memchr 前扫 (≤STRIDE-1 行)。
     /// 仅供 search 的命中回落 (命中数封顶 cap, 成本有界)。
     fn line_of_offset(&self, off: u64) -> u64 {
@@ -300,6 +328,60 @@ impl LogFile {
         *self = new;
         Ok(())
     }
+
+    /// 增长追加: 重新 mmap + 只对新字节区间增量索引, 返回新 LogFile (旧实例由调用方
+    /// 的 Arc 保活, 无 Mutex 无悬垂)。UTF-16 (转码副本) 与缩容退化全量 open。
+    pub fn append_from(old: &Self, path: &Path) -> Result<Self> {
+        // UTF-16 转码副本: 索引建在 UTF-8 副本上, 增量不适用 → 全量
+        if matches!(old.data, FileData::Owned(_)) {
+            return Self::open(path);
+        }
+        let t0 = Instant::now();
+        let file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+        let file_bytes = file.metadata().context("读取文件元信息失败")?.len();
+        let map = unsafe { Mmap::map(&file).context("建立内存映射失败")? };
+        let map_us = t0.elapsed().as_micros() as u64;
+
+        let old_len = old.data.as_bytes().len();
+        let new_data = &map[..];
+        // 缩容/无增长: 全量重建 (调用方通常据 stat 判过期, 这里是防御兜底)
+        if new_data.len() <= old_len {
+            drop(map);
+            return Self::open(path);
+        }
+
+        let t1 = Instant::now();
+        let (mut stride_offsets, line_count) = append_index(
+            &old.stride_offsets,
+            old.line_count,
+            old.data.as_bytes(),
+            new_data,
+        );
+        stride_offsets.shrink_to_fit();
+        let index = t1.elapsed();
+        let index_bytes = stride_offsets.len() * std::mem::size_of::<u64>();
+        let stat = FileStat::of(path).unwrap_or(FileStat {
+            len: file_bytes,
+            mtime: None,
+        });
+
+        let stats = OpenStats {
+            file_bytes,
+            map_us,
+            index,
+            line_count,
+            index_bytes,
+            encoding: old.stats.encoding,
+        };
+        Ok(Self {
+            data: FileData::Mapped(map),
+            encoding: old.encoding,
+            stride_offsets,
+            line_count,
+            stat,
+            stats,
+        })
+    }
 }
 
 /// 步进行索引: SIMD memchr 扫 `\n`, 每 STRIDE 行记一个起点偏移, 并数总行数。
@@ -327,6 +409,47 @@ fn build_line_index(data: &[u8]) -> (Vec<u64>, u64) {
         }
         if count % INDEX_STRIDE == 0 {
             strides.push(next);
+        }
+        count += 1;
+    }
+    (strides, count)
+}
+
+/// 增量索引: 只扫 `[old_len, new_len)` 的新字节, 追加 stride 表 + 行数。
+///
+/// 续行/复活语义: 旧数据以 `\n` 结尾时, 那个 trailing `\n` 因新数据到达而「复活」
+/// (它现在结束一行, 新行从 old_len 开始); 否则旧末行续着, 新字节里第一个 `\n`
+/// 结束它。每 16 行补一条 stride 项 (行起始偏移)。正确性靠「append == 全量重建」对拍。
+fn append_index(
+    old_strides: &[u64],
+    old_line_count: u64,
+    old_data: &[u8],
+    new_data: &[u8],
+) -> (Vec<u64>, u64) {
+    let old_len = old_data.len();
+    if new_data.len() <= old_len {
+        return (old_strides.to_vec(), old_line_count);
+    }
+    let tail = &new_data[old_len..];
+    let mut strides = old_strides.to_vec();
+    let mut count = old_line_count;
+
+    // 旧数据以 \n 结尾 (或空): trailing \n 复活, 第 old_line_count 行从 old_len 开始
+    if old_len == 0 || old_data[old_len - 1] == b'\n' {
+        if count % INDEX_STRIDE == 0 {
+            strides.push(old_len as u64);
+        }
+        count += 1;
+    }
+
+    // 扫描新字节: 每个非尾 \n 结束一行, 下一行从其后开始
+    for p in memchr::memchr_iter(b'\n', tail) {
+        let abs = old_len + p;
+        if abs + 1 == new_data.len() {
+            break; // 末尾换行不产生新行
+        }
+        if count % INDEX_STRIDE == 0 {
+            strides.push((abs + 1) as u64);
         }
         count += 1;
     }
@@ -639,5 +762,54 @@ mod tests {
         let lf = open_with(b"a\nb\n");
         assert_eq!(lf.line(2), b"");
         assert_eq!(lf.line(u64::MAX), b"");
+    }
+
+    #[test]
+    fn append_from_matches_full_rebuild() {
+        // 分多次追加 (跨越步进边界 16), 每次 append_from 与全量 open 对拍
+        let path = temp_path("append");
+        std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
+        let mut cur = LogFile::open(&path).unwrap();
+        let chunks: [&[u8]; 3] = [
+            b"delta\nepsilon\n",
+            b"zeta\neta\ntheta\niota\nkappa\nlambda\nmu\nnu\nxi\nomicron\npi\nrho\nsigma\ntau\n",
+            b"upsilon\nphi\nchi\npsi\nomega\n",
+        ];
+        for chunk in chunks {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(chunk)
+                .unwrap();
+            let appended = LogFile::append_from(&cur, &path).unwrap();
+            let full = LogFile::open(&path).unwrap();
+            assert_eq!(appended.line_count(), full.line_count(), "行数一致");
+            for i in 0..appended.line_count() {
+                assert_eq!(appended.line(i), full.line(i), "行 {i} 内容一致");
+            }
+            cur = appended;
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_handles_partial_line_continuation() {
+        // 旧末尾无 \n: 新字节先续旧行, 再开新行
+        let path = temp_path("append-cont");
+        std::fs::write(&path, b"hello ").unwrap();
+        let lf = LogFile::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"world\nnext\n")
+            .unwrap();
+        let appended = LogFile::append_from(&lf, &path).unwrap();
+        let full = LogFile::open(&path).unwrap();
+        assert_eq!(appended.line_count(), full.line_count(), "行数一致");
+        assert_eq!(appended.line(0), b"hello world", "续行拼接");
+        assert_eq!(appended.line(1), b"next");
+        std::fs::remove_file(&path).ok();
     }
 }

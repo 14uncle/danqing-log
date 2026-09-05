@@ -451,12 +451,18 @@ fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
 /// 禁用 line(i) 逐行随机访问 —— 步进索引下每次定位带段内前扫, 全量遍历会
 /// 把成本乘进行数 (T1 实测回归 235ms → 1072ms 的教训, 见 logfile.rs::lines 注释)。
 pub fn run_filter(file: &LogFile, clauses: &[Clause]) -> Vec<u64> {
+    run_filter_from(file, clauses, 0)
+}
+
+/// 增量过滤: 只对 >= start_line 的行跑谓词 (live-tail 追加), 返回命中行号 (升序)。
+/// 走 `lines_from` 顺序扫描, 不重扫前文 —— 与全量路径命中集一致 (单测对拍)。
+pub fn run_filter_from(file: &LogFile, clauses: &[Clause], start_line: u64) -> Vec<u64> {
     let compiled: Vec<Compiled> = clauses.iter().map(compile).collect();
     if compiled.is_empty() {
-        return (0..file.line_count()).collect();
+        return (start_line..file.line_count()).collect();
     }
     let mut hits = Vec::new();
-    for (i, line) in file.lines() {
+    for (i, line) in file.lines_from(start_line) {
         if line_matches(line, &compiled) {
             hits.push(i);
         }
@@ -747,6 +753,24 @@ mod tests {
         // 精确验证仍走 navigate: 第一处 id=7 不代表 user.id=7
         let v = parse_line(line).unwrap();
         assert_eq!(navigate(&v, &["user".into(), "id".into()]).unwrap().as_i64(), Some(42));
+    }
+
+    #[test]
+    fn run_filter_from_matches_full() {
+        let lf = open_with(
+            br#"{"level":"INFO","msg":"a"}
+{"level":"ERROR","msg":"b"}
+{"level":"INFO","msg":"c"}
+{"level":"ERROR","msg":"d"}
+{"level":"ERROR","msg":"e"}
+"#,
+        );
+        let clauses = parse_query("level=ERROR");
+        let full = run_filter(&lf, &clauses);
+        assert_eq!(full, vec![1, 3, 4]);
+        assert_eq!(run_filter_from(&lf, &clauses, 0), full, "从 0 起跑 == 全量");
+        assert_eq!(run_filter_from(&lf, &clauses, 3), vec![3, 4], "中间起跑");
+        assert_eq!(run_filter_from(&lf, &clauses, 99), Vec::<u64>::new(), "越界空");
     }
 
     #[test]
