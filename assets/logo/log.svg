@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  丹青日志 (danqing-log) Logo —— 「正在写入的那一行」
+  @author 十四叔
+  @date 2026/09/06
+
+  家族语法 (与 danqing / danqing-pomodoro / danqing-clipboard 同源):
+    玉色 #0F766E 承载产品意象, 朱砂 #E34234 一处点睛, 玻璃白 0.85 内填,
+    平涂无渐变, 16px 可辨。
+
+  图形构成:
+    玉色描边宽幅日志视窗 (玻璃白内填), 板内四条水平日志行,
+    底部一条朱砂 = 正被尾随/紧盯的那一行 (live tail)。
+    朱砂的位置语言与兄弟产品各司其职:
+    引擎破框而出 (自绘无边界), 番茄钟在轴心 (时间),
+    剪贴板在首行 (数据历史), 日志在底行 (正在写入的最新一行)。
+
+  位图一律由 tools/export-logo.py 从本文件几何手工同步导出, 不反向编辑 PNG。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>丹青日志 Logo</title>
+  <desc>玉色描边宽幅日志视窗, 内填玻璃白, 板内四条日志行, 底部一条朱砂红代表正在写入/尾随的最新一行。</desc>
+
+  <!-- 视窗外框: 玉色 #0F766E 描边 + 玻璃白 0.85 内填; 宽幅窗口承载横排日志行 -->
+  <rect x="28" y="48" width="200" height="160" rx="28" ry="28"
+        fill="white" fill-opacity="0.85" stroke="#0F766E" stroke-width="20"/>
+
+  <!-- 日志行: 前三条玉色 (陈述日志文本), 底部一条朱砂 = 正被尾随/紧盯的那一行 -->
+  <rect x="62" y="72"  width="120" height="16" rx="8" ry="8" fill="#0F766E"/>
+  <rect x="62" y="104" width="82"  height="16" rx="8" ry="8" fill="#0F766E"/>
+  <rect x="62" y="136" width="130" height="16" rx="8" ry="8" fill="#0F766E"/>
+  <rect x="62" y="168" width="138" height="16" rx="8" ry="8" fill="#E34234"/>
+</svg>
