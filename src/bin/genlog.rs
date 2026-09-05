@@ -3,9 +3,10 @@
 //!
 //! 测试日志生成器: 合成指定体积的写实日志, 供 POC 基准与演示。
 //!
-//! 用法: genlog <输出路径> <目标 MiB> [--jsonl]
-//! 默认生成明文日志 (时间戳+级别+组件+请求字段); --jsonl 生成结构化日志
-//! (开枪前提②的演示数据)。输出确定性 (xorshift 伪随机), 同参数同文件。
+//! 用法: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]
+//! 默认生成明文日志 (时间戳+级别+组件+请求字段); --jsonl 生成扁平结构化日志
+//! (开枪前提②的演示数据); --nested 生成嵌套 JSONL (user 对象 + tags 数组,
+//! 点路径过滤/嵌套展开的靶子)。输出确定性 (xorshift 伪随机), 同参数同文件。
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -48,10 +49,11 @@ const COMPONENTS: &[&str] = &[
 fn main() {
     let mut args = std::env::args().skip(1);
     let (Some(path), Some(mib)) = (args.next().map(PathBuf::from), args.next()) else {
-        eprintln!("用法: genlog <输出路径> <目标 MiB> [--jsonl]");
+        eprintln!("用法: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]");
         std::process::exit(2);
     };
-    let jsonl = args.any(|a| a == "--jsonl");
+    let nested = args.any(|a| a == "--nested");
+    let jsonl = args.any(|a| a == "--jsonl") || nested;
     let target: u64 = match mib.parse::<u64>() {
         Ok(m) if m > 0 => m * 1024 * 1024,
         _ => {
@@ -87,7 +89,12 @@ fn main() {
             200, 200, 200, 200, 201, 204, 301, 400, 401, 403, 404, 500, 502,
         ][(r() % 13) as usize];
         let endpoint = r() % 100_000;
-        if jsonl {
+        if nested {
+            // 嵌套 JSONL: user 为对象 (id+name), tags 数组 —— 点路径过滤/展开的靶子
+            line.push_str(&format!(
+                "{{\"ts\":\"2026-09-05T{h:02}:{m:02}:{sec:02}.{ms:03}Z\",\"level\":\"{lv}\",\"logger\":\"{comp}\",\"msg\":\"request completed\",\"req_id\":\"{req:016x}\",\"user\":{{\"id\":{user},\"name\":\"user_{user}\"}},\"tags\":[\"api\",\"orders\"],\"duration_ms\":{dur},\"bytes\":{bytes},\"status\":{status},\"path\":\"/api/v1/orders/{endpoint}\"}}\n"
+            ));
+        } else if jsonl {
             line.push_str(&format!(
                 "{{\"ts\":\"2026-09-05T{h:02}:{m:02}:{sec:02}.{ms:03}Z\",\"level\":\"{lv}\",\"logger\":\"{comp}\",\"msg\":\"request completed\",\"req_id\":\"{req:016x}\",\"user\":\"user_{user}\",\"duration_ms\":{dur},\"bytes\":{bytes},\"status\":{status},\"path\":\"/api/v1/orders/{endpoint}\"}}\n"
             ));

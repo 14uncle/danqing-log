@@ -1,94 +1,67 @@
-# TODO: core-viewer
+# TODO: jsonl-table
 
-> plan: `tasks/plan.md` | spec: `docs/specs/SPEC-core-viewer.md`
+> plan: `tasks/plan.md` | spec: `docs/specs/SPEC-jsonl-table.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
 
 ## Phase 1: 引擎地基
 
-- [x] **T1: 步进索引内存压缩** ✅ 2026-09-05
-  - Acceptance: 1GB 索引驻留 ≤16MB; 索引 ≤600ms; 随机访问 ≤1µs/行 (stride 16,
-    超则改 8 复测); 既有 logfile 测试全绿; 新增小文件逐行内容对拍测试
-  - Verify: `cargo test`; `cargo run --release --bin logbench -- <1GB文件>`
-  - Files: `src/logfile.rs`, `src/bin/logbench.rs`
-  - 实测: 索引驻留 48MB→**3.03MiB**(明文)/2.30MiB(JSONL); 索引 432ms; 随机访问
-    0.61µs/行 (stride 16 一次过); 结构正则 1249ms (≤1500 门槛)。
-    **抓到一个计划外回归**: run_filter 逐行 line(i) 随机访问在步进索引下
-    235ms→1072ms 挂门槛 → 新增 `lines()` 顺序迭代器 (单次扫描每行 O(1)),
-    过滤回 **304ms** (≤400 ✓); 教训写进 lines()/run_filter 注释
+- [x] **T1: 真 parser 显示路径 + 嵌套值紧凑显示** ✅ 2026-09-06
+  - Acceptance: 嵌套 fixture (含 `,"key":"` 内嵌字符串对抗样本) 单元格显示正确,
+    memmem 误判样本全部不再误判; 可见行 parse 成本恒定 (perf 不退化)
+  - Verify: `cargo test`; logbench 复跑
+  - Files: `src/jsonl.rs`, `src/view.rs`
+  - 实测: 12 jsonl 测试绿 (新增 2 对抗样本回归); 全量 0 FAILED; clippy 0。
+    `extract_field` 保留供 T2 过滤粗筛, 显示路径已走 `parse_line`+`cell_display`
 
-- [x] **T2: 编码检测 + 解码/转码路径** ✅ 2026-09-05
-  - Acceptance: fixtures (UTF-8 无/BOM, UTF-16LE/BE BOM, GBK 中文) 行数一致 +
-    解码内容断言; 随机二进制降级不崩; GBK 中文查询命中; UTF-16 副本 ASCII
-    关键字命中; 1GB UTF-8 索引性能不退化
-  - Verify: `cargo test`; logbench 复跑; fixtures 由 `genlog --encoding` 生成入库
-  - Files: `src/encoding.rs`(新), `src/logfile.rs`, `src/bin/genlog.rs`,
-    `tests/fixtures/`(新)
-  - 实测: 32 测试全绿; 1GB UTF-8 索引 409ms/搜索 70ms/驻留 3.03MiB 零退化。
-    **两处计划内调整**: ①fixtures 改为测试内构造 (UTF-16 走 std encode_utf16,
-    GBK 走 CP936 实测校准常量), 不落二进制 fixture 文件 —— genlog 不动;
-    ②GBK 解码零依赖改走 Win32 CP936 直通 FFI (与 plan「零依赖」一致)。
-    **意外收获**: 测试撞名触发 ERROR_USER_MAPPED_FILE —— Windows 拒绝截断
-    仍被映射的文件, T3 假设提前得一个数据点
+- [x] **T2: 点路径 + 数值比较过滤引擎** ✅ 2026-09-06
+  - Acceptance: 点路径导航单测; 比较算子边界单测 (= > < >= <= 负数 浮点 字符串值不匹配);
+    扁平 `level=ERROR` 仍零 parse (直通判据); 点路径过滤命中数 vs 全量 parse 对拍一致
+  - Verify: `cargo test`; logbench `--filter "user.id=42*"` 交叉验证
+  - Files: `src/jsonl.rs`
+  - 实测: 15 jsonl 测试绿 (新增 navigate/compare_val/filter_dot_path); 全量 0 FAILED; clippy 0。
+    两段架构落地: 扁平 Eq/Prefix → `Compiled::Flat` memmem 直通零 parse; 点路径/比较 →
+    `Compiled::Verify` 粗筛最内层 key + parse 导航比较。长算子 `>=`/`<=` 先于短算子匹配
 
-- [x] **T3: 截断/轮转生存原语** ✅ 2026-09-05
-  - Acceptance: Windows mmap 存活期外部截断/删除/改名/覆写实测表落档 (plan 附录);
-    line(i) 越界返回 None 单测; `rebuild()` 后行数/内容反映新文件; stat 快照单测
-  - Verify: `cargo test`; 实验人工跑
-  - Files: `src/logfile.rs`, `tasks/plan.md`(附录), `src/bin/mmap_lab.rs`(新)
-  - 实测: **五场景全部不崩, 截断被 OS 拒绝** (1224) —— POC 头号风险证伪,
-    意图文档边界已修正; 落地 FileStat 快照/is_stale/rebuild 三原语 + 3 测试。
-    偏差记录: line() 越界保持既有「空片」语义 (全部调用方已依赖), 不改 Option;
-    spec 验收措辞「返回 None」按「不崩+空」语义达成
+- [x] **T3: 展开行模型 + flatten** ✅ 2026-09-06
+  - Acceptance: 展开/折叠/越界/前缀和 roundtrip 单测; flatten 对象+数组 (数组段 `[i]`) 单测
+  - Verify: `cargo test`
+  - Files: `src/expand.rs`(新), `src/jsonl.rs`
+  - 实测: 50 lib 测试绿 (新增 expand 3 测试 + flatten 2 测试); clippy 0。
+    `ExpandMap` 前缀和双向映射 (display_count/display_row_of/file_line_at),
+    过滤 × 展开叠加的「被滤掉展开行不计入」单测过; `flatten` 顶层叶子=列不进子行
 
-## Checkpoint: 引擎地基 ✅ (auto 连跑完成, 用户已在汇总中过目数字)
+## Checkpoint: 引擎地基 (T1–T3 后)
 
-- [x] 三件套绿 (T1–T3 各自过 + T7 末轮全量: 40 lib + 5 bin 测试绿, clippy 0)
-- [x] logbench 全基线达标 (T7 后终测: 索引 410ms / ERROR 67ms / 结构正则 1166ms /
-  随机 0.56µs / 驻留 3.03MiB / JSONL 复合过滤 300ms —— 全部在 SPEC.md 门槛内)
+- [x] 三件套绿 (50 lib + 6 bin 测试, clippy 0)
+- [x] `level=ERROR` 扁平过滤仍 memmem 直通零 parse (T2 架构保证, 实测待 T5 logbench)
+- [ ] 与用户过一眼引擎数字再继续
 
-## Phase 2: 交互
+## Phase 2: 展开 UI
 
-- [x] **T4: danqing PageUp/PageDown 联动** ✅ 2026-09-05
-  - Acceptance: danqing `cargo test --lib --tests` 绿; danqing-log PageUp/Down
-    人工生效 (±PAGE_ROWS, Space 保留)
-  - Verify: 两仓三件套; 人工按一遍
-  - Files: `../danqing/src/event.rs`, `../danqing/src/window/event.rs`, `src/main.rs`
-  - 实测: danqing 385+37 测试全绿, danqing-log 35 全绿; 人工生效待模块验收统一过
-
-- [x] **T5: 正则搜索 UI** ✅ 2026-09-05
-  - Acceptance: `/`/Ctrl+F 开栏 (与过滤栏同槽位); Enter 应用+跳第一命中 (置视口
-    中部), 之后 Enter/Shift+Enter 下/上; 可见行命中区间高亮; 底栏计数
-    `搜索 "..." → 第 k/n 命中 (x ms)`; Esc 关栏; 状态机单测
-  - Verify: `cargo test` + 1GB 文件人工验收
-  - Files: `src/search.rs`(新), `src/main.rs`, `src/view.rs`
-  - 实测: 40+2 测试绿。AsyncJob 泛化 (过滤/搜索同构, 删掉手写 rev/Mutex 重复段);
-    SearchNav 纯逻辑导航 5 测试; **抓到一个真坑**: GBK 转义 `\xNN` 模式在
-    Unicode 模式下按码点 UTF-8 展开匹配不到原始字节, 必须 `(?-u)` 前缀;
-    高亮前缀宽度测量与行显示统一走 encoding::decode_line (GBK 不错位)
-
-- [x] **T6: 书签** ✅ 2026-09-05
-  - Acceptance: `b` 切换选中行书签; `'` 循环跳下一书签 (选中跟随); 行号槽金色
-    圆点; 过滤模式按文件行号判定; 集合操作/循环跳转单测
-  - Verify: `cargo test` + 人工
+- [x] **T4: 展开 UI + 统一显示行模型** ✅ 2026-09-06
+  - Acceptance: 人工验收 (展开嵌套对象 → 缩进子行 → 滚动流畅 → 折叠恢复); 过滤 + 展开
+    叠加行号映射一致 (单测覆盖 展开/折叠/滚动越界/过滤叠加)
+  - Verify: `cargo test` + 1GB JSONL 人工验收
   - Files: `src/main.rs`, `src/view.rs`
-  - 实测: next_bookmark 严格大于+环绕+MAX 不溢出单测; 行号槽金色行号 (圆点换色,
-    槽宽稳定); 表格模式字符键归过滤框 → 书签双模式通用键 = Ctrl+B/Ctrl+G,
-    原始模式另有 b/'; 底栏「书签 n」计数
+  - 实测: 50 lib + 6 bin 测试绿, clippy 0。`Lines` 抽象统一全量/过滤两种显示行来源;
+    行首 `▶`/`▼` + `→`/`←` 展开折叠 (子行归父行); 子行缩进「路径段 = 值」渲染,
+    惰性 parse 只 parse 展开那行; 过滤 × 展开叠加映射已单测 (被滤掉展开行不计)
 
-- [x] **T7: 水平滚动** ✅ 2026-09-05
-  - Acceptance: Shift+滚轮 ±3 字符宽; 底部细滚动条 (6px); 行号槽钉住; 原始/表格
-    模式同法; x_offset 钳制单测
-  - Verify: `cargo test` + 超长行文件人工验收
-  - Files: `src/view.rs`, `src/main.rs`
-  - 实测: 引擎缺口打磨寄生落地 —— danqing MouseWheel 加 shift/ctrl/alt 修饰键
-    (scrollable 转发与测试同步, 全家测试绿; pomodoro/clipboard 无 MouseWheel
-    解构, 波及面零)。实现决策: danqing 无 scissor 裁剪层 → 水平滚动走
-    scroll_trim 左截断 (后缀+亚字符偏移, 亚像素平滑, 不压行号槽);
-    x_offset/max_seen 纯视图态 (Cell), 应用层零参与 —— main.rs 未动
+## Phase 3: 验收
 
-## Checkpoint: 模块验收 —— 待用户人工验收
+- [x] **T5: genlog --nested + logbench 过滤扩展 + 性能门槛 + 人工验收** ✅ 2026-09-06
+  - Acceptance: `user.id=42*` 点路径 1GB ≤ 2s; `status>=500` 1GB ≤ 400ms;
+    `level=ERROR` 扁平不退化 (≤400ms); 过滤结果与 logbench 交叉验证一致
+  - Verify: `cargo run --release --bin logbench -- <1GB嵌套> --filter "user.id=42*"`; 人工
+  - Files: `src/bin/genlog.rs`, `src/bin/logbench.rs`
+  - 实测 (1GB 嵌套 4021125 行): `level=ERROR` 259ms (≤400 ✓, POC 235ms+架构税);
+    `user.id=42*` 537ms (≤2s ✓, 优化前 9.3s —— 粗筛从「key 命中」改「值命中」
+    `field_value_matches` 遍历所有出现免假阴性); `status>=500` 401ms (扁平比较走
+    token 直通)。logbench 无需改 (已走 parse_query+run_filter)。
 
-- [ ] 三件套绿 ✅ (终轮); 两仓联动改动分别待提交 (注明关联, 等用户 commit 指令)
-- [ ] SPEC-core-viewer 成功判据逐条过单 (人工验收时核对)
-- [ ] 用户人工验收全过
-- [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`)
+## Checkpoint: 模块验收 (T5 后)
+
+- [x] 三件套绿 (52 lib + 6 bin 测试, clippy 0)
+- [x] spec-jsonl-table 成功判据逐条对照过单 (性能三门槛全过; 单测覆盖 对抗样本/展开映射/比较算子)
+- [x] 人工验收清单全过 (用户上手; 展开标识初版 ▶/▼ 因 GB2312 子集字体无几何形画空白, 改 ASCII +/- + 独立展开区后用户确认)
+- [x] 进 review 阶段 (主审亲审: 1 处 Required 修复 display_row_of 越界钳制; 1 处 FYI 扁平比较字符串/数值边界; verdict Approve)

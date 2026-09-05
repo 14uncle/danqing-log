@@ -6,10 +6,9 @@
 //! 开枪前提②的主炮: 列化视图 + `level=ERROR status=50*` 字段过滤,
 //! 对标 VS Code 扩展 daucloud.json-viewer (独立窗口、秒开、不占编辑器)。
 //!
-//! 提取策略: 不做全量 JSON parse, 用 memmem 定位 `"key":` 后切值 token。
-//! 已知边界 (demo 范围, 正式版换真 parser):
-//! - 只认扁平顶层字段; 嵌套对象同名字段会撞名 (取最左命中);
-//! - 字符串值内含 `,"key":"` 形态会误判 (前缀校验只能挡一半)。
+//! 显示路径 (T1): 逐可见行 serde_json parse (真 parser, 恒定成本), 嵌套值紧凑显示;
+//! 过滤路径: 扁平等值/前缀走 memmem 粗筛零 parse (性能), 点路径/比较算子才
+//! parse 验证 (T2 两段架构)。memmem 提取 (`extract_field`) 仅供过滤粗筛, 不再进显示。
 
 use crate::logfile::LogFile;
 
@@ -104,15 +103,87 @@ fn field_needle(key: &str) -> Vec<u8> {
 
 /// 扁平字段提取: 返回值 token 切片 (字符串去引号, 数字/bool/null 原样)。
 /// 前缀校验: key 之前 (跳过空白) 必须是 `{` 或 `,`, 挡住行内裸文本误配的一半。
+/// 仅供**过滤粗筛** (T2 两段架构); 显示路径已换真 parser (见 [`parse_line`])。
 pub fn extract_field<'a>(line: &'a [u8], key: &str) -> Option<&'a [u8]> {
     extract_with_needle(line, &field_needle(key))
 }
 
-/// 值 token 切取 (needle 预编译版, 供过滤循环复用)。
-fn extract_with_needle<'a>(line: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
-    let mut from = 0usize;
-    while let Some(pos) = memchr::memmem::find(&line[from..], needle).map(|p| p + from) {
-        // 前缀校验
+/// 解析一行 JSON (显示路径, 只 parse 可见行, 恒定成本)。
+/// 淘汰 memmem 提取出显示路径 —— 消除 POC「`,"key":"` 内嵌误判」已知边界。
+pub fn parse_line(raw: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(raw).ok()
+}
+
+/// 单元格紧凑显示: 字符串裸值, 其余 (对象/数组/数字/bool/null) `to_string` 紧凑。
+pub fn cell_display(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 展开子行: 嵌套结构的一条 (深度, 路径段, 紧凑值)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubRow {
+    /// 缩进深度 (1 = 顶层字段, 递增)。
+    pub depth: usize,
+    /// 路径段: 对象 key 或数组索引 `[i]`。
+    pub label: String,
+    /// 值紧凑显示 (容器 = `{...}`/`[...]`, 叶子 = [`cell_display`])。
+    pub value: String,
+}
+
+/// 展开一行 JSON: 顶层对象/数组字段 → 递归子行序列 (顶层叶子 = 列, 不进子行)。
+/// 数组段显示为 `[i]` (spec Open Question 已答)。根为数组非 JSONL (spec Out)。
+pub fn flatten(value: &serde_json::Value) -> Vec<SubRow> {
+    let mut out = Vec::new();
+    if let serde_json::Value::Object(map) = value {
+        for (k, v) in map {
+            if v.is_object() || v.is_array() {
+                flatten_into(k, v, 1, &mut out);
+            }
+            // 顶层叶子 = 列, 不重复为子行
+        }
+    }
+    out
+}
+
+/// 该 JSON 值是否可展开 (顶层有对象/数组字段)。等价 `!flatten(v).is_empty()`, 但更省。
+pub fn is_expandable(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::Object(map) if map.values().any(|v| v.is_object() || v.is_array()))
+}
+
+/// 递归拍平一个 (路径段, 值) 对: 先推容器/叶子子行, 容器再递归子节点。
+fn flatten_into(label: &str, val: &serde_json::Value, depth: usize, out: &mut Vec<SubRow>) {
+    out.push(SubRow {
+        depth,
+        label: label.to_string(),
+        value: cell_display(val),
+    });
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                flatten_into(k, v, depth + 1, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                flatten_into(&format!("[{i}]"), v, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 找下一个带合法前缀的字段值 token: 返回 (值 token, 下一搜索起点)。
+/// 前缀校验: key 之前 (跳过空白) 必须是 `{` 或 `,`。字符串去引号, 数字/bool/null 原样。
+fn next_field_value<'a>(
+    line: &'a [u8],
+    needle: &[u8],
+    mut from: usize,
+) -> Option<(&'a [u8], usize)> {
+    loop {
+        let pos = memchr::memmem::find(&line[from..], needle)? + from;
         let mut i = pos;
         let prefix_ok = loop {
             if i == 0 {
@@ -125,82 +196,252 @@ fn extract_with_needle<'a>(line: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
                 _ => break false,
             }
         };
+        let next = pos + needle.len();
         if !prefix_ok {
-            from = pos + needle.len();
+            from = next;
             continue;
         }
-        // 值 token
-        let mut s = pos + needle.len();
+        let mut s = next;
         while s < line.len() && matches!(line[s], b' ' | b'\t') {
             s += 1;
         }
         if s >= line.len() {
             return None;
         }
-        if line[s] == b'"' {
+        let token = if line[s] == b'"' {
             // 字符串: 到未转义的收尾引号
             let mut e = s + 1;
+            let mut closed = false;
             while e < line.len() {
                 match line[e] {
                     b'\\' => e += 1,
-                    b'"' => return Some(&line[s + 1..e]),
+                    b'"' => {
+                        closed = true;
+                        break;
+                    }
                     _ => {}
                 }
                 e += 1;
             }
-            return None;
-        }
-        let mut e = s;
-        while e < line.len() && !matches!(line[e], b',' | b'}' | b' ' | b'\t') {
-            e += 1;
-        }
-        return Some(&line[s..e]);
+            if !closed {
+                return None;
+            }
+            &line[s + 1..e]
+        } else {
+            let mut e = s;
+            while e < line.len() && !matches!(line[e], b',' | b'}' | b' ' | b'\t') {
+                e += 1;
+            }
+            &line[s..e]
+        };
+        return Some((token, next));
     }
-    None
+}
+
+/// 值 token 切取 (needle 预编译版, 供扁平过滤直通): 返回首个带合法前缀的字段值。
+fn extract_with_needle<'a>(line: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    next_field_value(line, needle, 0).map(|(v, _)| v)
+}
+
+/// 行内是否存在某字段值命中 (点路径粗筛): 遍历所有 `"leaf":` 出现, 任一值匹配即 true。
+/// 无假阴性 (值命中行必过), 把候选压到「值命中量级」再 parse 验证 —— 避免全量 parse。
+fn field_value_matches(line: &[u8], needle: &[u8], op: Op, value: &str) -> bool {
+    let mut from = 0usize;
+    while let Some((token, next)) = next_field_value(line, needle, from) {
+        if token_matches(token, op, value) {
+            return true;
+        }
+        from = next;
+    }
+    false
+}
+
+/// 比较算子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// `=` 全等。
+    Eq,
+    /// `=...*` 前缀通配。
+    Prefix,
+    /// `>` 数值大于。
+    Gt,
+    /// `>=` 数值大于等于。
+    GtEq,
+    /// `<` 数值小于。
+    Lt,
+    /// `<=` 数值小于等于。
+    LtEq,
 }
 
 /// 过滤子句。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
-    /// 字段匹配: `key=value` / `key=前缀*`。
-    Field { key: String, pattern: String },
+    /// 字段匹配: `key=value` / `a.b.c=value` / `status>=500` / `level=ERR*`。
+    Field {
+        /// 字段路径 (点分; 单段 = 顶层)。
+        path: Vec<String>,
+        op: Op,
+        value: String,
+    },
     /// 裸词: 整行子串。
     Bare(String),
 }
 
-/// 解析查询: 空白分词, 含 `=` 为字段子句, 否则裸词。AND 语义。
+/// 解析查询: 空白分词, 含算子 (`= >= <= > <`) 为字段子句, 否则裸词。AND 语义。
 pub fn parse_query(q: &str) -> Vec<Clause> {
-    q.split_whitespace()
-        .map(|tok| match tok.split_once('=') {
-            Some((key, pattern)) if !key.is_empty() => Clause::Field {
-                key: key.to_string(),
-                pattern: pattern.to_string(),
-            },
-            _ => Clause::Bare(tok.to_string()),
-        })
-        .collect()
+    q.split_whitespace().map(parse_clause).collect()
 }
 
-/// 值匹配: 尾部 `*` = 前缀通配, 否则全等。
-fn value_matches(value: &[u8], pattern: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => value.len() >= prefix.len() && &value[..prefix.len()] == prefix.as_bytes(),
-        None => value == pattern.as_bytes(),
+/// 单 token → 子句。
+fn parse_clause(tok: &str) -> Clause {
+    let Some((path_str, op, value)) = split_operator(tok) else {
+        return Clause::Bare(tok.to_string());
+    };
+    let path: Vec<String> = path_str
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if path.is_empty() {
+        return Clause::Bare(tok.to_string());
     }
+    // `=` + 值尾缀 `*` → 前缀通配 (比较算子不识别 `*`)
+    let (op, value) = if op == Op::Eq {
+        match value.strip_suffix('*') {
+            Some(prefix) => (Op::Prefix, prefix.to_string()),
+            None => (Op::Eq, value.to_string()),
+        }
+    } else {
+        (op, value.to_string())
+    };
+    Clause::Field { path, op, value }
+}
+
+/// 找算子: 返回 (路径串, 算子, 值串)。长算子 (`>=`/`<=`) 先于短算子匹配。
+fn split_operator(tok: &str) -> Option<(&str, Op, &str)> {
+    for (pat, op) in [
+        (">=", Op::GtEq),
+        ("<=", Op::LtEq),
+        (">", Op::Gt),
+        ("<", Op::Lt),
+        ("=", Op::Eq),
+    ] {
+        if let Some(pos) = tok.find(pat) {
+            return Some((&tok[..pos], op, &tok[pos + pat.len()..]));
+        }
+    }
+    None
 }
 
 /// 预编译子句 (needle 只造一次, 过滤循环零分配)。
 enum Compiled {
-    Field { needle: Vec<u8>, pattern: String },
+    /// 裸词: 整行子串 (memmem)。
     Bare(Vec<u8>),
+    /// 扁平等值/前缀: memmem 提取值 token 直通, 零 parse (POC 性能路径)。
+    Flat {
+        needle: Vec<u8>,
+        op: Op,
+        value: String,
+    },
+    /// 需 parse 验证 (点路径或比较算子): 粗筛最内层 key + serde_json 导航比较。
+    Verify {
+        needle: Vec<u8>,
+        path: Vec<String>,
+        op: Op,
+        value: String,
+    },
+}
+
+/// 值 token 匹配: Eq 全等, Prefix 前缀, 比较算子按数值 (token 解析, 非数值不匹配)。
+/// 扁平直通与点路径粗筛共用。比较按 token 解析成 f64 —— 字符串 "500" 也会当数值 500,
+/// 与 parse 路径 (`compare_val`) 的严格字符串/数值区分有差异 (有意边界: 扁平比较是性能直通)。
+fn token_matches(token: &[u8], op: Op, target: &str) -> bool {
+    match op {
+        Op::Eq => token == target.as_bytes(),
+        Op::Prefix => token.starts_with(target.as_bytes()),
+        Op::Gt | Op::GtEq | Op::Lt | Op::LtEq => {
+            let Some(n) = std::str::from_utf8(token)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+            else {
+                return false;
+            };
+            let Ok(t) = target.parse::<f64>() else {
+                return false;
+            };
+            match op {
+                Op::Gt => n > t,
+                Op::GtEq => n >= t,
+                Op::Lt => n < t,
+                Op::LtEq => n <= t,
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// 验证路径比较: 等值/前缀按显示串 ([`cell_display`]), 比较按数值 (非数值不匹配)。
+fn compare_val(val: &serde_json::Value, op: Op, target: &str) -> bool {
+    match op {
+        Op::Eq => cell_display(val) == target,
+        Op::Prefix => cell_display(val).starts_with(target),
+        Op::Gt | Op::GtEq | Op::Lt | Op::LtEq => {
+            let Some(n) = val.as_f64() else {
+                return false;
+            };
+            let Ok(t) = target.parse::<f64>() else {
+                return false;
+            };
+            match op {
+                Op::Gt => n > t,
+                Op::GtEq => n >= t,
+                Op::Lt => n < t,
+                Op::LtEq => n <= t,
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// 沿路径导航: 对象取 key, 数组取索引。中途非对象/数组 = 无。
+fn navigate<'a>(mut val: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
+    for seg in path {
+        val = match val {
+            serde_json::Value::Object(map) => map.get(seg)?,
+            serde_json::Value::Array(arr) => {
+                let i: usize = seg.parse().ok()?;
+                arr.get(i)?
+            }
+            _ => return None,
+        };
+    }
+    Some(val)
 }
 
 /// 单行判定: 全部子句命中 (AND)。
 fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
     clauses.iter().all(|c| match c {
         Compiled::Bare(w) => memchr::memmem::find(line, w).is_some(),
-        Compiled::Field { needle, pattern } => {
-            extract_with_needle(line, needle).is_some_and(|v| value_matches(v, pattern))
+        Compiled::Flat { needle, op, value } => {
+            extract_with_needle(line, needle).is_some_and(|v| token_matches(v, *op, value))
+        }
+        Compiled::Verify {
+            needle,
+            path,
+            op,
+            value,
+        } => {
+            // 粗筛: 任一 leaf 字段值命中才 parse 验证 (把候选压到值命中量级, 免全量 parse)
+            if !field_value_matches(line, needle, *op, value) {
+                return false;
+            }
+            let Some(parsed) = parse_line(line) else {
+                return false;
+            };
+            let Some(val) = navigate(&parsed, path) else {
+                return false;
+            };
+            compare_val(val, *op, value)
         }
     })
 }
@@ -210,16 +451,7 @@ fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
 /// 禁用 line(i) 逐行随机访问 —— 步进索引下每次定位带段内前扫, 全量遍历会
 /// 把成本乘进行数 (T1 实测回归 235ms → 1072ms 的教训, 见 logfile.rs::lines 注释)。
 pub fn run_filter(file: &LogFile, clauses: &[Clause]) -> Vec<u64> {
-    let compiled: Vec<Compiled> = clauses
-        .iter()
-        .map(|c| match c {
-            Clause::Field { key, pattern } => Compiled::Field {
-                needle: field_needle(key),
-                pattern: pattern.clone(),
-            },
-            Clause::Bare(w) => Compiled::Bare(w.as_bytes().to_vec()),
-        })
-        .collect();
+    let compiled: Vec<Compiled> = clauses.iter().map(compile).collect();
     if compiled.is_empty() {
         return (0..file.line_count()).collect();
     }
@@ -230,6 +462,32 @@ pub fn run_filter(file: &LogFile, clauses: &[Clause]) -> Vec<u64> {
         }
     }
     hits
+}
+
+/// 子句 → 预编译 (needle = 最内层 key 的 `"key":` 针)。
+fn compile(c: &Clause) -> Compiled {
+    match c {
+        Clause::Bare(w) => Compiled::Bare(w.as_bytes().to_vec()),
+        Clause::Field { path, op, value } => {
+            let leaf = path.last().map(String::as_str).unwrap_or("");
+            let needle = field_needle(leaf);
+            // 扁平字段 (任意算子) → token 直通零 parse; 点路径 → 粗筛 + parse 验证
+            if path.len() == 1 {
+                Compiled::Flat {
+                    needle,
+                    op: *op,
+                    value: value.clone(),
+                }
+            } else {
+                Compiled::Verify {
+                    needle,
+                    path: path.clone(),
+                    op: *op,
+                    value: value.clone(),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -324,31 +582,171 @@ mod tests {
     }
 
     #[test]
+    fn parse_line_resolves_adversarial_embedded_key() {
+        // 对抗样本: msg 值内含 `,"key":"` 形态 —— memmem 提取会误判成 WRONG,
+        // 真 parser 不会 (T1 显示路径换 parser 的核心回归)。
+        let line = br#"{"msg":"see ,\"key\":\"WRONG\" here","key":"RIGHT"}"#;
+        let v = parse_line(line).expect("应可解析");
+        assert_eq!(cell_display(v.get("key").unwrap()), "RIGHT");
+        assert_eq!(
+            cell_display(v.get("msg").unwrap()),
+            "see ,\"key\":\"WRONG\" here"
+        );
+    }
+
+    #[test]
+    fn cell_display_compacts_nested_values() {
+        let v = parse_line(br#"{"user":{"id":42},"tags":[1,2],"ok":true,"ref":null}"#).unwrap();
+        assert_eq!(cell_display(v.get("user").unwrap()), "{\"id\":42}");
+        assert_eq!(cell_display(v.get("tags").unwrap()), "[1,2]");
+        assert_eq!(cell_display(v.get("ok").unwrap()), "true");
+        assert_eq!(cell_display(v.get("ref").unwrap()), "null");
+    }
+
+    #[test]
+    fn flatten_nested_object_and_array() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"level":"INFO","user":{"id":42,"name":"bob"},"tags":[7,8]}"#,
+        )
+        .unwrap();
+        let rows = flatten(&v);
+        // level 是顶层叶子 = 列, 不进子行; user/tags 是容器 → 展开
+        assert_eq!(
+            rows,
+            vec![
+                SubRow { depth: 1, label: "user".into(), value: "{\"id\":42,\"name\":\"bob\"}".into() },
+                SubRow { depth: 2, label: "id".into(), value: "42".into() },
+                SubRow { depth: 2, label: "name".into(), value: "bob".into() },
+                SubRow { depth: 1, label: "tags".into(), value: "[7,8]".into() },
+                SubRow { depth: 2, label: "[0]".into(), value: "7".into() },
+                SubRow { depth: 2, label: "[1]".into(), value: "8".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_top_level_scalars_are_columns_not_rows() {
+        let v = parse_line(br#"{"level":"ERROR","msg":"x"}"#).unwrap();
+        assert!(flatten(&v).is_empty(), "全顶层叶子 → 无子行");
+    }
+
+    #[test]
+    fn is_expandable_detects_nested_fields() {
+        let v = parse_line(br#"{"user":{"id":1},"tags":[1,2]}"#).unwrap();
+        assert!(is_expandable(&v), "有嵌套对象/数组");
+        let flat = parse_line(br#"{"level":"ERROR","msg":"x"}"#).unwrap();
+        assert!(!is_expandable(&flat), "全顶层叶子不可展开");
+    }
+
+    #[test]
     fn parse_query_splits_clauses() {
         let clauses = parse_query("level=ERROR status=50* slow");
         assert_eq!(
             clauses,
             vec![
                 Clause::Field {
-                    key: "level".into(),
-                    pattern: "ERROR".into()
+                    path: vec!["level".into()],
+                    op: Op::Eq,
+                    value: "ERROR".into()
                 },
                 Clause::Field {
-                    key: "status".into(),
-                    pattern: "50*".into()
+                    path: vec!["status".into()],
+                    op: Op::Prefix,
+                    value: "50".into()
                 },
                 Clause::Bare("slow".into()),
+            ]
+        );
+        // 点路径 + 比较算子 (长算子 >= 先于 >)
+        let clauses = parse_query("user.id=42 status>=500 duration_ms>1000");
+        assert_eq!(
+            clauses,
+            vec![
+                Clause::Field {
+                    path: vec!["user".into(), "id".into()],
+                    op: Op::Eq,
+                    value: "42".into()
+                },
+                Clause::Field {
+                    path: vec!["status".into()],
+                    op: Op::GtEq,
+                    value: "500".into()
+                },
+                Clause::Field {
+                    path: vec!["duration_ms".into()],
+                    op: Op::Gt,
+                    value: "1000".into()
+                },
             ]
         );
     }
 
     #[test]
-    fn value_wildcard_prefix() {
-        assert!(value_matches(b"500", "50*"));
-        assert!(value_matches(b"502", "50*"));
-        assert!(!value_matches(b"200", "50*"));
-        assert!(value_matches(b"ERROR", "ERROR"));
-        assert!(!value_matches(b"ERRORS", "ERROR"));
+    fn token_matches_eq_and_prefix() {
+        assert!(token_matches(b"500", Op::Eq, "500"));
+        assert!(!token_matches(b"500", Op::Eq, "50"));
+        assert!(token_matches(b"500", Op::Prefix, "50"));
+        assert!(token_matches(b"502", Op::Prefix, "50"));
+        assert!(!token_matches(b"200", Op::Prefix, "50"));
+        assert!(token_matches(b"ERROR", Op::Eq, "ERROR"));
+        assert!(!token_matches(b"ERRORS", Op::Eq, "ERROR"));
+    }
+
+    #[test]
+    fn navigate_dot_path_and_array() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"user":{"id":42,"tags":[7,8]}}"#).unwrap();
+        let p = |s: &str| s.split('.').map(String::from).collect::<Vec<_>>();
+        assert_eq!(navigate(&v, &p("user")).unwrap()["id"].as_i64(), Some(42));
+        assert_eq!(navigate(&v, &p("user.id")).unwrap().as_i64(), Some(42));
+        assert_eq!(navigate(&v, &p("user.tags.1")).unwrap().as_i64(), Some(8));
+        assert!(navigate(&v, &p("user.nope")).is_none());
+        assert!(navigate(&v, &p("nope.id")).is_none());
+    }
+
+    #[test]
+    fn compare_val_operators_and_boundaries() {
+        let num = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(compare_val(&num("500"), Op::GtEq, "500"), ">= 含等");
+        assert!(compare_val(&num("501"), Op::Gt, "500"));
+        assert!(!compare_val(&num("500"), Op::Gt, "500"), "> 不含等");
+        assert!(compare_val(&num("-5"), Op::Lt, "0"), "负数");
+        assert!(compare_val(&num("1.5"), Op::Lt, "2"), "浮点");
+        assert!(compare_val(&num("42"), Op::Eq, "42"), "Eq 数值按显示串");
+        assert!(
+            !compare_val(&serde_json::Value::String("500".into()), Op::Gt, "0"),
+            "字符串不参与数值比较"
+        );
+    }
+
+    #[test]
+    fn filter_dot_path_and_comparison() {
+        let lf = open_with(
+            br#"{"user":{"id":42},"status":500}
+{"user":{"id":7},"status":200}
+{"user":{"id":99},"status":503}
+{"user":{"id":42},"status":501}
+"#,
+        );
+        assert_eq!(run_filter(&lf, &parse_query("user.id=42")), vec![0, 3]);
+        assert_eq!(run_filter(&lf, &parse_query("status>=500")), vec![0, 2, 3]);
+        assert_eq!(
+            run_filter(&lf, &parse_query("user.id=42 status>=500")),
+            vec![0, 3]
+        );
+        assert_eq!(run_filter(&lf, &parse_query("user.id=4*")), vec![0, 3]);
+    }
+
+    #[test]
+    fn field_value_matches_scans_all_occurrences() {
+        // order.id 在前 (值 7), user.id 在后 (值 42): 粗筛必须扫到后者, 无假阴性
+        let line = br#"{"order":{"id":7},"user":{"id":42}}"#;
+        let needle = field_needle("id");
+        assert!(field_value_matches(line, &needle, Op::Eq, "42"), "第二处 id 命中");
+        assert!(!field_value_matches(line, &needle, Op::Eq, "99"), "无 99");
+        // 精确验证仍走 navigate: 第一处 id=7 不代表 user.id=7
+        let v = parse_line(line).unwrap();
+        assert_eq!(navigate(&v, &["user".into(), "id".into()]).unwrap().as_i64(), Some(42));
     }
 
     #[test]

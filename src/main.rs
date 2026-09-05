@@ -29,7 +29,8 @@ use danqing::{
 };
 
 use danqing_log::encoding::{self, Encoding};
-use danqing_log::jsonl::{self, Schema};
+use danqing_log::expand::{self, ExpandMap};
+use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::logfile::LogFile;
 use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 
@@ -98,6 +99,10 @@ pub(crate) struct LogApp {
     search_job: AsyncJob<SearchOutcome>,
     /// 书签: 文件行号集合 (会话内有效, 持久化归 v1.x 会话功能)。
     bookmarks: std::collections::BTreeSet<u64>,
+    /// 展开态 (jsonl-table T4): 文件行号 → 子行数。
+    expanded: ExpandMap,
+    /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭, 惰性 parse)。
+    sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
     /// 窗口事件发送器 (粘贴走 read_clipboard 回送 IME Commit)。
     sender: Option<WindowEventSender>,
 }
@@ -108,17 +113,27 @@ pub(crate) enum Msg {
     ScrollRows(f64),
     /// 点击选中显示行。
     Select(u64),
+    /// 展开/折叠某显示行的嵌套 (表格模式)。
+    ToggleExpand(u64),
     /// 跳到文件头/尾。
     GotoStart,
     GotoEnd,
 }
 
 impl LogApp {
-    /// 显示行数: 过滤命中数或全文行数。
+    /// 显示行来源 (全量恒等或过滤命中)。
+    fn lines(&self) -> expand::Lines<'_> {
+        match &self.filtered {
+            Some(hits) => expand::Lines::Filtered(hits),
+            None => expand::Lines::All {
+                total: self.file.line_count(),
+            },
+        }
+    }
+
+    /// 显示行数: 文件行数 + 展开子行数。
     fn display_count(&self) -> u64 {
-        self.filtered
-            .as_ref()
-            .map_or_else(|| self.file.line_count(), |hits| hits.len() as u64)
+        expand::display_count(self.lines(), &self.expanded)
     }
 
     /// 最大首行: 保守取 count-1 (尾部可滚出少量空白, POC 不追求贴底钳制)。
@@ -126,23 +141,39 @@ impl LogApp {
         self.display_count().saturating_sub(1) as f64
     }
 
-    /// 显示行 → 文件行号 (无过滤时恒等)。
-    fn file_line_of(&self, row: u64) -> u64 {
-        match &self.filtered {
-            Some(hits) => hits.get(row as usize).copied().unwrap_or(row),
-            None => row,
-        }
+    /// 显示行 → (文件行, 子行偏移)。偏移 0 = 文件行本身。
+    fn line_at(&self, row: u64) -> (u64, usize) {
+        expand::file_line_at(row, self.lines(), &self.expanded).unwrap_or((0, 0))
     }
 
-    /// 文件行号 → 显示行 (过滤模式下取插入点: 命中被滤掉时落最近位置)。
+    /// 显示行 → 文件行号 (书签/跳转用, 子行归父行)。
+    fn file_line_of(&self, row: u64) -> u64 {
+        self.line_at(row).0
+    }
+
+    /// 文件行号 → 显示行 (过滤 + 展开叠加)。越界 (文件行被滤掉) 钳到末行。
     fn display_row_of(&self, file_line: u64) -> u64 {
-        match &self.filtered {
-            Some(hits) => {
-                let p = hits.partition_point(|&l| l < file_line) as u64;
-                p.min(hits.len().saturating_sub(1) as u64)
-            }
-            None => file_line,
+        let row = expand::display_row_of(file_line, self.lines(), &self.expanded);
+        row.min(self.display_count().saturating_sub(1))
+    }
+
+    /// 展开/折叠某文件行的嵌套 (惰性 parse, 只 parse 展开的那一行)。
+    fn toggle_expand(&mut self, file_line: u64) {
+        if self.expanded.is_expanded(file_line) {
+            self.expanded.collapse(file_line);
+            self.sub_rows.remove(&file_line);
+            return;
         }
+        let raw = self.file.line(file_line);
+        let Some(parsed) = jsonl::parse_line(raw) else {
+            return;
+        };
+        let rows = jsonl::flatten(&parsed);
+        if rows.is_empty() {
+            return; // 无嵌套可展开
+        }
+        self.expanded.expand(file_line, rows.len());
+        self.sub_rows.insert(file_line, rows);
     }
 
     /// 合成底栏状态: base + 模式 + 过滤 + 搜索。
@@ -368,6 +399,10 @@ impl App for LogApp {
                     self.selected = row;
                 }
             }
+            Msg::ToggleExpand(row) => {
+                let file_line = self.file_line_of(row);
+                self.toggle_expand(file_line);
+            }
             Msg::GotoStart => {
                 self.top_row = 0.0;
                 self.selected = 0;
@@ -519,6 +554,19 @@ impl App for LogApp {
         match key {
             Key::Named(NamedKey::ArrowUp) => self.update(Msg::ScrollRows(-1.0)),
             Key::Named(NamedKey::ArrowDown) => self.update(Msg::ScrollRows(1.0)),
+            // 展开/折叠 (表格模式; → 展开 ← 折叠选中行, 子行归父行)
+            Key::Named(NamedKey::ArrowRight) if self.mode == ViewMode::Table => {
+                let file_line = self.file_line_of(self.selected);
+                if !self.expanded.is_expanded(file_line) {
+                    self.toggle_expand(file_line);
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) if self.mode == ViewMode::Table => {
+                let file_line = self.file_line_of(self.selected);
+                if self.expanded.is_expanded(file_line) {
+                    self.toggle_expand(file_line);
+                }
+            }
             // PageUp/PageDown = danqing 打磨寄生新增 (T4, 联动改动两仓分别待提交)
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
             Key::Named(NamedKey::PageDown) => self.update(Msg::ScrollRows(PAGE_ROWS)),
@@ -658,6 +706,8 @@ fn run(path: &Path) -> Result<()> {
         search_elapsed: None,
         search_job: AsyncJob::new(),
         bookmarks: std::collections::BTreeSet::new(),
+        expanded: ExpandMap::new(),
+        sub_rows: std::collections::BTreeMap::new(),
         sender: None,
     };
     app.refresh_status();

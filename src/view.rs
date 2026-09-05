@@ -23,7 +23,8 @@ use std::sync::Arc;
 use danqing::widget::{EventResult, MsgQueue, Widget};
 use danqing::{Color, Constraints, Event, Rect, RectBatch, Size, TextBatch};
 
-use danqing_log::jsonl::{self, Column, Schema};
+use danqing_log::expand::{self, ExpandMap};
+use danqing_log::jsonl::{self, Column, Schema, SubRow};
 use danqing_log::logfile::LogFile;
 
 use crate::{LogApp, Msg, ViewMode};
@@ -38,6 +39,8 @@ const AUX_FONT_SIZE: u16 = 11;
 const GUTTER_MIN: f32 = 56.0;
 /// 文本与行号槽间距。
 const GUTTER_GAP: f32 = 12.0;
+/// 展开标识区宽度 (行首 ▶/▼, 独立于行号槽, 不与行号重叠)。
+const EXPAND_W: f32 = 16.0;
 /// 底栏状态行高度。
 const STATUS_HEIGHT: f32 = 26.0;
 /// 过滤栏高度 (表格模式)。
@@ -136,6 +139,9 @@ pub(crate) struct LogView {
     encoding: danqing_log::encoding::Encoding,
     /// 书签文件行号 (用户量级, 逐帧克隆无感)。
     bookmarks: std::collections::BTreeSet<u64>,
+    // ---- 展开态 (jsonl-table T4) ----
+    expanded: ExpandMap,
+    sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
     // ---- 水平滚动 (T7, 纯视图态: 应用层不参与) ----
     /// 内容左缘偏移像素 (Cell: paint 只读, 事件写入, paint 防御性回钳)。
     x_offset: std::cell::Cell<f32>,
@@ -164,6 +170,8 @@ impl LogView {
             search_hits: None,
             encoding: danqing_log::encoding::Encoding::Utf8,
             bookmarks: std::collections::BTreeSet::new(),
+            expanded: ExpandMap::new(),
+            sub_rows: std::collections::BTreeMap::new(),
             x_offset: std::cell::Cell::new(0.0),
             max_seen: std::cell::Cell::new(0.0),
         }
@@ -185,21 +193,24 @@ impl LogView {
         }
     }
 
-    /// 显示行数: 过滤命中数或全文行数。
-    fn display_count(&self) -> u64 {
-        match (&self.file, &self.filtered) {
-            (Some(f), None) => f.line_count(),
-            (_, Some(hits)) => hits.len() as u64,
-            (None, _) => 0,
+    /// 显示行来源 (全量恒等或过滤命中)。
+    fn lines(&self) -> expand::Lines<'_> {
+        match &self.filtered {
+            Some(hits) => expand::Lines::Filtered(hits),
+            None => expand::Lines::All {
+                total: self.file.as_ref().map(|f| f.line_count()).unwrap_or(0),
+            },
         }
     }
 
-    /// 显示行 → 文件行号 (无过滤时恒等)。
-    fn line_of(&self, row: u64) -> u64 {
-        match &self.filtered {
-            Some(hits) => hits.get(row as usize).copied().unwrap_or(row),
-            None => row,
-        }
+    /// 显示行数: 文件行数 + 展开子行数。
+    fn display_count(&self) -> u64 {
+        expand::display_count(self.lines(), &self.expanded)
+    }
+
+    /// 显示行 → (文件行, 子行偏移)。偏移 0 = 文件行本身。
+    fn line_at(&self, row: u64) -> (u64, usize) {
+        expand::file_line_at(row, self.lines(), &self.expanded).unwrap_or((0, 0))
     }
 }
 
@@ -299,6 +310,8 @@ impl Widget for LogView {
         self.search_hits = app.search.as_ref().map(|n| Arc::clone(n.hits()));
         self.encoding = app.file.encoding();
         self.bookmarks = app.bookmarks.clone();
+        self.expanded = app.expanded.clone();
+        self.sub_rows = app.sub_rows.clone();
         // 模式变化才重编译 (正则编译 ms 级, 不能进 paint)
         if self.search_pattern_src != app.search_pattern {
             self.search_pattern_src = app.search_pattern.clone();
@@ -328,7 +341,8 @@ impl Widget for LogView {
         let digits = format!("{}", file.line_count()).len();
         let sample = "8".repeat(digits.max(4));
         let gutter_w = (texts.measure(&sample, AUX_FONT_SIZE) + 20.0).max(GUTTER_MIN);
-        let text_x = area.origin.x + gutter_w + GUTTER_GAP;
+        // 展开标识区 + 行号槽 + 间距
+        let text_x = area.origin.x + EXPAND_W + gutter_w + GUTTER_GAP;
         let text_right = area.origin.x + area.size.width - SCROLLBAR_W - 6.0;
         let text_w = (text_right - text_x).max(1.0);
         // 水平偏移 (T7): paint 防御性回钳 (窗口变宽/内容变窄后 offset 可能越界)
@@ -417,7 +431,28 @@ impl Widget for LogView {
                     0.0,
                 );
             }
-            let line_no = self.line_of(i);
+            let (line_no, sub_off) = self.line_at(i);
+            // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
+            if sub_off > 0 {
+                if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1)) {
+                    let indent = (row.depth as f32 - 1.0) * 16.0;
+                    let s = format!("{} = {}", row.label, row.value);
+                    let draw_x = text_x + indent;
+                    if draw_x < text_right {
+                        fit_push(
+                            texts,
+                            &s,
+                            text_right - draw_x,
+                            draw_x,
+                            y + baseline_off,
+                            FONT_SIZE,
+                            status_fg(),
+                        );
+                    }
+                }
+                i += 1;
+                continue;
+            }
             // 搜索命中行: 表格模式淡琥珀行底 (原始模式在行内画区间高亮, 见下)
             if table {
                 if let Some(hits) = &self.search_hits {
@@ -445,7 +480,7 @@ impl Widget for LogView {
             };
             texts.push_text(
                 &no,
-                area.origin.x + gutter_w - 10.0 - no_w,
+                area.origin.x + EXPAND_W + gutter_w - 10.0 - no_w,
                 y + aux_baseline_off,
                 AUX_FONT_SIZE,
                 no_color,
@@ -486,13 +521,32 @@ impl Widget for LogView {
                 }
             }
             if table {
-                // 单元格: memmem 字段提取, 零 parse; level 列按级别着色;
+                // 单元格: 逐可见行 serde_json parse (真 parser, 消除 memmem 内嵌误判),
+                // 取顶层字段紧凑显示; level 列按级别着色;
                 // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
+                let parsed = jsonl::parse_line(raw);
+                // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
+                // (字体是 GB2312 子集, 无 ▶/▼ 几何形, 用 ASCII +- 保可用)
+                let expanded_here = self.expanded.is_expanded(line_no);
+                let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
+                if expanded_here || expandable {
+                    let glyph = if expanded_here { "-" } else { "+" };
+                    texts.push_text(
+                        glyph,
+                        area.origin.x + 3.0,
+                        y + aux_baseline_off,
+                        AUX_FONT_SIZE,
+                        text_default(),
+                    );
+                }
                 for (cx, cw, col) in &cols {
-                    let Some(v) = jsonl::extract_field(raw, &col.name) else {
+                    let Some(v) = parsed
+                        .as_ref()
+                        .and_then(|p| p.get(col.name.as_str()))
+                        .map(jsonl::cell_display)
+                    else {
                         continue;
                     };
-                    let v = String::from_utf8_lossy(v);
                     let color = if col.name == "level" {
                         level_color(v.as_bytes())
                     } else {
@@ -646,7 +700,13 @@ impl Widget for LogView {
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
                     let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
-                    msgs.push(Box::new(Msg::Select(row)));
+                    // 行首 ▶/▼ 展开开关区 (左 16px, 表格模式); 其余点击选中
+                    let in_glyph = self.table_mode() && position.x - area.origin.x < 16.0;
+                    if in_glyph {
+                        msgs.push(Box::new(Msg::ToggleExpand(row)));
+                    } else {
+                        msgs.push(Box::new(Msg::Select(row)));
+                    }
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored
