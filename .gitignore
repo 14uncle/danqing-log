@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# IDE
+/.idea
+/.vscode
+*.iml
+.rust-analyzer/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Local Claude Code settings
+/.claude/settings.local*.json*

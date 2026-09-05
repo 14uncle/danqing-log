@@ -1,0 +1,41 @@
+[package]
+name = "danqing-log"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "丹青日志 —— 大文件日志/JSONL 查看分析器 (第四件产品)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# 提交状态固定为 git 依赖 (全家同一约定):
+# 仓库自洽 + Cargo.lock 钉 rev 保可复现; 本机经下方 [patch] 段透明使用本地 danqing。
+danqing = { git = "https://github.com/14uncle/danqing" }
+log = "0.4"
+anyhow = "1"
+memmap2 = "0.9"
+memchr = "2"
+regex = "1"
+# preserve_order: Object 底层换 IndexMap 保插入序, 列发现的「首见顺序」才有意义
+# (默认 BTreeMap 按键名字典序, 会把 ts/level/msg 排成字母序)。
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
+strip = "debuginfo"
+
+[build-dependencies]
+winresource = "0.1"
+
+# 本地联动开发：git 依赖透明替换为本地 danqing 副本。
+# 发布时去掉本段，Cargo.lock 钉 git rev 保可复现。
+[patch."https://github.com/14uncle/danqing"]
+danqing = { path = "../danqing" }
