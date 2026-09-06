@@ -12,6 +12,7 @@
   - 实测: TitleBar::themed(&title_theme(), title) + LogoKind::Log + 三键 → WindowAction + bind_maximized
     (LogApp 加 maximized 字段 + override maximized_changed); Bar 挪进 embed 槽;
     title_theme() 用 SceneTheme 深色调色板(浅色文字, log 深色系); 56 lib + 6 主测试绿, clippy 0
+  - **人工验收 2026-09-06 ✅ 用户「通过」**: 标题/三窗键/过滤栏聚焦 OK; 拖拽补 on_drag(5aaf250) 后生效
 
 - [ ] **A2: Bar 适配 embed 槽几何**
   - Acceptance: Bar layout/paint/event 用槽 area; label_width/input_area 以槽为基准; Bar Hidden 时标题栏仅标题+三键
