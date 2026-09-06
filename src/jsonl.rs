@@ -611,21 +611,44 @@ mod tests {
 
     #[test]
     fn flatten_nested_object_and_array() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"level":"INFO","user":{"id":42,"name":"bob"},"tags":[7,8]}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"level":"INFO","user":{"id":42,"name":"bob"},"tags":[7,8]}"#)
+                .unwrap();
         let rows = flatten(&v);
         // level 是顶层叶子 = 列, 不进子行; user/tags 是容器 → 展开
         assert_eq!(
             rows,
             vec![
-                SubRow { depth: 1, label: "user".into(), value: "{\"id\":42,\"name\":\"bob\"}".into() },
-                SubRow { depth: 2, label: "id".into(), value: "42".into() },
-                SubRow { depth: 2, label: "name".into(), value: "bob".into() },
-                SubRow { depth: 1, label: "tags".into(), value: "[7,8]".into() },
-                SubRow { depth: 2, label: "[0]".into(), value: "7".into() },
-                SubRow { depth: 2, label: "[1]".into(), value: "8".into() },
+                SubRow {
+                    depth: 1,
+                    label: "user".into(),
+                    value: "{\"id\":42,\"name\":\"bob\"}".into()
+                },
+                SubRow {
+                    depth: 2,
+                    label: "id".into(),
+                    value: "42".into()
+                },
+                SubRow {
+                    depth: 2,
+                    label: "name".into(),
+                    value: "bob".into()
+                },
+                SubRow {
+                    depth: 1,
+                    label: "tags".into(),
+                    value: "[7,8]".into()
+                },
+                SubRow {
+                    depth: 2,
+                    label: "[0]".into(),
+                    value: "7".into()
+                },
+                SubRow {
+                    depth: 2,
+                    label: "[1]".into(),
+                    value: "8".into()
+                },
             ]
         );
     }
@@ -748,11 +771,19 @@ mod tests {
         // order.id 在前 (值 7), user.id 在后 (值 42): 粗筛必须扫到后者, 无假阴性
         let line = br#"{"order":{"id":7},"user":{"id":42}}"#;
         let needle = field_needle("id");
-        assert!(field_value_matches(line, &needle, Op::Eq, "42"), "第二处 id 命中");
+        assert!(
+            field_value_matches(line, &needle, Op::Eq, "42"),
+            "第二处 id 命中"
+        );
         assert!(!field_value_matches(line, &needle, Op::Eq, "99"), "无 99");
         // 精确验证仍走 navigate: 第一处 id=7 不代表 user.id=7
         let v = parse_line(line).unwrap();
-        assert_eq!(navigate(&v, &["user".into(), "id".into()]).unwrap().as_i64(), Some(42));
+        assert_eq!(
+            navigate(&v, &["user".into(), "id".into()])
+                .unwrap()
+                .as_i64(),
+            Some(42)
+        );
     }
 
     #[test]
@@ -770,7 +801,11 @@ mod tests {
         assert_eq!(full, vec![1, 3, 4]);
         assert_eq!(run_filter_from(&lf, &clauses, 0), full, "从 0 起跑 == 全量");
         assert_eq!(run_filter_from(&lf, &clauses, 3), vec![3, 4], "中间起跑");
-        assert_eq!(run_filter_from(&lf, &clauses, 99), Vec::<u64>::new(), "越界空");
+        assert_eq!(
+            run_filter_from(&lf, &clauses, 99),
+            Vec::<u64>::new(),
+            "越界空"
+        );
     }
 
     #[test]

@@ -4,9 +4,10 @@
 
 ## 一句话状态
 
-danqing-log 产品侧「窗件」build 进行中: **app-chrome A1 已完成并人工验证通过**
-(标题栏 = logo+标题+内嵌过滤/搜索 Bar+三窗键, 拖拽/标题/三键/过滤栏聚焦都 OK)。
-剩 **app-chrome A2→A5** + **settings S1→S5**。
+danqing-log 产品侧「窗件」+「设置」build 进行中: **app-chrome A1–A5 + settings S1–S5 代码全部完成**
+(标题栏 = logo+标题+内嵌过滤/搜索 Bar+三窗键; A3 标题同步已加框架 `App::window_title()` + `WindowAction::SetTitle`;
+设置卡 = scrim + 居中玻璃卡(关于/版本/反馈) + Esc/✕/遮罩关闭; 状态栏「⚙ 关于」入口)。
+剩 **人工验收** (app-chrome: 三键/拖拽/输入/IME; settings: 入口/开卡/版本行/反馈/关闭)。
 
 ## 必读 (按此顺序)
 
@@ -25,27 +26,37 @@ danqing-log v1 三模块闭环后, 用户反馈「UI 很丑 / 无最小最大化
 
 ## 已提交 (别重复做)
 
-**danqing 框架 — 已推 `origin/dev` (HEAD `cced4cf`)**:
+**danqing 框架 — 本地, 待推**:
 - `titlebar-embed` T1–T4 + review 修复 C1(坐标)/I1(零宽槽) — TitleBar 可选 `.embed(widget)` 槽
 - `update-check` U1–U5 — `danqing::update` 版本检查核心(feature `update`, 默认关), GitHub 轨
 - `fix(image)` — `Image::paint_image` 用 aspect_fit 居中, 不再拉伸填满传入区
-- 全链测试绿(31 title_bar + 12 update + 全量), clippy 0, 默认树无网络栈
+- **新增** `App::window_title()` — 每帧查询, 变化时 `set_title`; `WindowAction::SetTitle(String)` — 窗口标题动态同步
+- 全链测试绿(394 lib + 多集成), clippy 0
 
-**danqing-log — 本地, 3 提交未推 (`origin/dev` 落后 3)**:
+**danqing-log — 本地, 待推**:
 - `2a5be97` 规划 docs(app-chrome/settings 的 spec/plan/todo)
 - `08682da` **A1** view() 换 TitleBar + 内嵌 Bar + 三窗键接线
 - `5aaf250` fix: TitleBar 补 `on_drag`(漏接则拖拽失效)
+- **A2** 确认 A1 隐式完成 (TitleBar embed 机制传槽 area)
+- **A3** `make_title()` 统一标题逻辑 + `window_title()` 实现; 标题随 Ctrl+T 自动同步任务栏
+- **A4** 代码逻辑验证通过 (Enter/Esc/Page/Ctrl+T/Tab 转发)
+- **A5** 三件套绿; release 构建成功
+- **S1** `Cargo.toml` 加 features=["update]; `app_update.rs` 封装 UpdateSpec + init/hint/go_download
+- **S2** 状态栏「⚙ 关于」入口 (hover 亮色 + 点击→OpenSettings); 位置计数左移让位
+- **S3** `settings.rs` settings_overlay (SettingsOverlay 组件) + settings_card (关于/版本/反馈) + Scrim + Link
+- **S4** Msg 增 OpenSettings/CloseSettings/OpenUrl; view() 改 Stack overlay; event Esc 关
+- **S5** 三件套绿; release 构建成功
 
 ## 下一步任务 (按依赖序)
 
-### app-chrome (后续)
-- **A2**: Bar 适配 embed 槽几何 — Bar `layout/paint/event` 用槽 area(非整窗 Column 行宽);
-  槽内 `label_width`/`input_area` 以槽为基准; Bar 为 Hidden 时标题栏仅标题+三键(无输入).
-  Verify: 原始模式无搜索时标题栏无输入, 表格/搜索有输入.
-- **A3**: 标题串 + 窗口配置一致性 — TitleBar.title 与 `WindowConfig.title` 同串; 随 mode 带/不带 JSONL.
-- **A4**: 键盘/焦点/IME 回归 — 栏聚焦 Enter 应用/Esc 清关/PageUp·PageDown 滚动/中文 IME 贴框/
-  粘贴/点击落焦; `app_key_filter` Ctrl+T 栏聚焦仍生效; Tab/方向键不冲突. 人工回归(参考 v1 todo).
-- **A5**: 三件套 + 人工验收(三键/拖拽/输入/IME/快捷键).
+### 人工验收 (app-chrome + settings)
+- **app-chrome 人工验收**: 三键(最小/最大/还原/关闭)/拖拽移窗/双击最大化/过滤栏输入/中文 IME/粘贴/
+  Ctrl+T 切模式/快捷键
+- **settings 人工验收**: 状态栏「⚙ 关于」入口点开 → 卡显示名称/版本/设计/反馈链接; 链接能开浏览器;
+  有新版显示「前往下载」; Esc/✕/遮罩关闭; 焦点限制在卡内
+- 进 checkpoint → review
+
+### settings 已完成
 
 ### settings (app-chrome 后, 依赖框架 update-check)
 - **S1**: `Cargo.toml` 加 `danqing = { ..., features = ["update"] }`; `src/app_update.rs` 供
@@ -69,6 +80,16 @@ danqing-log v1 三模块闭环后, 用户反馈「UI 很丑 / 无最小最大化
   (A1 真实踩坑)。
 - **Bar 挪进 TitleBar.embed 槽**, 不再是 Column sibling。Bar 的 `focus_id="log-bar"` 保留;
   首帧自动聚焦落在 embed Bar (日志里 `焦点变化：None -> Some([0, 0])` = Column[0]=TitleBar 的 child[0]=Bar)。
+- **`App::window_title()`**: 框架每帧查询, 返回 `Some(title)` 且与上次不同才 `set_title` (避系统调用)。
+  产品 `LogApp::make_title()` 统一 `view()` 和 `window_title()` 的标题逻辑。
+- **`WindowAction::SetTitle(String)`**: 去掉 `Copy` derive (String 非 Copy), 改 `Clone`。
+  handler `handle_window_action` 匹配后调 `window.set_title()` + 更新 `config.title`。
+- **设置卡 `SettingsOverlay`**: 包装 scrim + 卡片, `sync` 读 `LogApp.settings_open`,
+  关闭时零高零宽不拦截事件。view 层 Stack overlay 叠在 Column 上。
+- **`open` crate**: Cargo.toml 直接引入 (danqing 的 optional dep 未 re-export),
+  反馈链接/发布页用 `open::that()`。
+- **Esc 关闭**: `event()` 开头检查 `settings_open`, 调 `settings::handle_settings_key(key)`。
+  设置卡内部 Scrim 点击也发 `CloseSettings`。
 - **共享编译产物**: 各仓 `.cargo/config.toml` → `../.cargo-target`。exe 在
   `/.cargo-target/release/danqing-log.exe`。**构建前若 exe 被运行实例锁住会「拒绝访问」**, 先关窗口。
 - **演示文件**: `target/demo/demo.jsonl`(嵌套 JSONL, 触发表格+过滤)+ `target/demo/demo.log`(明文)。

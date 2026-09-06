@@ -15,6 +15,8 @@
 
 #![windows_subsystem = "windows"]
 
+mod app_update;
+mod settings;
 mod view;
 
 use std::path::{Path, PathBuf};
@@ -22,11 +24,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use danqing::widget::{Column, LogoKind, Node, TitleBar, node};
+use danqing::theme::{ScenePalette, SceneTheme};
+use danqing::widget::{Column, LogoKind, Node, Stack, TitleBar, node};
 use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
-use danqing::theme::{ScenePalette, SceneTheme};
 
 use danqing_log::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
@@ -132,6 +134,8 @@ pub(crate) struct LogApp {
     notice: Option<String>,
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
+    /// 设置卡是否打开 (S2)。
+    settings_open: bool,
 }
 
 /// 应用消息。
@@ -159,9 +163,30 @@ pub(crate) enum Msg {
     ClearFilter,
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
+    // ---- S2–S4 设置卡 ----
+    /// 打开设置卡。
+    OpenSettings,
+    /// 关闭设置卡。
+    CloseSettings,
+    /// 打开 URL (反馈链接/发布页)。
+    OpenUrl(String),
 }
 
 impl LogApp {
+    /// 窗口标题: 文件名 + 模式指示 (随 Ctrl+T 切换)。
+    fn make_title(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(未命名)");
+        if self.mode == ViewMode::Table {
+            format!("丹青日志 [JSONL] — {name}")
+        } else {
+            format!("丹青日志 POC — {name}")
+        }
+    }
+
     /// 显示行来源 (全量恒等或过滤命中)。
     fn lines(&self) -> expand::Lines<'_> {
         match &self.filtered {
@@ -569,41 +594,45 @@ impl App for LogApp {
             Msg::CloseSearch => self.close_search(),
             Msg::ClearFilter => self.clear_filter(),
             Msg::ToggleMode => self.toggle_mode(),
+            // ---- S2–S4 设置卡 ----
+            Msg::OpenSettings => {
+                self.settings_open = true;
+            }
+            Msg::CloseSettings => {
+                self.settings_open = false;
+            }
+            Msg::OpenUrl(url) => {
+                if let Err(err) = open::that(&url) {
+                    log::warn!("打开链接失败: {err}");
+                }
+            }
         }
     }
 
     fn view(&self) -> Node {
-        // 顶层: 框架 TitleBar (logo + 标题 + 内嵌过滤/搜索 Bar + 三窗键) + 列表 (行锚定虚拟视口, fill)。
-        // Bar 从独立 sibling 挪进 TitleBar 的 embed 槽; 栏与列表均经 sync 拉应用态。
-        let title = {
-            let name = self
-                .path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(未命名)");
-            if self.mode == ViewMode::Table {
-                format!("丹青日志 [JSONL] — {name}")
-            } else {
-                format!("丹青日志 POC — {name}")
-            }
-        };
+        // 顶层: Stack[Column[TitleBar.embed(Bar), LogView.fill], SettingsOverlay]。
+        // 设置卡浮层在最上层, 关闭时零高不拦截事件。
         node(
-            Column::new()
+            Stack::new()
                 .child(
-                    TitleBar::themed(&title_theme(), title)
-                        .logo_kind(LogoKind::Log)
-                        .on_close(|| WindowAction::Close)
-                        .on_minimize(|| WindowAction::Minimize)
-                        .on_maximize(|| WindowAction::MaximizeOrRestore)
-                        .on_drag(|| WindowAction::Drag)
-                        .bind_maximized(|app: &LogApp| app.maximized)
-                        .embed(
-                            view::Bar::default()
-                                .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
-                        ),
+                    Column::new()
+                        .child(
+                            TitleBar::themed(&title_theme(), self.make_title())
+                                .logo_kind(LogoKind::Log)
+                                .on_close(|| WindowAction::Close)
+                                .on_minimize(|| WindowAction::Minimize)
+                                .on_maximize(|| WindowAction::MaximizeOrRestore)
+                                .on_drag(|| WindowAction::Drag)
+                                .bind_maximized(|app: &LogApp| app.maximized)
+                                .embed(
+                                    view::Bar::default()
+                                        .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
+                                        .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                                ),
+                        )
+                        .fill(view::LogView::new(), 1),
                 )
-                .fill(view::LogView::new(), 1),
+                .child(settings::settings_overlay()),
         )
     }
 
@@ -618,6 +647,13 @@ impl App for LogApp {
         else {
             return;
         };
+        // 设置卡打开时 Esc 关闭 (S3)
+        if self.settings_open {
+            if let Some(msg) = settings::handle_settings_key(key) {
+                self.update(msg);
+                return;
+            }
+        }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
         if *ctrl {
             if let Key::Character(s) = key {
@@ -759,6 +795,10 @@ impl App for LogApp {
     fn focus_restored(&mut self) {
         self.focus_bar = false;
     }
+
+    fn window_title(&self) -> Option<String> {
+        Some(self.make_title())
+    }
 }
 
 /// 底栏打开统计一行流 (截图弹药)。
@@ -796,6 +836,8 @@ fn run(path: &Path) -> Result<()> {
     let file = Arc::new(LogFile::open(path)?);
     let base_status = status_text(path, &file);
     log::info!("{base_status}");
+    // 启动后台更新检查 (24h TTL 缓存, 静默)。
+    app_update::init();
     // JSONL 自动检测 → 列发现 (采样毫秒级; 检出即表格模式开局)
     let schema = if jsonl::detect(&file) {
         jsonl::discover_schema(&file).map(Arc::new)
@@ -859,6 +901,7 @@ fn run(path: &Path) -> Result<()> {
         last_stat_poll: Instant::now(),
         notice: None,
         maximized: false,
+        settings_open: false,
     };
     app.refresh_status();
     let config = WindowConfig {

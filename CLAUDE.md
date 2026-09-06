@@ -7,7 +7,8 @@
 - 2026-09-05: 开枪 (新选型方针首次实战, 五域扫描→双深潜→用户裁决), 当日建仓 + POC v0 落地
 - 2026-09-05 晚: POC 双前提判过 → 用户发起 spec 技能 = **转正**; 能力地图+3 模块 spec (core-viewer/live-tail/jsonl-table) 写完, 停在 spec 评审门 (SPEC.md + docs/specs/)
 - 2026-09-05 深夜: /build auto 零 commit 连跑 core-viewer T1–T7 全绿 (用户裁决: 全程不 commit)
-- 当前: **用户人工验收门** (上手试 PageUp/搜索/书签/横滚/编码) → review 阶段 (/agent-skills:code-review-and-quality); 余前提③ = 发布后首单外检
+- 2026-09-06: **app-chrome A1–A5 + settings S1–S5 代码全部完成** (三件套绿, release 构建成功)
+- 当前: **用户人工验收门** (app-chrome: 三键/拖拽/输入/IME; settings: 入口/开卡/版本行/反馈/关闭) → review; 余前提③ = 发布后首单外检
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例)
 
 ## 必读

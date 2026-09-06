@@ -145,8 +145,13 @@ pub(crate) struct LogView {
     /// 内容左缘偏移像素 (Cell: paint 只读, 事件写入, paint 防御性回钳)。
     x_offset: std::cell::Cell<f32>,
     /// 迄今见过的最大内容宽 (渲染时边测边长; 滚动范围的下界估计, 诚实边界:
-    /// 未探索区域的宽度未知, 与编辑器「minimap 边走边长」同构)。
+    /// 未探索区域的宽度未知, 与编辑器「边走边长」同构)。
     max_seen: std::cell::Cell<f32>,
+    // ---- 设置入口 (S2) ----
+    /// 设置按钮 hover 态 (event 写, paint 读)。
+    settings_hover: std::cell::Cell<bool>,
+    /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
+    settings_btn_rect: std::cell::Cell<Rect>,
 }
 
 impl LogView {
@@ -168,6 +173,8 @@ impl LogView {
             sub_rows: std::collections::BTreeMap::new(),
             x_offset: std::cell::Cell::new(0.0),
             max_seen: std::cell::Cell::new(0.0),
+            settings_hover: std::cell::Cell::new(false),
+            settings_btn_rect: std::cell::Cell::new(Rect::default()),
         }
     }
 
@@ -625,15 +632,36 @@ impl Widget for LogView {
             AUX_FONT_SIZE,
             status_fg(),
         );
+        // 设置入口 (S2): ⚙ 关于 — 位置计数左侧, hover 可辨
+        let settings_label = "⚙ 关于";
+        let settings_w = texts.measure(settings_label, AUX_FONT_SIZE);
+        let settings_x = area.origin.x + area.size.width - SCROLLBAR_W - 10.0 - settings_w;
+        let settings_rect =
+            Rect::from_xywh(settings_x - 4.0, status_y, settings_w + 8.0, STATUS_HEIGHT);
+        self.settings_btn_rect.set(settings_rect);
+        let settings_color = if self.settings_hover.get() {
+            text_default()
+        } else {
+            status_fg()
+        };
+        texts.push_text(
+            settings_label,
+            settings_x,
+            sy,
+            AUX_FONT_SIZE,
+            settings_color,
+        );
+        // 位置计数: 设置入口左侧
         let pos = if count == 0 {
             format!("行 0/{count}")
         } else {
             format!("行 {}/{count}", self.selected + 1)
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
+        let pos_x = settings_x - 16.0 - pos_w;
         texts.push_text(
             &pos,
-            area.origin.x + area.size.width - SCROLLBAR_W - 10.0 - pos_w,
+            pos_x.max(area.origin.x + 10.0),
             sy,
             AUX_FONT_SIZE,
             status_fg(),
@@ -644,6 +672,12 @@ impl Widget for LogView {
         let chrome_top = self.chrome_top();
         let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
         match event {
+            // 设置按钮 hover (S2): 矩形已含绝对坐标 (paint 计算)
+            Event::CursorMoved(position) => {
+                self.settings_hover
+                    .set(self.settings_btn_rect.get().contains(*position));
+                EventResult::Ignored // 不消费, 让列表区也能响应 hover
+            }
             Event::MouseWheel { delta, shift, .. } => {
                 // 横滚源 (T7): 触控板直接给 delta.0; 否则 Shift+纵滚
                 // (MouseWheel 修饰键是 danqing 打磨寄生新增, 联动改动两仓待提交)
@@ -674,6 +708,11 @@ impl Widget for LogView {
                 position,
                 ..
             } => {
+                // 设置按钮点击 (S2)
+                if self.settings_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::OpenSettings));
+                    return EventResult::Consumed;
+                }
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
                     let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;

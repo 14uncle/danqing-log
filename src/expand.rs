@@ -189,7 +189,11 @@ mod tests {
         m.expand(3, 1);
         let filtered = [0u64, 3];
         let lines = Lines::Filtered(&filtered);
-        assert_eq!(display_count(lines, &m), 3, "2 行 + 1 子行 (行 1 子行被滤掉)");
+        assert_eq!(
+            display_count(lines, &m),
+            3,
+            "2 行 + 1 子行 (行 1 子行被滤掉)"
+        );
         assert_eq!(file_line_at(0, lines, &m), Some((0, 0)));
         assert_eq!(file_line_at(1, lines, &m), Some((3, 0)));
         assert_eq!(file_line_at(2, lines, &m), Some((3, 1)));
