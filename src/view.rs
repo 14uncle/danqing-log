@@ -893,13 +893,11 @@ impl Widget for Bar {
         let app = state
             .downcast_ref::<LogApp>()
             .expect("Bar 绑定状态类型不匹配");
-        // 生效角色: 表格=过滤, 否则搜索开=搜索, 否则隐藏 (表格优先, 同 chrome_top)。
+        // 生效角色: 表格=过滤, 原始=搜索 (搜索栏始终可见, 不可隐藏)。
         self.active = if app.mode == ViewMode::Table {
             ActiveBar::Filter
-        } else if app.search_open {
-            ActiveBar::Search
         } else {
-            ActiveBar::Hidden
+            ActiveBar::Search
         };
 
         // 清空信号: revision 变化时原地 clear。
@@ -1066,7 +1064,7 @@ impl Bar {
     fn handle_escape(&self, active: ActiveBar, msgs: &mut MsgQueue) -> EventResult {
         match active {
             ActiveBar::Filter => msgs.push(Box::new(Msg::ClearFilter)),
-            ActiveBar::Search => msgs.push(Box::new(Msg::CloseSearch)),
+            ActiveBar::Search => msgs.push(Box::new(Msg::ClearSearch)),
             ActiveBar::Hidden => return EventResult::Ignored,
         }
         EventResult::Ignored

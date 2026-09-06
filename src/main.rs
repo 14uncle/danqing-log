@@ -157,8 +157,10 @@ pub(crate) enum Msg {
     /// 空搜索时 Enter=下一命中, Shift+Enter=上一命中。
     SearchNextHit,
     SearchPrevHit,
-    /// Esc 关闭搜索栏。
-    CloseSearch,
+    /// Esc 清除搜索结果 (栏保持可见)。
+    ClearSearch,
+    /// Ctrl+F / `/: 聚焦搜索栏。
+    FocusSearch,
     /// Esc 清除过滤。
     ClearFilter,
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
@@ -347,7 +349,6 @@ impl LogApp {
         self.filter_applied.clear();
         self.filter_clear_rev += 1;
         self.filter_elapsed = None;
-        self.search_open = false;
         self.search_clear_rev += 1;
         self.search = None;
         self.search_query.clear();
@@ -482,17 +483,15 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// 打开搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
+    /// 聚焦搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
     fn open_search(&mut self) {
-        self.search_open = true;
-        self.search_clear_rev += 1; // 打开即干净开始
+        self.search_clear_rev += 1; // 聚焦即干净开始
         self.focus_bar = true; // 自动聚焦搜索栏
         self.refresh_status();
     }
 
-    /// Esc (搜索): 关栏并清搜索态 (命中高亮同步消失)。
-    fn close_search(&mut self) {
-        self.search_open = false;
+    /// Esc (搜索): 清搜索态, 栏保持可见 (搜索栏始终显示, 不可隐藏)。
+    fn clear_search(&mut self) {
         self.search_clear_rev += 1;
         self.search = None;
         self.search_query.clear();
@@ -642,7 +641,8 @@ impl App for LogApp {
             Msg::ApplySearch(q) => self.apply_search(q),
             Msg::SearchNextHit => self.next_hit(),
             Msg::SearchPrevHit => self.prev_hit(),
-            Msg::CloseSearch => self.close_search(),
+            Msg::ClearSearch => self.clear_search(),
+            Msg::FocusSearch => self.open_search(),
             Msg::ClearFilter => self.clear_filter(),
             Msg::ToggleMode => self.toggle_mode(),
             // ---- S2–S4 设置卡 ----
@@ -792,15 +792,27 @@ impl App for LogApp {
         let Event::Key {
             key,
             pressed: true,
-            ctrl: true,
+            ctrl,
             ..
         } = event
         else {
             return None;
         };
+        // `/` 全局触发搜索 (非 Ctrl 组合, 拦截后搜索栏内无法输入 `/`, 可粘贴)
+        if !ctrl {
+            if let Key::Character(s) = key {
+                if s == "/" {
+                    return Some(Msg::FocusSearch);
+                }
+            }
+            return None;
+        }
         let Key::Character(s) = key else {
             return None;
         };
+        if s.eq_ignore_ascii_case("f") {
+            return Some(Msg::FocusSearch);
+        }
         if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
             return Some(Msg::ToggleMode);
         }
