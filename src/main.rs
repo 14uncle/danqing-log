@@ -179,17 +179,12 @@ pub(crate) enum Msg {
 }
 
 impl LogApp {
-    /// 窗口标题：文件名 + 模式指示 (随 Ctrl+T 切换)。
+    /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
     fn make_title(&self) -> String {
-        let name = self
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("(未命名)");
         if self.mode == ViewMode::Table {
-            format!("丹青日志 [JSONL] — {name}")
+            "丹青日志 [JSONL]".to_string()
         } else {
-            format!("丹青日志 POC — {name}")
+            "丹青日志".to_string()
         }
     }
 
@@ -937,18 +932,12 @@ fn run(path: &Path) -> Result<()> {
                 .join(", ")
         );
     }
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let title = format!(
-        "丹青日志 POC{} — {name}",
-        if mode == ViewMode::Table {
-            " [JSONL]"
-        } else {
-            ""
-        }
-    );
+    let title = if mode == ViewMode::Table {
+        "丹青日志 [JSONL]"
+    } else {
+        "丹青日志"
+    }
+    .to_string();
     let mut app = LogApp {
         file,
         top_row: 0.0,

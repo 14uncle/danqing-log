@@ -399,13 +399,24 @@ impl Widget for LogView {
 
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
+        let rows_bottom = rows_top + list_h;
+        // 裁剪: 行内容不溢出到表头/底栏
+        let clip = Rect::from_xywh(area.origin.x, rows_top, area.size.width, list_h);
+        rects.push_clip(clip);
+        texts.push_clip(clip);
         let first = self.top_row.floor() as u64;
         let frac = (self.top_row - first as f64) as f32;
         let mut i = first;
         loop {
             let y = rows_top + (i - first) as f32 * ROW_HEIGHT - frac * ROW_HEIGHT;
-            if y >= rows_top + list_h || i >= count {
+            // 行顶部超出可见区底部 → 停止
+            if y >= rows_bottom || i >= count {
                 break;
+            }
+            // 行完全在可见区上方 → 跳过 (滚动时首行可能部分溢出)
+            if y + ROW_HEIGHT <= rows_top {
+                i += 1;
+                continue;
             }
             // 选中行底色
             if i == self.selected {
@@ -576,6 +587,8 @@ impl Widget for LogView {
             }
             i += 1;
         }
+        rects.pop_clip();
+        texts.pop_clip();
 
         // 水平滚动条 (T7): 内容宽于视口才出现, 列表区底部 6px
         let max_seen = self.max_seen.get();
