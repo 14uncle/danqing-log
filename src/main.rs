@@ -22,8 +22,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use danqing::widget::{Column, Node, node};
-use danqing::{AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowConfig, run_app};
+use danqing::widget::{Column, LogoKind, Node, TitleBar, node};
+use danqing::{
+    AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
+};
+use danqing::theme::{ScenePalette, SceneTheme};
 
 use danqing_log::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
@@ -60,6 +63,21 @@ pub(crate) struct SearchOutcome {
     pattern: String,
     /// 用户输入原文 (展示)。
     query: String,
+}
+
+/// 标题栏主题: 深色 (匹配日志正文 VS Code 系基底), 浅色文字。
+/// SceneTheme 提供跨明暗 Theme 实现; 背景透明, 标题文字/按钮符号用浅色。
+fn title_theme() -> SceneTheme {
+    SceneTheme::new(ScenePalette {
+        base: Color::rgb(0.118, 0.118, 0.145),
+        accent: Color::rgb(0.24, 0.42, 0.66),
+        text_primary: Color::rgb(0.83, 0.83, 0.83),
+        text_secondary: Color::rgb(0.55, 0.57, 0.62),
+        surface: Color::rgba(1.0, 1.0, 1.0, 0.03),
+        surface_input: Color::rgba(1.0, 1.0, 1.0, 0.035),
+        backdrop_light: Color::rgb(0.30, 0.30, 0.36),
+        backdrop_dark: Color::rgb(0.08, 0.08, 0.10),
+    })
 }
 
 /// 应用状态本体 (danqing App)。
@@ -112,6 +130,8 @@ pub(crate) struct LogApp {
     last_stat_poll: Instant,
     /// 底栏提示 (截断/轮转等一次性事件)。
     notice: Option<String>,
+    /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
+    maximized: bool,
 }
 
 /// 应用消息。
@@ -502,6 +522,11 @@ fn clamp_top(top: f64, line_count: u64) -> f64 {
 impl App for LogApp {
     type Msg = Msg;
 
+    /// 窗口最大化状态回调 (框架 Handler 经 set_maximized 触发): 存 `maximized` 供 TitleBar 图标。
+    fn maximized_changed(&mut self, is_maximized: bool) {
+        self.maximized = is_maximized;
+    }
+
     fn update(&mut self, msg: Msg) {
         match msg {
             Msg::ScrollRows(d) => {
@@ -548,14 +573,34 @@ impl App for LogApp {
     }
 
     fn view(&self) -> Node {
-        // 顶层: 过滤/搜索栏 (真 TextInput, 内容高度) + 列表 (行锚定虚拟视口, fill)。
-        // 栏与列表均经 Widget::sync 各自拉取应用状态; 栏清空经 clear-revision 通知。
+        // 顶层: 框架 TitleBar (logo + 标题 + 内嵌过滤/搜索 Bar + 三窗键) + 列表 (行锚定虚拟视口, fill)。
+        // Bar 从独立 sibling 挪进 TitleBar 的 embed 槽; 栏与列表均经 sync 拉应用态。
+        let title = {
+            let name = self
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("(未命名)");
+            if self.mode == ViewMode::Table {
+                format!("丹青日志 [JSONL] — {name}")
+            } else {
+                format!("丹青日志 POC — {name}")
+            }
+        };
         node(
             Column::new()
                 .child(
-                    view::Bar::default()
-                        .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                        .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                    TitleBar::themed(&title_theme(), title)
+                        .logo_kind(LogoKind::Log)
+                        .on_close(|| WindowAction::Close)
+                        .on_minimize(|| WindowAction::Minimize)
+                        .on_maximize(|| WindowAction::MaximizeOrRestore)
+                        .bind_maximized(|app: &LogApp| app.maximized)
+                        .embed(
+                            view::Bar::default()
+                                .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
+                                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                        ),
                 )
                 .fill(view::LogView::new(), 1),
         )
@@ -812,6 +857,7 @@ fn run(path: &Path) -> Result<()> {
         follow: false,
         last_stat_poll: Instant::now(),
         notice: None,
+        maximized: false,
     };
     app.refresh_status();
     let config = WindowConfig {

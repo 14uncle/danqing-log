@@ -4,11 +4,14 @@
 > 依赖框架 `titlebar-embed`(先 push danqing → `cargo update -p danqing` → 本项目再搬)。
 > 逐条勾选; 每任务后跑三件套。
 
-- [ ] **A1: view() 换 TitleBar + 接三窗键**
+- [x] **A1: view() 换 TitleBar + 接三窗键** ✅ 编码 (人工开窗验收待用户)
   - Acceptance: `view()` = `Column[TitleBar.embed(Bar), LogView.fill]`; TitleBar 设 title/logo_kind=Log/
     on_close(Close)/on_minimize(Minimize)/on_maximize(MaximizeOrRestore)/bind_maximized; Bar 不再作 sibling
   - Verify: `cargo build` + 人工开窗看标题+三键
   - Files: `src/main.rs`
+  - 实测: TitleBar::themed(&title_theme(), title) + LogoKind::Log + 三键 → WindowAction + bind_maximized
+    (LogApp 加 maximized 字段 + override maximized_changed); Bar 挪进 embed 槽;
+    title_theme() 用 SceneTheme 深色调色板(浅色文字, log 深色系); 56 lib + 6 主测试绿, clippy 0
 
 - [ ] **A2: Bar 适配 embed 槽几何**
   - Acceptance: Bar layout/paint/event 用槽 area; label_width/input_area 以槽为基准; Bar Hidden 时标题栏仅标题+三键
