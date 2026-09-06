@@ -170,6 +170,10 @@ pub(crate) enum Msg {
     CloseSettings,
     /// 打开 URL (反馈链接/发布页)。
     OpenUrl(String),
+    /// Ctrl+O / 拖拽文件: 打开新文件。
+    OpenFile(PathBuf),
+    /// 无操作 (事件吞噬用, 不触发任何状态变更)。
+    Noop,
 }
 
 impl LogApp {
@@ -308,6 +312,53 @@ impl LogApp {
             }
             Err(e) => log::warn!("轮转重建失败: {e:#}"),
         }
+    }
+
+    /// 热替换文件 (Ctrl+O / 拖拽): 全部状态重建, 窗口不重建。
+    fn reload_file(&mut self, new_path: PathBuf) {
+        let Ok(new_file) = LogFile::open(&new_path) else {
+            self.notice = Some(format!(
+                "无法打开: {}",
+                new_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            ));
+            self.refresh_status();
+            return;
+        };
+        let base_status = status_text(&new_path, &new_file);
+        let new_file = Arc::new(new_file);
+        let schema = if jsonl::detect(&new_file) {
+            jsonl::discover_schema(&new_file).map(Arc::new)
+        } else {
+            None
+        };
+        let mode = if schema.is_some() {
+            ViewMode::Table
+        } else {
+            ViewMode::Raw
+        };
+        self.file = new_file;
+        self.path = new_path;
+        self.base_status = base_status;
+        self.mode = mode;
+        self.schema = schema;
+        self.top_row = 0.0;
+        self.selected = 0;
+        self.filtered = None;
+        self.filter_applied.clear();
+        self.filter_clear_rev += 1;
+        self.filter_elapsed = None;
+        self.search_open = false;
+        self.search_clear_rev += 1;
+        self.search = None;
+        self.search_query.clear();
+        self.search_pattern = None;
+        self.search_elapsed = None;
+        self.bookmarks.clear();
+        self.expanded = ExpandMap::new();
+        self.sub_rows.clear();
+        self.follow = false;
+        self.notice = None;
+        self.refresh_status();
     }
 
     /// 实时过滤: 增量行追加命中表 (只跑新行, 不全量重跑)。
@@ -606,6 +657,10 @@ impl App for LogApp {
                     log::warn!("打开链接失败: {err}");
                 }
             }
+            Msg::OpenFile(path) => {
+                self.reload_file(path);
+            }
+            Msg::Noop => {}
         }
     }
 
@@ -749,6 +804,16 @@ impl App for LogApp {
         if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
             return Some(Msg::ToggleMode);
         }
+        if s.eq_ignore_ascii_case("o") {
+            // Ctrl+O 全局: 弹文件选择器, 选中返回 OpenFile msg
+            if let Some(p) = rfd::FileDialog::new()
+                .set_title("选择日志文件")
+                .pick_file()
+            {
+                return Some(Msg::OpenFile(p));
+            }
+            return Some(Msg::Noop); // 取消: 吞掉事件, 不触发副作用
+        }
         None
     }
 
@@ -885,7 +950,7 @@ fn run(path: &Path) -> Result<()> {
         filter_clear_rev: 0,
         filter_elapsed: None,
         filter_job: AsyncJob::new(),
-        search_open: false,
+        search_open: true,
         search_clear_rev: 0,
         search: None,
         search_query: String::new(),

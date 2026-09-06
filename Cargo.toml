@@ -19,6 +19,7 @@ regex = "1"
 # (默认 BTreeMap 按键名字典序, 会把 ts/level/msg 排成字母序)。
 serde_json = { version = "1", features = ["preserve_order"] }
 open = "5"
+rfd = "0.15"
 
 [profile.dev]
 opt-level = 1
