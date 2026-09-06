@@ -137,6 +137,8 @@ pub(crate) enum Msg {
     CloseSearch,
     /// Esc 清除过滤。
     ClearFilter,
+    /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
+    ToggleMode,
 }
 
 impl LogApp {
@@ -370,6 +372,20 @@ impl LogApp {
         self.refresh_status();
     }
 
+    /// 表格/原始互切 (JSONL 检出才可用): 进表格自动聚焦过滤栏, 回原始清 focus_bar。
+    fn toggle_mode(&mut self) {
+        if self.schema.is_none() {
+            return;
+        }
+        if self.mode == ViewMode::Table {
+            self.mode = ViewMode::Raw;
+        } else {
+            self.mode = ViewMode::Table;
+            self.focus_bar = true;
+        }
+        self.refresh_status();
+    }
+
     /// 打开搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
     fn open_search(&mut self) {
         self.search_open = true;
@@ -527,6 +543,7 @@ impl App for LogApp {
             Msg::SearchPrevHit => self.prev_hit(),
             Msg::CloseSearch => self.close_search(),
             Msg::ClearFilter => self.clear_filter(),
+            Msg::ToggleMode => self.toggle_mode(),
         }
     }
 
@@ -574,14 +591,7 @@ impl App for LogApp {
                     return;
                 }
                 if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
-                    // 进表格自动聚焦过滤栏 (打字即以过滤); 回原始不聚焦
-                    if self.mode == ViewMode::Table {
-                        self.mode = ViewMode::Raw;
-                    } else {
-                        self.mode = ViewMode::Table;
-                        self.focus_bar = true;
-                    }
-                    self.refresh_status();
+                    self.update(Msg::ToggleMode);
                 }
             }
             return;
@@ -636,6 +646,28 @@ impl App for LogApp {
             Key::Named(NamedKey::End) => self.update(Msg::GotoEnd),
             _ => {}
         }
+    }
+
+    /// 键盘前置过滤 (焦点分发前拦截): 栏聚焦时键进焦点组件, 全局 Ctrl 快捷键
+    /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
+    /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
+    fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
+        let Event::Key {
+            key,
+            pressed: true,
+            ctrl: true,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let Key::Character(s) = key else {
+            return None;
+        };
+        if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
+            return Some(Msg::ToggleMode);
+        }
+        None
     }
 
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
