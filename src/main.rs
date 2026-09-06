@@ -595,6 +595,7 @@ impl App for LogApp {
                         .on_close(|| WindowAction::Close)
                         .on_minimize(|| WindowAction::Minimize)
                         .on_maximize(|| WindowAction::MaximizeOrRestore)
+                        .on_drag(|| WindowAction::Drag)
                         .bind_maximized(|app: &LogApp| app.maximized)
                         .embed(
                             view::Bar::default()
