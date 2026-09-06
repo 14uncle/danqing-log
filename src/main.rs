@@ -7,11 +7,11 @@
 //! (步进索引/编码三件套/截断轮转原语/PageUp-Down/正则搜索)。
 //! 无窗口基准走 bin/logbench, 测试数据生成走 bin/genlog, mmap 行为实验走 bin/mmap_lab。
 //!
-//! 键盘总览:
+//! 键盘总览 (v1 后栏走焦点系统, 栏聚焦时方向键移光标, 无焦点时这些全局键生效):
 //! - 滚动: 滚轮/方向键/PageUp/PageDown/Space(Shift 反向)/Home/End; 点击选中
-//! - 搜索: `/` (原始模式) 或 Ctrl+F (任意模式) 开栏; Enter 应用, 栏空后
+//! - 搜索: `/` (原始模式) 或 Ctrl+F (任意模式) 开栏并聚焦; Enter 应用, 栏空后
 //!   Enter/Shift+Enter 下/上一命中 (环绕); Esc 关闭
-//! - 表格模式 (JSONL 检出): 字符直捕进过滤框, Enter 应用, Esc 清除, Ctrl+T 切原始
+//! - 表格模式 (JSONL 检出): 框架自动聚焦过滤栏 (真 TextInput); Enter 应用, Esc 清除并清焦, Ctrl+T 切原始
 
 #![windows_subsystem = "windows"]
 
@@ -22,11 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use danqing::widget::{Node, node};
-use danqing::{
-    AnimationCtx, App, Color, Event, ImeEvent, Key, NamedKey, Size, WindowConfig,
-    WindowEventSender, run_app,
-};
+use danqing::widget::{Column, Node, node};
+use danqing::{AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowConfig, run_app};
 
 use danqing_log::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
@@ -35,7 +32,7 @@ use danqing_log::logfile::{FileStat, LogFile};
 use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 
 /// 空格/PageUp-Down 翻页的行数: POC 定值。正式版由组件回报视口行数。
-const PAGE_ROWS: f64 = 25.0;
+pub(crate) const PAGE_ROWS: f64 = 25.0;
 /// 搜索命中行号收集上限 (防命中过密内存爆; 总数如实报告)。
 const SEARCH_HIT_CAP: usize = 1_000_000;
 
@@ -81,15 +78,18 @@ pub(crate) struct LogApp {
     schema: Option<Arc<Schema>>,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
-    /// 正在编辑的过滤查询 (表格模式下字符键直捕)。
-    filter_input: String,
     /// 已应用的过滤查询。
     filter_applied: String,
+    /// 过滤栏清空信号 (Bar::bind_clear_filter 借此原地 clear)。
+    filter_clear_rev: u64,
     filter_elapsed: Option<Duration>,
     filter_job: AsyncJob<FilterOutcome>,
-    /// 搜索栏开闭 (开着时键盘优先归搜索)。
+    /// 搜索栏开闭 (开着时面板聚焦搜索框)。
     search_open: bool,
-    search_input: String,
+    /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
+    search_clear_rev: u64,
+    /// 一次性焦点请求: 开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
+    focus_bar: bool,
     /// 已应用搜索的导航态 (命中表 + 当前位置)。
     search: Option<SearchNav>,
     search_query: String,
@@ -103,8 +103,6 @@ pub(crate) struct LogApp {
     expanded: ExpandMap,
     /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭, 惰性 parse)。
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
-    /// 窗口事件发送器 (粘贴走 read_clipboard 回送 IME Commit)。
-    sender: Option<WindowEventSender>,
     // ---- live-tail (T2) ----
     /// 文件路径 (增长检测轮询用)。
     path: PathBuf,
@@ -127,6 +125,18 @@ pub(crate) enum Msg {
     /// 跳到文件头/尾。
     GotoStart,
     GotoEnd,
+    // ---- v1 真 TextInput 栏 (Bar 抛给应用) ----
+    /// 应用过滤 (携带当前输入值; 空 = 回到全量)。
+    ApplyFilter(String),
+    /// 应用搜索 (携带当前输入值; 非空才发)。
+    ApplySearch(String),
+    /// 空搜索时 Enter=下一命中, Shift+Enter=上一命中。
+    SearchNextHit,
+    SearchPrevHit,
+    /// Esc 关闭搜索栏。
+    CloseSearch,
+    /// Esc 清除过滤。
+    ClearFilter,
 }
 
 impl LogApp {
@@ -325,10 +335,9 @@ impl LogApp {
     }
 
     /// Enter (过滤): 应用。空查询 = 回全量; 非空走 AsyncJob (1GB 亚秒, 不冻界面)。
-    fn apply_filter(&mut self) {
-        let query = self.filter_input.trim().to_string();
-        self.filter_input.clear();
+    fn apply_filter(&mut self, query: String) {
         self.filter_applied = query.clone();
+        self.filter_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         if query.is_empty() {
             self.filtered = None;
             self.filter_elapsed = None;
@@ -350,12 +359,9 @@ impl LogApp {
         });
     }
 
-    /// Esc (过滤): 清输入 + 清已应用过滤, 回到全量。
+    /// Esc (过滤): 清已应用过滤, 回到全量。
     fn clear_filter(&mut self) {
-        if self.filter_input.is_empty() && self.filter_applied.is_empty() {
-            return;
-        }
-        self.filter_input.clear();
+        self.filter_clear_rev += 1;
         self.filter_applied.clear();
         self.filter_elapsed = None;
         self.filtered = None;
@@ -367,14 +373,15 @@ impl LogApp {
     /// 打开搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
     fn open_search(&mut self) {
         self.search_open = true;
-        self.search_input.clear();
+        self.search_clear_rev += 1; // 打开即干净开始
+        self.focus_bar = true; // 自动聚焦搜索栏
         self.refresh_status();
     }
 
     /// Esc (搜索): 关栏并清搜索态 (命中高亮同步消失)。
     fn close_search(&mut self) {
         self.search_open = false;
-        self.search_input.clear();
+        self.search_clear_rev += 1;
         self.search = None;
         self.search_query.clear();
         self.search_pattern = None;
@@ -383,8 +390,7 @@ impl LogApp {
     }
 
     /// Enter (搜索): 栏内有输入 = 应用新搜索; 栏空 = 下一命中。
-    fn apply_search(&mut self) {
-        let q = self.search_input.trim().to_string();
+    fn apply_search(&mut self, q: String) {
         if q.is_empty() {
             return;
         }
@@ -393,7 +399,7 @@ impl LogApp {
             self.status = format!("{} · 搜索 \"{q}\" 正则无效", self.base_status);
             return;
         };
-        self.search_input.clear();
+        self.search_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         self.search_query = q.clone();
         let file = Arc::clone(&self.file);
         self.status = format!("{} · 搜索 \"{q}\" 中…", self.base_status);
@@ -445,14 +451,6 @@ impl LogApp {
         if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.selected)) {
             self.jump_to_file_line(line);
             self.refresh_status();
-        }
-    }
-
-    /// Ctrl+V: 请求引擎读剪贴板 (回送为 IME Commit 进搜索/过滤框)。
-    /// App 层无剪贴板直连, 走 WindowEventSender::read_clipboard (打磨寄生新增)。
-    fn paste(&mut self) {
-        if let Some(sender) = &self.sender {
-            sender.read_clipboard();
         }
     }
 }
@@ -522,24 +520,31 @@ impl App for LogApp {
                     self.refresh_status();
                 }
             }
+            // ---- v1 真 TextInput 栏 ----
+            Msg::ApplyFilter(q) => self.apply_filter(q),
+            Msg::ApplySearch(q) => self.apply_search(q),
+            Msg::SearchNextHit => self.next_hit(),
+            Msg::SearchPrevHit => self.prev_hit(),
+            Msg::CloseSearch => self.close_search(),
+            Msg::ClearFilter => self.clear_filter(),
         }
     }
 
     fn view(&self) -> Node {
-        node(view::LogView::new())
+        // 顶层: 过滤/搜索栏 (真 TextInput, 内容高度) + 列表 (行锚定虚拟视口, fill)。
+        // 栏与列表均经 Widget::sync 各自拉取应用状态; 栏清空经 clear-revision 通知。
+        node(
+            Column::new()
+                .child(
+                    view::Bar::default()
+                        .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
+                        .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                )
+                .fill(view::LogView::new(), 1),
+        )
     }
 
     fn event(&mut self, event: &Event) {
-        // IME 提交 (中文输入; 粘贴经引擎 read_clipboard 回送也走这里) 优先归栏:
-        // winit 下 IME 合成文本只经 Ime(Commit) 送达, Key::Character 拿不到汉字。
-        if let Event::Ime(ImeEvent::Commit { value }) = event {
-            if self.search_open {
-                self.search_input.push_str(value);
-            } else if self.mode == ViewMode::Table {
-                self.filter_input.push_str(value);
-            }
-            return;
-        }
         let Event::Key {
             key,
             pressed: true,
@@ -550,41 +555,7 @@ impl App for LogApp {
         else {
             return;
         };
-        // 搜索栏开着: 键盘优先归搜索 (方向键等未拦的键放行去滚动)
-        if self.search_open {
-            match key {
-                Key::Character(s) if !ctrl => {
-                    self.search_input.push_str(s);
-                    return;
-                }
-                Key::Named(NamedKey::Space) => {
-                    self.search_input.push(' ');
-                    return;
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    self.search_input.pop();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    if self.search_input.trim().is_empty() {
-                        // 栏空: Enter/Shift+Enter = 下/上一命中
-                        if *shift {
-                            self.prev_hit();
-                        } else {
-                            self.next_hit();
-                        }
-                    } else {
-                        self.apply_search();
-                    }
-                    return;
-                }
-                Key::Named(NamedKey::Escape) => {
-                    self.close_search();
-                    return;
-                }
-                _ => {}
-            }
-        }
+        // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
         if *ctrl {
             if let Key::Character(s) = key {
                 if s.eq_ignore_ascii_case("f") {
@@ -593,7 +564,7 @@ impl App for LogApp {
                     }
                     return;
                 }
-                // 书签键双模式通用 (表格模式字符键归过滤框, 故走 Ctrl)
+                // 书签键双模式通用
                 if s.eq_ignore_ascii_case("b") {
                     self.toggle_bookmark();
                     return;
@@ -602,21 +573,20 @@ impl App for LogApp {
                     self.goto_next_bookmark();
                     return;
                 }
-                if s.eq_ignore_ascii_case("v") {
-                    self.paste();
-                    return;
-                }
                 if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
-                    self.mode = match self.mode {
-                        ViewMode::Raw => ViewMode::Table,
-                        ViewMode::Table => ViewMode::Raw,
-                    };
+                    // 进表格自动聚焦过滤栏 (打字即以过滤); 回原始不聚焦
+                    if self.mode == ViewMode::Table {
+                        self.mode = ViewMode::Raw;
+                    } else {
+                        self.mode = ViewMode::Table;
+                        self.focus_bar = true;
+                    }
                     self.refresh_status();
                 }
             }
             return;
         }
-        // 原始模式: `/` 开搜索栏; `b`/`'` 书签 (表格模式字符键归过滤框)
+        // 原始模式: `/` 开搜索栏; `b`/`'` 书签; `f` 跟随 (栏聚焦时键进 TextInput, 不达此处)
         if self.mode == ViewMode::Raw {
             if let Key::Character(s) = key {
                 match s.as_str() {
@@ -632,39 +602,12 @@ impl App for LogApp {
                         self.goto_next_bookmark();
                         return;
                     }
-                    // F = tail 跟随 toggle (原始模式; 表格模式字符键归过滤框)
                     "f" => {
                         self.toggle_follow();
                         return;
                     }
                     _ => {}
                 }
-            }
-        }
-        if self.mode == ViewMode::Table {
-            match key {
-                Key::Character(s) => {
-                    self.filter_input.push_str(s);
-                    return;
-                }
-                // danqing 空格产 Named(Space) 而非 Character, 过滤查询需要空格分词
-                Key::Named(NamedKey::Space) => {
-                    self.filter_input.push(' ');
-                    return;
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    self.filter_input.pop();
-                    return;
-                }
-                Key::Named(NamedKey::Enter) => {
-                    self.apply_filter();
-                    return;
-                }
-                Key::Named(NamedKey::Escape) => {
-                    self.clear_filter();
-                    return;
-                }
-                _ => {}
             }
         }
         match key {
@@ -683,7 +626,6 @@ impl App for LogApp {
                     self.toggle_expand(file_line);
                 }
             }
-            // PageUp/PageDown = danqing 打磨寄生新增 (T4, 联动改动两仓分别待提交)
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
             Key::Named(NamedKey::PageDown) => self.update(Msg::ScrollRows(PAGE_ROWS)),
             Key::Named(NamedKey::Space) => {
@@ -694,12 +636,6 @@ impl App for LogApp {
             Key::Named(NamedKey::End) => self.update(Msg::GotoEnd),
             _ => {}
         }
-    }
-
-    /// 无焦点应用声明 IME 需求: 表格模式过滤框或搜索栏开启时请求中文输入法
-    /// (框架 `update_ime` 无焦点时默认关 IME, 经此钩子放行)。
-    fn wants_ime(&self) -> bool {
-        self.mode == ViewMode::Table || self.search_open
     }
 
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
@@ -732,8 +668,18 @@ impl App for LogApp {
         }
     }
 
-    fn attach_window_sender(&mut self, sender: WindowEventSender) {
-        self.sender = Some(sender);
+    /// 焦点为空时的一次性恢复请求: 开搜索/进表格时把焦点给栏 (via `log-bar`)。
+    fn focus_request(&self) -> Option<&'static str> {
+        if self.focus_bar {
+            Some("log-bar")
+        } else {
+            None
+        }
+    }
+
+    /// 消费焦点请求 (逐帧调用, 一次性: 置位后立即清除, 避免 Esc 后误拉回)。
+    fn focus_restored(&mut self) {
+        self.focus_bar = false;
     }
 }
 
@@ -815,12 +761,12 @@ fn run(path: &Path) -> Result<()> {
         mode,
         schema,
         filtered: None,
-        filter_input: String::new(),
         filter_applied: String::new(),
+        filter_clear_rev: 0,
         filter_elapsed: None,
         filter_job: AsyncJob::new(),
         search_open: false,
-        search_input: String::new(),
+        search_clear_rev: 0,
         search: None,
         search_query: String::new(),
         search_pattern: None,
@@ -829,7 +775,7 @@ fn run(path: &Path) -> Result<()> {
         bookmarks: std::collections::BTreeSet::new(),
         expanded: ExpandMap::new(),
         sub_rows: std::collections::BTreeMap::new(),
-        sender: None,
+        focus_bar: false,
         path: path.to_path_buf(),
         follow: false,
         last_stat_poll: Instant::now(),

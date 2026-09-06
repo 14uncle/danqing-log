@@ -8,11 +8,13 @@
 //! 底部滚动会出现亚行漂移 —— 恰好在 POC 要证明的 1GB+ 场景失守。
 //! 行锚定 (u64 行号 + 行内小数偏移) 在任意文件大小下精度无损。
 //!
-//! 双模式:
+//! 布局 (v1 后过滤/搜索栏是独立 sibling, 不在此组件内):
+//! `Column[ Bar(真 TextInput, 内容高 32) · LogView(本组件, fill) ]`
+//!  LogView 负责: [表头 24px(仅表格)] [虚拟化行] [状态栏 26px]。
 //! - 原始模式: 整行文本 + 级别着色, 与 POC v0 一致;
-//! - 表格模式 (前提②): [过滤栏 32px][表头 24px][虚拟化行][状态栏 26px] 四区,
-//!   列定义来自 JSONL 采样 (jsonl::Schema), 单元格经 memmem 字段提取 (零 parse),
-//!   显示行→文件行号经 filtered 命中表映射 (无过滤时恒等), 行号槽恒显真实行号。
+//! - 表格模式 (前提②): 表头 + 虚拟化行, 列定义来自 JSONL 采样 (jsonl::Schema),
+//!   单元格经 memmem 字段提取 (零 parse), 显示行→文件行号经 filtered 命中表映射
+//!   (无过滤时恒等), 行号槽恒显真实行号。
 //!
 //! POC 边界: 无水平滚动 (超宽单元格截断省略, 溢出右缘的列整列不画),
 //! 无鼠标拖滚动条 (滚轮/键盘/点击), 无搜索/过滤命中高亮。
@@ -20,8 +22,10 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use danqing::widget::{EventResult, MsgQueue, Widget};
-use danqing::{Color, Constraints, Event, Rect, RectBatch, Size, TextBatch};
+use danqing::widget::{EventResult, MsgQueue, TextInput, Widget};
+use danqing::{
+    Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Rect, RectBatch, Size, TextBatch,
+};
 
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Column, Schema, SubRow};
@@ -124,12 +128,7 @@ pub(crate) struct LogView {
     schema: Option<Arc<Schema>>,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
-    filter_input: String,
-    filter_applied: String,
     // ---- 搜索态 (T5) ----
-    search_open: bool,
-    search_input: String,
-    search_query: String,
     /// 已应用模式原文 (变化检测) 与编译缓存 (sync 时按需重编译, paint 零成本)。
     search_pattern_src: Option<String>,
     search_re: Option<regex::bytes::Regex>,
@@ -160,11 +159,6 @@ impl LogView {
             mode: ViewMode::Raw,
             schema: None,
             filtered: None,
-            filter_input: String::new(),
-            filter_applied: String::new(),
-            search_open: false,
-            search_input: String::new(),
-            search_query: String::new(),
             search_pattern_src: None,
             search_re: None,
             search_hits: None,
@@ -182,15 +176,10 @@ impl LogView {
         self.mode == ViewMode::Table && self.schema.is_some()
     }
 
-    /// 顶部 chrome 高度: 表格 = 过滤/搜索栏同槽 + 表头; 原始模式开搜索栏时 +栏高。
+    /// 顶部 chrome 高度: 过滤/搜索栏是独立 sibling (Column 上面), LogView 不含它;
+    /// 表格模式只留表头, 原始模式无 chrome。
     fn chrome_top(&self) -> f32 {
-        if self.table_mode() {
-            FILTER_BAR_H + HEADER_H
-        } else if self.search_open {
-            FILTER_BAR_H
-        } else {
-            0.0
-        }
+        if self.table_mode() { HEADER_H } else { 0.0 }
     }
 
     /// 显示行来源 (全量恒等或过滤命中)。
@@ -302,11 +291,6 @@ impl Widget for LogView {
         self.mode = app.mode;
         self.schema = app.schema.clone();
         self.filtered = app.filtered.clone();
-        self.filter_input = app.filter_input.clone();
-        self.filter_applied = app.filter_applied.clone();
-        self.search_open = app.search_open;
-        self.search_input = app.search_input.clone();
-        self.search_query = app.search_query.clone();
         self.search_hits = app.search.as_ref().map(|n| Arc::clone(n.hits()));
         self.encoding = app.file.encoding();
         self.bookmarks = app.bookmarks.clone();
@@ -355,13 +339,6 @@ impl Widget for LogView {
         let aux_baseline_off =
             (ROW_HEIGHT - aux_line_h) / 2.0 + texts.ascent(f32::from(AUX_FONT_SIZE));
 
-        // 顶栏: 搜索栏开着即占槽 (与过滤栏同槽替换), 否则表格模式画过滤栏
-        if self.search_open {
-            self.paint_search_bar(area, rects, texts, line_h);
-        } else if table {
-            self.paint_filter_bar(area, rects, texts, line_h);
-        }
-
         // 表格模式: 列布局 (列宽 = 采样字符宽实测 + 内边距, ≤16 列常量成本;
         // 水平滚动: 列区整体左移, 滚出左右缘的列整列不画)
         let mut cols: Vec<(f32, f32, &Column)> = Vec::new();
@@ -386,8 +363,8 @@ impl Widget for LogView {
             if total_w > self.max_seen.get() {
                 self.max_seen.set(total_w);
             }
-            // 表头 + 分隔线 (表头随列水平滚动, 左缘切断同单元格)
-            let hy = area.origin.y + FILTER_BAR_H;
+            // 表头 + 分隔线 (表头随列水平滚动, 左缘切断同单元格); LogView 顶部即表头 (栏是 sibling)
+            let hy = area.origin.y;
             for (cx, cw, col) in &cols {
                 let cell_x = cx + 8.0;
                 let left_cut = (text_x - cell_x).max(0.0);
@@ -717,78 +694,362 @@ impl Widget for LogView {
     }
 }
 
-impl LogView {
-    /// 搜索栏 (T5): 与过滤栏同槽同高。输入中显输入+光标, 已应用显查询+翻页提示。
-    fn paint_search_bar(
-        &self,
-        area: Rect,
-        rects: &mut RectBatch,
-        texts: &mut TextBatch,
-        line_h: f32,
-    ) {
-        rects.push_rect(
-            Rect::from_xywh(area.origin.x, area.origin.y, area.size.width, FILTER_BAR_H),
-            filter_bar_bg(),
-            0.0,
-        );
-        let baseline =
-            area.origin.y + (FILTER_BAR_H - line_h) / 2.0 + texts.ascent(f32::from(FONT_SIZE));
-        let label = if !self.search_input.is_empty() {
-            format!("搜索: {}▏", self.search_input)
-        } else if !self.search_query.is_empty() {
-            format!(
-                "搜索: {}  (Enter 下一命中 · Shift+Enter 上一 · Esc 关闭)",
-                self.search_query
-            )
-        } else {
-            "搜索: 输入正则 · Enter 应用 · Esc 关闭 (GBK/Latin-1 文件退化为字面量)".to_string()
-        };
-        fit_push(
-            texts,
-            &label,
-            area.size.width - 20.0,
-            area.origin.x + 10.0,
-            baseline,
-            FONT_SIZE,
-            filter_fg(),
-        );
+/// 栏内水平内边距。
+const BAR_PAD_X: f32 = 10.0;
+/// 前缀标签 ("过滤:"/"搜索:") 与输入区间隙。
+const BAR_LABEL_GAP: f32 = 8.0;
+/// 光标色 (深色栏上浅色, 保证可辨)。
+fn caret_fg() -> Color {
+    Color::rgb(0.90, 0.92, 0.96)
+}
+/// 占位文字色。
+fn placeholder_fg() -> Color {
+    Color::rgb(0.45, 0.48, 0.54)
+}
+
+/// 「清空输入」绑定闭包: 从应用状态读 clear revision。
+type ClearBinding = Box<dyn Fn(&dyn Any) -> u64>;
+
+/// 当前生效的输入角色。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveBar {
+    /// 表格模式过滤栏。
+    Filter,
+    /// 原始模式 + 搜索栏开启。
+    Search,
+    /// 无栏。
+    Hidden,
+}
+
+/// 过滤/搜索栏: 同一槽位两种输入 (表格模式过滤, 原始+搜索开搜索)。
+///
+/// 参考 danqing-clipboard `bottom_bar.rs`: TextInput 作为字段而非 child 节点,
+/// 焦点路径落在本容器上, 经 `wants_ime`/`ime_area`/`selected_text`/`hit_area`/
+/// `reset_focus` 转发到内部 TextInput (否则 IME / 剪贴板快照 / 命中全部失效)。
+/// 清空经 clear revision 原地 clear (不重建实例, 保焦点态)。
+pub(crate) struct Bar {
+    filter_ti: TextInput,
+    search_ti: TextInput,
+    /// 已应用过滤 (sync 设占位文字)。
+    filter_applied: String,
+    /// 已应用搜索查询 (sync 设占位文字)。
+    search_query: String,
+    /// 应用侧清空 revision (读值变化时原地 clear)。
+    filter_clear_binding: Option<ClearBinding>,
+    search_clear_binding: Option<ClearBinding>,
+    applied_filter_rev: u64,
+    applied_search_rev: u64,
+    /// 当前生效角色 (sync 计算)。
+    active: ActiveBar,
+    /// 前缀标签宽度 (paint 测量缓存, event 转发与 paint 的 input_area 须一致,
+    /// 否则点击定位光标会偏一个 label 宽)。
+    label_width: std::cell::Cell<f32>,
+}
+
+impl Bar {
+    pub(crate) fn new() -> Self {
+        Self {
+            filter_ti: Self::fresh_filter(),
+            search_ti: Self::fresh_search(),
+            filter_applied: String::new(),
+            search_query: String::new(),
+            filter_clear_binding: None,
+            search_clear_binding: None,
+            applied_filter_rev: 0,
+            applied_search_rev: 0,
+            active: ActiveBar::Hidden,
+            label_width: std::cell::Cell::new(0.0),
+        }
     }
 
-    /// 过滤栏: 输入中显输入+光标, 已应用显查询+操作提示, 空态显语法提示。
-    fn paint_filter_bar(
-        &self,
-        area: Rect,
-        rects: &mut RectBatch,
-        texts: &mut TextBatch,
-        line_h: f32,
-    ) {
+    fn fresh_filter() -> TextInput {
+        Self::base_input().placeholder(
+            "输入如 level=ERROR status=50* (AND · 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回",
+            placeholder_fg(),
+        )
+    }
+
+    fn fresh_search() -> TextInput {
+        Self::base_input().placeholder(
+            "输入正则 · Enter 应用 · Esc 关闭 (GBK/Latin-1 文件退化为字面量)",
+            placeholder_fg(),
+        )
+    }
+
+    fn base_input() -> TextInput {
+        TextInput::themed(&LightTheme)
+            .font_size(FONT_SIZE)
+            .chromeless()
+            .color(filter_fg())
+            .caret_color(caret_fg())
+            .selection_color(selection_bg())
+            .padding(Edges::symmetric(2.0, 0.0))
+    }
+
+    /// 绑定过滤清空信号: 应用侧 revision 变化时原地 clear。
+    pub(crate) fn bind_clear_filter<S: 'static>(mut self, f: impl Fn(&S) -> u64 + 'static) -> Self {
+        self.filter_clear_binding = Some(Box::new(move |state: &dyn Any| {
+            let state = state
+                .downcast_ref::<S>()
+                .expect("Bar::bind_clear_filter 状态类型不匹配");
+            f(state)
+        }));
+        self
+    }
+
+    /// 绑定搜索清空信号: 应用侧 revision 变化时原地 clear。
+    pub(crate) fn bind_clear_search<S: 'static>(mut self, f: impl Fn(&S) -> u64 + 'static) -> Self {
+        self.search_clear_binding = Some(Box::new(move |state: &dyn Any| {
+            let state = state
+                .downcast_ref::<S>()
+                .expect("Bar::bind_clear_search 状态类型不匹配");
+            f(state)
+        }));
+        self
+    }
+
+    /// 前缀标签。
+    fn label(&self) -> &'static str {
+        match self.active {
+            ActiveBar::Filter => "过滤:",
+            ActiveBar::Search => "搜索:",
+            ActiveBar::Hidden => "",
+        }
+    }
+
+    /// 输入矩形 (label 之后到右缘)。
+    fn input_area(&self, area: Rect, label_w: f32) -> Rect {
+        let text_x = area.origin.x + BAR_PAD_X + label_w + BAR_LABEL_GAP;
+        let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X).max(1.0);
+        Rect::from_xywh(text_x, area.origin.y, w, area.size.height)
+    }
+
+    /// 当前生效输入的引用。
+    fn active_input(&self) -> Option<&TextInput> {
+        match self.active {
+            ActiveBar::Filter => Some(&self.filter_ti),
+            ActiveBar::Search => Some(&self.search_ti),
+            ActiveBar::Hidden => None,
+        }
+    }
+
+    /// 当前生效输入的可变引用。
+    fn active_input_mut(&mut self) -> Option<&mut TextInput> {
+        match self.active {
+            ActiveBar::Filter => Some(&mut self.filter_ti),
+            ActiveBar::Search => Some(&mut self.search_ti),
+            ActiveBar::Hidden => None,
+        }
+    }
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Widget for Bar {
+    fn sync(&mut self, state: &dyn Any) {
+        let app = state
+            .downcast_ref::<LogApp>()
+            .expect("Bar 绑定状态类型不匹配");
+        // 生效角色: 表格=过滤, 否则搜索开=搜索, 否则隐藏 (表格优先, 同 chrome_top)。
+        self.active = if app.mode == ViewMode::Table {
+            ActiveBar::Filter
+        } else if app.search_open {
+            ActiveBar::Search
+        } else {
+            ActiveBar::Hidden
+        };
+
+        // 清空信号: revision 变化时原地 clear。
+        if let Some(binding) = &self.filter_clear_binding {
+            let rev = binding(state);
+            if rev != self.applied_filter_rev {
+                self.applied_filter_rev = rev;
+                self.filter_ti.clear();
+            }
+        }
+        if let Some(binding) = &self.search_clear_binding {
+            let rev = binding(state);
+            if rev != self.applied_search_rev {
+                self.applied_search_rev = rev;
+                self.search_ti.clear();
+            }
+        }
+
+        // 应用态 → 占位文字 (空态显示 "已应用" 提示; 有输入时占位消失)。
+        self.filter_applied = app.filter_applied.clone();
+        self.search_query = app.search_query.clone();
+        self.set_filter_placeholder();
+        self.set_search_placeholder();
+    }
+
+    fn animate(&mut self, ctx: &danqing::AnimationCtx) {
+        self.filter_ti.animate(ctx);
+        self.search_ti.animate(ctx);
+    }
+
+    fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
+        if self.active == ActiveBar::Hidden {
+            return Size::new(constraints.max().width, 0.0);
+        }
+        // 让当前生效的输入框先 layout (缓存 vertical_pad / char_offsets)。
+        if let Some(ti) = self.active_input_mut() {
+            let _ = ti.layout(constraints, texts);
+        }
+        Size::new(constraints.max().width, FILTER_BAR_H)
+    }
+
+    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        if self.active == ActiveBar::Hidden {
+            return;
+        }
         rects.push_rect(
             Rect::from_xywh(area.origin.x, area.origin.y, area.size.width, FILTER_BAR_H),
             filter_bar_bg(),
             0.0,
         );
+        let line_h = texts.line_height(f32::from(FONT_SIZE));
         let baseline =
             area.origin.y + (FILTER_BAR_H - line_h) / 2.0 + texts.ascent(f32::from(FONT_SIZE));
-        let label = if !self.filter_input.is_empty() {
-            format!("过滤: {}▏", self.filter_input)
-        } else if !self.filter_applied.is_empty() {
-            format!(
-                "过滤: {}  (已应用 · Esc 清除 · Ctrl+T 切回原始)",
-                self.filter_applied
-            )
-        } else {
-            "过滤: 直接输入, 如 level=ERROR status=50* (AND, 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回原始"
-                .to_string()
-        };
-        fit_push(
-            texts,
-            &label,
-            area.size.width - 20.0,
-            area.origin.x + 10.0,
+        let label = self.label();
+        texts.push_text(
+            label,
+            area.origin.x + BAR_PAD_X,
             baseline,
             FONT_SIZE,
             filter_fg(),
         );
+        let label_w = texts.measure(label, FONT_SIZE);
+        self.label_width.set(label_w);
+        let input_area = self.input_area(area, label_w);
+        match self.active {
+            ActiveBar::Filter => self.filter_ti.paint(input_area, rects, texts),
+            ActiveBar::Search => self.search_ti.paint(input_area, rects, texts),
+            ActiveBar::Hidden => {}
+        }
+    }
+
+    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        let active = self.active;
+        if active == ActiveBar::Hidden {
+            return EventResult::Ignored;
+        }
+        // 拦截 Enter/Esc/PageUp/PageDown: Enter=应用, Esc=关闭/清除, Page=滚动 (栏聚焦时导航仍可用)。
+        if let Event::Key {
+            key,
+            pressed: true,
+            shift,
+            ..
+        } = event
+        {
+            match key {
+                Key::Named(NamedKey::Enter) => return self.handle_enter(active, *shift, msgs),
+                Key::Named(NamedKey::Escape) => return self.handle_escape(active, msgs),
+                Key::Named(NamedKey::PageUp) => {
+                    msgs.push(Box::new(Msg::ScrollRows(-crate::PAGE_ROWS)));
+                    return EventResult::Consumed;
+                }
+                Key::Named(NamedKey::PageDown) => {
+                    msgs.push(Box::new(Msg::ScrollRows(crate::PAGE_ROWS)));
+                    return EventResult::Consumed;
+                }
+                _ => {}
+            }
+        }
+        // 其余转发给当前生效的输入框 (打字/方向键移动光标等)。
+        let input_area = self.input_area(area, self.label_width.get());
+        let ti = self
+            .active_input_mut()
+            .expect("active 非 Hidden 必有输入框");
+        ti.event(event, input_area, msgs)
+    }
+
+    fn focusable(&self) -> bool {
+        self.active != ActiveBar::Hidden
+    }
+
+    fn focus_id(&self) -> Option<&'static str> {
+        Some("log-bar")
+    }
+
+    fn wants_ime(&self) -> bool {
+        self.active_input().map(|t| t.wants_ime()).unwrap_or(false)
+    }
+
+    fn ime_area(&self) -> Option<Rect> {
+        self.active_input().and_then(|t| t.ime_area())
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.active_input().and_then(|t| t.selected_text())
+    }
+
+    fn hit_area(&self) -> Option<Rect> {
+        self.active_input().and_then(|t| t.hit_area())
+    }
+
+    fn reset_focus(&mut self) {
+        self.filter_ti.reset_focus();
+        self.search_ti.reset_focus();
+    }
+}
+
+impl Bar {
+    /// Enter 处理: 过滤=应用; 搜索=空时下/上一命中 (shift), 非空应用。
+    fn handle_enter(&self, active: ActiveBar, shift: bool, msgs: &mut MsgQueue) -> EventResult {
+        match active {
+            ActiveBar::Filter => {
+                let q = self.filter_ti.value().trim().to_string();
+                msgs.push(Box::new(Msg::ApplyFilter(q)));
+            }
+            ActiveBar::Search => {
+                let q = self.search_ti.value().trim().to_string();
+                if q.is_empty() {
+                    msgs.push(Box::new(if shift {
+                        Msg::SearchPrevHit
+                    } else {
+                        Msg::SearchNextHit
+                    }));
+                } else {
+                    msgs.push(Box::new(Msg::ApplySearch(q)));
+                }
+            }
+            ActiveBar::Hidden => return EventResult::Ignored,
+        }
+        EventResult::Consumed
+    }
+
+    /// Esc 处理: 搜索=关闭, 过滤=清除。返回 Ignored 让框架清焦
+    /// (焦点路由中 Esc 不被焦点组件消费 ⇒ 清焦, 用户可继续用键导航列表)。
+    fn handle_escape(&self, active: ActiveBar, msgs: &mut MsgQueue) -> EventResult {
+        match active {
+            ActiveBar::Filter => msgs.push(Box::new(Msg::ClearFilter)),
+            ActiveBar::Search => msgs.push(Box::new(Msg::CloseSearch)),
+            ActiveBar::Hidden => return EventResult::Ignored,
+        }
+        EventResult::Ignored
+    }
+
+    fn set_filter_placeholder(&mut self) {
+        if self.filter_applied.is_empty() {
+            return;
+        }
+        let msg = format!("已应用: {} · Esc 清除 · Ctrl+T 切回", self.filter_applied);
+        self.filter_ti.set_placeholder(msg);
+    }
+
+    fn set_search_placeholder(&mut self) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        let msg = format!(
+            "{} · Enter 下一命中 · Shift+Enter 上一 · Esc 关闭",
+            self.search_query
+        );
+        self.search_ti.set_placeholder(msg);
     }
 }
 
