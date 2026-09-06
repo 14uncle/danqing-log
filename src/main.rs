@@ -3,15 +3,15 @@
 //!
 //! 丹青日志 —— 大文件日志/JSONL 查看分析器 (第四件产品)。
 //!
-//! 已落地: 开枪前提①(性能) + 前提②(JSONL 列化 demo) + core-viewer T1–T5
+//! 已落地：开枪前提①(性能) + 前提②(JSONL 列化 demo) + core-viewer T1–T5
 //! (步进索引/编码三件套/截断轮转原语/PageUp-Down/正则搜索)。
 //! 无窗口基准走 bin/logbench, 测试数据生成走 bin/genlog, mmap 行为实验走 bin/mmap_lab。
 //!
-//! 键盘总览 (v1 后栏走焦点系统, 栏聚焦时方向键移光标, 无焦点时这些全局键生效):
-//! - 滚动: 滚轮/方向键/PageUp/PageDown/Space(Shift 反向)/Home/End; 点击选中
-//! - 搜索: `/` (原始模式) 或 Ctrl+F (任意模式) 开栏并聚焦; Enter 应用, 栏空后
+//! 键盘总览 (v1 后栏走焦点系统，栏聚焦时方向键移光标，无焦点时这些全局键生效):
+//! - 滚动：滚轮/方向键/PageUp/PageDown/Space(Shift 反向)/Home/End; 点击选中
+//! - 搜索：`/` (原始模式) 或 Ctrl+F (任意模式) 开栏并聚焦; Enter 应用，栏空后
 //!   Enter/Shift+Enter 下/上一命中 (环绕); Esc 关闭
-//! - 表格模式 (JSONL 检出): 框架自动聚焦过滤栏 (真 TextInput); Enter 应用, Esc 清除并清焦, Ctrl+T 切原始
+//! - 表格模式 (JSONL 检出): 框架自动聚焦过滤栏 (真 TextInput); Enter 应用，Esc 清除并清焦，Ctrl+T 切原始
 
 #![windows_subsystem = "windows"]
 
@@ -36,7 +36,7 @@ use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::logfile::{FileStat, LogFile};
 use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 
-/// 空格/PageUp-Down 翻页的行数: POC 定值。正式版由组件回报视口行数。
+/// 空格/PageUp-Down 翻页的行数：POC 定值。正式版由组件回报视口行数。
 pub(crate) const PAGE_ROWS: f64 = 25.0;
 /// 搜索命中行号收集上限 (防命中过密内存爆; 总数如实报告)。
 const SEARCH_HIT_CAP: usize = 1_000_000;
@@ -61,14 +61,14 @@ pub(crate) struct SearchOutcome {
     hits: Vec<u64>,
     total: u64,
     elapsed: Duration,
-    /// 实际编译的正则模式 (GBK 文件为 \xNN 转义串, 供渲染侧编译高亮)。
+    /// 实际编译的正则模式 (GBK 文件为 \xNN 转义串，供渲染侧编译高亮)。
     pattern: String,
     /// 用户输入原文 (展示)。
     query: String,
 }
 
-/// 标题栏主题: 深色 (匹配日志正文 VS Code 系基底), 浅色文字。
-/// SceneTheme 提供跨明暗 Theme 实现; 背景透明, 标题文字/按钮符号用浅色。
+/// 标题栏主题：深色 (匹配日志正文 VS Code 系基底), 浅色文字。
+/// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用浅色。
 fn title_theme() -> SceneTheme {
     SceneTheme::new(ScenePalette {
         base: Color::rgb(0.118, 0.118, 0.145),
@@ -85,7 +85,7 @@ fn title_theme() -> SceneTheme {
 /// 应用状态本体 (danqing App)。
 pub(crate) struct LogApp {
     file: Arc<LogFile>,
-    /// 首可见显示行 (行锚定, 小数 = 行内偏移, 任意文件大小无损; 见 view.rs 注释)。
+    /// 首可见显示行 (行锚定，小数 = 行内偏移，任意文件大小无损; 见 view.rs 注释)。
     top_row: f64,
     /// 点击选中显示行 (过滤模式下经 filtered 映射到文件行号)。
     selected: u64,
@@ -108,7 +108,7 @@ pub(crate) struct LogApp {
     search_open: bool,
     /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
     search_clear_rev: u64,
-    /// 一次性焦点请求: 开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
+    /// 一次性焦点请求：开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
     focus_bar: bool,
     /// 已应用搜索的导航态 (命中表 + 当前位置)。
     search: Option<SearchNav>,
@@ -117,16 +117,16 @@ pub(crate) struct LogApp {
     search_pattern: Option<String>,
     search_elapsed: Option<Duration>,
     search_job: AsyncJob<SearchOutcome>,
-    /// 书签: 文件行号集合 (会话内有效, 持久化归 v1.x 会话功能)。
+    /// 书签：文件行号集合 (会话内有效，持久化归 v1.x 会话功能)。
     bookmarks: std::collections::BTreeSet<u64>,
     /// 展开态 (jsonl-table T4): 文件行号 → 子行数。
     expanded: ExpandMap,
-    /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭, 惰性 parse)。
+    /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭，惰性 parse)。
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
     // ---- live-tail (T2) ----
     /// 文件路径 (增长检测轮询用)。
     path: PathBuf,
-    /// 跟随模式: 新行到达自动滚底 (F 键 toggle)。
+    /// 跟随模式：新行到达自动滚底 (F 键 toggle)。
     follow: bool,
     /// 上次 stat 轮询时刻 (250ms 节流)。
     last_stat_poll: Instant,
@@ -154,7 +154,7 @@ pub(crate) enum Msg {
     ApplyFilter(String),
     /// 应用搜索 (携带当前输入值; 非空才发)。
     ApplySearch(String),
-    /// 空搜索时 Enter=下一命中, Shift+Enter=上一命中。
+    /// 空搜索时 Enter=下一命中，Shift+Enter=上一命中。
     SearchNextHit,
     SearchPrevHit,
     /// Esc 清除搜索结果 (栏保持可见)。
@@ -172,14 +172,14 @@ pub(crate) enum Msg {
     CloseSettings,
     /// 打开 URL (反馈链接/发布页)。
     OpenUrl(String),
-    /// Ctrl+O / 拖拽文件: 打开新文件。
+    /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
-    /// 无操作 (事件吞噬用, 不触发任何状态变更)。
+    /// 无操作 (事件吞噬用，不触发任何状态变更)。
     Noop,
 }
 
 impl LogApp {
-    /// 窗口标题: 文件名 + 模式指示 (随 Ctrl+T 切换)。
+    /// 窗口标题：文件名 + 模式指示 (随 Ctrl+T 切换)。
     fn make_title(&self) -> String {
         let name = self
             .path
@@ -203,22 +203,22 @@ impl LogApp {
         }
     }
 
-    /// 显示行数: 文件行数 + 展开子行数。
+    /// 显示行数：文件行数 + 展开子行数。
     fn display_count(&self) -> u64 {
         expand::display_count(self.lines(), &self.expanded)
     }
 
-    /// 最大首行: 保守取 count-1 (尾部可滚出少量空白, POC 不追求贴底钳制)。
+    /// 最大首行：保守取 count-1 (尾部可滚出少量空白，POC 不追求贴底钳制)。
     fn max_top(&self) -> f64 {
         self.display_count().saturating_sub(1) as f64
     }
 
-    /// 显示行 → (文件行, 子行偏移)。偏移 0 = 文件行本身。
+    /// 显示行 → (文件行，子行偏移)。偏移 0 = 文件行本身。
     fn line_at(&self, row: u64) -> (u64, usize) {
         expand::file_line_at(row, self.lines(), &self.expanded).unwrap_or((0, 0))
     }
 
-    /// 显示行 → 文件行号 (书签/跳转用, 子行归父行)。
+    /// 显示行 → 文件行号 (书签/跳转用，子行归父行)。
     fn file_line_of(&self, row: u64) -> u64 {
         self.line_at(row).0
     }
@@ -248,7 +248,7 @@ impl LogApp {
         self.sub_rows.insert(file_line, rows);
     }
 
-    /// F 键: 跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
+    /// F 键：跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
     fn toggle_follow(&mut self) {
         self.follow = !self.follow;
         if self.follow {
@@ -271,7 +271,7 @@ impl LogApp {
             // 首块变 = 轮转/覆写 (内容换了), 即便新文件更大也全量重建
             self.rebuild_file();
         } else if cur.len > known.len {
-            // 同文件增长: 增量追加
+            // 同文件增长：增量追加
             let old_line_count = self.file.line_count();
             match LogFile::append_from(&self.file, &self.path) {
                 Ok(new) => {
@@ -283,7 +283,7 @@ impl LogApp {
                     }
                     self.refresh_status();
                 }
-                Err(e) => log::warn!("tail 追加失败: {e:#}"),
+                Err(e) => log::warn!("tail 追加失败：{e:#}"),
             }
         } else {
             // 同文件缩容 (截断): 全量重建
@@ -312,15 +312,15 @@ impl LogApp {
                 self.notice = Some("文件已截断/轮转".into());
                 self.refresh_status();
             }
-            Err(e) => log::warn!("轮转重建失败: {e:#}"),
+            Err(e) => log::warn!("轮转重建失败：{e:#}"),
         }
     }
 
-    /// 热替换文件 (Ctrl+O / 拖拽): 全部状态重建, 窗口不重建。
+    /// 热替换文件 (Ctrl+O / 拖拽): 全部状态重建，窗口不重建。
     fn reload_file(&mut self, new_path: PathBuf) {
         let Ok(new_file) = LogFile::open(&new_path) else {
             self.notice = Some(format!(
-                "无法打开: {}",
+                "无法打开：{}",
                 new_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             ));
             self.refresh_status();
@@ -362,7 +362,7 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// 实时过滤: 增量行追加命中表 (只跑新行, 不全量重跑)。
+    /// 实时过滤：增量行追加命中表 (只跑新行，不全量重跑)。
     fn append_filter_hits(&mut self, old_line_count: u64) {
         if self.filter_applied.is_empty() {
             return;
@@ -380,7 +380,7 @@ impl LogApp {
         self.filtered = Some(Arc::new(merged));
     }
 
-    /// 合成底栏状态: base + 模式 + 过滤 + 搜索。
+    /// 合成底栏状态：base + 模式 + 过滤 + 搜索。
     fn refresh_status(&mut self) {
         let mut s = self.base_status.clone();
         if self.mode == ViewMode::Table {
@@ -433,7 +433,7 @@ impl LogApp {
         self.status = s;
     }
 
-    /// Enter (过滤): 应用。空查询 = 回全量; 非空走 AsyncJob (1GB 亚秒, 不冻界面)。
+    /// Enter (过滤): 应用。空查询 = 回全量; 非空走 AsyncJob (1GB 亚秒，不冻界面)。
     fn apply_filter(&mut self, query: String) {
         self.filter_applied = query.clone();
         self.filter_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
@@ -449,7 +449,7 @@ impl LogApp {
         let file = Arc::clone(&self.file);
         self.status = format!("{} · 过滤 \"{query}\" 中…", self.base_status);
         self.filter_job.launch(move || {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             let lines = jsonl::run_filter(&file, &clauses);
             FilterOutcome {
                 lines,
@@ -458,7 +458,7 @@ impl LogApp {
         });
     }
 
-    /// Esc (过滤): 清已应用过滤, 回到全量。
+    /// Esc (过滤): 清已应用过滤，回到全量。
     fn clear_filter(&mut self) {
         self.filter_clear_rev += 1;
         self.filter_applied.clear();
@@ -469,7 +469,7 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// 表格/原始互切 (JSONL 检出才可用): 进表格自动聚焦过滤栏, 回原始清 focus_bar。
+    /// 表格/原始互切 (JSONL 检出才可用): 进表格自动聚焦过滤栏，回原始清 focus_bar。
     fn toggle_mode(&mut self) {
         if self.schema.is_none() {
             return;
@@ -490,7 +490,7 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// Esc (搜索): 清搜索态, 栏保持可见 (搜索栏始终显示, 不可隐藏)。
+    /// Esc (搜索): 清搜索态，栏保持可见 (搜索栏始终显示，不可隐藏)。
     fn clear_search(&mut self) {
         self.search_clear_rev += 1;
         self.search = None;
@@ -515,7 +515,7 @@ impl LogApp {
         let file = Arc::clone(&self.file);
         self.status = format!("{} · 搜索 \"{q}\" 中…", self.base_status);
         self.search_job.launch(move || {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             let (hits, total, _) = file.search(&re, SEARCH_HIT_CAP);
             SearchOutcome {
                 hits,
@@ -527,7 +527,7 @@ impl LogApp {
         });
     }
 
-    /// 跳到命中行 (置视口中部, 选中跟随)。
+    /// 跳到命中行 (置视口中部，选中跟随)。
     fn jump_to_file_line(&mut self, file_line: u64) {
         let row = self.display_row_of(file_line);
         self.top_row = clamp_top(row as f64 - PAGE_ROWS / 2.0, self.display_count());
@@ -548,7 +548,7 @@ impl LogApp {
         }
     }
 
-    /// `b` / Ctrl+B: 切换选中行书签 (按文件行号, 过滤模式下语义不漂移)。
+    /// `b` / Ctrl+B: 切换选中行书签 (按文件行号，过滤模式下语义不漂移)。
     fn toggle_bookmark(&mut self) {
         let line = self.file_line_of(self.selected);
         if !self.bookmarks.insert(line) {
@@ -557,7 +557,7 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行, 环绕)。
+    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。
     fn goto_next_bookmark(&mut self) {
         if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.selected)) {
             self.jump_to_file_line(line);
@@ -566,7 +566,7 @@ impl LogApp {
     }
 }
 
-/// 下一书签: 严格大于 current 的最小书签, 无则环绕到最小书签。空集 None。
+/// 下一书签：严格大于 current 的最小书签，无则环绕到最小书签。空集 None。
 pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64) -> Option<u64> {
     set.range(current.saturating_add(1)..)
         .next()
@@ -574,11 +574,11 @@ pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64)
         .copied()
 }
 
-/// 搜索模式构造: UTF-8 **存储**编码直接用原查询 (完整正则语法); 非 UTF-8 存储
-/// (GBK) 查询转字节 → `\xNN` 字面量 (正则语法退化为字面量, 有意边界)。
+/// 搜索模式构造：UTF-8 **存储**编码直接用原查询 (完整正则语法); 非 UTF-8 存储
+/// (GBK) 查询转字节 → `\xNN` 字面量 (正则语法退化为字面量，有意边界)。
 ///
-/// 必须用存储编码而非检出编码: UTF-16 文件打开即转 UTF-8 副本, 存储编码是 Utf8,
-/// 走完整正则路径; 误用 stats().encoding (检出 Utf16*) 会把它踢进字面量分支,
+/// 必须用存储编码而非检出编码：UTF-16 文件打开即转 UTF-8 副本，存储编码是 Utf8,
+/// 走完整正则路径; 误用 stats().encoding (检出 Utf16*) 会把它踢进字面量分支，
 /// `ERROR|FATAL` 之类交替正则静默失效 (review 当场抓住的回归)。
 fn build_search_pattern(enc: Encoding, query: &str) -> String {
     if enc == Encoding::Utf8 {
@@ -597,11 +597,6 @@ fn clamp_top(top: f64, line_count: u64) -> f64 {
 impl App for LogApp {
     type Msg = Msg;
 
-    /// 窗口最大化状态回调 (框架 Handler 经 set_maximized 触发): 存 `maximized` 供 TitleBar 图标。
-    fn maximized_changed(&mut self, is_maximized: bool) {
-        self.maximized = is_maximized;
-    }
-
     fn update(&mut self, msg: Msg) {
         match msg {
             Msg::ScrollRows(d) => {
@@ -611,7 +606,7 @@ impl App for LogApp {
                     self.refresh_status();
                 }
                 self.top_row = clamp_top(self.top_row + d, self.display_count());
-                // 方向键滚动时选中跟随首行, 底栏读数即当前位置
+                // 方向键滚动时选中跟随首行，底栏读数即当前位置
                 self.selected = self.top_row as u64;
             }
             Msg::Select(row) => {
@@ -654,7 +649,7 @@ impl App for LogApp {
             }
             Msg::OpenUrl(url) => {
                 if let Err(err) = open::that(&url) {
-                    log::warn!("打开链接失败: {err}");
+                    log::warn!("打开链接失败：{err}");
                 }
             }
             Msg::OpenFile(path) => {
@@ -665,8 +660,8 @@ impl App for LogApp {
     }
 
     fn view(&self) -> Node {
-        // 顶层: Stack[Column[TitleBar.embed(Bar), LogView.fill], SettingsOverlay]。
-        // 设置卡浮层在最上层, 关闭时零高不拦截事件。
+        // 顶层：Stack[Column[TitleBar.embed(Bar), LogView.fill], SettingsOverlay]。
+        // 设置卡浮层在最上层，关闭时零高不拦截事件。
         node(
             Stack::new()
                 .child(
@@ -733,7 +728,7 @@ impl App for LogApp {
             }
             return;
         }
-        // 原始模式: `/` 开搜索栏; `b`/`'` 书签; `f` 跟随 (栏聚焦时键进 TextInput, 不达此处)
+        // 原始模式：`/` 开搜索栏; `b`/`'` 书签; `f` 跟随 (栏聚焦时键进 TextInput, 不达此处)
         if self.mode == ViewMode::Raw {
             if let Key::Character(s) = key {
                 match s.as_str() {
@@ -760,7 +755,7 @@ impl App for LogApp {
         match key {
             Key::Named(NamedKey::ArrowUp) => self.update(Msg::ScrollRows(-1.0)),
             Key::Named(NamedKey::ArrowDown) => self.update(Msg::ScrollRows(1.0)),
-            // 展开/折叠 (表格模式; → 展开 ← 折叠选中行, 子行归父行)
+            // 展开/折叠 (表格模式; → 展开 ← 折叠选中行，子行归父行)
             Key::Named(NamedKey::ArrowRight) if self.mode == ViewMode::Table => {
                 let file_line = self.file_line_of(self.selected);
                 if !self.expanded.is_expanded(file_line) {
@@ -785,7 +780,7 @@ impl App for LogApp {
         }
     }
 
-    /// 键盘前置过滤 (焦点分发前拦截): 栏聚焦时键进焦点组件, 全局 Ctrl 快捷键
+    /// 键盘前置过滤 (焦点分发前拦截): 栏聚焦时键进焦点组件，全局 Ctrl 快捷键
     /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
     /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
     fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
@@ -798,7 +793,7 @@ impl App for LogApp {
         else {
             return None;
         };
-        // `/` 全局触发搜索 (非 Ctrl 组合, 拦截后搜索栏内无法输入 `/`, 可粘贴)
+        // `/` 全局触发搜索 (非 Ctrl 组合，拦截后搜索栏内无法输入 `/`, 可粘贴)
         if !ctrl {
             if let Key::Character(s) = key {
                 if s == "/" {
@@ -817,14 +812,14 @@ impl App for LogApp {
             return Some(Msg::ToggleMode);
         }
         if s.eq_ignore_ascii_case("o") {
-            // Ctrl+O 全局: 弹文件选择器, 选中返回 OpenFile msg
+            // Ctrl+O 全局：弹文件选择器，选中返回 OpenFile msg
             if let Some(p) = rfd::FileDialog::new()
                 .set_title("选择日志文件")
                 .pick_file()
             {
                 return Some(Msg::OpenFile(p));
             }
-            return Some(Msg::Noop); // 取消: 吞掉事件, 不触发副作用
+            return Some(Msg::Noop); // 取消：吞掉事件，不触发副作用
         }
         None
     }
@@ -843,7 +838,7 @@ impl App for LogApp {
             self.search_pattern = Some(out.pattern);
             self.search_query = out.query;
             self.search_elapsed = Some(out.elapsed);
-            // 首跳: 当前选中行之后的第一条命中 (无则环绕回首条)
+            // 首跳：当前选中行之后的第一条命中 (无则环绕回首条)
             let from = self.file_line_of(self.selected);
             let first = nav.jump_first_from(from);
             self.search = Some(nav);
@@ -852,14 +847,19 @@ impl App for LogApp {
             }
             self.refresh_status();
         }
-        // 增长检测 (live-tail): 250ms 节流 stat 轮询, 增长则增量追加
+        // 增长检测 (live-tail): 250ms 节流 stat 轮询，增长则增量追加
         if self.last_stat_poll.elapsed() >= Duration::from_millis(250) {
             self.last_stat_poll = Instant::now();
             self.poll_growth();
         }
     }
 
-    /// 焦点为空时的一次性恢复请求: 开搜索/进表格时把焦点给栏 (via `log-bar`)。
+    /// 窗口最大化状态回调 (框架 Handler 经 set_maximized 触发): 存 `maximized` 供 TitleBar 图标。
+    fn maximized_changed(&mut self, is_maximized: bool) {
+        self.maximized = is_maximized;
+    }
+
+    /// 焦点为空时的一次性恢复请求：开搜索/进表格时把焦点给栏 (via `log-bar`)。
     fn focus_request(&self) -> Option<&'static str> {
         if self.focus_bar {
             Some("log-bar")
@@ -868,7 +868,7 @@ impl App for LogApp {
         }
     }
 
-    /// 消费焦点请求 (逐帧调用, 一次性: 置位后立即清除, 避免 Esc 后误拉回)。
+    /// 消费焦点请求 (逐帧调用，一次性：置位后立即清除，避免 Esc 后误拉回)。
     fn focus_restored(&mut self) {
         self.focus_bar = false;
     }
@@ -899,12 +899,12 @@ fn status_text(path: &Path, file: &LogFile) -> String {
 fn main() {
     danqing::log::init_log();
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("用法: danqing-log <日志文件路径>");
+        eprintln!("用法：danqing-log <日志文件路径>");
         std::process::exit(2);
     };
     if let Err(e) = run(&path) {
-        log::error!("启动失败: {e:#}");
-        eprintln!("启动失败: {e:#}");
+        log::error!("启动失败：{e:#}");
+        eprintln!("启动失败：{e:#}");
         std::process::exit(1);
     }
 }
@@ -913,7 +913,7 @@ fn run(path: &Path) -> Result<()> {
     let file = Arc::new(LogFile::open(path)?);
     let base_status = status_text(path, &file);
     log::info!("{base_status}");
-    // 启动后台更新检查 (24h TTL 缓存, 静默)。
+    // 启动后台更新检查 (24h TTL 缓存，静默)。
     app_update::init();
     // JSONL 自动检测 → 列发现 (采样毫秒级; 检出即表格模式开局)
     let schema = if jsonl::detect(&file) {
@@ -928,7 +928,7 @@ fn run(path: &Path) -> Result<()> {
     };
     if let Some(s) = &schema {
         log::info!(
-            "JSONL 检出, 列化 {} 列: {}",
+            "JSONL 检出，列化 {} 列：{}",
             s.columns.len(),
             s.columns
                 .iter()
@@ -986,7 +986,7 @@ fn run(path: &Path) -> Result<()> {
         size: Size::new(1100.0, 760.0),
         clear_color: Color::rgb(0.118, 0.118, 0.145),
         logo_name: "log".into(),
-        hotkeys: vec![], // 显式置空: 不继承番茄钟默认热键 (danqing WindowConfig 注释)
+        hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
         ..Default::default()
     };
     run_app(config, &mut app).context("事件循环异常退出")
@@ -1018,14 +1018,14 @@ mod tests {
 
     #[test]
     fn build_search_pattern_utf8_keeps_regex_gbk_literalizes() {
-        // UTF-8 存储 (含 UTF-16 转码副本) 保留完整正则语法 —— review 抓的回归:
-        // 旧代码查 stats().encoding, 把 UTF-16 文件误踢进字面量分支, `ERROR|FATAL`
-        // 变成逐字节字面匹配, 命中恒空。
+        // UTF-8 存储 (含 UTF-16 转码副本) 保留完整正则语法 —— review 抓的回归：
+        // 旧代码查 stats().encoding, 把 UTF-16 文件误踢进字面量分支，`ERROR|FATAL`
+        // 变成逐字节字面匹配，命中恒空。
         assert_eq!(
             build_search_pattern(Encoding::Utf8, "ERROR|FATAL"),
             "ERROR|FATAL"
         );
-        // GBK 存储: 转字节 → \xNN 字面量 (退化为字面量语义)
+        // GBK 存储：转字节 → \xNN 字面量 (退化为字面量语义)
         assert_eq!(
             build_search_pattern(Encoding::Gbk, "中文"),
             "(?-u)\\xD6\\xD0\\xCE\\xC4"
