@@ -3,7 +3,7 @@ name = "danqing-log"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "丹青日志 —— 大文件日志/JSONL 查看分析器 (第四件产品)"
+description = "丹青日志 LogLens —— 大文件日志/JSONL 查看分析器 (第四件产品)"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

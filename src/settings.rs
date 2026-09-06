@@ -171,7 +171,7 @@ fn about_section() -> impl Widget {
         .gap(6.0)
         .cross_stretch()
         .child(Center::new(
-            Text::new("丹青日志".to_string())
+            Text::new("丹青日志 LogLens".to_string())
                 .font_size(18)
                 .bind_color(|_: &LogApp| accent()),
         ))

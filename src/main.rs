@@ -1,7 +1,7 @@
 //! @author 十四叔
 //! @date 2026/09/05
 //!
-//! 丹青日志 —— 大文件日志/JSONL 查看分析器 (第四件产品)。
+//! 丹青日志 LogLens —— 大文件日志/JSONL 查看分析器 (第四件产品)。
 //!
 //! 已落地：开枪前提①(性能) + 前提②(JSONL 列化 demo) + core-viewer T1–T5
 //! (步进索引/编码三件套/截断轮转原语/PageUp-Down/正则搜索)。
@@ -180,9 +180,9 @@ impl LogApp {
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
     fn make_title(&self) -> String {
         if self.mode == ViewMode::Table {
-            "丹青日志 [JSONL]".to_string()
+            "丹青日志 LogLens [JSONL]".to_string()
         } else {
-            "丹青日志".to_string()
+            "丹青日志 LogLens".to_string()
         }
     }
 
@@ -916,9 +916,9 @@ fn run(path: &Path) -> Result<()> {
         );
     }
     let title = if mode == ViewMode::Table {
-        "丹青日志 [JSONL]"
+        "丹青日志 LogLens [JSONL]"
     } else {
-        "丹青日志"
+        "丹青日志 LogLens"
     }
     .to_string();
     let mut app = LogApp {
