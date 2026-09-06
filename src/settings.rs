@@ -23,22 +23,22 @@ const CARD_WIDTH: f32 = 360.0;
 const BODY_SIZE: u16 = 14;
 
 fn text_primary() -> Color {
-    Color::rgb(0.83, 0.83, 0.83)
+    Color::rgb(0.12, 0.12, 0.12)
 }
 fn text_secondary() -> Color {
-    Color::rgb(0.55, 0.57, 0.62)
+    Color::rgb(0.40, 0.40, 0.42)
 }
 fn accent() -> Color {
-    Color::rgb(0.24, 0.42, 0.66)
+    Color::rgb(0.18, 0.35, 0.60)
 }
 fn card_bg() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.06)
+    Color::rgba(0.0, 0.0, 0.0, 0.04)
 }
 fn scrim() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.45)
+    Color::rgba(0.0, 0.0, 0.0, 0.25)
 }
 fn hover_bg() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.08)
+    Color::rgba(0.0, 0.0, 0.0, 0.06)
 }
 
 /// 设置卡浮层: 全窗 scrim + 居中玻璃卡。

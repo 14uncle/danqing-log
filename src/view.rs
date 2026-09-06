@@ -58,47 +58,47 @@ const SCROLLBAR_W: f32 = 6.0;
 /// 滚动条拇指最小高度。
 const THUMB_MIN_H: f32 = 24.0;
 
-/// 暗色基底 (VS Code 系: 开发者日志场景心智)。
+/// 浅色基底 (白底日志视图)。
 fn bg() -> Color {
-    Color::rgb(0.118, 0.118, 0.145)
+    Color::rgb(0.98, 0.98, 0.98)
 }
 fn text_default() -> Color {
-    Color::rgb(0.83, 0.83, 0.83)
+    Color::rgb(0.15, 0.15, 0.15)
 }
 fn gutter_fg() -> Color {
-    Color::rgb(0.38, 0.40, 0.44)
+    Color::rgb(0.65, 0.65, 0.65)
 }
 fn selection_bg() -> Color {
-    Color::rgba(0.24, 0.42, 0.66, 0.35)
+    Color::rgba(0.24, 0.42, 0.66, 0.20)
 }
 fn status_fg() -> Color {
-    Color::rgb(0.55, 0.57, 0.62)
+    Color::rgb(0.40, 0.40, 0.40)
 }
 fn scrollbar_track() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.04)
+    Color::rgba(0.0, 0.0, 0.0, 0.05)
 }
 fn scrollbar_thumb() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.18)
+    Color::rgba(0.0, 0.0, 0.0, 0.18)
 }
 fn filter_bar_bg() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.035)
+    Color::rgba(0.0, 0.0, 0.0, 0.04)
 }
 fn filter_fg() -> Color {
-    Color::rgb(0.75, 0.78, 0.82)
+    Color::rgb(0.30, 0.30, 0.30)
 }
 fn header_fg() -> Color {
-    Color::rgb(0.62, 0.65, 0.72)
+    Color::rgb(0.35, 0.35, 0.38)
 }
 fn header_line() -> Color {
-    Color::rgba(1.0, 1.0, 1.0, 0.08)
+    Color::rgba(0.0, 0.0, 0.0, 0.10)
 }
 /// 搜索命中行内区间底色 (琥珀)。
 fn hit_bg() -> Color {
-    Color::rgba(0.95, 0.75, 0.25, 0.30)
+    Color::rgba(0.95, 0.75, 0.10, 0.35)
 }
 /// 表格模式命中行底色 (淡琥珀; 行内区间高亮只在原始模式)。
 fn hit_row_bg() -> Color {
-    Color::rgba(0.95, 0.75, 0.25, 0.08)
+    Color::rgba(0.95, 0.75, 0.10, 0.12)
 }
 
 /// 日志级别着色: 行前 200 字节内找级别关键字 (日志行级别几乎都在行首)。
@@ -107,11 +107,11 @@ fn level_color(line: &[u8]) -> Color {
     // 长词优先: FATAL 含 "AT" 之类子串碰撞无所谓 (都是错误级), 但 WARN 要先于 INFO 判
     let has = |pat: &[u8]| memchr::memmem::find(head, pat).is_some();
     if has(b"FATAL") || has(b"ERROR") {
-        Color::rgb(0.95, 0.30, 0.30)
+        Color::rgb(0.75, 0.18, 0.18)
     } else if has(b"WARN") {
-        Color::rgb(0.85, 0.65, 0.13)
+        Color::rgb(0.70, 0.50, 0.08)
     } else if has(b"DEBUG") || has(b"TRACE") {
-        Color::rgb(0.50, 0.52, 0.56)
+        Color::rgb(0.55, 0.55, 0.58)
     } else {
         text_default()
     }
@@ -469,7 +469,7 @@ impl Widget for LogView {
             let no = format!("{}", line_no + 1);
             let no_w = texts.measure(&no, AUX_FONT_SIZE);
             let no_color = if self.bookmarks.contains(&line_no) {
-                Color::rgb(0.90, 0.75, 0.30)
+                Color::rgb(0.75, 0.60, 0.10)
             } else {
                 gutter_fg()
             };
@@ -750,13 +750,13 @@ impl Widget for LogView {
 const BAR_PAD_X: f32 = 10.0;
 /// 前缀标签 ("过滤:"/"搜索:") 与输入区间隙。
 const BAR_LABEL_GAP: f32 = 8.0;
-/// 光标色 (深色栏上浅色, 保证可辨)。
+/// 光标色 (浅色栏上深色)。
 fn caret_fg() -> Color {
-    Color::rgb(0.90, 0.92, 0.96)
+    Color::rgb(0.10, 0.10, 0.12)
 }
 /// 占位文字色。
 fn placeholder_fg() -> Color {
-    Color::rgb(0.45, 0.48, 0.54)
+    Color::rgb(0.55, 0.55, 0.58)
 }
 
 /// 「清空输入」绑定闭包: 从应用状态读 clear revision。
@@ -1116,11 +1116,11 @@ mod tests {
             "INFO 走默认色"
         );
         let err = level_color(b"2026-09-05 ERROR disk full");
-        assert!(err.r > 0.9, "ERROR 判红: {err:?}");
+        assert!(err.r > 0.7, "ERROR 判红: {err:?}");
         let fatal = level_color(b"FATAL boom");
-        assert!(fatal.r > 0.9, "FATAL 判红");
+        assert!(fatal.r > 0.7, "FATAL 判红");
         let warn = level_color(b"WARN slow query");
-        assert!(warn.r > 0.8 && warn.g > 0.5, "WARN 判黄: {warn:?}");
+        assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
         let dbg = level_color(b"DEBUG cache miss");
         assert!(dbg.r < 0.6, "DEBUG 判灰");
     }

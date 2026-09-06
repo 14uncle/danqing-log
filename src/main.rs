@@ -67,18 +67,18 @@ pub(crate) struct SearchOutcome {
     query: String,
 }
 
-/// 标题栏主题：深色 (匹配日志正文 VS Code 系基底), 浅色文字。
-/// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用浅色。
+/// 标题栏主题：浅色 (匹配白底日志视图), 深色文字。
+/// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用深色。
 fn title_theme() -> SceneTheme {
     SceneTheme::new(ScenePalette {
-        base: Color::rgb(0.118, 0.118, 0.145),
-        accent: Color::rgb(0.24, 0.42, 0.66),
-        text_primary: Color::rgb(0.83, 0.83, 0.83),
-        text_secondary: Color::rgb(0.55, 0.57, 0.62),
-        surface: Color::rgba(1.0, 1.0, 1.0, 0.03),
-        surface_input: Color::rgba(1.0, 1.0, 1.0, 0.035),
-        backdrop_light: Color::rgb(0.30, 0.30, 0.36),
-        backdrop_dark: Color::rgb(0.08, 0.08, 0.10),
+        base: Color::rgb(0.96, 0.96, 0.96),
+        accent: Color::rgb(0.18, 0.35, 0.60),
+        text_primary: Color::rgb(0.12, 0.12, 0.12),
+        text_secondary: Color::rgb(0.40, 0.40, 0.42),
+        surface: Color::rgba(0.0, 0.0, 0.0, 0.04),
+        surface_input: Color::rgba(0.0, 0.0, 0.0, 0.06),
+        backdrop_light: Color::rgb(0.85, 0.85, 0.88),
+        backdrop_dark: Color::rgb(0.70, 0.70, 0.74),
     })
 }
 
@@ -955,7 +955,7 @@ fn run(path: &Path) -> Result<()> {
     let config = WindowConfig {
         title,
         size: Size::new(1100.0, 760.0),
-        clear_color: Color::rgb(0.118, 0.118, 0.145),
+        clear_color: Color::rgb(0.98, 0.98, 0.98),
         logo_name: "log".into(),
         hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
         ..Default::default()
