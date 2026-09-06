@@ -104,8 +104,6 @@ pub(crate) struct LogApp {
     filter_clear_rev: u64,
     filter_elapsed: Option<Duration>,
     filter_job: AsyncJob<FilterOutcome>,
-    /// 搜索栏开闭 (开着时面板聚焦搜索框)。
-    search_open: bool,
     /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
     search_clear_rev: u64,
     /// 一次性焦点请求：开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
@@ -702,12 +700,6 @@ impl App for LogApp {
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
         if *ctrl {
             if let Key::Character(s) = key {
-                if s.eq_ignore_ascii_case("f") {
-                    if !self.search_open {
-                        self.open_search();
-                    }
-                    return;
-                }
                 // 书签键双模式通用
                 if s.eq_ignore_ascii_case("b") {
                     self.toggle_bookmark();
@@ -782,21 +774,12 @@ impl App for LogApp {
         let Event::Key {
             key,
             pressed: true,
-            ctrl,
+            ctrl: true,
             ..
         } = event
         else {
             return None;
         };
-        // `/` 全局触发搜索 (非 Ctrl 组合，拦截后搜索栏内无法输入 `/`, 可粘贴)
-        if !ctrl {
-            if let Key::Character(s) = key {
-                if s == "/" {
-                    return Some(Msg::FocusSearch);
-                }
-            }
-            return None;
-        }
         let Key::Character(s) = key else {
             return None;
         };
@@ -951,7 +934,6 @@ fn run(path: &Path) -> Result<()> {
         filter_clear_rev: 0,
         filter_elapsed: None,
         filter_job: AsyncJob::new(),
-        search_open: true,
         search_clear_rev: 0,
         search: None,
         search_query: String::new(),
