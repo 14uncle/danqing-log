@@ -8,6 +8,7 @@
 //! 无窗口基准走 bin/logbench, 测试数据生成走 bin/genlog, mmap 行为实验走 bin/mmap_lab。
 //!
 //! 键盘总览 (v1 后栏走焦点系统，栏聚焦时方向键移光标，无焦点时这些全局键生效):
+//! - 文件：路径参数可选，无参启动进空态 (欢迎提示); Ctrl+O 打开/换开文件
 //! - 滚动：滚轮/方向键/PageUp/PageDown/Space(Shift 反向)/Home/End; 点击选中
 //! - 搜索：`/` (原始模式) 或 Ctrl+F (任意模式) 开栏并聚焦; Enter 应用，栏空后
 //!   Enter/Shift+Enter 下/上一命中 (环绕); Esc 关闭
@@ -40,6 +41,8 @@ use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 pub(crate) const PAGE_ROWS: f64 = 25.0;
 /// 搜索命中行号收集上限 (防命中过密内存爆; 总数如实报告)。
 const SEARCH_HIT_CAP: usize = 1_000_000;
+/// 空态底栏提示 (无参启动, 未打开文件时)。
+const EMPTY_STATUS: &str = "未打开文件 · 按 Ctrl+O 打开日志文件";
 
 /// 视图模式 (仅 JSONL 检出后可进表格; Ctrl+T 互切)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +88,9 @@ fn title_theme() -> SceneTheme {
 /// 应用状态本体 (danqing App)。
 pub(crate) struct LogApp {
     file: Arc<LogFile>,
+    /// 是否已打开真实文件 (false = 无参启动空态占位: 轮询/键盘导航全门禁,
+    /// 仅 Ctrl+O 与设置可用)。
+    has_file: bool,
     /// 首可见显示行 (行锚定，小数 = 行内偏移，任意文件大小无损; 见 view.rs 注释)。
     top_row: f64,
     /// 点击选中显示行 (过滤模式下经 filtered 映射到文件行号)。
@@ -253,6 +259,9 @@ impl LogApp {
 
     /// 增长检测 (live-tail): 文件变长 → `append_from` 增量; 缩容/轮转 → 全量重建。
     fn poll_growth(&mut self) {
+        if !self.has_file {
+            return; // 空态无文件可轮询
+        }
         let Ok(cur) = FileStat::of(&self.path) else {
             return; // 文件暂不可读 (轮转间隙), 下轮再试
         };
@@ -314,7 +323,10 @@ impl LogApp {
         let Ok(new_file) = LogFile::open(&new_path) else {
             self.notice = Some(format!(
                 "无法打开：{}",
-                new_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                new_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
             ));
             self.refresh_status();
             return;
@@ -332,6 +344,7 @@ impl LogApp {
             ViewMode::Raw
         };
         self.file = new_file;
+        self.has_file = true;
         self.path = new_path;
         self.base_status = base_status;
         self.mode = mode;
@@ -697,6 +710,10 @@ impl App for LogApp {
                 return;
             }
         }
+        // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
+        if !self.has_file {
+            return;
+        }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
         if *ctrl {
             if let Key::Character(s) = key {
@@ -791,10 +808,7 @@ impl App for LogApp {
         }
         if s.eq_ignore_ascii_case("o") {
             // Ctrl+O 全局：弹文件选择器，选中返回 OpenFile msg
-            if let Some(p) = rfd::FileDialog::new()
-                .set_title("选择日志文件")
-                .pick_file()
-            {
+            if let Some(p) = rfd::FileDialog::new().set_title("选择日志文件").pick_file() {
                 return Some(Msg::OpenFile(p));
             }
             return Some(Msg::Noop); // 取消：吞掉事件，不触发副作用
@@ -876,45 +890,55 @@ fn status_text(path: &Path, file: &LogFile) -> String {
 
 fn main() {
     danqing::log::init_log();
-    let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("用法：danqing-log <日志文件路径>");
-        std::process::exit(2);
-    };
-    if let Err(e) = run(&path) {
+    // 路径参数可选: 无参进空态 (Ctrl+O 打开), 带参直接打开。
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    if let Err(e) = run(path.as_deref()) {
         log::error!("启动失败：{e:#}");
         eprintln!("启动失败：{e:#}");
         std::process::exit(1);
     }
 }
 
-fn run(path: &Path) -> Result<()> {
-    let file = Arc::new(LogFile::open(path)?);
-    let base_status = status_text(path, &file);
-    log::info!("{base_status}");
+fn run(path: Option<&Path>) -> Result<()> {
     // 启动后台更新检查 (24h TTL 缓存，静默)。
     app_update::init();
-    // JSONL 自动检测 → 列发现 (采样毫秒级; 检出即表格模式开局)
-    let schema = if jsonl::detect(&file) {
-        jsonl::discover_schema(&file).map(Arc::new)
-    } else {
-        None
+    let (file, base_status, schema, has_file, path_buf) = match path {
+        Some(p) => {
+            let file = LogFile::open(p)?;
+            let base_status = status_text(p, &file);
+            log::info!("{base_status}");
+            // JSONL 自动检测 → 列发现 (采样毫秒级; 检出即表格模式开局)
+            let schema = if jsonl::detect(&file) {
+                jsonl::discover_schema(&file).map(Arc::new)
+            } else {
+                None
+            };
+            if let Some(s) = &schema {
+                log::info!(
+                    "JSONL 检出，列化 {} 列：{}",
+                    s.columns.len(),
+                    s.columns
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            (Arc::new(file), base_status, schema, true, p.to_path_buf())
+        }
+        None => (
+            Arc::new(LogFile::empty()),
+            EMPTY_STATUS.to_string(),
+            None,
+            false,
+            PathBuf::new(),
+        ),
     };
     let mode = if schema.is_some() {
         ViewMode::Table
     } else {
         ViewMode::Raw
     };
-    if let Some(s) = &schema {
-        log::info!(
-            "JSONL 检出，列化 {} 列：{}",
-            s.columns.len(),
-            s.columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     let title = if mode == ViewMode::Table {
         "丹青日志 LogLens [JSONL]"
     } else {
@@ -923,6 +947,7 @@ fn run(path: &Path) -> Result<()> {
     .to_string();
     let mut app = LogApp {
         file,
+        has_file,
         top_row: 0.0,
         selected: 0,
         base_status,
@@ -944,7 +969,7 @@ fn run(path: &Path) -> Result<()> {
         expanded: ExpandMap::new(),
         sub_rows: std::collections::BTreeMap::new(),
         focus_bar: false,
-        path: path.to_path_buf(),
+        path: path_buf,
         follow: false,
         last_stat_poll: Instant::now(),
         notice: None,

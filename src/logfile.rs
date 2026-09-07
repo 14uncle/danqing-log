@@ -184,6 +184,30 @@ impl LogFile {
         })
     }
 
+    /// 空占位 (无参启动): 内存空数据, 0 行 UTF-8, 统计全零。
+    /// 读路径与真实空文件同语义; GUI 层靠自身标记区分「占位」与「真实的空文件」。
+    pub fn empty() -> Self {
+        Self {
+            data: FileData::Owned(Vec::new()),
+            encoding: Encoding::Utf8,
+            stride_offsets: Vec::new(),
+            line_count: 0,
+            stat: FileStat {
+                len: 0,
+                mtime: None,
+                head: 0,
+            },
+            stats: OpenStats {
+                file_bytes: 0,
+                map_us: 0,
+                index: Duration::ZERO,
+                line_count: 0,
+                index_bytes: 0,
+                encoding: Encoding::Utf8,
+            },
+        }
+    }
+
     /// 打开统计 (供状态栏与基准输出)。
     pub fn stats(&self) -> &OpenStats {
         &self.stats
@@ -558,6 +582,16 @@ mod tests {
         let lf = open_with(b"");
         assert_eq!(lf.line_count(), 0);
         assert_eq!(lf.line(0), b"", "越界返回空片");
+    }
+
+    #[test]
+    fn empty_placeholder_matches_empty_file_semantics() {
+        // 无参启动的空占位: 与真实空文件同语义 (0 行/越界空片), 编码恒 UTF-8
+        let lf = LogFile::empty();
+        assert_eq!(lf.line_count(), 0);
+        assert_eq!(lf.line(0), b"");
+        assert_eq!(lf.encoding(), Encoding::Utf8);
+        assert_eq!(lf.stats().file_bytes, 0);
     }
 
     #[test]

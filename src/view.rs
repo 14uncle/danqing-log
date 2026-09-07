@@ -33,8 +33,8 @@ use danqing_log::logfile::LogFile;
 
 use crate::{LogApp, Msg, ViewMode};
 
-/// 行高 (逻辑像素)。
-pub(crate) const ROW_HEIGHT: f32 = 20.0;
+/// 行高 (逻辑像素)。24 = 可读性底线: 13px 正文上下各留 ~4px 呼吸, 终端感消失。
+pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// 正文字号。
 const FONT_SIZE: u16 = 13;
 /// 行号/状态栏字号。
@@ -50,7 +50,7 @@ const STATUS_HEIGHT: f32 = 26.0;
 /// 过滤栏高度 (表格模式)。
 const FILTER_BAR_H: f32 = 32.0;
 /// 表头高度 (表格模式)。
-const HEADER_H: f32 = 24.0;
+const HEADER_H: f32 = 28.0;
 /// 列内边距 (含在列宽里, 单元格文本右留 8)。
 const COL_PAD: f32 = 16.0;
 /// 右侧滚动条宽度。
@@ -69,7 +69,7 @@ fn gutter_fg() -> Color {
     Color::rgb(0.65, 0.65, 0.65)
 }
 fn selection_bg() -> Color {
-    Color::rgba(0.24, 0.42, 0.66, 0.20)
+    Color::rgba(0.24, 0.42, 0.66, 0.24)
 }
 fn status_fg() -> Color {
     Color::rgb(0.40, 0.40, 0.40)
@@ -100,6 +100,46 @@ fn hit_bg() -> Color {
 fn hit_row_bg() -> Color {
     Color::rgba(0.95, 0.75, 0.10, 0.12)
 }
+/// 斑马纹 (奇数显示行): 宽表横向跟踪不串行。
+fn zebra_bg() -> Color {
+    Color::rgba(0.0, 0.0, 0.0, 0.025)
+}
+/// 鼠标悬停行底色。
+fn hover_bg() -> Color {
+    Color::rgba(0.0, 0.0, 0.0, 0.045)
+}
+/// 强调蓝 (选中行左侧竖条)。
+fn accent() -> Color {
+    Color::rgb(0.24, 0.42, 0.66)
+}
+/// 表头底色 (与数据区轻分隔)。
+fn header_bg() -> Color {
+    Color::rgba(0.0, 0.0, 0.0, 0.04)
+}
+/// 降权文本 (时间戳等标识列)。
+fn dim_fg() -> Color {
+    Color::rgb(0.47, 0.47, 0.51)
+}
+/// INFO / 3xx 蓝。
+fn info_fg() -> Color {
+    Color::rgb(0.22, 0.46, 0.74)
+}
+/// 2xx 绿。
+fn ok_fg() -> Color {
+    Color::rgb(0.16, 0.56, 0.32)
+}
+/// WARN / 4xx 琥珀。
+fn warn_fg() -> Color {
+    Color::rgb(0.72, 0.50, 0.02)
+}
+/// ERROR / 5xx 红。
+fn err_fg() -> Color {
+    Color::rgb(0.76, 0.21, 0.21)
+}
+/// DEBUG / TRACE 灰。
+fn trace_fg() -> Color {
+    Color::rgb(0.56, 0.56, 0.60)
+}
 
 /// 日志级别着色: 行前 200 字节内找级别关键字 (日志行级别几乎都在行首)。
 fn level_color(line: &[u8]) -> Color {
@@ -117,9 +157,74 @@ fn level_color(line: &[u8]) -> Color {
     }
 }
 
+/// level 列单元格着色 (表格模式): INFO 也给蓝 —— 窄列色带是语义扫描线;
+/// 原始模式整行着色的降噪策略 (INFO 走默认色) 不同, 两函数有意不共用。
+fn level_cell_color(v: &str) -> Color {
+    let b = v.as_bytes();
+    let has = |pat: &[u8]| memchr::memmem::find(b, pat).is_some();
+    if has(b"FATAL") || has(b"ERROR") {
+        err_fg()
+    } else if has(b"WARN") {
+        warn_fg()
+    } else if has(b"INFO") {
+        info_fg()
+    } else if has(b"DEBUG") || has(b"TRACE") {
+        trace_fg()
+    } else {
+        text_default()
+    }
+}
+
+/// status 列按首数字分段: 2xx 绿 / 3xx 蓝 / 4xx 琥珀 / 5xx 红。
+fn status_color(v: &str) -> Color {
+    match v.as_bytes().first() {
+        Some(b'2') => ok_fg(),
+        Some(b'3') => info_fg(),
+        Some(b'4') => warn_fg(),
+        Some(b'5') => err_fg(),
+        _ => text_default(),
+    }
+}
+
+/// 时间戳列名判定 (降权淡色): 常见命名 + `_at`/`_ts` 后缀。
+fn is_ts_column(name: &str) -> bool {
+    matches!(
+        name,
+        "ts" | "time" | "timestamp" | "@timestamp" | "datetime"
+    ) || name.ends_with("_at")
+        || name.ends_with("_ts")
+}
+
+/// 纯数字值判定 (含小数点/负号/千分位): 有资格右对齐。
+fn is_numeric(v: &str) -> bool {
+    let b = v.as_bytes();
+    !b.is_empty()
+        && b.iter().any(|c| c.is_ascii_digit())
+        && b.iter()
+            .all(|c| matches!(c, b'0'..=b'9' | b'.' | b'-' | b','))
+}
+
+/// 表格单元格语义配色: level/status 按值分段, 时间戳列降权, 其余默认。
+fn cell_color(name: &str, v: &str) -> Color {
+    if name == "level" || name == "severity" {
+        return level_cell_color(v);
+    }
+    if (name.contains("status") || name == "code")
+        && v.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return status_color(v);
+    }
+    if is_ts_column(name) {
+        return dim_fg();
+    }
+    text_default()
+}
+
 /// 行锚定虚拟列表 (整窗唯一组件, 含搜索栏/过滤栏/表头/底栏状态行与滚动条)。
 pub(crate) struct LogView {
     file: Option<Arc<LogFile>>,
+    /// 是否已打开真实文件 (false = 无参启动空态, 画欢迎提示)。
+    has_file: bool,
     top_row: f64,
     /// 选中的显示行。
     selected: u64,
@@ -152,12 +257,15 @@ pub(crate) struct LogView {
     settings_hover: std::cell::Cell<bool>,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
     settings_btn_rect: std::cell::Cell<Rect>,
+    /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
+    hover_row: std::cell::Cell<u64>,
 }
 
 impl LogView {
     pub(crate) fn new() -> Self {
         Self {
             file: None,
+            has_file: false,
             top_row: 0.0,
             selected: 0,
             status: String::new(),
@@ -175,6 +283,7 @@ impl LogView {
             max_seen: std::cell::Cell::new(0.0),
             settings_hover: std::cell::Cell::new(false),
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
+            hover_row: std::cell::Cell::new(u64::MAX),
         }
     }
 
@@ -292,6 +401,7 @@ impl Widget for LogView {
             .downcast_ref::<LogApp>()
             .expect("LogView 绑定状态类型不匹配");
         self.file = Some(Arc::clone(&app.file));
+        self.has_file = app.has_file;
         self.top_row = app.top_row;
         self.selected = app.selected;
         self.status = app.status.clone();
@@ -370,8 +480,13 @@ impl Widget for LogView {
             if total_w > self.max_seen.get() {
                 self.max_seen.set(total_w);
             }
-            // 表头 + 分隔线 (表头随列水平滚动, 左缘切断同单元格); LogView 顶部即表头 (栏是 sibling)
+            // 表头: 淡灰底与数据区分层 + 底部 1px 线 (表头随列水平滚动, 左缘切断同单元格)
             let hy = area.origin.y;
+            rects.push_rect(
+                Rect::from_xywh(area.origin.x, hy, area.size.width, HEADER_H - 1.0),
+                header_bg(),
+                0.0,
+            );
             for (cx, cw, col) in &cols {
                 let cell_x = cx + 8.0;
                 let left_cut = (text_x - cell_x).max(0.0);
@@ -400,6 +515,28 @@ impl Widget for LogView {
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
         let rows_bottom = rows_top + list_h;
+        // 空态欢迎 (无参启动): 列表区居中两行提示; 行循环 count=0 本就不画
+        if !self.has_file {
+            let mid_y = rows_top + list_h / 2.0;
+            let title = "丹青日志 LogLens";
+            let hint = "按 Ctrl+O 打开日志文件";
+            let title_w = texts.measure(title, 16);
+            texts.push_text(
+                title,
+                area.origin.x + (area.size.width - title_w) / 2.0,
+                mid_y - 12.0,
+                16,
+                text_default(),
+            );
+            let hint_w = texts.measure(hint, FONT_SIZE);
+            texts.push_text(
+                hint,
+                area.origin.x + (area.size.width - hint_w) / 2.0,
+                mid_y + 12.0,
+                FONT_SIZE,
+                gutter_fg(),
+            );
+        }
         // 裁剪: 行内容不溢出到表头/底栏
         let clip = Rect::from_xywh(area.origin.x, rows_top, area.size.width, list_h);
         rects.push_clip(clip);
@@ -418,13 +555,22 @@ impl Widget for LogView {
                 i += 1;
                 continue;
             }
-            // 选中行底色
+            // 行底色层叠: 斑马纹 (奇数显示行, 绝对行号奇偶, 滚动时不游动)
+            // → 选中 (底色 + 左侧 3px 强调条) / hover (选中行不再叠 hover)
+            let row_rect =
+                Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
+            if i % 2 == 1 {
+                rects.push_rect(row_rect, zebra_bg(), 0.0);
+            }
             if i == self.selected {
+                rects.push_rect(row_rect, selection_bg(), 0.0);
                 rects.push_rect(
-                    Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT),
-                    selection_bg(),
+                    Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
+                    accent(),
                     0.0,
                 );
+            } else if i == self.hover_row.get() {
+                rects.push_rect(row_rect, hover_bg(), 0.0);
             }
             let (line_no, sub_off) = self.line_at(i);
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
@@ -542,16 +688,29 @@ impl Widget for LogView {
                     else {
                         continue;
                     };
-                    let color = if col.name == "level" {
-                        level_color(v.as_bytes())
-                    } else {
-                        text_default()
-                    };
+                    let color = cell_color(&col.name, &v);
                     let cell_x = cx + 8.0;
                     let left_cut = (text_x - cell_x).max(0.0);
+                    let right_edge = (cx + cw - 8.0).min(text_right);
+                    // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
+                    if left_cut <= 0.0 && is_numeric(&v) {
+                        let (shown, truncated) =
+                            fit_line(texts, &v, right_edge - cell_x, FONT_SIZE);
+                        if !truncated {
+                            let w = texts.measure(shown, FONT_SIZE);
+                            texts.push_text(
+                                shown,
+                                right_edge - w,
+                                y + baseline_off,
+                                FONT_SIZE,
+                                color,
+                            );
+                            continue;
+                        }
+                    }
                     let (shown, sub) = scroll_trim(texts, &v, left_cut, FONT_SIZE);
                     let draw_x = cell_x + left_cut - sub;
-                    let max_w = (cx + cw - 8.0).min(text_right) - draw_x;
+                    let max_w = right_edge - draw_x;
                     if max_w > 0.0 {
                         fit_push(
                             texts,
@@ -635,7 +794,12 @@ impl Widget for LogView {
             );
         }
 
-        // 底栏状态行 (打开耗时/过滤统计 = 截图弹药本体)
+        // 底栏状态行 (打开耗时/过滤统计 = 截图弹药本体); 顶部 1px 线与列表区分层
+        rects.push_rect(
+            Rect::from_xywh(area.origin.x, status_y, area.size.width, 1.0),
+            header_line(),
+            0.0,
+        );
         let sy =
             status_y + (STATUS_HEIGHT - aux_line_h) / 2.0 + texts.ascent(f32::from(AUX_FONT_SIZE));
         texts.push_text(
@@ -664,8 +828,10 @@ impl Widget for LogView {
             AUX_FONT_SIZE,
             settings_color,
         );
-        // 位置计数: 设置入口左侧
-        let pos = if count == 0 {
+        // 位置计数: 设置入口左侧 (空态无意义, 不画)
+        let pos = if !self.has_file {
+            String::new()
+        } else if count == 0 {
             format!("行 0/{count}")
         } else {
             format!("行 {}/{count}", self.selected + 1)
@@ -685,11 +851,23 @@ impl Widget for LogView {
         let chrome_top = self.chrome_top();
         let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
         match event {
-            // 设置按钮 hover (S2): 矩形已含绝对坐标 (paint 计算)
+            // hover 跟踪 (设置按钮 + 列表行): 矩形已含绝对坐标 (paint 计算)
             Event::CursorMoved(position) => {
                 self.settings_hover
                     .set(self.settings_btn_rect.get().contains(*position));
-                EventResult::Ignored // 不消费, 让列表区也能响应 hover
+                let rel_y = position.y - area.origin.y - chrome_top;
+                if (0.0..list_h).contains(&rel_y) {
+                    self.hover_row
+                        .set((self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64);
+                } else {
+                    self.hover_row.set(u64::MAX);
+                }
+                EventResult::Ignored // 不消费, 让其他组件也能响应 hover
+            }
+            Event::CursorLeft => {
+                self.settings_hover.set(false);
+                self.hover_row.set(u64::MAX);
+                EventResult::Ignored
             }
             Event::MouseWheel { delta, shift, .. } => {
                 // 横滚源 (T7): 触控板直接给 delta.0; 否则 Shift+纵滚
@@ -906,8 +1084,10 @@ impl Widget for Bar {
         let app = state
             .downcast_ref::<LogApp>()
             .expect("Bar 绑定状态类型不匹配");
-        // 生效角色: 表格=过滤, 原始=搜索 (搜索栏始终可见, 不可隐藏)。
-        self.active = if app.mode == ViewMode::Table {
+        // 生效角色: 表格=过滤, 原始=搜索 (搜索栏始终可见, 不可隐藏); 空态无文件不出栏。
+        self.active = if !app.has_file {
+            ActiveBar::Hidden
+        } else if app.mode == ViewMode::Table {
             ActiveBar::Filter
         } else {
             ActiveBar::Search
@@ -1131,6 +1311,56 @@ mod tests {
         assert_eq!(clamp_x(5000.0, 1000.0, 100.0), 900.0, "越界钳到内容尾");
         assert_eq!(clamp_x(42.0, 1000.0, 100.0), 42.0, "区间内不变");
         assert_eq!(clamp_x(10.0, 50.0, 100.0), 0.0, "内容窄于视口归零");
+    }
+
+    #[test]
+    fn cell_color_semantics() {
+        // level 列: 全级别色带 (INFO 蓝, 与原始模式整行降噪策略不同)
+        assert_eq!(cell_color("level", "INFO"), info_fg(), "INFO 蓝");
+        assert_eq!(cell_color("level", "ERROR"), err_fg(), "ERROR 红");
+        assert_eq!(
+            cell_color("severity", "WARN"),
+            warn_fg(),
+            "severity 同 level"
+        );
+        // status 列: 按首数字分段, 非数字值不着色
+        assert_eq!(cell_color("status", "200"), ok_fg(), "2xx 绿");
+        assert_eq!(cell_color("status", "301"), info_fg(), "3xx 蓝");
+        assert_eq!(cell_color("http_status", "404"), warn_fg(), "4xx 琥珀");
+        assert_eq!(cell_color("status", "503"), err_fg(), "5xx 红");
+        assert_eq!(
+            cell_color("status", "N/A"),
+            text_default(),
+            "非数字 status 默认色"
+        );
+        // 时间戳列降权
+        assert_eq!(cell_color("ts", "2026-09-05"), dim_fg(), "ts 淡色");
+        assert_eq!(cell_color("created_at", "x"), dim_fg(), "_at 后缀淡色");
+        // 其余列默认色 (req_id 虽含数字段但非纯数字)
+        assert_eq!(cell_color("msg", "request completed"), text_default());
+        assert_eq!(cell_color("req_id", "1b26690fb267"), text_default());
+    }
+
+    #[test]
+    fn is_numeric_gate() {
+        assert!(is_numeric("707"), "整数");
+        assert!(is_numeric("40.5"), "小数");
+        assert!(is_numeric("-3"), "负数");
+        assert!(is_numeric("1,234"), "千分位");
+        assert!(!is_numeric("1b266"), "hex 标识符不算数字");
+        assert!(!is_numeric(""), "空串");
+        assert!(!is_numeric("-"), "无数字不算");
+        assert!(!is_numeric("200 OK"), "带文本不算");
+    }
+
+    #[test]
+    fn ts_column_names() {
+        assert!(is_ts_column("ts"));
+        assert!(is_ts_column("@timestamp"));
+        assert!(is_ts_column("created_at"));
+        assert!(is_ts_column("req_ts"));
+        assert!(!is_ts_column("status"), "status 不误判为时间戳");
+        assert!(!is_ts_column("msg"));
     }
 
     #[test]
