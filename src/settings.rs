@@ -31,8 +31,13 @@ fn text_secondary() -> Color {
 fn accent() -> Color {
     Color::rgb(0.18, 0.35, 0.60)
 }
+/// 卡片底色: 不透明白 —— 4% 黑「玻璃」叠在密集表格文字上等于没底 (看不清教训)。
 fn card_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.04)
+    Color::rgb(1.0, 1.0, 1.0)
+}
+/// 卡片描边 (白卡在 scrim 上的边缘定义)。
+fn card_border() -> Color {
+    Color::rgba(0.0, 0.0, 0.0, 0.12)
 }
 fn scrim() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.25)
@@ -96,6 +101,10 @@ impl Widget for SettingsOverlay {
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
         if self.open {
+            // 独立渲染层: 矩形/文本分批次的渲染架构下同层文本恒在矩形之上,
+            // 开新层后本层矩形才能盖住底层表格文本 (「关于」卡看不清的根因)。
+            rects.push_layer();
+            texts.push_layer();
             self.inner.paint(area, rects, texts);
         }
     }
@@ -139,6 +148,7 @@ fn settings_card() -> impl Widget {
     };
     UiBox::new(card_bg())
         .radius(12.0)
+        .border_color(card_border())
         .child(Padding::new(
             pad,
             Column::new()
@@ -357,7 +367,8 @@ impl Widget for VersionRow {
     }
 }
 
-/// 可点击链接: accent 色 + hover 下划线 + 点击开浏览器。
+/// 可点击链接行: 整行宽幽灵按钮 —— 常显下划线 (裸小字链接发现性太差),
+/// hover 整行底色反馈, 命中区整行 32px。
 struct Link {
     text: String,
     url: String,
@@ -376,28 +387,35 @@ impl Link {
     }
 }
 
+/// 链接行高。
+const LINK_ROW_H: f32 = 32.0;
+
 impl Widget for Link {
     fn sync(&mut self, _state: &dyn Any) {}
     fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
-        let w = texts.measure(&self.text, BODY_SIZE);
-        let h = texts.line_height(f32::from(BODY_SIZE));
-        let size = constraints.constrain(Size::new(w, h));
+        let _ = texts.measure(&self.text, BODY_SIZE);
+        let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
         self.area = Rect::new(Point::ZERO, size);
         size
     }
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
-        let baseline = area.origin.y
-            + (area.size.height - texts.line_height(f32::from(BODY_SIZE))) / 2.0
-            + texts.ascent(f32::from(BODY_SIZE));
-        texts.push_text(&self.text, area.origin.x, baseline, BODY_SIZE, accent());
         if self.hovered {
-            let underline_y = area.origin.y + area.size.height - 1.0;
-            rects.push_rect(
-                Rect::from_xywh(area.origin.x, underline_y, area.size.width, 1.0),
-                accent(),
-                0.0,
-            );
+            rects.push_rect(area, hover_bg(), 6.0);
         }
+        // 文本整行居中, 下划线随行
+        let text_w = texts.measure(&self.text, BODY_SIZE);
+        let text_x = area.origin.x + (area.size.width - text_w) / 2.0;
+        let baseline = area.origin.y
+            + (LINK_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
+            + texts.ascent(f32::from(BODY_SIZE));
+        texts.push_text(&self.text, text_x, baseline, BODY_SIZE, accent());
+        // 常显下划线: 链接身份不依赖 hover 才发现
+        let underline_y = baseline + texts.descent(f32::from(BODY_SIZE)) + 1.0;
+        rects.push_rect(
+            Rect::from_xywh(text_x, underline_y, text_w, 1.0),
+            accent(),
+            0.0,
+        );
     }
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
         self.area = area;

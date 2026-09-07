@@ -63,7 +63,7 @@ fn bg() -> Color {
     Color::rgb(0.98, 0.98, 0.98)
 }
 fn text_default() -> Color {
-    Color::rgb(0.15, 0.15, 0.15)
+    Color::rgb(0.12, 0.12, 0.12)
 }
 fn gutter_fg() -> Color {
     Color::rgb(0.65, 0.65, 0.65)
@@ -204,7 +204,18 @@ fn is_numeric(v: &str) -> bool {
             .all(|c| matches!(c, b'0'..=b'9' | b'.' | b'-' | b','))
 }
 
-/// 表格单元格语义配色: level/status 按值分段, 时间戳列降权, 其余默认。
+/// 不透明标识符判定 (降权淡色): 长 hex/UUID 形值 (req_id/trace_id)。
+/// 全 hex±连字符 + 长度 ≥12 + 字母数字兼有 —— logger 名 (含非 hex 字母)、
+/// path (含 /)、msg (含空格)、纯数字 (走右对齐) 都天然不命中。
+fn is_opaque_id(v: &str) -> bool {
+    let b = v.as_bytes();
+    b.len() >= 12
+        && b.iter().all(|c| c.is_ascii_hexdigit() || *c == b'-')
+        && b.iter().any(|c| c.is_ascii_digit())
+        && b.iter().any(|c| matches!(c, b'a'..=b'f' | b'A'..=b'F'))
+}
+
+/// 表格单元格语义配色: level/status 按值分段, 时间戳列与不透明标识符降权, 其余默认。
 fn cell_color(name: &str, v: &str) -> Color {
     if name == "level" || name == "severity" {
         return level_cell_color(v);
@@ -214,7 +225,7 @@ fn cell_color(name: &str, v: &str) -> Color {
     {
         return status_color(v);
     }
-    if is_ts_column(name) {
+    if is_ts_column(name) || is_opaque_id(v) {
         return dim_fg();
     }
     text_default()
@@ -1336,9 +1347,48 @@ mod tests {
         // 时间戳列降权
         assert_eq!(cell_color("ts", "2026-09-05"), dim_fg(), "ts 淡色");
         assert_eq!(cell_color("created_at", "x"), dim_fg(), "_at 后缀淡色");
-        // 其余列默认色 (req_id 虽含数字段但非纯数字)
+        // 其余列默认色; 长 hex 标识符 (req_id) 降权淡色
         assert_eq!(cell_color("msg", "request completed"), text_default());
-        assert_eq!(cell_color("req_id", "1b26690fb267"), text_default());
+        assert_eq!(
+            cell_color("logger", "auth-service"),
+            text_default(),
+            "logger 不误伤"
+        );
+        assert_eq!(
+            cell_color("path", "/api/v1/orders/84701"),
+            text_default(),
+            "path 不误伤"
+        );
+        assert_eq!(
+            cell_color("req_id", "1b26690fb26795f6"),
+            dim_fg(),
+            "长 hex 淡色"
+        );
+        assert_eq!(
+            cell_color("trace_id", "550e8400-e29b-41d4-a716-446655440000"),
+            dim_fg(),
+            "UUID 淡色"
+        );
+        assert_eq!(
+            cell_color("req_id", "deadbeef"),
+            text_default(),
+            "短 hex 不降权"
+        );
+    }
+
+    #[test]
+    fn opaque_id_gate() {
+        assert!(is_opaque_id("1b26690fb26795f6"), "hex16");
+        assert!(
+            is_opaque_id("550E8400-E29B-41D4-A716-446655440000"),
+            "大写 UUID"
+        );
+        assert!(!is_opaque_id("auth-service"), "logger 名含非 hex 字母");
+        assert!(!is_opaque_id("/api/v1/orders/84701"), "path 含斜杠");
+        assert!(!is_opaque_id("request-completed"), "词组含非 hex 字母");
+        assert!(!is_opaque_id("20408"), "纯数字 (走右对齐)");
+        assert!(!is_opaque_id("deadbeef"), "长度不足 12");
+        assert!(!is_opaque_id("abcdefabcdefab"), "无数字不算 id");
     }
 
     #[test]
