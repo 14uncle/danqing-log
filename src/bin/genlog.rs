@@ -52,8 +52,11 @@ fn main() {
         eprintln!("用法: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]");
         std::process::exit(2);
     };
-    let nested = args.any(|a| a == "--nested");
-    let jsonl = args.any(|a| a == "--jsonl") || nested;
+    // flags 先收集再判: 连续两次 args.any() 会让第一个 any 耗光迭代器,
+    // "--jsonl" 单独传时被静默吞掉 (生成明文还报成功)
+    let flags: Vec<String> = args.collect();
+    let nested = flags.iter().any(|a| a == "--nested");
+    let jsonl = flags.iter().any(|a| a == "--jsonl") || nested;
     let target: u64 = match mib.parse::<u64>() {
         Ok(m) if m > 0 => m * 1024 * 1024,
         _ => {
