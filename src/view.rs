@@ -761,8 +761,9 @@ impl Widget for LogView {
         }
 
         // 滚动条: 拇指尺寸 ∝ 视口/全文, 位置 ∝ top_row (显示行域)
-        if count > 0 {
-            let visible = f64::from(list_h / ROW_HEIGHT).max(1.0);
+        // 仅内容溢出视口时出现 (与水平条同规: 全部可见 = 无条)
+        let visible = f64::from(list_h / ROW_HEIGHT).max(1.0);
+        if count as f64 > visible && list_h > 0.0 {
             let track_x = area.origin.x + area.size.width - SCROLLBAR_W;
             rects.push_rect(
                 Rect::from_xywh(track_x, rows_top, SCROLLBAR_W, list_h),
