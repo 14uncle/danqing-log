@@ -6,7 +6,8 @@
 //! POC 的碾压主张全部落在这一层:
 //! - 秒开 = mmap 零拷贝, 建立映射本身 O(1);
 //! - 行索引 = memchr 扫 `\n` (SIMD) + 步进表 (每 16 行一记, ~3.2MB/GB,
-//!   段内前扫定位, 见 INDEX_STRIDE 注释);
+//!   段内前扫定位, 见 INDEX_STRIDE 注释); ≥64MB 分段并行构建
+//!   (单线程 1GB 冷扫 1028ms 破 1s 线, 2026-09-08 实测触发并行化, 见 build_line_index);
 //! - 全文搜索 = regex::bytes 直接跑在映射页上, 内核按需调页, 无用户态缓冲拷贝。
 //!
 //! POC 边界 (见意图文档「三大技术风险」):
@@ -100,6 +101,36 @@ fn hash_head(path: &Path) -> std::io::Result<u64> {
 /// 退化预案 stride=8 见 tasks/plan.md 决策 1。
 const INDEX_STRIDE: u64 = 16;
 
+/// 并行索引阈值: 小于此单线程 (线程调度开销回不来, 64MB 串行 ≈ 27ms)。
+const PARALLEL_MIN_BYTES: usize = 64 << 20;
+
+/// 索引线程上限: 热扫被内存带宽封顶 (~4-6 线程饱和), 冷扫缺页并发收益
+/// ~8 见顶 (2026-09-08 实测: 冷 1GB 缺页驱动 996MiB/s vs 裸顺序读 1655MiB/s),
+/// 再多只剩调度税。
+const MAX_INDEX_THREADS: usize = 8;
+
+/// 步进索引段: 并行构建时每个线程一段, 段内语义与全局步进表一致
+/// (第 j 项 = 段内第 j*STRIDE 行起点的绝对字节偏移)。
+///
+/// 不变式: 无空段 (0 行段合并时丢弃); 段按 `base_line` 严格递增;
+/// `strides` 非空且 `strides[0]` = 段首行起点。单段 (串行/小文件) 布局
+/// 与 2026-09-08 并行化前的全局表逐字节一致。
+#[derive(Debug, Clone)]
+struct Segment {
+    /// 段首行的全局行号 (段内第 k 行 = 全局 base_line + k)。
+    base_line: u64,
+    /// 段内步进表 (绝对字节偏移)。
+    strides: Vec<u64>,
+}
+
+/// 索引驻留字节 (各段步进表堆占用之和)。
+fn index_resident_bytes(segments: &[Segment]) -> usize {
+    segments
+        .iter()
+        .map(|s| s.strides.len() * std::mem::size_of::<u64>())
+        .sum()
+}
+
 /// 数据载体: UTF-8/GBK/Latin-1 走 mmap 零拷贝; UTF-16 为打开时转码的 UTF-8 副本。
 enum FileData {
     Mapped(Mmap),
@@ -115,14 +146,14 @@ impl FileData {
     }
 }
 
-/// 已映射的日志文件: 步进行索引 + 只读访问。
+/// 已映射的日志文件: 分段步进行索引 + 只读访问。
 pub struct LogFile {
     data: FileData,
     /// 存储字节的编码 (UTF-16 文件转码后为 Utf8; 原始检出编码在 stats.encoding)。
     encoding: Encoding,
-    /// 步进表: 第 j 项 = 第 j*STRIDE 行的起始字节偏移。
-    stride_offsets: Vec<u64>,
-    /// 总行数 (步进表长度 × STRIDE ≠ 行数, 单独存)。
+    /// 步进索引段 (不变式见 Segment; 非空 ⟺ line_count > 0)。
+    segments: Vec<Segment>,
+    /// 总行数 (各段行数之和, 单独存)。
     line_count: u64,
     /// 打开时的文件状态快照 (过期检测基准)。
     stat: FileStat,
@@ -156,10 +187,9 @@ impl LogFile {
         };
 
         let t1 = Instant::now();
-        let (mut stride_offsets, line_count) = build_line_index(data.as_bytes());
-        stride_offsets.shrink_to_fit();
+        let (segments, line_count) = build_line_index(data.as_bytes());
         let index = t1.elapsed();
-        let index_bytes = stride_offsets.len() * std::mem::size_of::<u64>();
+        let index_bytes = index_resident_bytes(&segments);
         let stat = FileStat::of(path).unwrap_or(FileStat {
             len: file_bytes,
             mtime: None,
@@ -177,7 +207,7 @@ impl LogFile {
         Ok(Self {
             data,
             encoding: data_enc,
-            stride_offsets,
+            segments,
             line_count,
             stat,
             stats,
@@ -190,7 +220,7 @@ impl LogFile {
         Self {
             data: FileData::Owned(Vec::new()),
             encoding: Encoding::Utf8,
-            stride_offsets: Vec::new(),
+            segments: Vec::new(),
             line_count: 0,
             stat: FileStat {
                 len: 0,
@@ -226,14 +256,16 @@ impl LogFile {
 
     /// 第 i 行原始字节 (不含 `\n` / `\r`)。越界返回空片。
     ///
-    /// 步进索引定位: 二分步进表定段 → 段内 memchr 前扫 (i % STRIDE) 个换行。
+    /// 定位: 二分段基准定段 → 段内步进表 → memchr 前扫 (local % STRIDE) 个换行。
     pub fn line(&self, i: u64) -> &[u8] {
         if i >= self.line_count {
             return &[];
         }
         let data = self.data.as_bytes();
-        let mut start = self.stride_offsets[(i / INDEX_STRIDE) as usize] as usize;
-        for _ in 0..(i % INDEX_STRIDE) {
+        let seg = self.segment_of_line(i);
+        let local = i - seg.base_line;
+        let mut start = seg.strides[(local / INDEX_STRIDE) as usize] as usize;
+        for _ in 0..(local % INDEX_STRIDE) {
             // 索引由同一份数据建出, 扫描必命中; None 分支为防御 (索引一致性不信赖)
             match memchr::memchr(b'\n', &data[start..]) {
                 Some(p) => start += p + 1,
@@ -251,6 +283,16 @@ impl LogFile {
         s
     }
 
+    /// 全局行号 → 所在段 (不变式: 无空段 + base_line 严格递增 ⇒ 恰有一段)。
+    /// 调用方保证 i < line_count。
+    fn segment_of_line(&self, i: u64) -> &Segment {
+        let idx = self
+            .segments
+            .partition_point(|s| s.base_line <= i)
+            .saturating_sub(1);
+        &self.segments[idx]
+    }
+
     /// 第 i 行解码为 UTF-8 文本 (按检出编码; 非原生 UTF-8 走行级转码)。
     pub fn line_lossy(&self, i: u64) -> Cow<'_, str> {
         encoding::decode_line(self.encoding, self.line(i))
@@ -261,7 +303,7 @@ impl LogFile {
     /// 逐行全量遍历走它会把定位成本乘进行数 (实测过滤 235ms → 1072ms 的教训)。
     pub fn lines(&self) -> LineIter<'_> {
         let start = if self.line_count > 0 {
-            self.stride_offsets[0] as usize
+            self.segments[0].strides[0] as usize
         } else {
             0
         };
@@ -286,8 +328,10 @@ impl LogFile {
             };
         }
         // 步进定位 start_line 的起始字节 + 段内前扫
-        let mut start = self.stride_offsets[(start_line / INDEX_STRIDE) as usize] as usize;
-        for _ in 0..(start_line % INDEX_STRIDE) {
+        let seg = self.segment_of_line(start_line);
+        let local = start_line - seg.base_line;
+        let mut start = seg.strides[(local / INDEX_STRIDE) as usize] as usize;
+        for _ in 0..(local % INDEX_STRIDE) {
             match memchr::memchr(b'\n', &data[start..]) {
                 Some(p) => start += p + 1,
                 None => break,
@@ -301,16 +345,19 @@ impl LogFile {
         }
     }
 
-    /// 字节偏移 → 行号: 步进表二分定段 + 段内 memchr 前扫 (≤STRIDE-1 行)。
+    /// 字节偏移 → 行号: 先按段首行起点二分段 (分段是字节的连续划分),
+    /// 再段内步进表二分 + memchr 前扫 (≤STRIDE-1 行)。
     /// 仅供 search 的命中回落 (命中数封顶 cap, 成本有界)。
     fn line_of_offset(&self, off: u64) -> u64 {
         let data = self.data.as_bytes();
-        let seg = self
-            .stride_offsets
-            .partition_point(|&o| o <= off)
+        let seg_idx = self
+            .segments
+            .partition_point(|s| s.strides[0] <= off)
             .saturating_sub(1);
-        let mut line = seg as u64 * INDEX_STRIDE;
-        let mut p = self.stride_offsets[seg] as usize;
+        let seg = &self.segments[seg_idx];
+        let entry = seg.strides.partition_point(|&o| o <= off).saturating_sub(1);
+        let mut line = seg.base_line + entry as u64 * INDEX_STRIDE;
+        let mut p = seg.strides[entry] as usize;
         while line + 1 < self.line_count {
             match memchr::memchr(b'\n', &data[p..]) {
                 // 换行符在 off 之前 → off 属于下一行, 前进
@@ -394,15 +441,13 @@ impl LogFile {
         }
 
         let t1 = Instant::now();
-        let (mut stride_offsets, line_count) = append_index(
-            &old.stride_offsets,
-            old.line_count,
-            old.data.as_bytes(),
-            new_data,
-        );
-        stride_offsets.shrink_to_fit();
+        let (mut segments, line_count) =
+            append_index(&old.segments, old.line_count, old.data.as_bytes(), new_data);
+        if let Some(last) = segments.last_mut() {
+            last.strides.shrink_to_fit();
+        }
         let index = t1.elapsed();
-        let index_bytes = stride_offsets.len() * std::mem::size_of::<u64>();
+        let index_bytes = index_resident_bytes(&segments);
         let stat = FileStat::of(path).unwrap_or(FileStat {
             len: file_bytes,
             mtime: None,
@@ -420,7 +465,7 @@ impl LogFile {
         Ok(Self {
             data: FileData::Mapped(map),
             encoding: old.encoding,
-            stride_offsets,
+            segments,
             line_count,
             stat,
             stats,
@@ -432,23 +477,91 @@ impl LogFile {
 ///
 /// UTF-8 BOM 跳过 (首行从 BOM 之后开始)。文件以 `\n` 结尾时末尾换行不产生
 /// 新行 (不存在「最后一空行」)。
-/// 单线程先行: 实测吞吐达标则不并行化 (简洁优先; 1GB 目标 < 1s)。
-fn build_line_index(data: &[u8]) -> (Vec<u64>, u64) {
-    if data.is_empty() {
-        return (Vec::new(), 0);
-    }
-    let bom = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        3u64
+/// ≥PARALLEL_MIN_BYTES 走分段并行: 单线程 1GB 冷扫实测 1028ms (2026-09-08,
+/// 缺页驱动 I/O 996MiB/s vs 裸顺序读 1655MiB/s) 破了 1s 线, 触发并行化;
+/// 多线程缺页并发同时提速冷盘。分段布局与串行单段仅内部排列不同,
+/// 查行语义由「并行 == 串行」对拍钉死 (见 tests)。
+fn build_line_index(data: &[u8]) -> (Vec<Segment>, u64) {
+    let threads = if data.len() >= PARALLEL_MIN_BYTES {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(MAX_INDEX_THREADS)
     } else {
-        0
+        1
     };
+    if threads <= 1 {
+        let (mut strides, count) = scan_chunk(data, 0, true, data.len() as u64);
+        strides.shrink_to_fit();
+        let segments = if count > 0 {
+            vec![Segment {
+                base_line: 0,
+                strides,
+            }]
+        } else {
+            Vec::new()
+        };
+        return (segments, count);
+    }
+    build_index_parallel(data, threads)
+}
+
+/// 并行分段构建: 按字节等分, 每线程扫一段 (scan_chunk 的行归属规则保证不重不漏),
+/// 合并时丢弃空段 (如整段被一条超长行占满)、按序累算 base_line。
+fn build_index_parallel(data: &[u8], threads: usize) -> (Vec<Segment>, u64) {
+    let total = data.len() as u64;
+    let chunk_len = data.len().div_ceil(threads);
+    let mut segments = Vec::new();
+    let mut total_lines = 0u64;
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for c in 0..threads {
+            let start = c * chunk_len;
+            if start >= data.len() {
+                break;
+            }
+            let end = (start + chunk_len).min(data.len());
+            let slice = &data[start..end];
+            handles.push(s.spawn(move || scan_chunk(slice, start as u64, c == 0, total)));
+        }
+        // 按 chunk 顺序 join: 合并确定性, base_line 单调
+        for h in handles {
+            let (mut strides, count) = h.join().expect("索引线程 panic");
+            if count == 0 {
+                continue; // 空段丢弃, 保「无空段」不变式
+            }
+            strides.shrink_to_fit();
+            segments.push(Segment {
+                base_line: total_lines,
+                strides,
+            });
+            total_lines += count;
+        }
+    });
+    (segments, total_lines)
+}
+
+/// 扫一段字节: 产段内步进表 (绝对偏移) + 段内行数。串行与并行的同一工函数。
+///
+/// 行归属: chunk 拥有「起点落在 (base, base+len] 的行」(由其内 `\n` 派生);
+/// chunk 0 额外拥有第 0 行 (BOM 跳过)。全文件末尾 `\n` 不产生新行
+/// (仅末 chunk 的最后一字节触发)。无 `\n` 的 chunk 产 0 行 (空段由合并丢弃)。
+fn scan_chunk(slice: &[u8], base: u64, is_first: bool, total_len: u64) -> (Vec<u64>, u64) {
     // 预分配: 经验值 ~64 字节/行 + 步进 16, 避免 Vec 反复扩容
-    let mut strides = Vec::with_capacity(data.len() / 64 / INDEX_STRIDE as usize + 16);
-    strides.push(bom); // 第 0 行
-    let mut count = 1u64;
-    for p in memchr::memchr_iter(b'\n', data) {
-        let next = p as u64 + 1;
-        if next == data.len() as u64 {
+    let mut strides = Vec::with_capacity(slice.len() / 64 / INDEX_STRIDE as usize + 16);
+    let mut count = 0u64;
+    if is_first && !slice.is_empty() {
+        let bom = if slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            3u64
+        } else {
+            0
+        };
+        strides.push(bom); // 第 0 行
+        count = 1;
+    }
+    for p in memchr::memchr_iter(b'\n', slice) {
+        let next = base + p as u64 + 1;
+        if next == total_len {
             break; // 末尾换行不产生新行
         }
         if count % INDEX_STRIDE == 0 {
@@ -459,29 +572,40 @@ fn build_line_index(data: &[u8]) -> (Vec<u64>, u64) {
     (strides, count)
 }
 
-/// 增量索引: 只扫 `[old_len, new_len)` 的新字节, 追加 stride 表 + 行数。
+/// 增量索引: 只扫 `[old_len, new_len)` 的新字节, 往末段追加 stride 项 + 行数。
 ///
 /// 续行/复活语义: 旧数据以 `\n` 结尾时, 那个 trailing `\n` 因新数据到达而「复活」
 /// (它现在结束一行, 新行从 old_len 开始); 否则旧末行续着, 新字节里第一个 `\n`
-/// 结束它。每 16 行补一条 stride 项 (行起始偏移)。正确性靠「append == 全量重建」对拍。
+/// 结束它。每 16 行 (末段段内行号) 补一条 stride 项 (行起始偏移)。
+/// 正确性靠「append == 全量重建」语义对拍 —— 分段布局可与全量重建不同
+/// (追加只扩末段, 重段边界不挪动), 查行语义一致。
 fn append_index(
-    old_strides: &[u64],
+    old_segments: &[Segment],
     old_line_count: u64,
     old_data: &[u8],
     new_data: &[u8],
-) -> (Vec<u64>, u64) {
+) -> (Vec<Segment>, u64) {
     let old_len = old_data.len();
     if new_data.len() <= old_len {
-        return (old_strides.to_vec(), old_line_count);
+        return (old_segments.to_vec(), old_line_count);
     }
     let tail = &new_data[old_len..];
-    let mut strides = old_strides.to_vec();
+    let mut segments = old_segments.to_vec();
     let mut count = old_line_count;
 
     // 旧数据以 \n 结尾 (或空): trailing \n 复活, 第 old_line_count 行从 old_len 开始
     if old_len == 0 || old_data[old_len - 1] == b'\n' {
-        if count % INDEX_STRIDE == 0 {
-            strides.push(old_len as u64);
+        if segments.is_empty() {
+            // 旧文件零行 ⟺ 空文件: 首段从此开始
+            segments.push(Segment {
+                base_line: 0,
+                strides: Vec::new(),
+            });
+        }
+        let last = segments.last_mut().expect("上一行保证非空");
+        let local = count - last.base_line;
+        if local % INDEX_STRIDE == 0 {
+            last.strides.push(old_len as u64);
         }
         count += 1;
     }
@@ -492,12 +616,14 @@ fn append_index(
         if abs + 1 == new_data.len() {
             break; // 末尾换行不产生新行
         }
-        if count % INDEX_STRIDE == 0 {
-            strides.push((abs + 1) as u64);
+        let last = segments.last_mut().expect("旧文件非空必有段");
+        let local = count - last.base_line;
+        if local % INDEX_STRIDE == 0 {
+            last.strides.push((abs + 1) as u64);
         }
         count += 1;
     }
-    (strides, count)
+    (segments, count)
 }
 
 /// 顺序行迭代器 (见 [`LogFile::lines`])。
@@ -736,6 +862,140 @@ mod tests {
         // walker 行号递增且从 0 起
         let ids: Vec<u64> = lf.lines().map(|(i, _)| i).collect();
         assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "walker 行号连续");
+    }
+
+    /// 用现成索引拼一个 LogFile (串行/并行/追加产物的语义对拍载体)。
+    fn logfile_from_parts(content: Vec<u8>, segments: Vec<Segment>, line_count: u64) -> LogFile {
+        let file_bytes = content.len() as u64;
+        LogFile {
+            data: FileData::Owned(content),
+            encoding: Encoding::Utf8,
+            segments,
+            line_count,
+            stat: FileStat {
+                len: file_bytes,
+                mtime: None,
+                head: 0,
+            },
+            stats: OpenStats {
+                file_bytes,
+                map_us: 0,
+                index: Duration::ZERO,
+                line_count,
+                index_bytes: 0,
+                encoding: Encoding::Utf8,
+            },
+        }
+    }
+
+    /// 刁难语料: BOM + 300KB 超长行 (4 段并行下整段无换行 → 制造空段)
+    /// + 变长行 (0..200B 含空行) + 末尾无换行。返回 (字节, 每行起点偏移表)。
+    fn tricky_corpus() -> (Vec<u8>, Vec<u64>) {
+        let mut content = Vec::new();
+        content.extend_from_slice(b"\xEF\xBB\xBF");
+        let mut starts = vec![3u64]; // 第 0 行 = BOM 后的超长行
+        content.extend_from_slice(&vec![b'L'; 300_000]);
+        content.push(b'\n');
+        let mut rng = Rng(0xDEAD_BEEF_1234_5678);
+        for _ in 0..1500 {
+            starts.push(content.len() as u64);
+            let len = (rng.next() % 200) as usize;
+            for _ in 0..len {
+                content.push(b'a' + (rng.next() % 26) as u8);
+            }
+            content.push(b'\n');
+        }
+        starts.push(content.len() as u64);
+        content.extend_from_slice(b"tail-no-newline");
+        (content, starts)
+    }
+
+    #[test]
+    fn parallel_segments_match_serial_semantics() {
+        let (content, starts) = tricky_corpus();
+        let content_len = content.len() as u64;
+        let (ser_segs, ser_n) = build_line_index(&content); // 串行 (< 并行阈值)
+        let (par_segs, par_n) = build_index_parallel(&content, 4); // 强制 4 段
+        assert_eq!(ser_n, par_n, "行数一致");
+        assert_eq!(ser_segs.len(), 1, "小文件串行单段");
+        assert!(
+            par_segs.len() > 1,
+            "确实多段 (空段已丢弃): {} 段",
+            par_segs.len()
+        );
+        // 段不变式: base_line 严格递增 + 无空段
+        for w in par_segs.windows(2) {
+            assert!(w[0].base_line < w[1].base_line, "base_line 严格递增");
+        }
+        for s in &par_segs {
+            assert!(!s.strides.is_empty(), "无空段");
+        }
+        let a = logfile_from_parts(content.clone(), ser_segs, ser_n);
+        let b = logfile_from_parts(content, par_segs, par_n);
+        assert_eq!(a.line_count(), starts.len() as u64, "行数 == 语料预期");
+        // line(i) 逐行对拍
+        for i in 0..a.line_count() {
+            assert_eq!(a.line(i), b.line(i), "行 {i} 串并一致");
+        }
+        // 偏移→行号对拍: 行起点 / 换行符本身 / 均匀探针
+        for (i, &st) in starts.iter().enumerate() {
+            assert_eq!(b.line_of_offset(st), i as u64, "行 {i} 起点回落");
+            if i + 1 < starts.len() {
+                let nl = starts[i + 1] - 1; // 行 i 的换行符属于行 i
+                assert_eq!(b.line_of_offset(nl), i as u64, "行 {i} 换行符归属");
+            }
+        }
+        for off in (0..content_len).step_by(4093) {
+            assert_eq!(
+                a.line_of_offset(off),
+                b.line_of_offset(off),
+                "偏移 {off} 串并一致"
+            );
+        }
+        // lines_from 跨段边界对拍 (段基 ±1)
+        let bases: Vec<u64> = b.segments.iter().map(|s| s.base_line).collect();
+        for probe in bases
+            .iter()
+            .flat_map(|&base| [base.saturating_sub(1), base, base + 1])
+        {
+            if probe >= a.line_count() {
+                continue;
+            }
+            let wa: Vec<&[u8]> = a.lines_from(probe).map(|(_, s)| s).collect();
+            let wb: Vec<&[u8]> = b.lines_from(probe).map(|(_, s)| s).collect();
+            assert_eq!(wa, wb, "lines_from({probe}) 串并一致");
+        }
+    }
+
+    #[test]
+    fn append_on_parallel_segments_matches_rebuild() {
+        // 变体 A: 旧数据以 \n 结尾 (trailing 复活); 变体 B: 旧末行无换行 (续行)
+        for resurrect in [true, false] {
+            let mut old = Vec::new();
+            let mut rng = Rng(0xABCD_EF01_2345_6789);
+            for _ in 0..800 {
+                let len = (rng.next() % 120) as usize;
+                for _ in 0..len {
+                    old.push(b'a' + (rng.next() % 26) as u8);
+                }
+                old.push(b'\n');
+            }
+            if !resurrect {
+                old.extend_from_slice(b"partial");
+            }
+            let (old_segs, old_n) = build_index_parallel(&old, 4); // 强制多段
+            assert!(old_segs.len() > 1, "确实多段 (复活={resurrect})");
+            let mut new = old.clone();
+            new.extend_from_slice(b"new-line-one\nnew-line-two\nthird-no-newline");
+            let (app_segs, app_n) = append_index(&old_segs, old_n, &old, &new);
+            let (full_segs, full_n) = build_line_index(&new); // 串行全量
+            assert_eq!(app_n, full_n, "行数一致 (复活={resurrect})");
+            let a = logfile_from_parts(new.clone(), app_segs, app_n);
+            let f = logfile_from_parts(new, full_segs, full_n);
+            for i in 0..f.line_count() {
+                assert_eq!(a.line(i), f.line(i), "行 {i} 追加==全量 (复活={resurrect})");
+            }
+        }
     }
 
     #[test]
