@@ -46,24 +46,65 @@ const COMPONENTS: &[&str] = &[
     "scheduler",
 ];
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let (Some(path), Some(mib)) = (args.next().map(PathBuf::from), args.next()) else {
-        eprintln!("用法: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]");
-        std::process::exit(2);
+/// 命令行解析结果。
+#[derive(Debug)]
+struct Cli {
+    path: PathBuf,
+    mib: u64,
+    /// 生成 JSONL (nested 隐含 true)。
+    jsonl: bool,
+    /// 生成嵌套 JSONL。
+    nested: bool,
+}
+
+/// 解析命令行: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]。
+/// 未知 flag 与多余位置参数一律报错拒绝 —— 静默吞掉 = 用户要 A 得到 B 还报
+/// 成功, 与曾修掉的 args.any() 耗迭代器是同一失败模式, 不能留同类洞。
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    const USAGE: &str = "用法: genlog <输出路径> <目标 MiB> [--jsonl] [--nested]";
+    let mut positional: Vec<&String> = Vec::new();
+    let mut jsonl = false;
+    let mut nested = false;
+    for a in args {
+        match a.as_str() {
+            "--jsonl" => jsonl = true,
+            "--nested" => nested = true,
+            _ if a.starts_with('-') => return Err(format!("未知参数: {a}\n{USAGE}")),
+            _ => positional.push(a),
+        }
+    }
+    let [path, mib] = positional.as_slice() else {
+        return Err(USAGE.into());
     };
-    // flags 先收集再判: 连续两次 args.any() 会让第一个 any 耗光迭代器,
-    // "--jsonl" 单独传时被静默吞掉 (生成明文还报成功)
-    let flags: Vec<String> = args.collect();
-    let nested = flags.iter().any(|a| a == "--nested");
-    let jsonl = flags.iter().any(|a| a == "--jsonl") || nested;
-    let target: u64 = match mib.parse::<u64>() {
-        Ok(m) if m > 0 => m * 1024 * 1024,
-        _ => {
-            eprintln!("目标 MiB 必须是正整数: {mib}");
+    let mib: u64 = mib
+        .parse()
+        .ok()
+        .filter(|m| *m > 0)
+        .ok_or_else(|| format!("目标 MiB 必须是正整数: {mib}"))?;
+    Ok(Cli {
+        path: PathBuf::from(path),
+        mib,
+        jsonl: jsonl || nested,
+        nested,
+    })
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_args(&args) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("{msg}");
             std::process::exit(2);
         }
     };
+    let Cli {
+        path,
+        mib,
+        jsonl,
+        nested,
+    } = cli;
+    let target = mib * 1024 * 1024;
 
     let t = Instant::now();
     let file = File::create(&path).unwrap_or_else(|e| {
@@ -119,4 +160,64 @@ fn main() {
         t.elapsed().as_millis(),
         written as f64 / (1024.0 * 1024.0) / t.elapsed().as_secs_f64(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_plain_default() {
+        let cli = parse_args(&args(&["out.log", "10"])).unwrap();
+        assert!(!cli.jsonl && !cli.nested);
+        assert_eq!(cli.mib, 10);
+        assert_eq!(cli.path, PathBuf::from("out.log"));
+    }
+
+    #[test]
+    fn parse_jsonl_flag_not_swallowed() {
+        // 回归: 旧实现连续两次 args.any() 耗光迭代器, --jsonl 单传被静默吞掉
+        let cli = parse_args(&args(&["out.log", "10", "--jsonl"])).unwrap();
+        assert!(cli.jsonl && !cli.nested);
+    }
+
+    #[test]
+    fn parse_nested_implies_jsonl() {
+        let cli = parse_args(&args(&["out.log", "10", "--nested"])).unwrap();
+        assert!(cli.nested && cli.jsonl);
+    }
+
+    #[test]
+    fn parse_flags_may_precede_positionals() {
+        let cli = parse_args(&args(&["--jsonl", "out.log", "10"])).unwrap();
+        assert!(cli.jsonl);
+        assert_eq!(cli.path, PathBuf::from("out.log"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_flag() {
+        let err = parse_args(&args(&["out.log", "10", "--jsnl"])).unwrap_err();
+        assert!(err.contains("--jsnl"), "错误信息应带出原 flag: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_extra_positional() {
+        assert!(parse_args(&args(&["a", "1", "b"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_bad_mib() {
+        assert!(parse_args(&args(&["out.log", "0"])).is_err());
+        assert!(parse_args(&args(&["out.log", "abc"])).is_err());
+    }
+
+    #[test]
+    fn parse_requires_two_positionals() {
+        assert!(parse_args(&args(&["out.log"])).is_err());
+        assert!(parse_args(&args(&[])).is_err());
+    }
 }
