@@ -7,4 +7,6 @@ pub mod encoding;
 pub mod expand;
 pub mod jsonl;
 pub mod logfile;
+pub mod open;
 pub mod search;
+pub mod selection;

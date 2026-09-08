@@ -21,15 +21,18 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 
 use danqing::widget::{EventResult, MsgQueue, TextInput, Widget};
 use danqing::{
-    Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Rect, RectBatch, Size, TextBatch,
+    Color, Constraints, Edges, Event, Key, LightTheme, MouseButton, NamedKey, Point, Rect,
+    RectBatch, Size, TextBatch,
 };
 
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Column, Schema, SubRow};
 use danqing_log::logfile::LogFile;
+use danqing_log::selection::{self, TextSelection};
 
 use crate::{LogApp, Msg, ViewMode};
 
@@ -57,6 +60,10 @@ const COL_PAD: f32 = 16.0;
 const SCROLLBAR_W: f32 = 6.0;
 /// 滚动条拇指最小高度。
 const THUMB_MIN_H: f32 = 24.0;
+/// 双击判定窗口 (沿用 danqing title_bar.rs 先例)。
+const DOUBLE_CLICK_MS: u128 = 300;
+/// 双击位移容差; 同值兼任「按下→框选」升级阈值 (抖动不产选区)。
+const CLICK_DIST: f32 = 4.0;
 
 /// 浅色基底 (白底日志视图)。
 fn bg() -> Color {
@@ -110,6 +117,11 @@ fn zebra_bg() -> Color {
 /// 鼠标悬停行底色。
 fn hover_bg() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.045)
+}
+/// 文本选区底色 (T3): 与行选中同族蓝但略实 —— 行选中是整行宽淡底+强调条,
+/// 文本选区只垫字符区间, 叠在搜索命中琥珀上时仍可读 (选区优先)。
+fn text_sel_bg() -> Color {
+    Color::rgba(0.24, 0.42, 0.66, 0.32)
 }
 /// 强调蓝 (选中行左侧竖条)。
 fn accent() -> Color {
@@ -209,11 +221,47 @@ fn cell_color(name: &str, v: &str) -> Color {
     text_default()
 }
 
+/// 一行可见窗口的命中几何 (选区 T3): `base_byte` = 左截断起点的解码字节偏移,
+/// `offs` = 窗口内逐字符 (内容域 x_end, 字节_end)。只缓存可见窗口字符 ——
+/// 用户点不到的不测, 超长行 (minified JSON) 单帧成本有界。
+struct RowGeom {
+    base_byte: usize,
+    offs: Vec<(f32, usize)>,
+}
+
+/// 构建一行可见窗口的命中几何: 从 `base` (左截断字节) 起逐字符累计宽度,
+/// 越过 `right_bound` (内容域 x) 即停 —— 右缘外字符用户点不到, 不测。
+/// `start_x` = base 处的内容域 x (调用方由 scroll_trim 的 sub 换算, 免重复测量)。
+fn measure_row_geom(
+    texts: &mut TextBatch,
+    raw: &str,
+    base: usize,
+    start_x: f32,
+    right_bound: f32,
+) -> RowGeom {
+    let mut acc = start_x;
+    let mut offs = Vec::new();
+    for (rel, ch) in raw[base..].char_indices() {
+        let end = base + rel + ch.len_utf8();
+        acc += texts.measure(&raw[base + rel..end], FONT_SIZE);
+        if acc > right_bound {
+            break;
+        }
+        offs.push((acc, end));
+    }
+    RowGeom {
+        base_byte: base,
+        offs,
+    }
+}
+
 /// 行锚定虚拟列表 (整窗唯一组件, 含搜索栏/过滤栏/表头/底栏状态行与滚动条)。
 pub(crate) struct LogView {
     file: Option<Arc<LogFile>>,
     /// 是否已打开真实文件 (false = 无参启动空态, 画欢迎提示)。
     has_file: bool,
+    /// Loading 占位文案 (async-open: 无旧文件 + job 在途; 空态分支改画打开进度)。
+    loading_label: Option<(String, String)>,
     top_row: f64,
     /// 选中的显示行。
     selected: u64,
@@ -248,6 +296,25 @@ pub(crate) struct LogView {
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
     hover_row: std::cell::Cell<u64>,
+    // ---- 文本选区 (T3, 仅原始模式) ----
+    /// 文本选区 (锚点/光标点 = 显示行 + 解码字节偏移); None 或空 = 无选区。
+    selection: Option<TextSelection>,
+    /// 按下待升级 (行, 字节, 屏幕位置): 拖超 CLICK_DIST 升级框选,
+    /// 未超即抬起 = 单击 (不产空选区)。
+    press: Option<(u64, usize, Point)>,
+    /// 框选进行中 (press 已升级; release 落定选区)。
+    dragging: bool,
+    /// 上次按下 (时刻, 位置) —— 双击判定用。
+    last_click: Option<(Instant, Point)>,
+    /// 选区命中几何 (paint 写, event 读): 显示行 → 可见窗口逐字符偏移。
+    /// event 无 TextBatch, 命中测试与渲染同源靠它 (TextInput char_offsets 同法)。
+    row_geom: std::cell::RefCell<std::collections::BTreeMap<u64, RowGeom>>,
+    /// 行号槽宽缓存 (paint 算, event 用; measure 只在 paint 可得)。
+    gutter_w: std::cell::Cell<f32>,
+    /// 组件矩形缓存 (paint 写, 窗口坐标): hit_area 供 set_by_click 聚焦用。
+    /// 无它 focusable 形同虚设 —— hit_focusable 只认 hit_area (评审自查发现:
+    /// 只加 focusable 不加 hit_area, 点击永不聚焦, Ctrl+C 链路断路)。
+    area: std::cell::Cell<Rect>,
 }
 
 impl LogView {
@@ -255,6 +322,7 @@ impl LogView {
         Self {
             file: None,
             has_file: false,
+            loading_label: None,
             top_row: 0.0,
             selected: 0,
             status: String::new(),
@@ -273,6 +341,13 @@ impl LogView {
             settings_hover: std::cell::Cell::new(false),
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
+            selection: None,
+            press: None,
+            dragging: false,
+            last_click: None,
+            row_geom: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            gutter_w: std::cell::Cell::new(GUTTER_MIN),
+            area: std::cell::Cell::new(Rect::default()),
         }
     }
 
@@ -305,6 +380,76 @@ impl LogView {
     /// 显示行 → (文件行, 子行偏移)。偏移 0 = 文件行本身。
     fn line_at(&self, row: u64) -> (u64, usize) {
         expand::file_line_at(row, self.lines(), &self.expanded).unwrap_or((0, 0))
+    }
+
+    /// 选区是否超复制上限 (R3, 2026-09-08 评审): 滚轮甩底可造出全文件选区,
+    /// 无上限复制 = 逐行解码 + 逐行分配, UI 冻结分钟级 —— 对「1GB 不卡」
+    /// 立身之本的产品是口碑级事故。超限 Ctrl+C 不动作 + 底栏提示。
+    fn selection_over_limit(&self) -> bool {
+        self.selection.as_ref().is_some_and(|s| {
+            let ((r0, _), (r1, _)) = s.ordered();
+            r1.saturating_sub(r0) + 1 > selection::COPY_MAX_LINES
+        })
+    }
+
+    /// 行文本区左键按下的选区处理 (T3)。双击 (300ms/4px, title_bar 先例) =
+    /// 空白分隔 token 整选; 单击 = 潜伏锚点 (拖超阈值才升级框选) 且清除旧选区。
+    /// 调用方已判定: 原始模式 + 左键 + 已打开文件 + px 在文本区。
+    fn handle_text_press(&mut self, area: Rect, position: Point) {
+        let now = Instant::now();
+        let dbl = self.last_click.is_some_and(|(t, p)| {
+            now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
+                && (position.x - p.x).abs() < CLICK_DIST
+                && (position.y - p.y).abs() < CLICK_DIST
+        });
+        if dbl {
+            if let Some((r, b)) = self.hit_text(area, position) {
+                let (line_no, _) = self.line_at(r);
+                let text = self
+                    .file
+                    .as_ref()
+                    .map(|f| f.line_lossy(line_no))
+                    .unwrap_or_default();
+                let (s, e) = selection::token_at(&text, b);
+                self.selection = Some(TextSelection::new((r, s), (r, e)));
+            }
+            self.press = None;
+            self.dragging = false;
+            self.last_click = None; // 三连击不链式放大, 重新开始计数
+        } else {
+            self.press = self.hit_text(area, position).map(|(r, b)| (r, b, position));
+            self.dragging = false;
+            self.selection = None;
+            self.last_click = Some((now, position));
+        }
+    }
+
+    /// 选区命中测试 (T3): 屏幕坐标 → (显示行, 解码字节偏移)。
+    ///
+    /// event 无 TextBatch, 字符级命中走 paint 缓存的逐字符几何 ([`Self::row_geom`],
+    /// TextInput char_offsets 同法); 与渲染同一解码路径, 宽度天然一致。
+    /// 返回 None = 该坐标不可选 (列表区外 / 表格模式 / 展开子行 / 未缓存行)。
+    /// 按下路径由调用方挡 gutter 区 (px < text_x 不进选区); 拖动路径的
+    /// gutter 内坐标 (content_x 为负) 归 base_byte = 可见窗口首字符 ——
+    /// 水平滚动后 != 行首, 语义为「选到最左可见处」。缓存未覆盖的字符区间
+    /// (视口右缘外) 归最后可见字符 —— 用户只能选中看得到的文本。
+    fn hit_text(&self, area: Rect, pos: Point) -> Option<(u64, usize)> {
+        let chrome_top = self.chrome_top();
+        let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
+        let rel_y = pos.y - area.origin.y - chrome_top;
+        if !(0.0..list_h).contains(&rel_y) {
+            return None;
+        }
+        let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
+        let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
+        let content_x = pos.x - text_x + self.x_offset.get();
+        let geom = self.row_geom.borrow();
+        let g = geom.get(&row)?;
+        // 首个 x_end > content_x 的字符即 caret 归属 (TextInput hit_to_index 同语义);
+        // 全在左侧 → 末字符后; 全在右侧 (左缘点击) → base_byte。
+        let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
+        let byte = if n == 0 { g.base_byte } else { g.offs[n - 1].1 };
+        Some((row, byte))
     }
 }
 
@@ -389,8 +534,26 @@ impl Widget for LogView {
         let app = state
             .downcast_ref::<LogApp>()
             .expect("LogView 绑定状态类型不匹配");
+        // 选区失效守卫: 显示行→内容映射变化 (换文件/过滤变化/切模式) 时
+        // 旧选区的 (显示行, 偏移) 不再对应原文, 必须作废 (含潜伏按下);
+        // 追加 tail 换入新 Arc 同样触发 —— 保守清除胜过复制出错行。
+        let file_changed = self
+            .file
+            .as_ref()
+            .is_none_or(|f| !Arc::ptr_eq(f, &app.file));
+        let filtered_changed = match (&self.filtered, &app.filtered) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if file_changed || filtered_changed || self.mode != app.mode {
+            self.selection = None;
+            self.press = None;
+            self.dragging = false;
+        }
         self.file = Some(Arc::clone(&app.file));
         self.has_file = app.has_file;
+        self.loading_label = app.loading_label.clone();
         self.top_row = app.top_row;
         self.selected = app.selected;
         self.status = app.status.clone();
@@ -417,6 +580,7 @@ impl Widget for LogView {
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        self.area.set(area); // hit_area 供 set_by_click 聚焦 (窗口坐标)
         let Some(file) = &self.file else { return };
         let count = self.display_count();
         let table = self.table_mode();
@@ -431,6 +595,7 @@ impl Widget for LogView {
         let digits = format!("{}", file.line_count()).len();
         let sample = "8".repeat(digits.max(4));
         let gutter_w = (texts.measure(&sample, AUX_FONT_SIZE) + 20.0).max(GUTTER_MIN);
+        self.gutter_w.set(gutter_w); // 选区命中 (event 无 TextBatch) 同源
         // 展开标识区 + 行号槽 + 间距
         let text_x = area.origin.x + EXPAND_W + gutter_w + GUTTER_GAP;
         let text_right = area.origin.x + area.size.width - SCROLLBAR_W - 6.0;
@@ -504,11 +669,17 @@ impl Widget for LogView {
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
         let rows_bottom = rows_top + list_h;
+        // 选区 (T3): 命中几何随可见窗口逐帧重建; 非空选区存在时行选中视觉让位
+        self.row_geom.borrow_mut().clear();
+        let has_text_sel = self.selection.as_ref().is_some_and(|s| !s.is_empty());
         // 空态欢迎 (无参启动): 列表区居中两行提示; 行循环 count=0 本就不画
         if !self.has_file {
             let mid_y = rows_top + list_h / 2.0;
-            let title = "丹青日志 LogLens";
-            let hint = "按 Ctrl+O 打开日志文件";
+            // Loading (async-open): 文件名 + 进度行; 否则欢迎语
+            let (title, hint) = match &self.loading_label {
+                Some((name, progress)) => (name.as_str(), progress.as_str()),
+                None => ("丹青日志 LogLens", "按 Ctrl+O 打开日志文件"),
+            };
             let title_w = texts.measure(title, 16);
             texts.push_text(
                 title,
@@ -553,7 +724,7 @@ impl Widget for LogView {
             if table && i % 2 == 1 {
                 rects.push_rect(row_rect, zebra_bg(), 0.0);
             }
-            if i == self.selected {
+            if i == self.selected && !has_text_sel {
                 rects.push_rect(row_rect, selection_bg(), 0.0);
                 rects.push_rect(
                     Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
@@ -724,6 +895,33 @@ impl Widget for LogView {
                     self.max_seen.set(full_w);
                 }
                 let (shown, sub) = scroll_trim(texts, &raw, x_off, FONT_SIZE);
+                // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
+                // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
+                let base = raw.len() - shown.len();
+                let geom = measure_row_geom(texts, &raw, base, x_off - sub, x_off + text_w + 64.0);
+                self.row_geom.borrow_mut().insert(i, geom);
+                // 文本选区区间 (T3): 与命中高亮同法 (measure 前缀→矩形);
+                // 在循环末尾才画 = 与同批命中矩形交叠时选区优先
+                if let Some(sel) = self.selection.as_ref().filter(|s| !s.is_empty()) {
+                    if let Some((b0, b1)) = selection::row_slice(sel, i, &raw) {
+                        let x0 =
+                            (text_x + texts.measure(&raw[..b0], FONT_SIZE) - x_off).max(text_x);
+                        // 整行选中时复用刚算过的 full_w, 省一次 O(行长) 测量
+                        let w1 = if b1 == raw.len() {
+                            full_w
+                        } else {
+                            texts.measure(&raw[..b1], FONT_SIZE)
+                        };
+                        let x1 = (text_x + w1 - x_off).min(text_right);
+                        if x1 > x0 {
+                            rects.push_rect(
+                                Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                text_sel_bg(),
+                                2.0,
+                            );
+                        }
+                    }
+                }
                 let draw_x = text_x - sub;
                 fit_push(
                     texts,
@@ -854,11 +1052,28 @@ impl Widget for LogView {
                 } else {
                     self.hover_row.set(u64::MAX);
                 }
+                // 框选跟手 (T3): 按下未抬起期间, 超阈值即升级/更新选区;
+                // 命中失败 (拖出列表/不可选行) 冻结 caret 在最后有效点
+                if let Some((arow, abyte, pos0)) = self.press {
+                    let moved = (position.x - pos0.x).abs() > CLICK_DIST
+                        || (position.y - pos0.y).abs() > CLICK_DIST;
+                    if self.dragging || moved {
+                        self.dragging = true;
+                        if let Some((crow, cbyte)) = self.hit_text(area, *position) {
+                            self.selection = Some(TextSelection::new((arow, abyte), (crow, cbyte)));
+                        }
+                    }
+                }
                 EventResult::Ignored // 不消费, 让其他组件也能响应 hover
             }
             Event::CursorLeft => {
                 self.settings_hover.set(false);
                 self.hover_row.set(u64::MAX);
+                // 按下未拖动就离窗 = 放弃潜伏选区; 框选中离窗保留
+                // (窗口最大化下边缘拖出是常态, 回窗继续跟手)
+                if !self.dragging {
+                    self.press = None;
+                }
                 EventResult::Ignored
             }
             Event::MouseWheel { delta, shift, .. } => {
@@ -889,6 +1104,7 @@ impl Widget for LogView {
             Event::MouseInput {
                 pressed: true,
                 position,
+                button,
                 ..
             } => {
                 // 设置按钮点击 (S2)
@@ -905,7 +1121,61 @@ impl Widget for LogView {
                         msgs.push(Box::new(Msg::ToggleExpand(row)));
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
+                        // 文本选区 (T3): 仅左键 + 原始模式 (右键不清选区/不污染
+                        // 双击判定 —— 评审 O1); 左键落 gutter = 仅行选中并清选区
+                        let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
+                        if *button == MouseButton::Left && !self.table_mode() && self.has_file {
+                            if position.x >= text_x {
+                                self.handle_text_press(area, *position);
+                            } else {
+                                self.selection = None;
+                            }
+                        }
                     }
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            Event::MouseInput {
+                pressed: false,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // 左键抬起: 框选落定 / 潜伏按下作废 (单击不产选区)。
+                // 引擎指针捕获保证拖出本区域的抬起也路由到此 (danqing R1)。
+                if self.press.is_some() || self.dragging {
+                    self.press = None;
+                    self.dragging = false;
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            Event::Copy => {
+                // 框架 Ctrl+C 链路 (handler → 焦点路径 → selected_text 写 arboard)。
+                // 有内容才消费; 空选区 Ignored = 剪贴板保持不动。
+                // 超限选区 (R3): 不复制并底栏提示 (防逐行解码冻结 UI)。
+                if self.selected_text().is_some() {
+                    EventResult::Consumed
+                } else if self.selection_over_limit() {
+                    msgs.push(Box::new(Msg::Notice(format!(
+                        "选区超 {} 万行未复制 (防冻结)",
+                        selection::COPY_MAX_LINES / 10000
+                    ))));
+                    EventResult::Ignored
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            Event::Key {
+                key: Key::Named(NamedKey::Escape),
+                pressed: true,
+                ..
+            } => {
+                // 有选区时 Esc 清选区; 无选区 Ignored (框架清焦, 现状)
+                if self.selection.as_ref().is_some_and(|s| !s.is_empty()) {
+                    self.selection = None;
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored
@@ -913,6 +1183,52 @@ impl Widget for LogView {
             }
             _ => EventResult::Ignored,
         }
+    }
+
+    /// 持焦 = 接入框架焦点剪贴板链路 (Ctrl+C → Event::Copy → selected_text)。
+    /// 持焦后未消费的键经 `App::propagate_unhandled_keys` 回退应用层,
+    /// 应用级导航 (j/k/翻页/`/`/b) 不失灵 (danqing T1 opt-in, LogApp 已开启)。
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn focus_id(&self) -> Option<&'static str> {
+        Some("log-view")
+    }
+
+    /// 命中区域 = 组件全矩形 (窗口坐标, paint 缓存)。
+    /// set_by_click 的 hit_focusable 只认 hit_area —— 无此实现则
+    /// 点击永不聚焦, focusable/Ctrl+C 链路全断 (TextInput 同法)。
+    fn hit_area(&self) -> Option<Rect> {
+        Some(self.area.get())
+    }
+
+    /// 当前可复制文本: 原始模式 = 非空且不超限的文本选区 (跨行 `\n` 拼接);
+    /// 表格模式 = 选中行完整原文 (不受单元格截断省略影响; 选中展开子行时
+    /// 归父行原文 —— 子行是父行 JSON 的投影, 复制原文不丢信息);
+    /// 其余 (原始模式仅行选中) = None —— Ctrl+C 只认文本选区 (spec 决策)。
+    fn selected_text(&self) -> Option<String> {
+        if let Some(sel) = &self.selection {
+            if !sel.is_empty() {
+                if self.selection_over_limit() {
+                    return None;
+                }
+                let file = self.file.as_ref()?;
+                return Some(selection::copy_text(sel, &|row| {
+                    let (line_no, sub_off) = self.line_at(row);
+                    if sub_off > 0 {
+                        return String::new(); // 展开子行不进选区文本 (防御)
+                    }
+                    file.line_lossy(line_no).into_owned()
+                }));
+            }
+        }
+        if self.table_mode() && self.has_file && self.selected < self.display_count() {
+            let file = self.file.as_ref()?;
+            let (line_no, _) = self.line_at(self.selected);
+            return Some(file.line_lossy(line_no).into_owned());
+        }
+        None
     }
 }
 
@@ -1380,5 +1696,173 @@ mod tests {
         assert!(sub > 0.0 && sub <= char_w, "亚字符偏移平滑: {sub}");
         let (none, _) = scroll_trim(&mut texts, s, 99999.0, FONT_SIZE);
         assert_eq!(none, "", "全滚出为空");
+    }
+
+    /// 选区命中: 坐标 → (显示行, 解码字节偏移), 含 gutter 扣除与水平滚动还原。
+    /// 几何走 paint 写入的 row_geom 缓存 (测试中手工预填, 与渲染同源约定)。
+    #[test]
+    fn hit_text_maps_coords_through_gutter_and_xoff() {
+        let v = LogView::new();
+        v.gutter_w.set(56.0);
+        // 行 0: 3 字符, 每字符 10px (内容域 x_end, 字节_end)
+        v.row_geom.borrow_mut().insert(
+            0,
+            RowGeom {
+                base_byte: 0,
+                offs: vec![(10.0, 1), (20.0, 2), (30.0, 3)],
+            },
+        );
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        // text_x = 16 + 56 + 12 = 84; 点内容 x=15 → caret 在第 2 字符前 (byte 1)
+        assert_eq!(v.hit_text(area, Point::new(84.0 + 15.0, 5.0)), Some((0, 1)));
+        // 点在行首 → 首个缓存字符以左 → base_byte
+        assert_eq!(v.hit_text(area, Point::new(84.0, 5.0)), Some((0, 0)));
+        // 水平滚动后: content_x = px - text_x + x_off = 15 + 100 = 115 → 超末字符 → byte 3
+        v.x_offset.set(100.0);
+        assert_eq!(v.hit_text(area, Point::new(84.0 + 15.0, 5.0)), Some((0, 3)));
+        // 未缓存行 (表格/展开子行/空白行区) → None (不可选)
+        assert_eq!(
+            v.hit_text(area, Point::new(84.0 + 15.0, 5.0 + ROW_HEIGHT)),
+            None
+        );
+        // 列表区外 (状态栏) → None
+        assert_eq!(v.hit_text(area, Point::new(84.0, 599.0)), None);
+    }
+
+    /// 左截断窗口: base_byte 之后才是缓存字符, 左缘点击归 base_byte (不乱指行首)。
+    #[test]
+    fn hit_text_respects_trimmed_window_base() {
+        let v = LogView::new();
+        v.gutter_w.set(56.0);
+        // 左滚 200px 后, 可见窗口从 byte 20 起, 首字符 x_end=205
+        v.row_geom.borrow_mut().insert(
+            0,
+            RowGeom {
+                base_byte: 20,
+                offs: vec![(205.0, 21), (215.0, 22)],
+            },
+        );
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        // content_x = 15 - 84... 直接给: px=text_x → content_x = 0 + x_off
+        v.x_offset.set(200.0);
+        // content_x = 200 → 全缓存字符在右 → base_byte 20 (不是 0!)
+        assert_eq!(v.hit_text(area, Point::new(84.0, 5.0)), Some((0, 20)));
+        // content_x = 210 → caret 在 byte 21 字符后 → 21
+        assert_eq!(
+            v.hit_text(area, Point::new(84.0 + 10.0, 5.0)),
+            Some((0, 21))
+        );
+    }
+
+    /// 复制接线 (T4): 原始模式 = 文本选区拼文本; 表格模式 = 选中行完整原文;
+    /// 空选区/原始仅行选中 = None (Ctrl+C 不动作, 剪贴板不动)。
+    #[test]
+    fn selected_text_raw_selection_and_table_row() {
+        let path = std::env::temp_dir().join(format!("danqing-log-sel-{}.log", std::process::id()));
+        std::fs::write(&path, "aaa bbb\nccc\nddd eee\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        // 原始模式: 跨行选区 → 首行后缀 + 末行前缀
+        v.selection = Some(TextSelection::new((0, 4), (1, 2)));
+        assert_eq!(v.selected_text().as_deref(), Some("bbb\ncc"));
+        // 反向选区同内容
+        v.selection = Some(TextSelection::new((1, 2), (0, 4)));
+        assert_eq!(v.selected_text().as_deref(), Some("bbb\ncc"));
+        // 空选区 → None
+        v.selection = Some(TextSelection::new((0, 1), (0, 1)));
+        assert_eq!(v.selected_text(), None);
+        // 原始模式仅行选中 → None (spec: Ctrl+C 只认文本选区)
+        v.selection = None;
+        v.selected = 2;
+        assert_eq!(v.selected_text(), None);
+        // 表格模式: 选中行完整原文 (行内容不经单元格截断)
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "x".into(),
+                width_chars: 4,
+            }],
+        }));
+        assert_eq!(v.selected_text().as_deref(), Some("ddd eee"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Esc 语义 (T4): 有选区 → 清选区并消费; 无选区 → Ignored (框架清焦)。
+    #[test]
+    fn esc_clears_selection_only_when_present() {
+        let mut v = LogView::new();
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        };
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        // 无选区: Ignored (框架随后清焦点)
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Ignored);
+        // 空选区同样 Ignored
+        v.selection = Some(TextSelection::new((1, 1), (1, 1)));
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Ignored);
+        // 非空选区: 清除并消费
+        v.selection = Some(TextSelection::new((0, 0), (1, 2)));
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert_eq!(v.selection, None);
+    }
+
+    /// 框选状态机 (R1 回归): 单击 (未超阈值抬起) 不产选区;
+    /// 拖超阈值选区成形, 抬起后落定且按下态清空。
+    #[test]
+    fn drag_state_machine_forms_and_settles_selection() {
+        let mut v = LogView::new();
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.row_geom.borrow_mut().insert(
+            0,
+            RowGeom {
+                base_byte: 0,
+                offs: vec![(10.0, 1), (20.0, 2), (30.0, 3)],
+            },
+        );
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let input = |pressed: bool, x: f32, y: f32| Event::MouseInput {
+            button: MouseButton::Left,
+            pressed,
+            position: Point::new(x, y),
+        };
+        // 单击: 按下即抬起 (未超阈值) → 不产选区, 按下态清空
+        // (与后续框选按下拉开 >4px, 避免触发双击判定)
+        v.event(&input(true, 200.0, 5.0), area, &mut msgs);
+        v.event(&input(false, 200.0, 5.0), area, &mut msgs);
+        assert_eq!(v.selection, None);
+        assert!(v.press.is_none());
+        // 框选: 拖超 4px → 选区成形 (锚点 byte0 → caret byte1)
+        v.event(&input(true, 89.0, 5.0), area, &mut msgs);
+        v.event(&Event::CursorMoved(Point::new(99.0, 5.0)), area, &mut msgs);
+        assert_eq!(v.selection, Some(TextSelection::new((0, 0), (0, 1))));
+        assert!(v.dragging);
+        // 抬起 → 落定: 选区保留, 按下/框选态清空 (粘滞回归钉死)
+        v.event(&input(false, 99.0, 5.0), area, &mut msgs);
+        assert_eq!(v.selection, Some(TextSelection::new((0, 0), (0, 1))));
+        assert!(v.press.is_none());
+        assert!(!v.dragging);
+        // 右键按下: 不清既有选区、不产潜伏锚点、不覆写双击记录 (O1 钉死)
+        let lc = v.last_click;
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Right,
+                pressed: true,
+                position: Point::new(200.0, 5.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.selection, Some(TextSelection::new((0, 0), (0, 1))));
+        assert!(v.press.is_none(), "右键不产潜伏锚点");
+        assert_eq!(v.last_click, lc, "右键不污染双击判定");
     }
 }

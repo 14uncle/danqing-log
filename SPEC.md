@@ -17,8 +17,12 @@ v1 单二进制全功能 (付费层刀法留 v1.x, 2026-09-05 用户裁决)。
 | `core-viewer` | mmap 引擎硬化 (截断/轮转/编码)、虚拟视口、正则搜索+高亮、级别着色、书签 | — |
 | `live-tail` | tail 跟随、增量索引、实时过滤刷新、截断/轮转生存 | core-viewer |
 | `jsonl-table` | 真 parser 换 memmem、行内子行嵌套展开、点路径/数值比较过滤 | core-viewer |
+| `app-chrome` | 标题栏窗件 (框架 TitleBar 嵌槽, 过滤+搜索进 titlebar) | core-viewer, danqing titlebar-embed |
+| `settings` | 设置入口 + 轻量设置卡 (底部状态栏入口, 版本检查) | app-chrome, danqing update |
+| `async-open` | 异步打开管道 (启动/reload/重建/巨量追加后台索引) + 进度反馈 + 取消 | core-viewer, live-tail |
 
-构建序: `core-viewer` → `live-tail` ∥ `jsonl-table` (两模块可并行)。
+构建序: `core-viewer` → `live-tail` ∥ `jsonl-table` → `app-chrome` → `settings`
+→ `async-open` (改写 live-tail 同步打开形态, 排其之后)。
 意图文档付费层 (多文件时间戳合并/过滤器会话/导出) 不在 MVP, 归 v1.x。
 
 ## Tech Stack

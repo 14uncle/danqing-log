@@ -19,6 +19,8 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -82,18 +84,40 @@ impl FileStat {
     }
 }
 
+/// 「索引已取消」错误文案 (取消识别常量; 显示侧据此区分主动取消与真失败,
+/// 措辞改动只动这里 —— review O2)。
+pub const INDEX_CANCELLED: &str = "索引已取消";
+
 /// 前 64 字节 FNV-1a 哈希 (首块指纹, 无依赖)。
 fn hash_head(path: &Path) -> std::io::Result<u64> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut buf = [0u8; 64];
     let n = f.read(&mut buf)?;
+    Ok(fnv_head(&buf[..n]))
+}
+
+/// FNV-1a (首块指纹的纯函数半; 快照自足 stat 与读盘路径共用, 算法必须同源)。
+fn fnv_head(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in &buf[..n] {
+    for &b in bytes {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
-    Ok(h)
+    h
+}
+
+/// stat 快照自足构造 (review R1): 描述「被索引的这份字节」而非完成时刻的
+/// 路径 —— len = 打开时刻元数据, head = map 期首块指纹, mtime 取打开句柄
+/// (轮转 rename 后句柄仍指旧 inode = 快照身份)。索引期间的增长/轮转由
+/// 下一轮 250ms poll 检出 (cur != known) 驱动追平/重建; 取完成时刻路径
+/// stat 会让增长缺口永久漏尾、轮转嫁接把旧偏移错写到新内容上。
+fn snapshot_stat(file: &File, file_bytes: u64, head_hash: u64) -> FileStat {
+    FileStat {
+        len: file_bytes,
+        mtime: file.metadata().ok().and_then(|m| m.modified().ok()),
+        head: head_hash,
+    }
 }
 
 /// 步进索引步长: 每 STRIDE 行记一个绝对偏移, 段内 memchr 前扫定位。
@@ -108,6 +132,49 @@ const PARALLEL_MIN_BYTES: usize = 64 << 20;
 /// ~8 见顶 (2026-09-08 实测: 冷 1GB 缺页驱动 996MiB/s vs 裸顺序读 1655MiB/s),
 /// 再多只剩调度税。
 const MAX_INDEX_THREADS: usize = 8;
+
+/// 进度/取消检查粒度: 每累计 8MB 做一次原子操作。
+/// 每换行检查 = 千万次级/GB 的原子税, 必须节流 (async-open plan D2)。
+const PROGRESS_CHECK_STRIDE: u64 = 8 << 20;
+
+/// 索引进度/取消钩子 (async-open 异步打开管道)。
+///
+/// 同步 API ([`LogFile::open`] / [`LogFile::append_from`]) 走 `Default` 全 None,
+/// 检查点全部短路, 零可测开销; 异步管道 (open.rs OpenJob) 注入 Arc 句柄。
+/// 钩子只读不改: 分段/归属/查行语义与无钩子路径逐字节一致 (对拍网钉着)。
+#[derive(Debug, Default, Clone)]
+pub struct IndexHooks {
+    /// 已扫字节累加器 (各 chunk worker 每 ≥8MB 节流向此加; 取消早退不结清尾量,
+    /// 故 分子<分母 ⟺ 被取消)。
+    pub progress: Option<Arc<AtomicU64>>,
+    /// 取消旗标: true → 扫描循环下一检查点早退; open 完成处复查返回 Err。
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl IndexHooks {
+    /// 进度累加 (无句柄短路)。
+    fn report(&self, bytes: u64) {
+        if let Some(p) = &self.progress {
+            p.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// 是否已请求取消 (无句柄恒 false)。
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    /// 取消检查点 (bail 版): 已取消则返回 [`INDEX_CANCELLED`] Err。
+    /// 扫描完成处与各阶段边界统一走这里, 不做内联重复。
+    fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!(INDEX_CANCELLED);
+        }
+        Ok(())
+    }
+}
 
 /// 步进索引段: 并行构建时每个线程一段, 段内语义与全局步进表一致
 /// (第 j 项 = 段内第 j*STRIDE 行起点的绝对字节偏移)。
@@ -146,6 +213,16 @@ impl FileData {
     }
 }
 
+/// 追加结果分派 (review R3): 真增量 vs 退化全量重建。
+/// 调用方按此分派换入链 (Append 链保过滤增量 / Rebuild 链清失效状态),
+/// 不凭「发起时想做什么」猜 —— worker 打开时文件可能已轮转/缩容。
+pub enum AppendOutcome {
+    /// 同文件增长的增量追加 (索引只扫新字节)。
+    Appended(LogFile),
+    /// 退化为全量重建 (UTF-16 转码副本不适用增量; 或缩容/轮转防御兜底)。
+    Rebuilt(LogFile),
+}
+
 /// 已映射的日志文件: 分段步进行索引 + 只读访问。
 pub struct LogFile {
     data: FileData,
@@ -166,6 +243,15 @@ impl LogFile {
     /// 编码: BOM → 交替 NUL → UTF-8 合法性 → GBK 统计 → Latin-1 兜底 (encoding.rs);
     /// UTF-16 打开时转码 UTF-8 内存副本, 其余编码原字节索引 + 行级解码。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_hooks(path, &IndexHooks::default())
+    }
+
+    /// 带进度/取消钩子的打开 (async-open 管道; 同步语义见 [`Self::open`])。
+    ///
+    /// 取消语义: 扫描循环按 8MB 粒度早退, 完成处复查命中则返回
+    /// 「索引已取消」Err —— 半成品索引永不交给调用方。UTF-16 转码副本
+    /// 路径无细粒度进度 (read/transcode 两段各一次取消检查)。
+    pub fn open_with_hooks(path: &Path, hooks: &IndexHooks) -> Result<Self> {
         let t0 = Instant::now();
         let file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
         let file_bytes = file.metadata().context("读取文件元信息失败")?.len();
@@ -175,26 +261,28 @@ impl LogFile {
 
         let head = &map[..map.len().min(encoding::SAMPLE)];
         let detected = encoding::detect(head);
+        // 快照首块指纹 (磁盘原字节, map 期取定; UTF-16 转码前同样成立)
+        let head_hash = fnv_head(&map[..map.len().min(64)]);
         let (data, data_enc) = if detected.is_utf16() {
             // 2 字节编码不适合字节级索引: 一次性转码 UTF-8 副本 (1GB UTF-16 ≈ 500MB UTF-8)
             let raw =
                 std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+            hooks.check_cancelled()?;
             drop(map);
             let utf8 = encoding::transcode_utf16(detected == Encoding::Utf16Le, &raw);
+            hooks.check_cancelled()?;
             (FileData::Owned(utf8), Encoding::Utf8)
         } else {
             (FileData::Mapped(map), detected)
         };
 
         let t1 = Instant::now();
-        let (segments, line_count) = build_line_index(data.as_bytes());
+        let (segments, line_count) = build_line_index_with(data.as_bytes(), hooks);
+        hooks.check_cancelled()?;
         let index = t1.elapsed();
         let index_bytes = index_resident_bytes(&segments);
-        let stat = FileStat::of(path).unwrap_or(FileStat {
-            len: file_bytes,
-            mtime: None,
-            head: 0, // 取不到指纹时的保守值 (与任何真实 head 必异 → 判过期)
-        });
+        // stat 快照自足 (review R1, 语义见 snapshot_stat)
+        let stat = snapshot_stat(&file, file_bytes, head_hash);
 
         let stats = OpenStats {
             file_bytes,
@@ -422,9 +510,25 @@ impl LogFile {
     /// 增长追加: 重新 mmap + 只对新字节区间增量索引, 返回新 LogFile (旧实例由调用方
     /// 的 Arc 保活, 无 Mutex 无悬垂)。UTF-16 (转码副本) 与缩容退化全量 open。
     pub fn append_from(old: &Self, path: &Path) -> Result<Self> {
+        // 同步调用方不区分增量/重建 (分派语义见 AppendOutcome, 异步管道用)
+        match Self::append_from_with_hooks(old, path, &IndexHooks::default())? {
+            AppendOutcome::Appended(f) | AppendOutcome::Rebuilt(f) => Ok(f),
+        }
+    }
+
+    /// 带进度/取消钩子的追加 (async-open 追平管道; 进度分母 = 新字节数)。
+    ///
+    /// 退化分支 (UTF-16/缩容) 同样带钩子并返回 [`AppendOutcome::Rebuilt`]
+    /// (review R3): 被取消的 job 不在兜底分支白跑全量, 调用方按产物分派
+    /// 换入链而非按发起意图。
+    pub fn append_from_with_hooks(
+        old: &Self,
+        path: &Path,
+        hooks: &IndexHooks,
+    ) -> Result<AppendOutcome> {
         // UTF-16 转码副本: 索引建在 UTF-8 副本上, 增量不适用 → 全量
         if matches!(old.data, FileData::Owned(_)) {
-            return Self::open(path);
+            return Ok(AppendOutcome::Rebuilt(Self::open_with_hooks(path, hooks)?));
         }
         let t0 = Instant::now();
         let file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
@@ -437,22 +541,31 @@ impl LogFile {
         // 缩容/无增长: 全量重建 (调用方通常据 stat 判过期, 这里是防御兜底)
         if new_data.len() <= old_len {
             drop(map);
-            return Self::open(path);
+            return Ok(AppendOutcome::Rebuilt(Self::open_with_hooks(path, hooks)?));
         }
 
         let t1 = Instant::now();
-        let (mut segments, line_count) =
-            append_index(&old.segments, old.line_count, old.data.as_bytes(), new_data);
+        let (mut segments, line_count) = append_index(
+            &old.segments,
+            old.line_count,
+            old.data.as_bytes(),
+            new_data,
+            hooks,
+        );
+        if hooks.is_cancelled() {
+            anyhow::bail!(INDEX_CANCELLED);
+        }
         if let Some(last) = segments.last_mut() {
             last.strides.shrink_to_fit();
         }
         let index = t1.elapsed();
         let index_bytes = index_resident_bytes(&segments);
-        let stat = FileStat::of(path).unwrap_or(FileStat {
-            len: file_bytes,
-            mtime: None,
-            head: 0, // 取不到指纹时的保守值 (与任何真实 head 必异 → 判过期)
-        });
+        // stat 快照自足 (review R1, 语义见 snapshot_stat)
+        let stat = snapshot_stat(
+            &file,
+            file_bytes,
+            fnv_head(&new_data[..new_data.len().min(64)]),
+        );
 
         let stats = OpenStats {
             file_bytes,
@@ -462,14 +575,14 @@ impl LogFile {
             index_bytes,
             encoding: old.stats.encoding,
         };
-        Ok(Self {
+        Ok(AppendOutcome::Appended(Self {
             data: FileData::Mapped(map),
             encoding: old.encoding,
             segments,
             line_count,
             stat,
             stats,
-        })
+        }))
     }
 }
 
@@ -481,7 +594,8 @@ impl LogFile {
 /// 缺页驱动 I/O 996MiB/s vs 裸顺序读 1655MiB/s) 破了 1s 线, 触发并行化;
 /// 多线程缺页并发同时提速冷盘。分段布局与串行单段仅内部排列不同,
 /// 查行语义由「并行 == 串行」对拍钉死 (见 tests)。
-fn build_line_index(data: &[u8]) -> (Vec<Segment>, u64) {
+/// 带钩子的构建入口 (async-open 进度/取消; 同步调用传 Default 全 None 钩子)。
+fn build_line_index_with(data: &[u8], hooks: &IndexHooks) -> (Vec<Segment>, u64) {
     let threads = if data.len() >= PARALLEL_MIN_BYTES {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -491,7 +605,7 @@ fn build_line_index(data: &[u8]) -> (Vec<Segment>, u64) {
         1
     };
     if threads <= 1 {
-        let (mut strides, count) = scan_chunk(data, 0, true, data.len() as u64);
+        let (mut strides, count) = scan_chunk(data, 0, true, data.len() as u64, hooks);
         strides.shrink_to_fit();
         let segments = if count > 0 {
             vec![Segment {
@@ -503,12 +617,12 @@ fn build_line_index(data: &[u8]) -> (Vec<Segment>, u64) {
         };
         return (segments, count);
     }
-    build_index_parallel(data, threads)
+    build_index_parallel(data, threads, hooks)
 }
 
 /// 并行分段构建: 按字节等分, 每线程扫一段 (scan_chunk 的行归属规则保证不重不漏),
 /// 合并时丢弃空段 (如整段被一条超长行占满)、按序累算 base_line。
-fn build_index_parallel(data: &[u8], threads: usize) -> (Vec<Segment>, u64) {
+fn build_index_parallel(data: &[u8], threads: usize, hooks: &IndexHooks) -> (Vec<Segment>, u64) {
     let total = data.len() as u64;
     let chunk_len = data.len().div_ceil(threads);
     let mut segments = Vec::new();
@@ -522,7 +636,7 @@ fn build_index_parallel(data: &[u8], threads: usize) -> (Vec<Segment>, u64) {
             }
             let end = (start + chunk_len).min(data.len());
             let slice = &data[start..end];
-            handles.push(s.spawn(move || scan_chunk(slice, start as u64, c == 0, total)));
+            handles.push(s.spawn(move || scan_chunk(slice, start as u64, c == 0, total, hooks)));
         }
         // 按 chunk 顺序 join: 合并确定性, base_line 单调
         for h in handles {
@@ -546,7 +660,15 @@ fn build_index_parallel(data: &[u8], threads: usize) -> (Vec<Segment>, u64) {
 /// 行归属: chunk 拥有「起点落在 (base, base+len] 的行」(由其内 `\n` 派生);
 /// chunk 0 额外拥有第 0 行 (BOM 跳过)。全文件末尾 `\n` 不产生新行
 /// (仅末 chunk 的最后一字节触发)。无 `\n` 的 chunk 产 0 行 (空段由合并丢弃)。
-fn scan_chunk(slice: &[u8], base: u64, is_first: bool, total_len: u64) -> (Vec<u64>, u64) {
+/// 钩子: 每累计 ≥8MB 报一次进度 + 查一次取消 (节流, 见 PROGRESS_CHECK_STRIDE);
+/// 取消早退时不结清尾量 (分子<分母 ⟺ 被取消), 半成品由 open 完成处复查拦截。
+fn scan_chunk(
+    slice: &[u8],
+    base: u64,
+    is_first: bool,
+    total_len: u64,
+    hooks: &IndexHooks,
+) -> (Vec<u64>, u64) {
     // 预分配: 经验值 ~64 字节/行 + 步进 16, 避免 Vec 反复扩容
     let mut strides = Vec::with_capacity(slice.len() / 64 / INDEX_STRIDE as usize + 16);
     let mut count = 0u64;
@@ -559,6 +681,7 @@ fn scan_chunk(slice: &[u8], base: u64, is_first: bool, total_len: u64) -> (Vec<u
         strides.push(bom); // 第 0 行
         count = 1;
     }
+    let mut last_report = 0u64; // slice 内已报进度的偏移
     for p in memchr::memchr_iter(b'\n', slice) {
         let next = base + p as u64 + 1;
         if next == total_len {
@@ -568,7 +691,15 @@ fn scan_chunk(slice: &[u8], base: u64, is_first: bool, total_len: u64) -> (Vec<u
             strides.push(next);
         }
         count += 1;
+        if p as u64 - last_report >= PROGRESS_CHECK_STRIDE {
+            hooks.report(p as u64 - last_report);
+            last_report = p as u64;
+            if hooks.is_cancelled() {
+                return (strides, count); // 早退不结清尾量
+            }
+        }
     }
+    hooks.report(slice.len() as u64 - last_report); // 尾量结清: 完成时分子=分母
     (strides, count)
 }
 
@@ -584,6 +715,7 @@ fn append_index(
     old_line_count: u64,
     old_data: &[u8],
     new_data: &[u8],
+    hooks: &IndexHooks,
 ) -> (Vec<Segment>, u64) {
     let old_len = old_data.len();
     if new_data.len() <= old_len {
@@ -611,6 +743,7 @@ fn append_index(
     }
 
     // 扫描新字节: 每个非尾 \n 结束一行, 下一行从其后开始
+    let mut last_report = 0u64; // tail 内已报进度的偏移 (钩子节流同 scan_chunk)
     for p in memchr::memchr_iter(b'\n', tail) {
         let abs = old_len + p;
         if abs + 1 == new_data.len() {
@@ -622,7 +755,15 @@ fn append_index(
             last.strides.push((abs + 1) as u64);
         }
         count += 1;
+        if p as u64 - last_report >= PROGRESS_CHECK_STRIDE {
+            hooks.report(p as u64 - last_report);
+            last_report = p as u64;
+            if hooks.is_cancelled() {
+                return (segments, count); // 早退不结清尾量
+            }
+        }
     }
+    hooks.report(tail.len() as u64 - last_report); // 尾量结清
     (segments, count)
 }
 
@@ -914,8 +1055,8 @@ mod tests {
     fn parallel_segments_match_serial_semantics() {
         let (content, starts) = tricky_corpus();
         let content_len = content.len() as u64;
-        let (ser_segs, ser_n) = build_line_index(&content); // 串行 (< 并行阈值)
-        let (par_segs, par_n) = build_index_parallel(&content, 4); // 强制 4 段
+        let (ser_segs, ser_n) = build_line_index_with(&content, &IndexHooks::default()); // 串行 (< 并行阈值)
+        let (par_segs, par_n) = build_index_parallel(&content, 4, &IndexHooks::default()); // 强制 4 段
         assert_eq!(ser_n, par_n, "行数一致");
         assert_eq!(ser_segs.len(), 1, "小文件串行单段");
         assert!(
@@ -983,12 +1124,13 @@ mod tests {
             if !resurrect {
                 old.extend_from_slice(b"partial");
             }
-            let (old_segs, old_n) = build_index_parallel(&old, 4); // 强制多段
+            let (old_segs, old_n) = build_index_parallel(&old, 4, &IndexHooks::default()); // 强制多段
             assert!(old_segs.len() > 1, "确实多段 (复活={resurrect})");
             let mut new = old.clone();
             new.extend_from_slice(b"new-line-one\nnew-line-two\nthird-no-newline");
-            let (app_segs, app_n) = append_index(&old_segs, old_n, &old, &new);
-            let (full_segs, full_n) = build_line_index(&new); // 串行全量
+            let (app_segs, app_n) =
+                append_index(&old_segs, old_n, &old, &new, &IndexHooks::default());
+            let (full_segs, full_n) = build_line_index_with(&new, &IndexHooks::default()); // 串行全量
             assert_eq!(app_n, full_n, "行数一致 (复活={resurrect})");
             let a = logfile_from_parts(new.clone(), app_segs, app_n);
             let f = logfile_from_parts(new, full_segs, full_n);
@@ -1143,5 +1285,153 @@ mod tests {
         assert_eq!(appended.line(0), b"hello world", "续行拼接");
         assert_eq!(appended.line(1), b"next");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// MiB 级临时日志 (钩子测试需要跨过 8MB 检查点; open_with 的内存语料
+    /// 走默认钩子, 故单独落盘)。
+    fn temp_big_file(tag: &str, mib: usize) -> std::path::PathBuf {
+        let path = temp_path(tag);
+        {
+            let mut f = File::create(&path).unwrap();
+            let chunk = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\n";
+            for _ in 0..(mib << 20) / chunk.len() {
+                f.write_all(chunk).unwrap();
+            }
+        }
+        path
+    }
+
+    #[test]
+    fn hooks_cancelled_open_returns_error_and_early_exits() {
+        let path = temp_big_file("hooks-cancel", 20);
+        let progress = Arc::new(AtomicU64::new(0));
+        let hooks = IndexHooks {
+            progress: Some(Arc::clone(&progress)),
+            cancel: Some(Arc::new(AtomicBool::new(true))), // 预置取消
+        };
+        let err = LogFile::open_with_hooks(&path, &hooks)
+            .err()
+            .expect("预置取消应报错");
+        assert!(
+            err.to_string().contains("索引已取消"),
+            "取消报「索引已取消」: {err:#}"
+        );
+        let done = progress.load(Ordering::Relaxed);
+        assert!(
+            done < 20 << 20,
+            "早退证据: 首个 8MB 检查点即停, 分子 {done} < 分母"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hooks_progress_reports_exact_total() {
+        let path = temp_big_file("hooks-progress", 20);
+        let progress = Arc::new(AtomicU64::new(0));
+        let hooks = IndexHooks {
+            progress: Some(Arc::clone(&progress)),
+            cancel: None,
+        };
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        LogFile::open_with_hooks(&path, &hooks).expect("打开成功");
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            file_len,
+            "尾量结清: 完成时分子=分母"
+        );
+        // 并行臂同款结清 (强制 4 段, 小语料)
+        let data: Vec<u8> = (0..100_000).flat_map(|_| b"line-here\n".to_vec()).collect();
+        let par_progress = Arc::new(AtomicU64::new(0));
+        let par_hooks = IndexHooks {
+            progress: Some(Arc::clone(&par_progress)),
+            cancel: None,
+        };
+        build_index_parallel(&data, 4, &par_hooks);
+        assert_eq!(
+            par_progress.load(Ordering::Relaxed),
+            data.len() as u64,
+            "并行各段结清之和 = 总字节"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hooks_cancelled_append_returns_error() {
+        // 追平管道: append_from_with_hooks 预置取消 → 「索引已取消」
+        let path = temp_big_file("hooks-append", 1);
+        let lf = LogFile::open(&path).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"more\nlines\n").unwrap();
+        }
+        let hooks = IndexHooks {
+            progress: None,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+        };
+        let err = LogFile::append_from_with_hooks(&lf, &path, &hooks)
+            .err()
+            .expect("预置取消应报错");
+        assert!(err.to_string().contains(INDEX_CANCELLED), "{err:#}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stat_snapshot_matches_path_stat_when_unchanged() {
+        // review R1: stat 快照自足构造必须与读盘口径同源 —— 文件未动时
+        // len/head 与 FileStat::of 完全一致 (竞态窗口的行为差异见 R1 注释,
+        // 无法在单测确定性复现; 本测试钉住常态路径不被改坏)
+        let path = temp_path("stat-identity");
+        std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
+        let lf = LogFile::open(&path).unwrap();
+        let snap = lf.stat_snapshot();
+        let cur = FileStat::of(&path).unwrap();
+        assert_eq!(snap.len, cur.len, "len = 快照字节数");
+        assert_eq!(snap.head, cur.head, "head 与读盘指纹同源一致");
+        assert!(!lf.is_stale(&path), "未动不过期");
+        // append_from 的 stat 同样快照自足
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"delta\n")
+            .unwrap();
+        let appended = LogFile::append_from(&lf, &path).unwrap();
+        let snap2 = appended.stat_snapshot();
+        let cur2 = FileStat::of(&path).unwrap();
+        assert_eq!(snap2.len, cur2.len);
+        assert_eq!(snap2.head, cur2.head);
+        assert!(!appended.is_stale(&path), "追加后新旧一致不过期");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_outcome_marks_rebuilt_and_fallback_carries_hooks() {
+        // review R3: 缩容兜底 → Rebuilt 分派 + 钩子生效 (取消不白跑)
+        let path = temp_path("append-rebuilt");
+        std::fs::write(&path, b"l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let lf = LogFile::open(&path).unwrap();
+        std::fs::rename(&path, path.with_extension("old")).expect("映射存活期改名合法 (T3)");
+        std::fs::write(&path, b"tiny\n").unwrap(); // 同路径更小的新文件 → 缩容兜底
+        let out = LogFile::append_from_with_hooks(&lf, &path, &IndexHooks::default()).unwrap();
+        match out {
+            AppendOutcome::Rebuilt(f) => {
+                assert_eq!(f.line_count(), 1, "全量重建看到新文件内容")
+            }
+            AppendOutcome::Appended(_) => panic!("缩容必须判 Rebuilt"),
+        }
+        // 兜底分支取消旗标生效 (review R3a: 不在退化路径白跑全量)
+        let hooks = IndexHooks {
+            progress: None,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+        };
+        let err = LogFile::append_from_with_hooks(&lf, &path, &hooks)
+            .err()
+            .expect("预置取消应报错");
+        assert!(err.to_string().contains(INDEX_CANCELLED), "{err:#}");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("old")).ok();
     }
 }

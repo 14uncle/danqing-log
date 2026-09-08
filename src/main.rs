@@ -34,13 +34,18 @@ use danqing::{
 use danqing_log::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
-use danqing_log::logfile::{FileStat, LogFile};
+use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
+use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
 use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
 
 /// 空格/PageUp-Down 翻页的行数：POC 定值。正式版由组件回报视口行数。
 pub(crate) const PAGE_ROWS: f64 = 25.0;
 /// 搜索命中行号收集上限 (防命中过密内存爆; 总数如实报告)。
 const SEARCH_HIT_CAP: usize = 1_000_000;
+/// tail 追加同步/异步阈值: 新追加字节几乎必在页缓存 (写入方刚产生的写回页),
+/// 串行增量索引 ~2.4GB/s → 32MB ≈ 13ms ≤ 16ms 帧预算 (async-open plan D3)。
+const APPEND_SYNC_MAX_BYTES: u64 = 32 << 20;
+
 /// 空态底栏提示 (无参启动, 未打开文件时)。
 const EMPTY_STATUS: &str = "未打开文件 · 按 Ctrl+O 打开日志文件";
 
@@ -138,6 +143,11 @@ pub(crate) struct LogApp {
     notice: Option<String>,
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
+    /// 在途打开作业 (async-open): Some = 打开/重建/追平进行中, UI 全程可响应;
+    /// 取消 = 置 None (worker 持 cancel Arc 早退, 见 open.rs drop 语义)。
+    open_job: Option<OpenJob>,
+    /// Loading 占位文案 (仅 无旧文件 + job 在途 时 Some; view 空态分支呈现)。
+    loading_label: Option<(String, String)>,
     /// 设置卡是否打开 (S2)。
     settings_open: bool,
 }
@@ -178,11 +188,50 @@ pub(crate) enum Msg {
     OpenUrl(String),
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
+    /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
+    Notice(String),
     /// 无操作 (事件吞噬用，不触发任何状态变更)。
     Noop,
 }
 
 impl LogApp {
+    /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
+    fn new_empty() -> Self {
+        Self {
+            file: Arc::new(LogFile::empty()),
+            has_file: false,
+            top_row: 0.0,
+            selected: 0,
+            base_status: EMPTY_STATUS.to_string(),
+            status: String::new(),
+            mode: ViewMode::Raw,
+            schema: None,
+            filtered: None,
+            filter_applied: String::new(),
+            filter_clear_rev: 0,
+            filter_elapsed: None,
+            filter_job: AsyncJob::new(),
+            search_clear_rev: 0,
+            search: None,
+            search_query: String::new(),
+            search_pattern: None,
+            search_elapsed: None,
+            search_job: AsyncJob::new(),
+            bookmarks: std::collections::BTreeSet::new(),
+            expanded: ExpandMap::new(),
+            sub_rows: std::collections::BTreeMap::new(),
+            focus_bar: false,
+            path: PathBuf::new(),
+            follow: false,
+            last_stat_poll: Instant::now(),
+            notice: None,
+            maximized: false,
+            open_job: None,
+            loading_label: None,
+            settings_open: false,
+        }
+    }
+
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
     fn make_title(&self) -> String {
         if self.mode == ViewMode::Table {
@@ -262,6 +311,9 @@ impl LogApp {
         if !self.has_file {
             return; // 空态无文件可轮询
         }
+        if self.open_job.is_some() {
+            return; // 打开/重建/追平在途: 不叠加 tail 动作 (async-open plan D3)
+        }
         let Ok(cur) = FileStat::of(&self.path) else {
             return; // 文件暂不可读 (轮转间隙), 下轮再试
         };
@@ -273,18 +325,25 @@ impl LogApp {
             // 首块变 = 轮转/覆写 (内容换了), 即便新文件更大也全量重建
             self.rebuild_file();
         } else if cur.len > known.len {
-            // 同文件增长：增量追加
-            let old_line_count = self.file.line_count();
+            let delta = cur.len - known.len;
+            if delta >= APPEND_SYNC_MAX_BYTES {
+                // 巨量追平 (久未轮询后的追平, 如隐藏期间暴涨): 转 worker,
+                // 旧快照保持可见可滚 + 底栏「追平中」; 在途期间本函数被门禁 (D3)。
+                // 过滤激活时子句随行 (review R2): 增量过滤随 worker 下沉,
+                // 落点只合并不扫描 —— 否则 GB 级追平的过滤成本回到 UI 线程。
+                let old = Arc::clone(&self.file);
+                let filter = if !self.filter_applied.is_empty() && self.filtered.is_some() {
+                    Some((jsonl::parse_query(&self.filter_applied), old.line_count()))
+                } else {
+                    None
+                };
+                self.open_job = Some(OpenJob::launch_append(&self.path, old, delta, filter));
+                self.refresh_status();
+                return;
+            }
+            // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
-                Ok(new) => {
-                    self.file = Arc::new(new);
-                    self.append_filter_hits(old_line_count);
-                    if self.follow {
-                        self.top_row = self.max_top();
-                        self.selected = self.display_count().saturating_sub(1);
-                    }
-                    self.refresh_status();
-                }
+                Ok(new) => self.apply_appended(new, None),
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
             }
         } else {
@@ -293,51 +352,81 @@ impl LogApp {
         }
     }
 
-    /// 缩容/轮转: 全量重建 + 清失效状态 (书签越界丢弃) + 状态提示。
+    /// 缩容/轮转: 异步全量重建 (旧快照保持可见可滚, spec 裁决);
+    /// pickup 走 [`Self::apply_rebuild`] 重置链。
     fn rebuild_file(&mut self) {
-        match LogFile::open(&self.path) {
-            Ok(new) => {
-                let new_count = new.line_count();
-                self.file = Arc::new(new);
-                self.bookmarks.retain(|&l| l < new_count);
-                self.filtered = None;
-                self.filter_applied.clear();
-                self.filter_elapsed = None;
-                self.search = None;
-                self.search_query.clear();
-                self.search_pattern = None;
-                self.search_elapsed = None;
-                self.expanded = ExpandMap::new();
-                self.sub_rows.clear();
-                self.top_row = 0.0;
-                self.selected = 0;
-                self.notice = Some("文件已截断/轮转".into());
-                self.refresh_status();
-            }
-            Err(e) => log::warn!("轮转重建失败：{e:#}"),
-        }
+        let path = self.path.clone();
+        self.open_job = Some(OpenJob::launch(OpenKind::Rebuild, &path));
+        self.refresh_status();
     }
 
-    /// 热替换文件 (Ctrl+O / 拖拽): 全部状态重建，窗口不重建。
-    fn reload_file(&mut self, new_path: PathBuf) {
-        let Ok(new_file) = LogFile::open(&new_path) else {
-            self.notice = Some(format!(
-                "无法打开：{}",
-                new_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default()
-            ));
-            self.refresh_status();
-            return;
-        };
-        let base_status = status_text(&new_path, &new_file);
-        let new_file = Arc::new(new_file);
-        let schema = if jsonl::detect(&new_file) {
-            jsonl::discover_schema(&new_file).map(Arc::new)
+    /// Rebuild 换入 (worker 交卷): 清失效状态 (书签越界丢弃) + 状态提示
+    /// (原 rebuild_file 重置链; base_status 换新打开统计 —— 同步时代留旧串,
+    /// 轮转后底栏数字失真, 异步化顺带修正)。
+    fn apply_rebuild(&mut self, path: &Path, out: OpenOutcome) {
+        // review C1: 旧内容上的在途 filter/search 结果不得贴到新内容
+        self.filter_job.invalidate();
+        self.search_job.invalidate();
+        let OpenOutcome { file, schema, .. } = out;
+        let base_status = status_text(path, &file);
+        let new_count = file.line_count();
+        self.file = Arc::new(file);
+        // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
+        self.schema = schema.map(Arc::new);
+        self.mode = if self.schema.is_some() {
+            ViewMode::Table
         } else {
-            None
+            ViewMode::Raw
         };
+        self.base_status = base_status;
+        self.bookmarks.retain(|&l| l < new_count);
+        self.filtered = None;
+        self.filter_applied.clear();
+        self.filter_elapsed = None;
+        self.search = None;
+        self.search_query.clear();
+        self.search_pattern = None;
+        self.search_elapsed = None;
+        self.expanded = ExpandMap::new();
+        self.sub_rows.clear();
+        self.top_row = 0.0;
+        self.selected = 0;
+        self.notice = Some("文件已截断/轮转".into());
+        self.refresh_status();
+    }
+
+    /// 热替换文件 (Ctrl+O / 拖拽): 异步管道发起 (在途旧 job 被 drop = 取消);
+    /// 旧视图保持至 worker 交卷 (spec 裁决 A), 换入走 [`Self::apply_fresh`]。
+    fn reload_file(&mut self, new_path: PathBuf) {
+        self.open_job = Some(OpenJob::launch(OpenKind::Fresh, &new_path));
+        self.refresh_status();
+    }
+
+    /// Fresh 换入 (worker 交卷): 全部状态重建, 窗口不重建 (原 reload_file 重置链)。
+    fn apply_fresh(&mut self, new_path: PathBuf, out: OpenOutcome) {
+        // review C1: 旧文件上的在途 filter/search 结果不得贴到新文件
+        self.filter_job.invalidate();
+        self.search_job.invalidate();
+        let OpenOutcome {
+            file: new_file,
+            schema,
+            ..
+        } = out;
+        let base_status = status_text(&new_path, &new_file);
+        log::info!("{base_status}");
+        if let Some(s) = &schema {
+            log::info!(
+                "JSONL 检出，列化 {} 列：{}",
+                s.columns.len(),
+                s.columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let new_file = Arc::new(new_file);
+        let schema = schema.map(Arc::new);
         let mode = if schema.is_some() {
             ViewMode::Table
         } else {
@@ -368,26 +457,140 @@ impl LogApp {
         self.refresh_status();
     }
 
+    /// Append 换入 (同步小追加 / 追平 worker 交卷同链): 增量过滤 + follow 滚底。
+    /// `worker_hits` = worker 已算好的增量命中 (review R2: 巨量追平过滤下沉);
+    /// None = 本地扫 (同步小追加, 毫秒级)。
+    fn apply_appended(&mut self, new: LogFile, worker_hits: Option<Vec<u64>>) {
+        let old_line_count = self.file.line_count();
+        self.file = Arc::new(new);
+        match worker_hits {
+            Some(hits) => self.merge_filter_hits(hits),
+            None => self.append_filter_hits(old_line_count),
+        }
+        if self.follow {
+            self.top_row = self.max_top();
+            self.selected = self.display_count().saturating_sub(1);
+        }
+        self.refresh_status();
+    }
+
+    /// 打开管道拾取 (async-open): 完成/失败都收摊 (take → drop 旧 job 语义),
+    /// 按 kind 分派换入链; 失败按 kind 分流 (Fresh notice / 余静默待重试)。
+    fn pickup_open_job(&mut self) {
+        let Some(res) = self.open_job.as_mut().and_then(OpenJob::poll) else {
+            return;
+        };
+        let job = self.open_job.take().expect("在途 job");
+        match res {
+            Ok(out) => match job.kind() {
+                OpenKind::Fresh => self.apply_fresh(job.path().to_path_buf(), out),
+                OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
+                OpenKind::Append => {
+                    if out.rebuilt {
+                        // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
+                        self.apply_rebuild(job.path(), out);
+                    } else {
+                        let OpenOutcome {
+                            file,
+                            incremental_hits,
+                            ..
+                        } = out;
+                        self.apply_appended(file, incremental_hits);
+                    }
+                }
+            },
+            Err(e) => {
+                // 「索引已取消」= 主动取消, 静默; 失败语义按 kind 分流 (保旧行为):
+                // Fresh 失败 notice + 留空态/旧视图; Rebuild/Append 静默,
+                // 文件仍过期, 下轮 250ms poll 自然驱动重试。
+                if !e.to_string().contains(INDEX_CANCELLED) {
+                    match job.kind() {
+                        OpenKind::Fresh => {
+                            log::warn!("打开失败：{e:#}");
+                            self.notice = Some(format!(
+                                "无法打开：{}",
+                                job.path()
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy())
+                                    .unwrap_or_default()
+                            ));
+                        }
+                        OpenKind::Rebuild => log::warn!("轮转重建失败：{e:#}"),
+                        OpenKind::Append => log::warn!("tail 追加失败：{e:#}"),
+                    }
+                }
+                self.refresh_status();
+            }
+        }
+    }
+
     /// 实时过滤：增量行追加命中表 (只跑新行，不全量重跑)。
     fn append_filter_hits(&mut self, old_line_count: u64) {
         if self.filter_applied.is_empty() {
             return;
         }
-        let Some(existing) = &self.filtered else {
+        if self.filtered.is_none() {
             return;
-        };
+        }
         let clauses = jsonl::parse_query(&self.filter_applied);
         let new_hits = jsonl::run_filter_from(&self.file, &clauses, old_line_count);
+        self.merge_filter_hits(new_hits);
+    }
+
+    /// 合并增量命中进过滤表 (本地扫描与 worker 下沉共用合并半段, review R2)。
+    fn merge_filter_hits(&mut self, new_hits: Vec<u64>) {
         if new_hits.is_empty() {
             return;
         }
+        let Some(existing) = &self.filtered else {
+            return;
+        };
         let mut merged = existing.as_ref().clone();
         merged.extend(new_hits);
         self.filtered = Some(Arc::new(merged));
     }
 
-    /// 合成底栏状态：base + 模式 + 过滤 + 搜索。
+    /// 合成底栏状态：base + 模式 + 过滤 + 搜索。job 在途时整行被 loading 覆盖。
+    /// loading 显示三元 (底栏动词, 文件名, 进度细节): job 在途才有。
+    /// refresh_status 的整行覆盖源 (计算与 mutation 分离)。
+    fn loading_parts(&self) -> Option<(&'static str, String, String)> {
+        let job = self.open_job.as_ref()?;
+        let (done, total) = job.progress();
+        let name = job
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let verb = match job.kind() {
+            OpenKind::Fresh => "正在索引",
+            OpenKind::Rebuild => "重建中",
+            OpenKind::Append => "追平中",
+        };
+        // done==0 = 刚发起或 UTF-16 读取/转码段 (无细粒度钩子, 见 plan D2)
+        let detail = if done == 0 {
+            "读取中…".to_string()
+        } else if let Some(pct) = (done * 100).checked_div(total) {
+            // 封顶 99: 在途分子可超分母 (索引期间文件增长 / UTF-16 转码口径),
+            // 完成时 loading 分支随 job 消失, 永远看不到 100 (review O1)
+            format!("{}% · {}/{} MiB", pct.min(99), done >> 20, total >> 20)
+        } else {
+            "…".to_string()
+        };
+        Some((verb, name, detail))
+    }
+
     fn refresh_status(&mut self) {
+        if let Some((verb, name, detail)) = self.loading_parts() {
+            self.status = format!("{verb} {name} · {detail}");
+            // 无旧文件才上占位文案 (有旧文件: 列表照画, 进度只上底栏)
+            self.loading_label = if self.has_file {
+                None
+            } else {
+                Some((name.clone(), format!("{verb} {detail}")))
+            };
+            return;
+        }
+        self.loading_label = None;
         let mut s = self.base_status.clone();
         if self.mode == ViewMode::Table {
             s.push_str(" · JSONL 表格");
@@ -661,6 +864,10 @@ impl App for LogApp {
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
+            Msg::Notice(text) => {
+                self.notice = Some(text);
+                self.refresh_status();
+            }
             Msg::Noop => {}
         }
     }
@@ -788,6 +995,18 @@ impl App for LogApp {
     /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
     /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
     fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
+        // 设置卡打开时 Esc 前置关闭 (评审 R2): LogView 持焦后, 框架对未消费
+        // 的 Escape 只清焦不回退应用层, 不经此前置关卡需按两次 —— S3 回归。
+        if self.settings_open {
+            if let Event::Key {
+                key: Key::Named(NamedKey::Escape),
+                pressed: true,
+                ..
+            } = event
+            {
+                return Some(Msg::CloseSettings);
+            }
+        }
         let Event::Key {
             key,
             pressed: true,
@@ -816,8 +1035,16 @@ impl App for LogApp {
         None
     }
 
+    /// LogView 持焦后, 焦点组件未消费的键回退应用层 (danqing opt-in):
+    /// 点击日志区后 j/k/翻页/`/`/b 等应用级导航不失灵 (text-selection T4)。
+    /// TextInput 栏持焦时其已消费的键不会重复到达 (引擎保证)。
+    fn propagate_unhandled_keys(&self) -> bool {
+        true
+    }
+
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
     fn tick(&mut self, _ctx: &AnimationCtx) {
+        self.pickup_open_job();
         if let Some(out) = self.filter_job.poll() {
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
@@ -842,6 +1069,9 @@ impl App for LogApp {
         // 增长检测 (live-tail): 250ms 节流 stat 轮询，增长则增量追加
         if self.last_stat_poll.elapsed() >= Duration::from_millis(250) {
             self.last_stat_poll = Instant::now();
+            if self.open_job.is_some() {
+                self.refresh_status(); // loading 进度文本随 poll 前进
+            }
             self.poll_growth();
         }
     }
@@ -902,83 +1132,15 @@ fn main() {
 fn run(path: Option<&Path>) -> Result<()> {
     // 启动后台更新检查 (24h TTL 缓存，静默)。
     app_update::init();
-    let (file, base_status, schema, has_file, path_buf) = match path {
-        Some(p) => {
-            let file = LogFile::open(p)?;
-            let base_status = status_text(p, &file);
-            log::info!("{base_status}");
-            // JSONL 自动检测 → 列发现 (采样毫秒级; 检出即表格模式开局)
-            let schema = if jsonl::detect(&file) {
-                jsonl::discover_schema(&file).map(Arc::new)
-            } else {
-                None
-            };
-            if let Some(s) = &schema {
-                log::info!(
-                    "JSONL 检出，列化 {} 列：{}",
-                    s.columns.len(),
-                    s.columns
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            (Arc::new(file), base_status, schema, true, p.to_path_buf())
-        }
-        None => (
-            Arc::new(LogFile::empty()),
-            EMPTY_STATUS.to_string(),
-            None,
-            false,
-            PathBuf::new(),
-        ),
-    };
-    let mode = if schema.is_some() {
-        ViewMode::Table
-    } else {
-        ViewMode::Raw
-    };
-    let title = if mode == ViewMode::Table {
-        "丹青日志 LogLens [JSONL]"
-    } else {
-        "丹青日志 LogLens"
+    // 一律空态骨架开局 (async-open): 带文件启动只发起 OpenJob 便立刻 run_app,
+    // 窗口按 GPU 速度出现, 索引在 worker 后台跑 (spec 判据: ≤ 无文件启动 +200ms)。
+    let mut app = LogApp::new_empty();
+    if let Some(p) = path {
+        app.open_job = Some(OpenJob::launch(OpenKind::Fresh, p));
     }
-    .to_string();
-    let mut app = LogApp {
-        file,
-        has_file,
-        top_row: 0.0,
-        selected: 0,
-        base_status,
-        status: String::new(),
-        mode,
-        schema,
-        filtered: None,
-        filter_applied: String::new(),
-        filter_clear_rev: 0,
-        filter_elapsed: None,
-        filter_job: AsyncJob::new(),
-        search_clear_rev: 0,
-        search: None,
-        search_query: String::new(),
-        search_pattern: None,
-        search_elapsed: None,
-        search_job: AsyncJob::new(),
-        bookmarks: std::collections::BTreeSet::new(),
-        expanded: ExpandMap::new(),
-        sub_rows: std::collections::BTreeMap::new(),
-        focus_bar: false,
-        path: path_buf,
-        follow: false,
-        last_stat_poll: Instant::now(),
-        notice: None,
-        maximized: false,
-        settings_open: false,
-    };
     app.refresh_status();
     let config = WindowConfig {
-        title,
+        title: "丹青日志 LogLens".to_string(),
         size: Size::new(1100.0, 760.0),
         clear_color: Color::rgb(0.98, 0.98, 0.98),
         logo_name: "log".into(),
@@ -1027,5 +1189,67 @@ mod tests {
             build_search_pattern(Encoding::Gbk, "中文"),
             "(?-u)\\xD6\\xD0\\xCE\\xC4"
         );
+    }
+
+    /// 空态 LogApp 测试夹具 (与 run() 的空态骨架同构)。
+    fn temp_log(content: &[u8]) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "danqing-log-main-{}-{}.log",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
+        // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
+        // 不得贴上 (worker 用通道闸门控制交付时序, 无运气成分)
+        let mut app = LogApp::new_empty();
+        let (f_tx, f_rx) = std::sync::mpsc::channel::<()>();
+        app.filter_job.launch(move || {
+            f_rx.recv().ok();
+            FilterOutcome {
+                lines: vec![1, 2],
+                elapsed: Duration::ZERO,
+            }
+        });
+        let (s_tx, s_rx) = std::sync::mpsc::channel::<()>();
+        app.search_job.launch(move || {
+            s_rx.recv().ok();
+            SearchOutcome {
+                hits: vec![5],
+                total: 1,
+                elapsed: Duration::ZERO,
+                pattern: "x".into(),
+                query: "x".into(),
+            }
+        });
+        // 两个 worker 阻塞中 (结果必未到达) → 换入新文件 (invalidate 发生)
+        let p = temp_log(b"new\nfile\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+        };
+        app.apply_fresh(p.clone(), out);
+        // 放行 worker 交付, 长窗轮询: 结果必须永不到达
+        f_tx.send(()).unwrap();
+        s_tx.send(()).unwrap();
+        let mut filter_got = false;
+        let mut search_got = false;
+        for _ in 0..100 {
+            filter_got |= app.filter_job.poll().is_some();
+            search_got |= app.search_job.poll().is_some();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!filter_got, "在途过滤结果必须被 invalidate 丢弃");
+        assert!(!search_got, "在途搜索结果必须被 invalidate 丢弃");
+        assert!(app.filtered.is_none());
+        assert!(app.search.is_none());
+        std::fs::remove_file(&p).ok();
     }
 }

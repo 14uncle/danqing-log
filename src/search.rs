@@ -66,6 +66,14 @@ impl<T: Send + 'static> AsyncJob<T> {
         }
         Some(out)
     }
+
+    /// 使在途作业失效 (代次 +1, 不发起新工作): 旧轮晚到的结果按乱序丢弃。
+    /// 跨作业失效场景: async-open 换入新文件后, 旧文件上的在途 filter/search
+    /// 结果不得贴到新文件 (review C1); AsyncJob 自身的代次只覆盖「同 job 连续
+    /// launch」, 换文件这种外部失效须由持有方显式调用。
+    pub fn invalidate(&mut self) {
+        self.generation += 1;
+    }
 }
 
 /// 命中导航: 升序命中表 (文件行号) + 环绕跳转。纯逻辑, 与渲染解耦供单测。
@@ -205,6 +213,34 @@ mod tests {
         }
         assert_eq!(got, Some(42), "1s 内必交付");
         assert_eq!(job.poll(), None, "结果只取一次");
+    }
+
+    #[test]
+    fn async_job_invalidate_discards_inflight_result() {
+        // review C1 机制钉: launch 后不 poll, invalidate, 结果完成后 poll 必须 None
+        let mut job: AsyncJob<u64> = AsyncJob::new();
+        job.launch(|| 7);
+        job.invalidate();
+        let mut got = None;
+        for _ in 0..1000 {
+            if let Some(v) = job.poll() {
+                got = Some(v);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(got, None, "失效轮的结果必须被丢弃");
+        // invalidate 不影响后续新一轮交付
+        job.launch(|| 8);
+        let mut got2 = None;
+        for _ in 0..1000 {
+            if let Some(v) = job.poll() {
+                got2 = Some(v);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(got2, Some(8), "新一轮照常交付");
     }
 
     #[test]
