@@ -37,8 +37,8 @@ use crate::{LogApp, Msg, ViewMode};
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// 正文字号。
 const FONT_SIZE: u16 = 13;
-/// 行号/状态栏字号。
-const AUX_FONT_SIZE: u16 = 11;
+/// 行号/状态栏字号 (12: 竞品基准的可读底线, 11 在白底上偏吃力)。
+const AUX_FONT_SIZE: u16 = 12;
 /// 行号槽最小宽度。
 const GUTTER_MIN: f32 = 56.0;
 /// 文本与行号槽间距。
@@ -66,13 +66,15 @@ fn text_default() -> Color {
     Color::rgb(0.12, 0.12, 0.12)
 }
 fn gutter_fg() -> Color {
-    Color::rgb(0.65, 0.65, 0.65)
+    // 行号可降权但不能淡到看不清 (0.65 白底教训; klogg 行号近正文色)
+    Color::rgb(0.45, 0.45, 0.45)
 }
 fn selection_bg() -> Color {
     Color::rgba(0.24, 0.42, 0.66, 0.24)
 }
 fn status_fg() -> Color {
-    Color::rgb(0.40, 0.40, 0.40)
+    // 底栏/展开子行: 0.40 在白底小字下临界, 加深到近正文
+    Color::rgb(0.25, 0.25, 0.25)
 }
 fn scrollbar_track() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.05)
@@ -84,7 +86,8 @@ fn filter_bar_bg() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.04)
 }
 fn filter_fg() -> Color {
-    Color::rgb(0.30, 0.30, 0.30)
+    // 输入文本与前缀标签: 0.30 仍偏浅, 对齐正文对比度
+    Color::rgb(0.20, 0.20, 0.20)
 }
 fn header_fg() -> Color {
     Color::rgb(0.35, 0.35, 0.38)
@@ -100,7 +103,7 @@ fn hit_bg() -> Color {
 fn hit_row_bg() -> Color {
     Color::rgba(0.95, 0.75, 0.10, 0.12)
 }
-/// 斑马纹 (奇数显示行): 宽表横向跟踪不串行。
+/// 斑马纹 (奇数显示行, 仅表格模式): 宽表横向跟踪不串行。
 fn zebra_bg() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.025)
 }
@@ -115,10 +118,6 @@ fn accent() -> Color {
 /// 表头底色 (与数据区轻分隔)。
 fn header_bg() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.04)
-}
-/// 降权文本 (时间戳等标识列)。
-fn dim_fg() -> Color {
-    Color::rgb(0.47, 0.47, 0.51)
 }
 /// INFO / 3xx 蓝。
 fn info_fg() -> Color {
@@ -186,15 +185,6 @@ fn status_color(v: &str) -> Color {
     }
 }
 
-/// 时间戳列名判定 (降权淡色): 常见命名 + `_at`/`_ts` 后缀。
-fn is_ts_column(name: &str) -> bool {
-    matches!(
-        name,
-        "ts" | "time" | "timestamp" | "@timestamp" | "datetime"
-    ) || name.ends_with("_at")
-        || name.ends_with("_ts")
-}
-
 /// 纯数字值判定 (含小数点/负号/千分位): 有资格右对齐。
 fn is_numeric(v: &str) -> bool {
     let b = v.as_bytes();
@@ -204,18 +194,9 @@ fn is_numeric(v: &str) -> bool {
             .all(|c| matches!(c, b'0'..=b'9' | b'.' | b'-' | b','))
 }
 
-/// 不透明标识符判定 (降权淡色): 长 hex/UUID 形值 (req_id/trace_id)。
-/// 全 hex±连字符 + 长度 ≥12 + 字母数字兼有 —— logger 名 (含非 hex 字母)、
-/// path (含 /)、msg (含空格)、纯数字 (走右对齐) 都天然不命中。
-fn is_opaque_id(v: &str) -> bool {
-    let b = v.as_bytes();
-    b.len() >= 12
-        && b.iter().all(|c| c.is_ascii_hexdigit() || *c == b'-')
-        && b.iter().any(|c| c.is_ascii_digit())
-        && b.iter().any(|c| matches!(c, b'a'..=b'f' | b'A'..=b'F'))
-}
-
-/// 表格单元格语义配色: level/status 按值分段, 时间戳列与不透明标识符降权, 其余默认。
+/// 表格单元格语义配色: level/status 按值分段, 其余一律正文色。
+/// (曾有时间戳列/hex 标识符降灰设计, 用户验收判死: 白底小字看不清;
+/// klogg/LogViewPlus/Daucloud 三家竞品对 ts/req_id 均一视同仁用正文色。)
 fn cell_color(name: &str, v: &str) -> Color {
     if name == "level" || name == "severity" {
         return level_cell_color(v);
@@ -224,9 +205,6 @@ fn cell_color(name: &str, v: &str) -> Color {
         && v.as_bytes().first().is_some_and(u8::is_ascii_digit)
     {
         return status_color(v);
-    }
-    if is_ts_column(name) || is_opaque_id(v) {
-        return dim_fg();
     }
     text_default()
 }
@@ -566,11 +544,13 @@ impl Widget for LogView {
                 i += 1;
                 continue;
             }
-            // 行底色层叠: 斑马纹 (奇数显示行, 绝对行号奇偶, 滚动时不游动)
+            // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
+            // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
+            // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
             // → 选中 (底色 + 左侧 3px 强调条) / hover (选中行不再叠 hover)
             let row_rect =
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
-            if i % 2 == 1 {
+            if table && i % 2 == 1 {
                 rects.push_rect(row_rect, zebra_bg(), 0.0);
             }
             if i == self.selected {
@@ -943,9 +923,9 @@ const BAR_LABEL_GAP: f32 = 8.0;
 fn caret_fg() -> Color {
     Color::rgb(0.10, 0.10, 0.12)
 }
-/// 占位文字色。
+/// 占位文字色 (可降权但 0.55 在白底 13px 下看不清, 用户验收打回)。
 fn placeholder_fg() -> Color {
-    Color::rgb(0.55, 0.55, 0.58)
+    Color::rgb(0.45, 0.45, 0.48)
 }
 
 /// 「清空输入」绑定闭包: 从应用状态读 clear revision。
@@ -1344,51 +1324,30 @@ mod tests {
             text_default(),
             "非数字 status 默认色"
         );
-        // 时间戳列降权
-        assert_eq!(cell_color("ts", "2026-09-05"), dim_fg(), "ts 淡色");
-        assert_eq!(cell_color("created_at", "x"), dim_fg(), "_at 后缀淡色");
-        // 其余列默认色; 长 hex 标识符 (req_id) 降权淡色
+        // 其余列一律正文色 (降灰设计已被用户验收判死: 白底小字看不清,
+        // klogg/LogViewPlus/Daucloud 对 ts/req_id 均用正文色)
+        assert_eq!(cell_color("ts", "2026-09-05"), text_default(), "ts 正文色");
         assert_eq!(cell_color("msg", "request completed"), text_default());
         assert_eq!(
             cell_color("logger", "auth-service"),
             text_default(),
-            "logger 不误伤"
+            "logger 正文色"
         );
         assert_eq!(
             cell_color("path", "/api/v1/orders/84701"),
             text_default(),
-            "path 不误伤"
+            "path 正文色"
         );
         assert_eq!(
             cell_color("req_id", "1b26690fb26795f6"),
-            dim_fg(),
-            "长 hex 淡色"
+            text_default(),
+            "长 hex 正文色"
         );
         assert_eq!(
             cell_color("trace_id", "550e8400-e29b-41d4-a716-446655440000"),
-            dim_fg(),
-            "UUID 淡色"
-        );
-        assert_eq!(
-            cell_color("req_id", "deadbeef"),
             text_default(),
-            "短 hex 不降权"
+            "UUID 正文色"
         );
-    }
-
-    #[test]
-    fn opaque_id_gate() {
-        assert!(is_opaque_id("1b26690fb26795f6"), "hex16");
-        assert!(
-            is_opaque_id("550E8400-E29B-41D4-A716-446655440000"),
-            "大写 UUID"
-        );
-        assert!(!is_opaque_id("auth-service"), "logger 名含非 hex 字母");
-        assert!(!is_opaque_id("/api/v1/orders/84701"), "path 含斜杠");
-        assert!(!is_opaque_id("request-completed"), "词组含非 hex 字母");
-        assert!(!is_opaque_id("20408"), "纯数字 (走右对齐)");
-        assert!(!is_opaque_id("deadbeef"), "长度不足 12");
-        assert!(!is_opaque_id("abcdefabcdefab"), "无数字不算 id");
     }
 
     #[test]
@@ -1401,16 +1360,6 @@ mod tests {
         assert!(!is_numeric(""), "空串");
         assert!(!is_numeric("-"), "无数字不算");
         assert!(!is_numeric("200 OK"), "带文本不算");
-    }
-
-    #[test]
-    fn ts_column_names() {
-        assert!(is_ts_column("ts"));
-        assert!(is_ts_column("@timestamp"));
-        assert!(is_ts_column("created_at"));
-        assert!(is_ts_column("req_ts"));
-        assert!(!is_ts_column("status"), "status 不误判为时间戳");
-        assert!(!is_ts_column("msg"));
     }
 
     #[test]
