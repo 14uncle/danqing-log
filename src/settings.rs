@@ -392,8 +392,7 @@ const LINK_ROW_H: f32 = 32.0;
 
 impl Widget for Link {
     fn sync(&mut self, _state: &dyn Any) {}
-    fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
-        let _ = texts.measure(&self.text, BODY_SIZE);
+    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
         let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
         self.area = Rect::new(Point::ZERO, size);
         size
