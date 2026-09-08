@@ -982,6 +982,7 @@ fn run(path: Option<&Path>) -> Result<()> {
         size: Size::new(1100.0, 760.0),
         clear_color: Color::rgb(0.98, 0.98, 0.98),
         logo_name: "log".into(),
+        maximized: true, // 日志查看器主战场是全屏阅读: 初始最大化
         hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
         ..Default::default()
     };
