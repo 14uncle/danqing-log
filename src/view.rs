@@ -33,10 +33,10 @@ use danqing_log::logfile::LogFile;
 
 use crate::{LogApp, Msg, ViewMode};
 
-/// 行高 (逻辑像素)。24 = 可读性底线: 13px 正文上下各留 ~4px 呼吸, 终端感消失。
+/// 行高 (逻辑像素)。24 = 可读性底线: 14px 正文上下仍留呼吸, 终端感消失。
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
-/// 正文字号。
-const FONT_SIZE: u16 = 13;
+/// 正文字号 (实机验收定档 14: 像素吸附落地后用户拍板; 行高 24 容得下)。
+const FONT_SIZE: u16 = 14;
 /// 行号/状态栏字号 (12: 竞品基准的可读底线, 11 在白底上偏吃力)。
 const AUX_FONT_SIZE: u16 = 12;
 /// 行号槽最小宽度。
