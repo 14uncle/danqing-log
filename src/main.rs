@@ -873,7 +873,7 @@ impl App for LogApp {
     }
 
     fn view(&self) -> Node {
-        // 顶层：Stack[Column[TitleBar.embed(Bar), LogView.fill], SettingsOverlay]。
+        // 顶层：Stack[Column[TitleBar.embed(Bar), LogView.fill], Overlay(设置卡)]。
         // 设置卡浮层在最上层，关闭时零高不拦截事件。
         node(
             Stack::new()

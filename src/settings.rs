@@ -1,17 +1,18 @@
 //! @author 十四叔
 //! @date 2026/09/06
 //!
-//! 轻量设置卡: scrim 遮罩 + 居中玻璃卡 + 关于/版本/反馈。
-//! 关闭: ✕ 按钮 / Esc / 点遮罩。
+//! 轻量设置卡: danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (关于/版本/反馈)。
+//! 关闭: ✕ 按钮 / Esc (app 级两阶段) / 点遮罩。
 
 use std::any::Any;
 
 use danqing::widget::{
-    Box as UiBox, Center, CloseButton, Column, EventResult, MsgQueue, Padding, Row, Stack, Text,
+    Box as UiBox, Center, CloseButton, Column, EventResult, MsgQueue, Overlay, Padding, Row, Text,
     Widget,
 };
 use danqing::{
-    Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch,
+    Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Point, Rect, RectBatch, Size,
+    TextBatch,
 };
 
 use crate::LogApp;
@@ -39,103 +40,15 @@ fn card_bg() -> Color {
 fn card_border() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.12)
 }
-fn scrim() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.25)
-}
 fn hover_bg() -> Color {
     Color::rgba(0.0, 0.0, 0.0, 0.06)
 }
 
-/// 设置卡浮层: 全窗 scrim + 居中玻璃卡。
-/// 内含 open 态, sync 从 LogApp.settings_open 读取;
-/// 关闭时零高零宽, 不拦截事件。
-pub(crate) fn settings_overlay() -> SettingsOverlay {
-    SettingsOverlay::new()
-}
-
-/// 设置卡浮层组件: 检查 settings_open 态, 关闭时不可见不可交互。
-pub(crate) struct SettingsOverlay {
-    open: bool,
-    /// 内部子树: scrim + 卡片。
-    inner: Box<dyn Widget>,
-}
-
-impl SettingsOverlay {
-    fn new() -> Self {
-        Self {
-            open: false,
-            inner: Box::new(
-                Stack::new()
-                    .child(Scrim::new())
-                    .child(Center::new(settings_card()).fill_max()),
-            ),
-        }
-    }
-}
-
-impl Widget for SettingsOverlay {
-    fn sync(&mut self, state: &dyn Any) {
-        let app = state
-            .downcast_ref::<LogApp>()
-            .expect("SettingsOverlay 绑定状态类型不匹配");
-        self.open = app.settings_open;
-        if self.open {
-            self.inner.sync(state);
-        }
-    }
-
-    fn animate(&mut self, ctx: &danqing::AnimationCtx) {
-        if self.open {
-            self.inner.animate(ctx);
-        }
-    }
-
-    fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
-        if self.open {
-            self.inner.layout(constraints, texts)
-        } else {
-            // 关闭时占零空间, 不影响底层布局。
-            Size::new(constraints.max().width, 0.0)
-        }
-    }
-
-    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
-        if self.open {
-            // 独立渲染层: 矩形/文本分批次的渲染架构下同层文本恒在矩形之上,
-            // 开新层后本层矩形才能盖住底层表格文本 (「关于」卡看不清的根因)。
-            rects.push_layer();
-            texts.push_layer();
-            self.inner.paint(area, rects, texts);
-        }
-    }
-
-    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
-        if self.open {
-            self.inner.event(event, area, msgs)
-        } else {
-            EventResult::Ignored
-        }
-    }
-
-    fn children(&self) -> &[danqing::widget::Node] {
-        if self.open {
-            self.inner.children()
-        } else {
-            &[]
-        }
-    }
-
-    fn children_mut(&mut self) -> &mut [danqing::widget::Node] {
-        if self.open {
-            self.inner.children_mut()
-        } else {
-            &mut []
-        }
-    }
-
-    fn focusable(&self) -> bool {
-        self.open
-    }
+/// 设置卡浮层: danqing::Overlay 承载 scrim/居中/模态门控 (簇C 下沉)。
+pub(crate) fn settings_overlay() -> impl Widget {
+    Overlay::themed(&LightTheme, Center::new(settings_card()).fill_max())
+        .bind_open(|app: &LogApp| app.settings_open)
+        .on_scrim_click(|| Msg::CloseSettings)
 }
 
 /// 玻璃卡片: 关闭行 + 关于 + 版本行 + 反馈链接。
@@ -205,46 +118,6 @@ fn version_row() -> impl Widget {
 /// 反馈链接行。
 fn feedback_row() -> impl Widget {
     Link::new("问题反馈", "https://github.com/14uncle/danqing-log/issues")
-}
-
-/// Scrim 遮罩: 点击关闭设置卡。
-struct Scrim {
-    area: Rect,
-}
-
-impl Scrim {
-    fn new() -> Self {
-        Self {
-            area: Rect::default(),
-        }
-    }
-}
-
-impl Widget for Scrim {
-    fn sync(&mut self, _state: &dyn Any) {}
-    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
-        constraints.max()
-    }
-    fn paint(&self, area: Rect, rects: &mut RectBatch, _texts: &mut TextBatch) {
-        rects.push_rect(area, scrim(), 0.0);
-    }
-    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
-        self.area = area;
-        match event {
-            Event::MouseInput {
-                pressed: true,
-                position,
-                ..
-            } if area.contains(*position) => {
-                msgs.push(Box::new(Msg::CloseSettings));
-                EventResult::Consumed
-            }
-            _ => EventResult::Ignored,
-        }
-    }
-    fn hit_area(&self) -> Option<Rect> {
-        Some(self.area)
-    }
 }
 
 /// 版本行: 有新版时显示提示 + 按钮; 无新版时空白。
