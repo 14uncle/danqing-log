@@ -8,15 +8,16 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # 提交状态固定为 git 依赖 (全家同一约定):
-# 仓库自洽 + Cargo.lock 钉 rev 保可复现; 本机经下方 [patch] 段透明使用本地 danqing。
+# 仓库自洽 + Cargo.lock 钉 rev 保可复现; 本机经下方 [patch] 段透明使用本地副本。
 danqing = { git = "https://github.com/14uncle/danqing", features = ["update"] }
+# 日志文件引擎 (mmap + 行步进索引 + 全文正则搜索 + JSONL 列化, 兄弟 crate)
+danqing-logfile = { git = "https://github.com/14uncle/danqing-logfile" }
 log = "0.4"
 anyhow = "1"
 memmap2 = "0.9"
 memchr = "2"
 regex = "1"
 # preserve_order: Object 底层换 IndexMap 保插入序, 列发现的「首见顺序」才有意义
-# (默认 BTreeMap 按键名字典序, 会把 ts/level/msg 排成字母序)。
 serde_json = { version = "1", features = ["preserve_order"] }
 open = "5"
 rfd = "0.15"
@@ -37,7 +38,9 @@ strip = "debuginfo"
 [build-dependencies]
 winresource = "0.1"
 
-# 本地联动开发：git 依赖透明替换为本地 danqing 副本。
+# 本地联动开发：git 依赖透明替换为本地副本。
 # 发布时去掉本段，Cargo.lock 钉 git rev 保可复现。
 [patch."https://github.com/14uncle/danqing"]
 danqing = { path = "../danqing" }
+[patch."https://github.com/14uncle/danqing-logfile"]
+danqing-logfile = { path = "../danqing-logfile" }

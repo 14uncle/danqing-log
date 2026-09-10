@@ -858,6 +858,7 @@ dependencies = [
  "arboard",
  "bytemuck",
  "chrono",
+ "danqing-encoding",
  "dirs 5.0.1",
  "env_logger",
  "etagere",
@@ -882,11 +883,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "danqing-encoding"
+version = "0.1.0"
+source = "git+https://github.com/14uncle/danqing-encoding#0731edcbe158463b0247ea52163cde1bff82ed37"
+
+[[package]]
 name = "danqing-log"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "danqing",
+ "danqing-logfile",
  "log",
  "memchr",
  "memmap2",
@@ -895,6 +902,19 @@ dependencies = [
  "rfd",
  "serde_json",
  "winresource",
+]
+
+[[package]]
+name = "danqing-logfile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "danqing-encoding",
+ "log",
+ "memchr",
+ "memmap2",
+ "regex",
+ "serde_json",
 ]
 
 [[package]]
