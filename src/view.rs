@@ -29,12 +29,17 @@ use danqing::{
     RectBatch, Size, TextBatch,
 };
 
+use danqing::selection::{self, TextSelection};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Column, Schema, SubRow};
 use danqing_log::logfile::LogFile;
-use danqing_log::selection::{self, TextSelection};
 
 use crate::{LogApp, Msg, ViewMode};
+
+/// 复制行数上限 (R3 业务护栏): 滚轮甩底可造出全文件选区, 无上限复制 = 逐行
+/// 解码 + 逐行分配, UI 冻结分钟级。10 万行 ≈ 16MB 文本, 剪贴板与内存都安全。
+/// (text::selection 下沉时留产品侧 —— 框架 copy_text 本身无行数限制。)
+const COPY_MAX_LINES: u64 = 100_000;
 
 /// 行高 (逻辑像素)。24 = 可读性底线: 14px 正文上下仍留呼吸, 终端感消失。
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
@@ -277,7 +282,7 @@ pub(crate) struct LogView {
     /// 命中文件行号表 (升序), 高亮成员判定走二分。
     search_hits: Option<Arc<Vec<u64>>>,
     /// 文件数据编码 (高亮前缀宽度测量须与行显示同一解码路径)。
-    encoding: danqing_log::encoding::Encoding,
+    encoding: danqing::encoding::Encoding,
     /// 书签文件行号 (用户量级, 逐帧克隆无感)。
     bookmarks: std::collections::BTreeSet<u64>,
     // ---- 展开态 (jsonl-table T4) ----
@@ -332,7 +337,7 @@ impl LogView {
             search_pattern_src: None,
             search_re: None,
             search_hits: None,
-            encoding: danqing_log::encoding::Encoding::Utf8,
+            encoding: danqing::encoding::Encoding::Utf8,
             bookmarks: std::collections::BTreeSet::new(),
             expanded: ExpandMap::new(),
             sub_rows: std::collections::BTreeMap::new(),
@@ -388,7 +393,7 @@ impl LogView {
     fn selection_over_limit(&self) -> bool {
         self.selection.as_ref().is_some_and(|s| {
             let ((r0, _), (r1, _)) = s.ordered();
-            r1.saturating_sub(r0) + 1 > selection::COPY_MAX_LINES
+            r1.saturating_sub(r0) + 1 > COPY_MAX_LINES
         })
     }
 
@@ -453,75 +458,15 @@ impl LogView {
     }
 }
 
-/// 截断到可用宽度: 先整行测量, 超宽则二分最长可容纳前缀 (字符边界对齐)。
-/// 返回 (展示切片, 是否被截断) —— 截断时调用方补省略号由 paint 统一处理。
-fn fit_line<'a>(texts: &mut TextBatch, s: &'a str, max_w: f32, px: u16) -> (&'a str, bool) {
-    if texts.measure(s, px) <= max_w {
-        return (s, false);
-    }
-    let mut lo = 0usize;
-    let mut hi = s.len();
-    while lo < hi {
-        let mut mid = (lo + hi).div_ceil(2);
-        while !s.is_char_boundary(mid) {
-            mid -= 1;
-        }
-        if texts.measure(&s[..mid], px) <= max_w {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-            while hi > 0 && !s.is_char_boundary(hi) {
-                hi -= 1;
-            }
-        }
-    }
-    // 给省略号腾位
-    let ell = texts.measure("…", px);
-    while lo > 0 && texts.measure(&s[..lo], px) + ell > max_w {
-        lo -= 1;
-        while !s.is_char_boundary(lo) {
-            lo -= 1;
-        }
-    }
-    (&s[..lo], true)
-}
-
 /// 画一段可能超宽的文本 (截断补省略号), 返回是否截断。
+/// 截断逻辑走 [`danqing::fit::fit_line`] (measure 闭包适配 TextBatch)。
 fn fit_push(texts: &mut TextBatch, s: &str, max_w: f32, x: f32, baseline: f32, px: u16, c: Color) {
-    let (shown, truncated) = fit_line(texts, s, max_w, px);
+    let (shown, truncated) = danqing::fit::fit_line(s, max_w, |t| texts.measure(t, px));
     texts.push_text(shown, x, baseline, px, c);
     if truncated {
         let w = texts.measure(shown, px);
         texts.push_text("…", x + w, baseline, px, c);
     }
-}
-
-/// 水平滚动左截断 (T7): 内容左缘在 w 像素处被切断, 返回 (后缀, 亚字符偏移)。
-/// 调用方把后缀画在 `x - sub` —— 亚像素平滑, 无需裁剪层 (danqing 无 scissor,
-/// 直接画负 x 会压行号槽)。
-fn scroll_trim<'a>(texts: &mut TextBatch, s: &'a str, w: f32, px: u16) -> (&'a str, f32) {
-    if w <= 0.0 {
-        return (s, 0.0);
-    }
-    // 二分: 最长宽度 ≤ w 的前缀
-    let mut lo = 0usize;
-    let mut hi = s.len();
-    while lo < hi {
-        let mut mid = (lo + hi).div_ceil(2);
-        while !s.is_char_boundary(mid) {
-            mid -= 1;
-        }
-        if texts.measure(&s[..mid], px) <= w {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-            while hi > 0 && !s.is_char_boundary(hi) {
-                hi -= 1;
-            }
-        }
-    }
-    let sub = w - texts.measure(&s[..lo], px);
-    (&s[lo..], sub.max(0.0))
 }
 
 /// 水平偏移钳制 (T7): [0, 内容宽 - 视口宽]。独立成函数供单测。
@@ -644,7 +589,8 @@ impl Widget for LogView {
             for (cx, cw, col) in &cols {
                 let cell_x = cx + 8.0;
                 let left_cut = (text_x - cell_x).max(0.0);
-                let (shown, sub) = scroll_trim(texts, &col.name, left_cut, FONT_SIZE);
+                let (shown, sub) =
+                    danqing::fit::scroll_trim(&col.name, left_cut, |t| texts.measure(t, FONT_SIZE));
                 let draw_x = cell_x + left_cut - sub;
                 let max_w = (cx + cw - 8.0).min(text_right) - draw_x;
                 if max_w > 0.0 {
@@ -796,15 +742,12 @@ impl Widget for LogView {
                     if hits.binary_search(&line_no).is_ok() {
                         for m in re.find_iter(raw) {
                             let px0 = texts.measure(
-                                &danqing_log::encoding::decode_line(
-                                    self.encoding,
-                                    &raw[..m.start()],
-                                ),
+                                &danqing::encoding::decode_line(self.encoding, &raw[..m.start()]),
                                 FONT_SIZE,
                             );
                             let px1 = px0
                                 + texts.measure(
-                                    &danqing_log::encoding::decode_line(
+                                    &danqing::encoding::decode_line(
                                         self.encoding,
                                         &raw[m.start()..m.end()],
                                     ),
@@ -857,7 +800,9 @@ impl Widget for LogView {
                     // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
                     if left_cut <= 0.0 && is_numeric(&v) {
                         let (shown, truncated) =
-                            fit_line(texts, &v, right_edge - cell_x, FONT_SIZE);
+                            danqing::fit::fit_line(&v, right_edge - cell_x, |t| {
+                                texts.measure(t, FONT_SIZE)
+                            });
                         if !truncated {
                             let w = texts.measure(shown, FONT_SIZE);
                             texts.push_text(
@@ -870,7 +815,8 @@ impl Widget for LogView {
                             continue;
                         }
                     }
-                    let (shown, sub) = scroll_trim(texts, &v, left_cut, FONT_SIZE);
+                    let (shown, sub) =
+                        danqing::fit::scroll_trim(&v, left_cut, |t| texts.measure(t, FONT_SIZE));
                     let draw_x = cell_x + left_cut - sub;
                     let max_w = right_edge - draw_x;
                     if max_w > 0.0 {
@@ -894,7 +840,8 @@ impl Widget for LogView {
                 if full_w > self.max_seen.get() {
                     self.max_seen.set(full_w);
                 }
-                let (shown, sub) = scroll_trim(texts, &raw, x_off, FONT_SIZE);
+                let (shown, sub) =
+                    danqing::fit::scroll_trim(&raw, x_off, |t| texts.measure(t, FONT_SIZE));
                 // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
                 // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
                 let base = raw.len() - shown.len();
@@ -1161,7 +1108,7 @@ impl Widget for LogView {
                 } else if self.selection_over_limit() {
                     msgs.push(Box::new(Msg::Notice(format!(
                         "选区超 {} 万行未复制 (防冻结)",
-                        selection::COPY_MAX_LINES / 10000
+                        COPY_MAX_LINES / 10000
                     ))));
                     EventResult::Ignored
                 } else {
@@ -1683,18 +1630,20 @@ mod tests {
     fn scroll_trim_prefix_math() {
         let mut texts = TextBatch::new();
         let s = "abcdefghij";
-        let (whole, sub0) = scroll_trim(&mut texts, s, 0.0, FONT_SIZE);
+        // 经 danqing::fit::scroll_trim (measure 闭包适配 TextBatch), 验证真实字体测量下适配
+        let (whole, sub0) = danqing::fit::scroll_trim(s, 0.0, |t| texts.measure(t, FONT_SIZE));
         assert_eq!(whole, s, "零偏移原样");
         assert_eq!(sub0, 0.0);
         let w5 = texts.measure("abcde", FONT_SIZE);
-        let (suf, sub) = scroll_trim(&mut texts, s, w5, FONT_SIZE);
+        let (suf, sub) = danqing::fit::scroll_trim(s, w5, |t| texts.measure(t, FONT_SIZE));
         assert_eq!(suf, "fghij", "恰好 5 字符宽处切断");
         assert!(sub.abs() < 1e-3, "整字符边界无亚偏移: {sub}");
         let char_w = texts.measure("a", FONT_SIZE);
-        let (suf, sub) = scroll_trim(&mut texts, s, char_w / 2.0, FONT_SIZE);
+        let (suf, sub) =
+            danqing::fit::scroll_trim(s, char_w / 2.0, |t| texts.measure(t, FONT_SIZE));
         assert_eq!(suf, s, "半字符处不切整字符");
         assert!(sub > 0.0 && sub <= char_w, "亚字符偏移平滑: {sub}");
-        let (none, _) = scroll_trim(&mut texts, s, 99999.0, FONT_SIZE);
+        let (none, _) = danqing::fit::scroll_trim(s, 99999.0, |t| texts.measure(t, FONT_SIZE));
         assert_eq!(none, "", "全滚出为空");
     }
 

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 
-use crate::encoding::{self, Encoding};
+use danqing::encoding::{self, Encoding};
 
 /// 打开统计: 截图弹药的原材料, 全部实测不估算。
 #[derive(Debug, Clone)]

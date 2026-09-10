@@ -31,7 +31,7 @@ use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
 
-use danqing_log::encoding::{self, Encoding};
+use danqing::encoding::{self, Encoding};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
