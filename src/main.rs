@@ -18,6 +18,7 @@
 
 mod app_update;
 mod settings;
+mod tray;
 mod view;
 
 use std::path::{Path, PathBuf};
@@ -92,6 +93,8 @@ fn title_theme() -> SceneTheme {
 
 /// 应用状态本体 (danqing App)。
 pub(crate) struct LogApp {
+    /// 窗口事件发送器 (显隐/退出等)。
+    window_sender: Option<danqing::WindowEventSender>,
     file: Arc<LogFile>,
     /// 是否已打开真实文件 (false = 无参启动空态占位: 轮询/键盘导航全门禁,
     /// 仅 Ctrl+O 与设置可用)。
@@ -190,6 +193,8 @@ pub(crate) enum Msg {
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     Notice(String),
+    /// 退出应用 (托盘菜单)。
+    Quit,
     /// 无操作 (事件吞噬用，不触发任何状态变更)。
     Noop,
 }
@@ -198,6 +203,7 @@ impl LogApp {
     /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
     fn new_empty() -> Self {
         Self {
+            window_sender: None,
             file: Arc::new(LogFile::empty()),
             has_file: false,
             top_row: 0.0,
@@ -868,6 +874,11 @@ impl App for LogApp {
                 self.notice = Some(text);
                 self.refresh_status();
             }
+            Msg::Quit => {
+                if let Some(sender) = &self.window_sender {
+                    sender.quit();
+                }
+            }
             Msg::Noop => {}
         }
     }
@@ -1097,6 +1108,24 @@ impl App for LogApp {
 
     fn window_title(&self) -> Option<String> {
         Some(self.make_title())
+    }
+
+    fn attach_window_sender(&mut self, sender: danqing::WindowEventSender) {
+        self.window_sender = Some(sender);
+    }
+
+    fn tray_menu(&self) -> danqing::tray_icon::menu::Menu {
+        tray::build_menu()
+    }
+
+    fn tray_action(&mut self, id: u8) -> Option<Msg> {
+        if id == tray::ACTION_SETTINGS {
+            Some(Msg::OpenSettings)
+        } else if id == tray::ACTION_QUIT {
+            Some(Msg::Quit)
+        } else {
+            None
+        }
     }
 }
 
