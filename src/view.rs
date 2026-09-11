@@ -261,7 +261,7 @@ pub(crate) struct LogView {
     /// 只加 focusable 不加 hit_area, 点击永不聚焦, Ctrl+C 链路断路)。
     area: std::cell::Cell<Rect>,
     /// 主题模式 (从 LogApp 同步)。
-    theme: crate::theme::ThemeMode,
+    theme: crate::config::AppTheme,
 }
 
 impl LogView {
@@ -295,7 +295,7 @@ impl LogView {
             row_geom: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             gutter_w: std::cell::Cell::new(GUTTER_MIN),
             area: std::cell::Cell::new(Rect::default()),
-            theme: crate::theme::ThemeMode::Light,
+            theme: crate::config::AppTheme::Light,
         }
     }
 
@@ -473,10 +473,10 @@ impl Widget for LogView {
         let Some(file) = &self.file else { return };
         let count = self.display_count();
         let table = self.table_mode();
-        let theme = self.theme;
+        let th = self.theme.theme();
 
         // 背景 + 区域划分
-        rects.push_rect(area, crate::theme::bg(theme), 0.0);
+        rects.push_rect(area, th.background(), 0.0);
         let chrome_top = self.chrome_top();
         let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
         let status_y = area.origin.y + chrome_top + list_h;
@@ -531,7 +531,7 @@ impl Widget for LogView {
             let hy = area.origin.y;
             rects.push_rect(
                 Rect::from_xywh(area.origin.x, hy, area.size.width, HEADER_H - 1.0),
-                crate::theme::header_bg(theme),
+                th.surface_variant(),
                 0.0,
             );
             for (cx, cw, col) in &cols {
@@ -549,7 +549,7 @@ impl Widget for LogView {
                         draw_x,
                         hy + baseline_off,
                         FONT_SIZE,
-                        crate::theme::header_fg(theme),
+                        th.text_secondary(),
                     );
                 }
             }
@@ -580,7 +580,7 @@ impl Widget for LogView {
                 area.origin.x + (area.size.width - title_w) / 2.0,
                 mid_y - 12.0,
                 16,
-                crate::theme::text_default(theme),
+                th.text_primary(),
             );
             let hint_w = texts.measure(hint, FONT_SIZE);
             texts.push_text(
@@ -588,7 +588,7 @@ impl Widget for LogView {
                 area.origin.x + (area.size.width - hint_w) / 2.0,
                 mid_y + 12.0,
                 FONT_SIZE,
-                crate::theme::gutter_fg(theme),
+                th.text_secondary(),
             );
         }
         // 裁剪: 行内容不溢出到表头/底栏
@@ -616,17 +616,17 @@ impl Widget for LogView {
             let row_rect =
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
             if table && i % 2 == 1 {
-                rects.push_rect(row_rect, crate::theme::zebra_bg(theme), 0.0);
+                rects.push_rect(row_rect, th.surface_variant(), 0.0);
             }
             if i == self.selected && !has_text_sel {
-                rects.push_rect(row_rect, crate::theme::selection_bg(theme), 0.0);
+                rects.push_rect(row_rect, th.selection(), 0.0);
                 rects.push_rect(
                     Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
-                    crate::theme::accent(theme),
+                    th.accent(),
                     0.0,
                 );
             } else if i == self.hover_row.get() {
-                rects.push_rect(row_rect, crate::theme::hover_bg(theme), 0.0);
+                rects.push_rect(row_rect, th.surface_variant(), 0.0);
             }
             let (line_no, sub_off) = self.line_at(i);
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
@@ -643,7 +643,7 @@ impl Widget for LogView {
                             draw_x,
                             y + baseline_off,
                             FONT_SIZE,
-                            crate::theme::status_fg(theme),
+                            th.text_secondary(),
                         );
                     }
                 }
@@ -661,7 +661,7 @@ impl Widget for LogView {
                                 area.size.width - SCROLLBAR_W,
                                 ROW_HEIGHT,
                             ),
-                            crate::theme::hit_row_bg(theme),
+                            th.selection(),
                             0.0,
                         );
                     }
@@ -673,7 +673,7 @@ impl Widget for LogView {
             let no_color = if self.bookmarks.contains(&line_no) {
                 Color::rgb(0.75, 0.60, 0.10)
             } else {
-                crate::theme::gutter_fg(theme)
+                th.text_secondary()
             };
             texts.push_text(
                 &no,
@@ -706,7 +706,7 @@ impl Widget for LogView {
                             if x1 > x0 {
                                 rects.push_rect(
                                     Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                    crate::theme::hit_bg(theme),
+                                    th.selection(),
                                     2.0,
                                 );
                             }
@@ -730,7 +730,7 @@ impl Widget for LogView {
                         area.origin.x + 2.0,
                         y + row_baseline_off,
                         EXPAND_FONT_SIZE,
-                        crate::theme::text_default(theme),
+                        th.text_primary(),
                     );
                 }
                 for (cx, cw, col) in &cols {
@@ -811,7 +811,7 @@ impl Widget for LogView {
                         if x1 > x0 {
                             rects.push_rect(
                                 Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                crate::theme::text_sel_bg(theme),
+                                th.selection(),
                                 2.0,
                             );
                         }
@@ -839,7 +839,7 @@ impl Widget for LogView {
             let track_y = rows_top + list_h - 6.0;
             rects.push_rect(
                 Rect::from_xywh(text_x, track_y, text_w, 6.0),
-                crate::theme::scrollbar_track(theme),
+                th.divider(),
                 3.0,
             );
             let ratio = (text_w / max_seen).min(1.0);
@@ -848,7 +848,7 @@ impl Widget for LogView {
             let thumb_x = text_x + (x_off / max_x) * (text_w - thumb_w);
             rects.push_rect(
                 Rect::from_xywh(thumb_x, track_y, thumb_w, 6.0),
-                crate::theme::scrollbar_thumb(theme),
+                th.border(),
                 3.0,
             );
         }
@@ -860,7 +860,7 @@ impl Widget for LogView {
             let track_x = area.origin.x + area.size.width - SCROLLBAR_W;
             rects.push_rect(
                 Rect::from_xywh(track_x, rows_top, SCROLLBAR_W, list_h),
-                crate::theme::scrollbar_track(theme),
+                th.divider(),
                 3.0,
             );
             let ratio = ((visible / count as f64) as f32).min(1.0);
@@ -874,7 +874,7 @@ impl Widget for LogView {
             let thumb_y = rows_top + t * (list_h - thumb_h);
             rects.push_rect(
                 Rect::from_xywh(track_x, thumb_y, SCROLLBAR_W, thumb_h),
-                crate::theme::scrollbar_thumb(theme),
+                th.border(),
                 3.0,
             );
         }
@@ -892,7 +892,7 @@ impl Widget for LogView {
             area.origin.x + 10.0,
             sy,
             AUX_FONT_SIZE,
-            crate::theme::status_fg(theme),
+            th.text_secondary(),
         );
         // 设置入口 (S2): ⚙ 关于 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 关于";
@@ -902,9 +902,9 @@ impl Widget for LogView {
             Rect::from_xywh(settings_x - 4.0, status_y, settings_w + 8.0, STATUS_HEIGHT);
         self.settings_btn_rect.set(settings_rect);
         let settings_color = if self.settings_hover.get() {
-            crate::theme::text_default(theme)
+            th.text_primary()
         } else {
-            crate::theme::status_fg(theme)
+            th.text_secondary()
         };
         texts.push_text(
             settings_label,
@@ -928,7 +928,7 @@ impl Widget for LogView {
             pos_x.max(area.origin.x + 10.0),
             sy,
             AUX_FONT_SIZE,
-            crate::theme::status_fg(theme),
+            th.text_secondary(),
         );
     }
 
@@ -1171,7 +1171,7 @@ pub(crate) struct Bar {
     /// 否则点击定位光标会偏一个 label 宽)。
     label_width: std::cell::Cell<f32>,
     /// 主题模式 (从 LogApp 同步)。
-    theme: crate::theme::ThemeMode,
+    theme: crate::config::AppTheme,
 }
 
 impl Bar {
@@ -1187,7 +1187,7 @@ impl Bar {
             applied_search_rev: 0,
             active: ActiveBar::Hidden,
             label_width: std::cell::Cell::new(0.0),
-            theme: crate::theme::ThemeMode::Light,
+            theme: crate::config::AppTheme::Light,
         }
     }
 
@@ -1336,10 +1336,10 @@ impl Widget for Bar {
         if self.active == ActiveBar::Hidden {
             return;
         }
-        let theme = self.theme;
+        let th = self.theme.theme();
         rects.push_rect(
             Rect::from_xywh(area.origin.x, area.origin.y, area.size.width, FILTER_BAR_H),
-            crate::theme::filter_bar_bg(theme),
+            th.surface_variant(),
             0.0,
         );
         let line_h = texts.line_height(f32::from(FONT_SIZE));
@@ -1353,7 +1353,7 @@ impl Widget for Bar {
             area.origin.x + BAR_PAD_X,
             baseline,
             FONT_SIZE,
-            crate::theme::filter_fg(theme),
+            th.text_primary(),
         );
         let label_w = texts.measure(label, FONT_SIZE);
         self.label_width.set(label_w);
