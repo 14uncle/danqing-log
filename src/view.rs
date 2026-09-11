@@ -1386,7 +1386,7 @@ impl Widget for Bar {
         if let Some(ti) = self.active_input_mut() {
             let _ = ti.layout(constraints, texts);
         }
-        Size::new(constraints.max().width, FILTER_BAR_H)
+        Size::new(constraints.max().width, FILTER_BAR_H + BAR_TOP_OFFSET)
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
