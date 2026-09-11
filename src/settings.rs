@@ -11,11 +11,11 @@ use danqing::widget::{
     Row, Text, Widget,
 };
 use danqing::{
-    Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Point, Rect, RectBatch, Size,
+    Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size,
     TextBatch, Theme,
 };
 
-use crate::config::AppTheme;
+use crate::config::{self, AppTheme};
 use crate::LogApp;
 use crate::Msg;
 
@@ -25,23 +25,25 @@ const CARD_WIDTH: f32 = 360.0;
 const BODY_SIZE: u16 = 14;
 
 /// 设置卡浮层: danqing::Overlay 承载 scrim/居中/模态门控 (簇C 下沉)。
-pub(crate) fn settings_overlay() -> impl Widget {
-    Overlay::themed(&LightTheme, Center::new(settings_card()).fill_max())
+pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(settings_card(theme)).fill_max())
         .bind_open(|app: &LogApp| app.settings_open)
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
 /// 玻璃卡片: 关闭行 + 关于 + 版本行 + 主题切换 + 反馈链接。
-fn settings_card() -> impl Widget {
+fn settings_card(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
     let pad = Edges {
         top: 24.0,
         right: 24.0,
         bottom: 16.0,
         left: 24.0,
     };
-    UiBox::new(Color::WHITE)
+    UiBox::new(t.surface())
         .radius(12.0)
-        .border_color(LightTheme.border())
+        .border_color(t.border())
         .child(Padding::new(
             pad,
             Column::new()
@@ -138,8 +140,8 @@ impl VersionRow {
             has_hint: false,
             btn_hover: false,
             btn_area: std::cell::Cell::new(Rect::default()),
-            text_secondary: LightTheme.text_secondary(),
-            text_primary: LightTheme.text_primary(),
+            text_secondary: Color::rgb(0.40, 0.40, 0.42),
+            text_primary: Color::rgb(0.12, 0.12, 0.12),
         }
     }
 }
@@ -264,8 +266,8 @@ impl Link {
             url: url.to_string(),
             hovered: false,
             area: Rect::default(),
-            hover_bg: LightTheme.surface_variant(),
-            accent: LightTheme.accent(),
+            hover_bg: Color::TRANSPARENT,
+            accent: Color::rgb(0.18, 0.35, 0.60),
         }
     }
 }

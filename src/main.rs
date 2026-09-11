@@ -928,7 +928,7 @@ impl App for LogApp {
                         )
                         .fill(view::LogView::new(), 1),
                 )
-                .child(settings::settings_overlay()),
+                .child(settings::settings_overlay(self.theme)),
         )
     }
 
