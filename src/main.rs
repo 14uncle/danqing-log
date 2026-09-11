@@ -80,17 +80,29 @@ pub(crate) struct SearchOutcome {
 
 /// 标题栏主题：浅色 (匹配白底日志视图), 深色文字。
 /// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用深色。
-fn title_theme() -> SceneTheme {
-    SceneTheme::new(ScenePalette {
-        base: Color::rgb(0.96, 0.96, 0.96),
-        accent: Color::rgb(0.18, 0.35, 0.60),
-        text_primary: Color::rgb(0.12, 0.12, 0.12),
-        text_secondary: Color::rgb(0.40, 0.40, 0.42),
-        surface: Color::rgba(0.0, 0.0, 0.0, 0.04),
-        surface_input: Color::rgba(0.0, 0.0, 0.0, 0.06),
-        backdrop_light: Color::rgb(0.85, 0.85, 0.88),
-        backdrop_dark: Color::rgb(0.70, 0.70, 0.74),
-    })
+fn title_theme(theme: config::AppTheme) -> SceneTheme {
+    match theme {
+        config::AppTheme::Light => SceneTheme::new(ScenePalette {
+            base: Color::rgb(0.96, 0.96, 0.96),
+            accent: Color::rgb(0.18, 0.35, 0.60),
+            text_primary: Color::rgb(0.12, 0.12, 0.12),
+            text_secondary: Color::rgb(0.40, 0.40, 0.42),
+            surface: Color::rgba(0.0, 0.0, 0.0, 0.04),
+            surface_input: Color::rgba(0.0, 0.0, 0.0, 0.06),
+            backdrop_light: Color::rgb(0.85, 0.85, 0.88),
+            backdrop_dark: Color::rgb(0.70, 0.70, 0.74),
+        }),
+        config::AppTheme::Dark => SceneTheme::new(ScenePalette {
+            base: Color::rgb(0.10, 0.10, 0.13),
+            accent: Color::from_srgb8(26, 158, 138),
+            text_primary: Color::rgb(0.90, 0.90, 0.92),
+            text_secondary: Color::rgb(0.56, 0.56, 0.58),
+            surface: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            surface_input: Color::rgba(1.0, 1.0, 1.0, 0.10),
+            backdrop_light: Color::rgb(0.16, 0.16, 0.20),
+            backdrop_dark: Color::rgb(0.06, 0.06, 0.08),
+        }),
+    }
 }
 
 /// 应用状态本体 (danqing App)。
@@ -908,7 +920,7 @@ impl App for LogApp {
                 .child(
                     Column::new()
                         .child(
-                            TitleBar::themed(&title_theme(), self.make_title())
+                            TitleBar::themed(&title_theme(self.theme), self.make_title())
                                 .logo_kind(LogoKind::Log)
                                 .on_close(|| WindowAction::Close)
                                 .on_minimize(|| WindowAction::Minimize)
