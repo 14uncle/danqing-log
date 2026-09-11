@@ -32,12 +32,12 @@ use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
 
-use danqing::encoding::{self, Encoding};
+use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
 use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
-use danqing_log::search::{AsyncJob, SearchNav, bytes_as_literal_regex};
+use danqing_log::search::{AsyncJob, SearchNav};
 
 /// 空格/PageUp-Down 翻页的行数：POC 定值。正式版由组件回报视口行数。
 pub(crate) const PAGE_ROWS: f64 = 25.0;

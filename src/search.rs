@@ -151,24 +151,10 @@ impl SearchNav {
     }
 }
 
-/// 字节序列 → `\xNN` 转义字面量正则: GBK 等非 UTF-8 编码的查询字节无法直接进
-/// regex 模式 (模式必须是合法 UTF-8 str), 转义后 bytes::Regex 可用。
-/// 必须带 `(?-u)` 关 Unicode 模式 —— 否则 `\xD6` 被当码点 U+00D6 按 UTF-8
-/// 展开成两字节 [C3 96], 匹配不到原始字节 (测试当场抓住)。
-/// 代价: 该编码下搜索退化为字面量语义 (无正则语法), 属有意边界。
-pub fn bytes_as_literal_regex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 4 + 5);
-    s.push_str("(?-u)");
-    for &b in bytes {
-        let _ = write!(s, "\\x{b:02X}");
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use danqing::encoding::bytes_as_literal_regex;
 
     #[test]
     fn nav_first_from_positions() {

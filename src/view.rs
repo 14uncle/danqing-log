@@ -26,7 +26,7 @@ use std::time::Instant;
 use danqing::widget::{EventResult, MsgQueue, TextInput, Widget};
 use danqing::{
     Color, Constraints, Edges, Event, Key, LightTheme, MouseButton, NamedKey, Point, Rect,
-    RectBatch, Size, TextBatch,
+    RectBatch, Size, TextBatch, Theme,
 };
 
 use danqing::selection::{self, TextSelection};
@@ -105,7 +105,7 @@ fn header_fg() -> Color {
     Color::rgb(0.35, 0.35, 0.38)
 }
 fn header_line() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.10)
+    LightTheme.divider()
 }
 /// 搜索命中行内区间底色 (琥珀)。
 fn hit_bg() -> Color {

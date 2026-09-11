@@ -12,7 +12,7 @@ use danqing::widget::{
 };
 use danqing::{
     Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Point, Rect, RectBatch, Size,
-    TextBatch,
+    TextBatch, Theme,
 };
 
 use crate::LogApp;
@@ -36,12 +36,13 @@ fn accent() -> Color {
 fn card_bg() -> Color {
     Color::rgb(1.0, 1.0, 1.0)
 }
-/// 卡片描边 (白卡在 scrim 上的边缘定义)。
+/// 卡片描边: 框架 border token。
 fn card_border() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.12)
+    LightTheme.border()
 }
+/// 悬停背景: 框架 surface_variant token。
 fn hover_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.06)
+    LightTheme.surface_variant()
 }
 
 /// 设置卡浮层: danqing::Overlay 承载 scrim/居中/模态门控 (簇C 下沉)。

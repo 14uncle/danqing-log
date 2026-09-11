@@ -35,10 +35,10 @@
 
 ## 结构
 
-- `src/logfile.rs` — 引擎层 (mmap/行索引/搜索), 全部碾压主张在此
-- `src/jsonl.rs` — 前提②引擎: JSONL 检测/列发现/memmem 字段提取/字段过滤 (零 parse; serde_json 需 preserve_order 保首见列序)
+- `src/logfile.rs` — 引擎层 (mmap/行索引/搜索), 全部碾压主张在此 (2026-09-10 拆为兄弟 crate `danqing-logfile`, 此处 re-export)
+- `src/jsonl.rs` — 前提②引擎: JSONL 检测/列发现/memmem 字段提取/字段过滤 (零 parse; serde_json 需 preserve_order 保首见列序) (同拆至 `danqing-logfile`)
 - `src/main.rs` + `src/view.rs` — GUI (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
-- `src/encoding.rs` — 编码检测/转码 (BOM→交替NUL→UTF-8合法性→GBK统计→Latin-1兜底; CP936 零依赖 FFI)
+- ~~`src/encoding.rs`~~ — 编码检测/转码 (2026-09-10 独立为兄弟 crate `danqing-encoding`, danqing 通过 `pub use danqing_encoding as encoding` re-export)
 - `src/search.rs` — AsyncJob (worker+tick拾取泛化) + SearchNav 命中导航
 - `src/settings.rs` — 轻量设置卡 (scrim 遮罩 + 玻璃卡: 关于/版本/反馈)
 - `src/app_update.rs` — 更新检查接线 (薄封装 `danqing::update`)
@@ -67,4 +67,4 @@
 
 ## Patterns
 
-`src/logfile.rs` 是全仓风格基准: 中文 doc comment 说明做什么+不做什么+为什么; 统计一律实测不估算 (OpenStats); 失败语义明确 (UTF-16 报错不猜码)。
+`danqing-logfile/src/logfile.rs` 是全仓风格基准: 中文 doc comment 说明做什么+不做什么+为什么; 统计一律实测不估算 (OpenStats); 失败语义明确 (UTF-16 报错不猜码)。兄弟 crate 零 UI 依赖。
