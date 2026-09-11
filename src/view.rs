@@ -72,71 +72,9 @@ const DOUBLE_CLICK_MS: u128 = 300;
 /// 双击位移容差; 同值兼任「按下→框选」升级阈值 (抖动不产选区)。
 const CLICK_DIST: f32 = 4.0;
 
-/// 浅色基底 (白底日志视图)。
-fn bg() -> Color {
-    Color::rgb(0.98, 0.98, 0.98)
-}
-fn text_default() -> Color {
-    Color::rgb(0.12, 0.12, 0.12)
-}
-fn gutter_fg() -> Color {
-    // 行号可降权但不能淡到看不清 (0.65 白底教训; klogg 行号近正文色)
-    Color::rgb(0.45, 0.45, 0.45)
-}
-fn selection_bg() -> Color {
-    Color::rgba(0.24, 0.42, 0.66, 0.24)
-}
-fn status_fg() -> Color {
-    // 底栏/展开子行: 0.40 在白底小字下临界, 加深到近正文
-    Color::rgb(0.25, 0.25, 0.25)
-}
-fn scrollbar_track() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.05)
-}
-fn scrollbar_thumb() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.18)
-}
-fn filter_bar_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.04)
-}
-fn filter_fg() -> Color {
-    // 输入文本与前缀标签: 0.30 仍偏浅, 对齐正文对比度
-    Color::rgb(0.20, 0.20, 0.20)
-}
-fn header_fg() -> Color {
-    Color::rgb(0.35, 0.35, 0.38)
-}
+/// header_line 使用框架 LightTheme divider。
 fn header_line() -> Color {
     LightTheme.divider()
-}
-/// 搜索命中行内区间底色 (琥珀)。
-fn hit_bg() -> Color {
-    Color::rgba(0.95, 0.75, 0.10, 0.35)
-}
-/// 表格模式命中行底色 (淡琥珀; 行内区间高亮只在原始模式)。
-fn hit_row_bg() -> Color {
-    Color::rgba(0.95, 0.75, 0.10, 0.12)
-}
-/// 斑马纹 (奇数显示行, 仅表格模式): 宽表横向跟踪不串行。
-fn zebra_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.025)
-}
-/// 鼠标悬停行底色。
-fn hover_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.045)
-}
-/// 文本选区底色 (T3): 与行选中同族蓝但略实 —— 行选中是整行宽淡底+强调条,
-/// 文本选区只垫字符区间, 叠在搜索命中琥珀上时仍可读 (选区优先)。
-fn text_sel_bg() -> Color {
-    Color::rgba(0.24, 0.42, 0.66, 0.32)
-}
-/// 强调蓝 (选中行左侧竖条)。
-fn accent() -> Color {
-    Color::rgb(0.24, 0.42, 0.66)
-}
-/// 表头底色 (与数据区轻分隔)。
-fn header_bg() -> Color {
-    Color::rgba(0.0, 0.0, 0.0, 0.04)
 }
 /// INFO / 3xx 蓝。
 fn info_fg() -> Color {
@@ -171,7 +109,7 @@ fn level_color(line: &[u8]) -> Color {
     } else if has(b"DEBUG") || has(b"TRACE") {
         Color::rgb(0.55, 0.55, 0.58)
     } else {
-        text_default()
+        Color::rgb(0.12, 0.12, 0.12) // text_default
     }
 }
 
@@ -189,7 +127,7 @@ fn level_cell_color(v: &str) -> Color {
     } else if has(b"DEBUG") || has(b"TRACE") {
         trace_fg()
     } else {
-        text_default()
+        Color::rgb(0.12, 0.12, 0.12) // text_default
     }
 }
 
@@ -200,7 +138,7 @@ fn status_color(v: &str) -> Color {
         Some(b'3') => info_fg(),
         Some(b'4') => warn_fg(),
         Some(b'5') => err_fg(),
-        _ => text_default(),
+        _ => Color::rgb(0.12, 0.12, 0.12), // text_default
     }
 }
 
@@ -225,7 +163,7 @@ fn cell_color(name: &str, v: &str) -> Color {
     {
         return status_color(v);
     }
-    text_default()
+    Color::rgb(0.12, 0.12, 0.12) // text_default
 }
 
 /// 一行可见窗口的命中几何 (选区 T3): `base_byte` = 左截断起点的解码字节偏移,
@@ -322,6 +260,8 @@ pub(crate) struct LogView {
     /// 无它 focusable 形同虚设 —— hit_focusable 只认 hit_area (评审自查发现:
     /// 只加 focusable 不加 hit_area, 点击永不聚焦, Ctrl+C 链路断路)。
     area: std::cell::Cell<Rect>,
+    /// 主题模式 (从 LogApp 同步)。
+    theme: crate::theme::ThemeMode,
 }
 
 impl LogView {
@@ -355,6 +295,7 @@ impl LogView {
             row_geom: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             gutter_w: std::cell::Cell::new(GUTTER_MIN),
             area: std::cell::Cell::new(Rect::default()),
+            theme: crate::theme::ThemeMode::Light,
         }
     }
 
@@ -512,6 +453,7 @@ impl Widget for LogView {
         self.bookmarks = app.bookmarks.clone();
         self.expanded = app.expanded.clone();
         self.sub_rows = app.sub_rows.clone();
+        self.theme = app.theme;
         // 模式变化才重编译 (正则编译 ms 级, 不能进 paint)
         if self.search_pattern_src != app.search_pattern {
             self.search_pattern_src = app.search_pattern.clone();
@@ -531,9 +473,10 @@ impl Widget for LogView {
         let Some(file) = &self.file else { return };
         let count = self.display_count();
         let table = self.table_mode();
+        let theme = self.theme;
 
         // 背景 + 区域划分
-        rects.push_rect(area, bg(), 0.0);
+        rects.push_rect(area, crate::theme::bg(theme), 0.0);
         let chrome_top = self.chrome_top();
         let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
         let status_y = area.origin.y + chrome_top + list_h;
@@ -588,7 +531,7 @@ impl Widget for LogView {
             let hy = area.origin.y;
             rects.push_rect(
                 Rect::from_xywh(area.origin.x, hy, area.size.width, HEADER_H - 1.0),
-                header_bg(),
+                crate::theme::header_bg(theme),
                 0.0,
             );
             for (cx, cw, col) in &cols {
@@ -606,7 +549,7 @@ impl Widget for LogView {
                         draw_x,
                         hy + baseline_off,
                         FONT_SIZE,
-                        header_fg(),
+                        crate::theme::header_fg(theme),
                     );
                 }
             }
@@ -637,7 +580,7 @@ impl Widget for LogView {
                 area.origin.x + (area.size.width - title_w) / 2.0,
                 mid_y - 12.0,
                 16,
-                text_default(),
+                crate::theme::text_default(theme),
             );
             let hint_w = texts.measure(hint, FONT_SIZE);
             texts.push_text(
@@ -645,7 +588,7 @@ impl Widget for LogView {
                 area.origin.x + (area.size.width - hint_w) / 2.0,
                 mid_y + 12.0,
                 FONT_SIZE,
-                gutter_fg(),
+                crate::theme::gutter_fg(theme),
             );
         }
         // 裁剪: 行内容不溢出到表头/底栏
@@ -673,17 +616,17 @@ impl Widget for LogView {
             let row_rect =
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
             if table && i % 2 == 1 {
-                rects.push_rect(row_rect, zebra_bg(), 0.0);
+                rects.push_rect(row_rect, crate::theme::zebra_bg(theme), 0.0);
             }
             if i == self.selected && !has_text_sel {
-                rects.push_rect(row_rect, selection_bg(), 0.0);
+                rects.push_rect(row_rect, crate::theme::selection_bg(theme), 0.0);
                 rects.push_rect(
                     Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
-                    accent(),
+                    crate::theme::accent(theme),
                     0.0,
                 );
             } else if i == self.hover_row.get() {
-                rects.push_rect(row_rect, hover_bg(), 0.0);
+                rects.push_rect(row_rect, crate::theme::hover_bg(theme), 0.0);
             }
             let (line_no, sub_off) = self.line_at(i);
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
@@ -700,7 +643,7 @@ impl Widget for LogView {
                             draw_x,
                             y + baseline_off,
                             FONT_SIZE,
-                            status_fg(),
+                            crate::theme::status_fg(theme),
                         );
                     }
                 }
@@ -718,7 +661,7 @@ impl Widget for LogView {
                                 area.size.width - SCROLLBAR_W,
                                 ROW_HEIGHT,
                             ),
-                            hit_row_bg(),
+                            crate::theme::hit_row_bg(theme),
                             0.0,
                         );
                     }
@@ -730,7 +673,7 @@ impl Widget for LogView {
             let no_color = if self.bookmarks.contains(&line_no) {
                 Color::rgb(0.75, 0.60, 0.10)
             } else {
-                gutter_fg()
+                crate::theme::gutter_fg(theme)
             };
             texts.push_text(
                 &no,
@@ -763,7 +706,7 @@ impl Widget for LogView {
                             if x1 > x0 {
                                 rects.push_rect(
                                     Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                    hit_bg(),
+                                    crate::theme::hit_bg(theme),
                                     2.0,
                                 );
                             }
@@ -787,7 +730,7 @@ impl Widget for LogView {
                         area.origin.x + 2.0,
                         y + row_baseline_off,
                         EXPAND_FONT_SIZE,
-                        text_default(),
+                        crate::theme::text_default(theme),
                     );
                 }
                 for (cx, cw, col) in &cols {
@@ -868,7 +811,7 @@ impl Widget for LogView {
                         if x1 > x0 {
                             rects.push_rect(
                                 Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                text_sel_bg(),
+                                crate::theme::text_sel_bg(theme),
                                 2.0,
                             );
                         }
@@ -896,7 +839,7 @@ impl Widget for LogView {
             let track_y = rows_top + list_h - 6.0;
             rects.push_rect(
                 Rect::from_xywh(text_x, track_y, text_w, 6.0),
-                scrollbar_track(),
+                crate::theme::scrollbar_track(theme),
                 3.0,
             );
             let ratio = (text_w / max_seen).min(1.0);
@@ -905,7 +848,7 @@ impl Widget for LogView {
             let thumb_x = text_x + (x_off / max_x) * (text_w - thumb_w);
             rects.push_rect(
                 Rect::from_xywh(thumb_x, track_y, thumb_w, 6.0),
-                scrollbar_thumb(),
+                crate::theme::scrollbar_thumb(theme),
                 3.0,
             );
         }
@@ -917,7 +860,7 @@ impl Widget for LogView {
             let track_x = area.origin.x + area.size.width - SCROLLBAR_W;
             rects.push_rect(
                 Rect::from_xywh(track_x, rows_top, SCROLLBAR_W, list_h),
-                scrollbar_track(),
+                crate::theme::scrollbar_track(theme),
                 3.0,
             );
             let ratio = ((visible / count as f64) as f32).min(1.0);
@@ -931,7 +874,7 @@ impl Widget for LogView {
             let thumb_y = rows_top + t * (list_h - thumb_h);
             rects.push_rect(
                 Rect::from_xywh(track_x, thumb_y, SCROLLBAR_W, thumb_h),
-                scrollbar_thumb(),
+                crate::theme::scrollbar_thumb(theme),
                 3.0,
             );
         }
@@ -949,7 +892,7 @@ impl Widget for LogView {
             area.origin.x + 10.0,
             sy,
             AUX_FONT_SIZE,
-            status_fg(),
+            crate::theme::status_fg(theme),
         );
         // 设置入口 (S2): ⚙ 关于 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 关于";
@@ -959,9 +902,9 @@ impl Widget for LogView {
             Rect::from_xywh(settings_x - 4.0, status_y, settings_w + 8.0, STATUS_HEIGHT);
         self.settings_btn_rect.set(settings_rect);
         let settings_color = if self.settings_hover.get() {
-            text_default()
+            crate::theme::text_default(theme)
         } else {
-            status_fg()
+            crate::theme::status_fg(theme)
         };
         texts.push_text(
             settings_label,
@@ -985,7 +928,7 @@ impl Widget for LogView {
             pos_x.max(area.origin.x + 10.0),
             sy,
             AUX_FONT_SIZE,
-            status_fg(),
+            crate::theme::status_fg(theme),
         );
     }
 
@@ -1190,15 +1133,6 @@ const BAR_PAD_X: f32 = 10.0;
 const BAR_LABEL_GAP: f32 = 8.0;
 /// 栏顶部内偏移 (视觉下沉, 避紧贴标题栏底边)。
 const BAR_TOP_OFFSET: f32 = 3.0;
-/// 光标色 (浅色栏上深色)。
-fn caret_fg() -> Color {
-    Color::rgb(0.10, 0.10, 0.12)
-}
-/// 占位文字色 (可降权但 0.55 在白底 13px 下看不清, 用户验收打回)。
-fn placeholder_fg() -> Color {
-    Color::rgb(0.45, 0.45, 0.48)
-}
-
 /// 「清空输入」绑定闭包: 从应用状态读 clear revision。
 type ClearBinding = Box<dyn Fn(&dyn Any) -> u64>;
 
@@ -1236,6 +1170,8 @@ pub(crate) struct Bar {
     /// 前缀标签宽度 (paint 测量缓存, event 转发与 paint 的 input_area 须一致,
     /// 否则点击定位光标会偏一个 label 宽)。
     label_width: std::cell::Cell<f32>,
+    /// 主题模式 (从 LogApp 同步)。
+    theme: crate::theme::ThemeMode,
 }
 
 impl Bar {
@@ -1251,20 +1187,21 @@ impl Bar {
             applied_search_rev: 0,
             active: ActiveBar::Hidden,
             label_width: std::cell::Cell::new(0.0),
+            theme: crate::theme::ThemeMode::Light,
         }
     }
 
     fn fresh_filter() -> TextInput {
         Self::base_input().placeholder(
             "输入如 level=ERROR status=50* (AND · 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回",
-            placeholder_fg(),
+            Color::rgb(0.45, 0.45, 0.48), // placeholder_fg
         )
     }
 
     fn fresh_search() -> TextInput {
         Self::base_input().placeholder(
             "输入正则 · Enter 应用 · Esc 关闭 (GBK/Latin-1 文件退化为字面量)",
-            placeholder_fg(),
+            Color::rgb(0.45, 0.45, 0.48), // placeholder_fg
         )
     }
 
@@ -1272,9 +1209,9 @@ impl Bar {
         TextInput::themed(&LightTheme)
             .font_size(FONT_SIZE)
             .chromeless()
-            .color(filter_fg())
-            .caret_color(caret_fg())
-            .selection_color(selection_bg())
+            .color(Color::rgb(0.20, 0.20, 0.20)) // filter_fg
+            .caret_color(Color::rgb(0.10, 0.10, 0.12)) // caret_fg
+            .selection_color(Color::rgba(0.24, 0.42, 0.66, 0.24)) // selection_bg
             .padding(Edges::symmetric(2.0, 0.0))
     }
 
@@ -1354,6 +1291,7 @@ impl Widget for Bar {
         } else {
             ActiveBar::Search
         };
+        self.theme = app.theme;
 
         // 清空信号: revision 变化时原地 clear。
         if let Some(binding) = &self.filter_clear_binding {
@@ -1398,9 +1336,10 @@ impl Widget for Bar {
         if self.active == ActiveBar::Hidden {
             return;
         }
+        let theme = self.theme;
         rects.push_rect(
             Rect::from_xywh(area.origin.x, area.origin.y, area.size.width, FILTER_BAR_H),
-            filter_bar_bg(),
+            crate::theme::filter_bar_bg(theme),
             0.0,
         );
         let line_h = texts.line_height(f32::from(FONT_SIZE));
@@ -1414,7 +1353,7 @@ impl Widget for Bar {
             area.origin.x + BAR_PAD_X,
             baseline,
             FONT_SIZE,
-            filter_fg(),
+            crate::theme::filter_fg(theme),
         );
         let label_w = texts.measure(label, FONT_SIZE);
         self.label_width.set(label_w);
@@ -1567,7 +1506,7 @@ mod tests {
         // 行首含 ERROR 与 "informational" 之类干扰时仍判 ERROR
         assert_eq!(
             level_color(b"2026-09-05 INFO ok"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12), // text_default
             "INFO 走默认色"
         );
         let err = level_color(b"2026-09-05 ERROR disk full");
@@ -1605,31 +1544,31 @@ mod tests {
         assert_eq!(cell_color("status", "503"), err_fg(), "5xx 红");
         assert_eq!(
             cell_color("status", "N/A"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12), // text_default
             "非数字 status 默认色"
         );
         // 其余列一律正文色 (降灰设计已被用户验收判死: 白底小字看不清,
         // klogg/LogViewPlus/Daucloud 对 ts/req_id 均用正文色)
-        assert_eq!(cell_color("ts", "2026-09-05"), text_default(), "ts 正文色");
-        assert_eq!(cell_color("msg", "request completed"), text_default());
+        assert_eq!(cell_color("ts", "2026-09-05"), Color::rgb(0.12, 0.12, 0.12), "ts 正文色");
+        assert_eq!(cell_color("msg", "request completed"), Color::rgb(0.12, 0.12, 0.12));
         assert_eq!(
             cell_color("logger", "auth-service"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12),
             "logger 正文色"
         );
         assert_eq!(
             cell_color("path", "/api/v1/orders/84701"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12),
             "path 正文色"
         );
         assert_eq!(
             cell_color("req_id", "1b26690fb26795f6"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12),
             "长 hex 正文色"
         );
         assert_eq!(
             cell_color("trace_id", "550e8400-e29b-41d4-a716-446655440000"),
-            text_default(),
+            Color::rgb(0.12, 0.12, 0.12),
             "UUID 正文色"
         );
     }
