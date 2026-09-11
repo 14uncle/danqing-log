@@ -203,6 +203,7 @@ fn title_theme(app: &AppTheme) -> SceneTheme {
 - `danqing-log/src/main.rs` — AppTheme 枚举、Msg::SelectTheme、title_theme 改动
 - `danqing-log/src/view.rs` — 全面改用 Theme token、删除旧颜色函数
 - `danqing-log/src/settings.rs` — 卡片改用 Theme token、Dropdown 替换文字按钮
+- `danqing-log/src/config.rs` — **新增** 配置文件读写（主题持久化）
 - `danqing-log/src/theme.rs` — **删除**
 
 ### Commands
@@ -239,4 +240,12 @@ fn title_theme(app: &AppTheme) -> SceneTheme {
 
 1. ~~accent 色~~ → 保持玉色 `#0F766E` 不变（已确认）
 2. ~~存储方式~~ → 枚举 + 薄封装（已确认）
-3. 深色主题是否需要持久化到配置文件？（当前仅会话内有效）
+3. ~~持久化~~ → 需要持久化到配置文件（已确认）
+
+### 持久化方案
+
+- 配置文件路径: `dirs::config_dir()` / `danqing-log/config.toml`
+- 字段: `[theme] mode = "light"` 或 `"dark"`
+- 启动时读取，默认 `light`
+- 切换主题时写入
+- 格式: TOML（与产品线其他配置统一）
