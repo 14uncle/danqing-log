@@ -7,14 +7,15 @@
 use std::any::Any;
 
 use danqing::widget::{
-    Box as UiBox, Center, CloseButton, Column, EventResult, MsgQueue, Overlay, Padding, Row, Text,
-    Widget,
+    Box as UiBox, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay, Padding,
+    Row, Text, Widget,
 };
 use danqing::{
     Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Point, Rect, RectBatch, Size,
     TextBatch, Theme,
 };
 
+use crate::config::AppTheme;
 use crate::LogApp;
 use crate::Msg;
 
@@ -22,28 +23,6 @@ use crate::Msg;
 const CARD_WIDTH: f32 = 360.0;
 /// 正文字号。
 const BODY_SIZE: u16 = 14;
-
-fn text_primary() -> Color {
-    Color::rgb(0.12, 0.12, 0.12)
-}
-fn text_secondary() -> Color {
-    Color::rgb(0.40, 0.40, 0.42)
-}
-fn accent() -> Color {
-    Color::rgb(0.18, 0.35, 0.60)
-}
-/// 卡片底色: 不透明白 —— 4% 黑「玻璃」叠在密集表格文字上等于没底 (看不清教训)。
-fn card_bg() -> Color {
-    Color::rgb(1.0, 1.0, 1.0)
-}
-/// 卡片描边: 框架 border token。
-fn card_border() -> Color {
-    LightTheme.border()
-}
-/// 悬停背景: 框架 surface_variant token。
-fn hover_bg() -> Color {
-    LightTheme.surface_variant()
-}
 
 /// 设置卡浮层: danqing::Overlay 承载 scrim/居中/模态门控 (簇C 下沉)。
 pub(crate) fn settings_overlay() -> impl Widget {
@@ -60,9 +39,9 @@ fn settings_card() -> impl Widget {
         bottom: 16.0,
         left: 24.0,
     };
-    UiBox::new(card_bg())
+    UiBox::new(Color::WHITE)
         .radius(12.0)
-        .border_color(card_border())
+        .border_color(LightTheme.border())
         .child(Padding::new(
             pad,
             Column::new()
@@ -71,7 +50,7 @@ fn settings_card() -> impl Widget {
                 .child(close_row())
                 .child(about_section())
                 .child(version_row())
-                .child(theme_row())
+                .child(theme_dropdown())
                 .child(feedback_row()),
         ))
         .width(CARD_WIDTH)
@@ -85,8 +64,8 @@ fn close_row() -> impl Widget {
         .child(
             CloseButton::new()
                 .on_click(|| Msg::CloseSettings)
-                .bind_color(|_: &LogApp| text_primary())
-                .bind_hover_color(|_: &LogApp| hover_bg()),
+                .bind_color(|app: &LogApp| app.theme.theme().text_primary())
+                .bind_hover_color(|app: &LogApp| app.theme.theme().surface_variant()),
         )
 }
 
@@ -98,17 +77,17 @@ fn about_section() -> impl Widget {
         .child(Center::new(
             Text::new("丹青日志 LogLens".to_string())
                 .font_size(18)
-                .bind_color(|_: &LogApp| accent()),
+                .bind_color(|app: &LogApp| app.theme.theme().accent()),
         ))
         .child(Center::new(
             Text::bind(|_app: &LogApp| format!("v{}", env!("CARGO_PKG_VERSION")))
                 .font_size(BODY_SIZE)
-                .bind_color(|_: &LogApp| text_secondary()),
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
         ))
         .child(Center::new(
             Text::new("大文件日志/JSONL 查看分析器".to_string())
                 .font_size(BODY_SIZE)
-                .bind_color(|_: &LogApp| text_secondary()),
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
         ))
 }
 
@@ -122,93 +101,20 @@ fn feedback_row() -> impl Widget {
     Link::new("问题反馈", "https://github.com/14uncle/danqing-log/issues")
 }
 
-/// 主题切换行: 点击切换浅色/深色主题。
-fn theme_row() -> impl Widget {
-    ThemeRow::new()
-}
-
-struct ThemeRow {
-    hovered: bool,
-    area: Rect,
-}
-
-impl ThemeRow {
-    fn new() -> Self {
-        Self {
-            hovered: false,
-            area: Rect::default(),
-        }
-    }
-}
-
-impl Widget for ThemeRow {
-    fn sync(&mut self, _state: &dyn Any) {}
-    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
-        let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
-        self.area = Rect::new(Point::ZERO, size);
-        size
-    }
-    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
-        if self.hovered {
-            rects.push_rect(area, hover_bg(), 6.0);
-        }
-        // 标签
-        let label = "主题";
-        let label_w = texts.measure(label, BODY_SIZE);
-        let label_x = area.origin.x + (area.size.width - label_w - 60.0) / 2.0;
-        let baseline = area.origin.y
-            + (LINK_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
-            + texts.ascent(f32::from(BODY_SIZE));
-        texts.push_text(label, label_x, baseline, BODY_SIZE, accent());
-        // 当前主题名称（可点击）
-        let theme_text = "浅色";
-        let theme_w = texts.measure(theme_text, BODY_SIZE);
-        let theme_x = label_x + label_w + 12.0;
-        texts.push_text(theme_text, theme_x, baseline, BODY_SIZE, accent());
-        // 下划线
-        let underline_y = baseline + texts.descent(f32::from(BODY_SIZE)) + 1.0;
-        rects.push_rect(
-            Rect::from_xywh(theme_x, underline_y, theme_w, 1.0),
-            accent(),
-            0.0,
-        );
-    }
-    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
-        self.area = area;
-        match event {
-            Event::CursorMoved(p) => {
-                self.hovered = area.contains(*p);
-                if self.hovered {
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
-                }
-            }
-            Event::CursorLeft => {
-                self.hovered = false;
-                EventResult::Ignored
-            }
-            Event::MouseInput {
-                pressed: true,
-                position,
-                ..
-            } => {
-                if area.contains(*position) {
-                    msgs.push(Box::new(Msg::ToggleTheme));
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
-                }
-            }
-            _ => EventResult::Ignored,
-        }
-    }
-    fn focusable(&self) -> bool {
-        true
-    }
-    fn hit_area(&self) -> Option<Rect> {
-        Some(self.area)
-    }
+/// 主题切换下拉选择器。
+fn theme_dropdown() -> impl Widget {
+    Row::new()
+        .cross_stretch()
+        .child(
+            Text::new("主题".to_string())
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+        )
+        .child(
+            Dropdown::new(AppTheme::options())
+                .on_select(|idx| Msg::SelectTheme(idx))
+                .bind_selected(|app: &LogApp| app.theme.index()),
+        )
 }
 
 /// 版本行: 有新版时显示提示 + 按钮; 无新版时空白。
@@ -220,6 +126,8 @@ struct VersionRow {
     /// Cell 跨 paint/event 共享: paint 测量后写入, event 命中检测读取;
     /// 依赖 paint 在 event 之前调用 (danqing 保证此顺序)。
     btn_area: std::cell::Cell<Rect>,
+    text_secondary: Color,
+    text_primary: Color,
 }
 
 impl VersionRow {
@@ -230,12 +138,19 @@ impl VersionRow {
             has_hint: false,
             btn_hover: false,
             btn_area: std::cell::Cell::new(Rect::default()),
+            text_secondary: LightTheme.text_secondary(),
+            text_primary: LightTheme.text_primary(),
         }
     }
 }
 
 impl Widget for VersionRow {
-    fn sync(&mut self, _state: &dyn Any) {
+    fn sync(&mut self, state: &dyn Any) {
+        if let Some(app) = state.downcast_ref::<LogApp>() {
+            let t = app.theme.theme();
+            self.text_secondary = t.text_secondary();
+            self.text_primary = t.text_primary();
+        }
         if let Some(hint) = crate::app_update::hint() {
             self.hint_status = hint.status;
             self.hint_action = hint.action;
@@ -266,16 +181,16 @@ impl Widget for VersionRow {
             area.origin.x,
             baseline,
             BODY_SIZE,
-            text_secondary(),
+            self.text_secondary,
         );
         // 按钮
         let status_w = texts.measure(&self.hint_status, BODY_SIZE);
         let btn_x = area.origin.x + status_w + 12.0;
         let btn_w = texts.measure(self.hint_action, BODY_SIZE) + 16.0;
         let btn_color = if self.btn_hover {
-            text_primary()
+            self.text_primary
         } else {
-            accent()
+            self.text_secondary
         };
         texts.push_text(
             self.hint_action,
@@ -338,6 +253,8 @@ struct Link {
     url: String,
     hovered: bool,
     area: Rect,
+    hover_bg: Color,
+    accent: Color,
 }
 
 impl Link {
@@ -347,6 +264,8 @@ impl Link {
             url: url.to_string(),
             hovered: false,
             area: Rect::default(),
+            hover_bg: LightTheme.surface_variant(),
+            accent: LightTheme.accent(),
         }
     }
 }
@@ -355,7 +274,13 @@ impl Link {
 const LINK_ROW_H: f32 = 32.0;
 
 impl Widget for Link {
-    fn sync(&mut self, _state: &dyn Any) {}
+    fn sync(&mut self, state: &dyn Any) {
+        if let Some(app) = state.downcast_ref::<LogApp>() {
+            let t = app.theme.theme();
+            self.hover_bg = t.surface_variant();
+            self.accent = t.accent();
+        }
+    }
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
         let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
         self.area = Rect::new(Point::ZERO, size);
@@ -363,7 +288,7 @@ impl Widget for Link {
     }
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
         if self.hovered {
-            rects.push_rect(area, hover_bg(), 6.0);
+            rects.push_rect(area, self.hover_bg, 6.0);
         }
         // 文本整行居中, 下划线随行
         let text_w = texts.measure(&self.text, BODY_SIZE);
@@ -371,12 +296,12 @@ impl Widget for Link {
         let baseline = area.origin.y
             + (LINK_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
             + texts.ascent(f32::from(BODY_SIZE));
-        texts.push_text(&self.text, text_x, baseline, BODY_SIZE, accent());
+        texts.push_text(&self.text, text_x, baseline, BODY_SIZE, self.accent);
         // 常显下划线: 链接身份不依赖 hover 才发现
         let underline_y = baseline + texts.descent(f32::from(BODY_SIZE)) + 1.0;
         rects.push_rect(
             Rect::from_xywh(text_x, underline_y, text_w, 1.0),
-            accent(),
+            self.accent,
             0.0,
         );
     }
