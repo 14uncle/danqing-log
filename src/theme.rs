@@ -5,22 +5,8 @@
 
 use danqing::Color;
 
-/// 主题模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThemeMode {
-    Light,
-    Dark,
-}
-
-impl ThemeMode {
-    /// 切换主题。
-    pub(crate) fn toggle(self) -> Self {
-        match self {
-            Self::Light => Self::Dark,
-            Self::Dark => Self::Light,
-        }
-    }
-}
+/// 主题模式 (复用 config::AppTheme)。
+pub(crate) type ThemeMode = crate::config::AppTheme;
 
 // ============ 通用颜色 ============
 

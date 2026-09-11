@@ -21,6 +21,7 @@ regex = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 open = "5"
 rfd = "0.15"
+dirs = "6"
 
 [profile.dev]
 opt-level = 1

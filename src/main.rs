@@ -17,6 +17,7 @@
 #![windows_subsystem = "windows"]
 
 mod app_update;
+mod config;
 mod settings;
 mod theme;
 mod tray;
@@ -155,7 +156,7 @@ pub(crate) struct LogApp {
     /// 设置卡是否打开 (S2)。
     settings_open: bool,
     /// 主题模式 (浅色/深色)。
-    theme: theme::ThemeMode,
+    theme: config::AppTheme,
 }
 
 /// 应用消息。
@@ -198,6 +199,8 @@ pub(crate) enum Msg {
     Notice(String),
     /// 切换主题 (浅色/深色)。
     ToggleTheme,
+    /// 通过下拉选择器选择主题 (索引)。
+    SelectTheme(usize),
     /// 退出应用 (托盘菜单)。
     Quit,
     /// 无操作 (事件吞噬用，不触发任何状态变更)。
@@ -240,7 +243,7 @@ impl LogApp {
             open_job: None,
             loading_label: None,
             settings_open: false,
-            theme: theme::ThemeMode::Light,
+            theme: config::AppTheme::load(),
         }
     }
 
@@ -882,6 +885,11 @@ impl App for LogApp {
             }
             Msg::ToggleTheme => {
                 self.theme = self.theme.toggle();
+                self.theme.save();
+            }
+            Msg::SelectTheme(idx) => {
+                self.theme = config::AppTheme::from_index(idx);
+                self.theme.save();
             }
             Msg::Quit => {
                 if let Some(sender) = &self.window_sender {
