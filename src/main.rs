@@ -1137,7 +1137,7 @@ fn status_text(path: &Path, file: &LogFile) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     format!(
-        "{name} · {} · {:.1} MiB · {} 行 · mmap {} µs · 索引 {} ms ({:.0} MiB/s)",
+        "{name} · {} · {:.1} MiB · {} 行 · mmap {} us · 索引 {} ms ({:.0} MiB/s)",
         s.encoding.label(),
         s.file_bytes as f64 / (1024.0 * 1024.0),
         s.line_count,
