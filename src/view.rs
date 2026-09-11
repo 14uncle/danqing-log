@@ -1507,15 +1507,26 @@ impl Bar {
         EventResult::Consumed
     }
 
-    /// Esc 处理: 搜索=关闭, 过滤=清除。返回 Ignored 让框架清焦
-    /// (焦点路由中 Esc 不被焦点组件消费 ⇒ 清焦, 用户可继续用键导航列表)。
+    /// Esc 处理: 栏有内容 → 清内容、保焦点 (方便重新输入);
+    /// 栏已空 → 返回 Ignored 让框架清焦, 用户可继续用键导航列表。
     fn handle_escape(&self, active: ActiveBar, msgs: &mut MsgQueue) -> EventResult {
         match active {
-            ActiveBar::Filter => msgs.push(Box::new(Msg::ClearFilter)),
-            ActiveBar::Search => msgs.push(Box::new(Msg::ClearSearch)),
-            ActiveBar::Hidden => return EventResult::Ignored,
+            ActiveBar::Filter => {
+                if self.filter_ti.value().is_empty() {
+                    return EventResult::Ignored;
+                }
+                msgs.push(Box::new(Msg::ClearFilter));
+                EventResult::Consumed
+            }
+            ActiveBar::Search => {
+                if self.search_ti.value().is_empty() {
+                    return EventResult::Ignored;
+                }
+                msgs.push(Box::new(Msg::ClearSearch));
+                EventResult::Consumed
+            }
+            ActiveBar::Hidden => EventResult::Ignored,
         }
-        EventResult::Ignored
     }
 
     fn set_filter_placeholder(&mut self) {
