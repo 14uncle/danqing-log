@@ -18,6 +18,7 @@
 
 mod app_update;
 mod settings;
+mod theme;
 mod tray;
 mod view;
 
@@ -153,6 +154,8 @@ pub(crate) struct LogApp {
     loading_label: Option<(String, String)>,
     /// 设置卡是否打开 (S2)。
     settings_open: bool,
+    /// 主题模式 (浅色/深色)。
+    theme: theme::ThemeMode,
 }
 
 /// 应用消息。
@@ -193,6 +196,8 @@ pub(crate) enum Msg {
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     Notice(String),
+    /// 切换主题 (浅色/深色)。
+    ToggleTheme,
     /// 退出应用 (托盘菜单)。
     Quit,
     /// 无操作 (事件吞噬用，不触发任何状态变更)。
@@ -235,6 +240,7 @@ impl LogApp {
             open_job: None,
             loading_label: None,
             settings_open: false,
+            theme: theme::ThemeMode::Light,
         }
     }
 
@@ -873,6 +879,9 @@ impl App for LogApp {
             Msg::Notice(text) => {
                 self.notice = Some(text);
                 self.refresh_status();
+            }
+            Msg::ToggleTheme => {
+                self.theme = self.theme.toggle();
             }
             Msg::Quit => {
                 if let Some(sender) = &self.window_sender {

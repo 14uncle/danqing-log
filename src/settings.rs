@@ -52,7 +52,7 @@ pub(crate) fn settings_overlay() -> impl Widget {
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
-/// 玻璃卡片: 关闭行 + 关于 + 版本行 + 反馈链接。
+/// 玻璃卡片: 关闭行 + 关于 + 版本行 + 主题切换 + 反馈链接。
 fn settings_card() -> impl Widget {
     let pad = Edges {
         top: 24.0,
@@ -71,6 +71,7 @@ fn settings_card() -> impl Widget {
                 .child(close_row())
                 .child(about_section())
                 .child(version_row())
+                .child(theme_row())
                 .child(feedback_row()),
         ))
         .width(CARD_WIDTH)
@@ -119,6 +120,95 @@ fn version_row() -> impl Widget {
 /// 反馈链接行。
 fn feedback_row() -> impl Widget {
     Link::new("问题反馈", "https://github.com/14uncle/danqing-log/issues")
+}
+
+/// 主题切换行: 点击切换浅色/深色主题。
+fn theme_row() -> impl Widget {
+    ThemeRow::new()
+}
+
+struct ThemeRow {
+    hovered: bool,
+    area: Rect,
+}
+
+impl ThemeRow {
+    fn new() -> Self {
+        Self {
+            hovered: false,
+            area: Rect::default(),
+        }
+    }
+}
+
+impl Widget for ThemeRow {
+    fn sync(&mut self, _state: &dyn Any) {}
+    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
+        let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
+        self.area = Rect::new(Point::ZERO, size);
+        size
+    }
+    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        if self.hovered {
+            rects.push_rect(area, hover_bg(), 6.0);
+        }
+        // 标签
+        let label = "主题";
+        let label_w = texts.measure(label, BODY_SIZE);
+        let label_x = area.origin.x + (area.size.width - label_w - 60.0) / 2.0;
+        let baseline = area.origin.y
+            + (LINK_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
+            + texts.ascent(f32::from(BODY_SIZE));
+        texts.push_text(label, label_x, baseline, BODY_SIZE, accent());
+        // 当前主题名称（可点击）
+        let theme_text = "浅色";
+        let theme_w = texts.measure(theme_text, BODY_SIZE);
+        let theme_x = label_x + label_w + 12.0;
+        texts.push_text(theme_text, theme_x, baseline, BODY_SIZE, accent());
+        // 下划线
+        let underline_y = baseline + texts.descent(f32::from(BODY_SIZE)) + 1.0;
+        rects.push_rect(
+            Rect::from_xywh(theme_x, underline_y, theme_w, 1.0),
+            accent(),
+            0.0,
+        );
+    }
+    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        self.area = area;
+        match event {
+            Event::CursorMoved(p) => {
+                self.hovered = area.contains(*p);
+                if self.hovered {
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            Event::CursorLeft => {
+                self.hovered = false;
+                EventResult::Ignored
+            }
+            Event::MouseInput {
+                pressed: true,
+                position,
+                ..
+            } => {
+                if area.contains(*position) {
+                    msgs.push(Box::new(Msg::ToggleTheme));
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            _ => EventResult::Ignored,
+        }
+    }
+    fn focusable(&self) -> bool {
+        true
+    }
+    fn hit_area(&self) -> Option<Rect> {
+        Some(self.area)
+    }
 }
 
 /// 版本行: 有新版时显示提示 + 按钮; 无新版时空白。

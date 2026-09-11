@@ -52,7 +52,9 @@ const GUTTER_MIN: f32 = 56.0;
 /// 文本与行号槽间距。
 const GUTTER_GAP: f32 = 12.0;
 /// 展开标识区宽度 (行首 ▶/▼, 独立于行号槽, 不与行号重叠)。
-const EXPAND_W: f32 = 16.0;
+const EXPAND_W: f32 = 20.0;
+/// 展开标识字号 (比正文大一号, 12px 太小看不清)。
+const EXPAND_FONT_SIZE: u16 = 16;
 /// 底栏状态行高度。
 const STATUS_HEIGHT: f32 = 26.0;
 /// 过滤栏高度 (表格模式)。
@@ -554,6 +556,9 @@ impl Widget for LogView {
         let aux_line_h = texts.line_height(f32::from(AUX_FONT_SIZE));
         let aux_baseline_off =
             (ROW_HEIGHT - aux_line_h) / 2.0 + texts.ascent(f32::from(AUX_FONT_SIZE));
+        let expand_line_h = texts.line_height(f32::from(EXPAND_FONT_SIZE));
+        let row_baseline_off =
+            (ROW_HEIGHT - expand_line_h) / 2.0 + texts.ascent(f32::from(EXPAND_FONT_SIZE));
 
         // 表格模式: 列布局 (列宽 = 采样字符宽实测 + 内边距, ≤16 列常量成本;
         // 水平滚动: 列区整体左移, 滚出左右缘的列整列不画)
@@ -776,12 +781,12 @@ impl Widget for LogView {
                 let expanded_here = self.expanded.is_expanded(line_no);
                 let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
                 if expanded_here || expandable {
-                    let glyph = if expanded_here { "-" } else { "+" };
+                    let glyph = if expanded_here { "−" } else { "+" };
                     texts.push_text(
                         glyph,
-                        area.origin.x + 3.0,
-                        y + aux_baseline_off,
-                        AUX_FONT_SIZE,
+                        area.origin.x + 2.0,
+                        y + row_baseline_off,
+                        EXPAND_FONT_SIZE,
                         text_default(),
                     );
                 }
@@ -1062,8 +1067,8 @@ impl Widget for LogView {
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
                     let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
-                    // 行首 ▶/▼ 展开开关区 (左 16px, 表格模式); 其余点击选中
-                    let in_glyph = self.table_mode() && position.x - area.origin.x < 16.0;
+                    // 行首 ▶/▼ 展开开关区 (左 20px, 表格模式); 其余点击选中
+                    let in_glyph = self.table_mode() && position.x - area.origin.x < EXPAND_W;
                     if in_glyph {
                         msgs.push(Box::new(Msg::ToggleExpand(row)));
                     } else {
