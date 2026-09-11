@@ -894,6 +894,7 @@ dependencies = [
  "anyhow",
  "danqing",
  "danqing-logfile",
+ "dirs 6.0.0",
  "log",
  "memchr",
  "memmap2",
