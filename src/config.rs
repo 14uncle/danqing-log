@@ -45,14 +45,6 @@ impl AppTheme {
         let _ = fs::write(&path, content);
     }
 
-    /// 切换主题。
-    pub(crate) fn toggle(self) -> Self {
-        match self {
-            Self::Light => Self::Dark,
-            Self::Dark => Self::Light,
-        }
-    }
-
     /// 选项索引 (Dropdown 用)。
     pub(crate) fn index(self) -> usize {
         match self {

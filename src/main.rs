@@ -19,7 +19,6 @@
 mod app_update;
 mod config;
 mod settings;
-mod theme;
 mod tray;
 mod view;
 
@@ -209,8 +208,6 @@ pub(crate) enum Msg {
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     Notice(String),
-    /// 切换主题 (浅色/深色)。
-    ToggleTheme,
     /// 通过下拉选择器选择主题 (索引)。
     SelectTheme(usize),
     /// 退出应用 (托盘菜单)。
@@ -894,10 +891,6 @@ impl App for LogApp {
             Msg::Notice(text) => {
                 self.notice = Some(text);
                 self.refresh_status();
-            }
-            Msg::ToggleTheme => {
-                self.theme = self.theme.toggle();
-                self.theme.save();
             }
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);

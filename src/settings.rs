@@ -112,7 +112,7 @@ fn theme_dropdown() -> impl Widget {
         )
         .child(
             Dropdown::new(AppTheme::options())
-                .on_select(|idx| Msg::SelectTheme(idx))
+                .on_select(Msg::SelectTheme)
                 .bind_selected(|app: &LogApp| app.theme.index()),
         )
 }
