@@ -1183,6 +1183,8 @@ impl Widget for LogView {
 const BAR_PAD_X: f32 = 10.0;
 /// 前缀标签 ("过滤:"/"搜索:") 与输入区间隙。
 const BAR_LABEL_GAP: f32 = 8.0;
+/// 栏顶部内偏移 (视觉下沉, 避紧贴标题栏底边)。
+const BAR_TOP_OFFSET: f32 = 3.0;
 /// 光标色 (浅色栏上深色)。
 fn caret_fg() -> Color {
     Color::rgb(0.10, 0.10, 0.12)
@@ -1303,10 +1305,10 @@ impl Bar {
     }
 
     /// 输入矩形 (label 之后到右缘)。
-    fn input_area(&self, area: Rect, label_w: f32) -> Rect {
+    fn input_area_at(&self, content_y: f32, area: Rect, label_w: f32) -> Rect {
         let text_x = area.origin.x + BAR_PAD_X + label_w + BAR_LABEL_GAP;
         let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X).max(1.0);
-        Rect::from_xywh(text_x, area.origin.y, w, area.size.height)
+        Rect::from_xywh(text_x, content_y, w, FILTER_BAR_H)
     }
 
     /// 当前生效输入的引用。
@@ -1391,14 +1393,15 @@ impl Widget for Bar {
         if self.active == ActiveBar::Hidden {
             return;
         }
+        let content_y = area.origin.y + BAR_TOP_OFFSET;
         rects.push_rect(
-            Rect::from_xywh(area.origin.x, area.origin.y, area.size.width, FILTER_BAR_H),
+            Rect::from_xywh(area.origin.x, content_y, area.size.width, FILTER_BAR_H),
             filter_bar_bg(),
             0.0,
         );
         let line_h = texts.line_height(f32::from(FONT_SIZE));
         let baseline =
-            area.origin.y + (FILTER_BAR_H - line_h) / 2.0 + texts.ascent(f32::from(FONT_SIZE));
+            content_y + (FILTER_BAR_H - line_h) / 2.0 + texts.ascent(f32::from(FONT_SIZE));
         let label = self.label();
         texts.push_text(
             label,
@@ -1409,7 +1412,7 @@ impl Widget for Bar {
         );
         let label_w = texts.measure(label, FONT_SIZE);
         self.label_width.set(label_w);
-        let input_area = self.input_area(area, label_w);
+        let input_area = self.input_area_at(content_y, area, label_w);
         match self.active {
             ActiveBar::Filter => self.filter_ti.paint(input_area, rects, texts),
             ActiveBar::Search => self.search_ti.paint(input_area, rects, texts),
@@ -1445,7 +1448,8 @@ impl Widget for Bar {
             }
         }
         // 其余转发给当前生效的输入框 (打字/方向键移动光标等)。
-        let input_area = self.input_area(area, self.label_width.get());
+        let content_y = area.origin.y + BAR_TOP_OFFSET;
+        let input_area = self.input_area_at(content_y, area, self.label_width.get());
         let ti = self
             .active_input_mut()
             .expect("active 非 Hidden 必有输入框");
