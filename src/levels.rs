@@ -274,20 +274,28 @@ pub struct LevelsOutcome {
     pub counts: LevelCounts,
     /// 本份计数用的口径列 (回传给应用层, 作业自足描述)。
     pub column: Option<String>,
+    /// 本份计数对应的**文件快照**。
+    ///
+    /// 为什么要把 Arc 交回来: 作业在算的时候文件可能又增长了, 落点需要拿
+    /// 「快照」与「当前」做一次差分才对得上账 ([`update_for_append`])。
+    /// 只是 Arc 克隆, 不复制数据。**没有它就只能把整个作业重起一遍** ——
+    /// 那会让持续增长的 tail 永远算不完。
+    pub file: std::sync::Arc<LogFile>,
 }
 
 /// 按口径算一份全文件计数 —— 后台计数作业的作业体。
 ///
 /// 与打开管道解耦: 打开只负责把文件与列名交出来, 计数由独立作业完成,
 /// 完成经 tick 拾取后才换入侧栏。
-pub fn counts_for(file: &LogFile, column: Option<&str>) -> LevelsOutcome {
+pub fn counts_for(file: std::sync::Arc<LogFile>, column: Option<&str>) -> LevelsOutcome {
     let counts = match column {
-        Some(c) => count_levels_field(file, c),
-        None => count_levels(file),
+        Some(c) => count_levels_field(&file, c),
+        None => count_levels(&file),
     };
     LevelsOutcome {
         counts,
         column: column.map(str::to_string),
+        file,
     }
 }
 

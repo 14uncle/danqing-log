@@ -316,15 +316,29 @@ impl LogApp {
         let file = Arc::clone(&self.file);
         let column = self.level_column.clone();
         self.levels_job
-            .launch(move || levels::counts_for(&file, column.as_deref()));
+            .launch(move || levels::counts_for(file, column.as_deref()));
     }
 
-    /// 计数作业交付: 换入计数与子句表。
+    /// 计数作业交付: 与快照对账后换入计数与子句表。
+    ///
+    /// 作业在算的时候文件可能又增长了 —— 此时**不能重起作业** (持续增长的 tail
+    /// 会永远算不完), 而是用 `update_for_append` 把快照之后的那几行按「重叠一行」
+    /// 补上。只数增量, 很便宜。
     fn pickup_levels_job(&mut self) {
         let Some(out) = self.levels_job.poll() else {
             return;
         };
-        self.level_counts = Arc::new(out.counts);
+        let counts = if out.file.line_count() < self.file.line_count() {
+            levels::update_for_append(
+                &out.file,
+                &self.file,
+                out.counts,
+                self.level_column.as_deref(),
+            )
+        } else {
+            out.counts
+        };
+        self.level_counts = Arc::new(counts);
         self.level_queries = out
             .column
             .as_deref()
@@ -603,9 +617,12 @@ impl LogApp {
         // 之间被别的追加换掉。**若将来允许并发追加, 这个摘/补对称会静默失效**
         // (摘多了漏行、摘少了重计), 届时须把 `from` 随产物一起交回来。
         let from = old_line_count.saturating_sub(1);
-        // 计数: 已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量, 便宜);
-        // 未就绪 (后台作业还在算旧快照) → 作废并在新文件上重起, 免得交出一份
-        // 与当前文件不符的数。**先算再换入**, 因为 update_for_append 需要旧快照。
+        // 计数: 已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量, 便宜),
+        // **先算再换入** (update_for_append 需要旧快照)。
+        //
+        // 未就绪 → **什么都不做**: 计数作业交付时会拿它自己的快照与当时的文件
+        // 对账 (见 `pickup_levels_job`)。这里若重起作业, 一个持续增长的 tail
+        // 会把计数一遍遍从头来过 —— 永远算不完, 侧栏永远挂在「…」。
         let recomputed = (!self.levels_pending).then(|| {
             levels::update_for_append(
                 &self.file,
@@ -615,9 +632,8 @@ impl LogApp {
             )
         });
         self.file = Arc::new(new);
-        match recomputed {
-            Some(c) => self.level_counts = Arc::new(c),
-            None => self.launch_levels_job(),
+        if let Some(c) = recomputed {
+            self.level_counts = Arc::new(c);
         }
         // 过滤: 先摘掉将被重算区间的旧命中, 再合并新命中 (否则重叠行出现两次)
         self.drop_filter_hits_from(from);
@@ -1503,25 +1519,72 @@ mod tests {
         std::fs::remove_file(&p2).ok();
     }
 
-    /// **计数未就绪时追加**: 不得在旧快照上做增量 (那会交出一份与当前文件不符的数),
-    /// 而是作废并重起作业; 侧栏保持「计算中」。
+    /// **计数未就绪时追加**: 不得重起作业 —— 一个持续增长的 tail 会把计数
+    /// 一遍遍从头来过 (永远算不完, 侧栏永远挂在「…」); 也不得把旧快照的增量
+    /// 贴到新文件上。正确做法是等作业交付时与快照对账 (`pickup_levels_job`)。
     #[test]
-    fn apply_appended_restarts_job_when_counts_pending() {
+    fn apply_appended_while_pending_keeps_counts_pending() {
         let mut app = LogApp::new_empty();
-        let p = temp_log("2026-09-05 12:00:01 ERROR one\n".as_bytes());
-        let f1 = LogFile::open(&p).unwrap();
-        app.file = Arc::new(f1);
+        let p = temp_log(
+            "2026-09-05 12:00:01 ERROR one
+"
+            .as_bytes(),
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
         app.levels_pending = true; // 模拟后台作业仍在算旧快照
         app.level_counts = Arc::new(LevelCounts::default());
 
         let f2 = LogFile::open(&p).unwrap();
         app.apply_appended(f2, None);
-        assert!(app.levels_pending, "仍未就绪");
+        assert!(app.levels_pending, "仍等原作业交付, 不得重起");
         assert_eq!(
             app.level_counts.total(),
             0,
             "不得把旧快照的增量贴到新文件上"
         );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 作业快照之后文件又长过 → 交付时按「重叠一行」与快照对账, 得到与**当前**
+    /// 文件一致的计数 (既不重起作业, 也不交付一份过期的数)。
+    #[test]
+    fn pickup_levels_job_reconciles_lines_added_after_snapshot() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log(
+            "2026-09-05 12:00:01 ERROR one
+"
+            .as_bytes(),
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.level_column = None;
+        app.launch_levels_job(); // 快照 = 此刻的 1 行
+
+        // 作业在算的同时文件又长了两行
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(
+                b"2026-09-05 12:00:02 INFO two
+2026-09-05 12:00:03 ERROR three
+",
+            )
+            .unwrap();
+        }
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        assert_eq!(app.file.line_count(), 3, "快照之后又长了两行");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(Arc::clone(&app.file), None).counts,
+            "对账后 == 当前文件全量重算 (不是过期的那份)"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 2, "两条 ERROR 都在");
+        assert_eq!(app.level_counts.total(), 3);
         std::fs::remove_file(&p).ok();
     }
 
@@ -1660,7 +1723,7 @@ mod tests {
         }
         assert_eq!(
             *app.level_counts.as_ref(),
-            levels::counts_for(&app.file, Some("level")).counts,
+            levels::counts_for(Arc::clone(&app.file), Some("level")).counts,
             "交付的计数 == 全量重算"
         );
         assert_eq!(app.level_counts.get(Level::Error), 1);
@@ -1718,7 +1781,7 @@ mod tests {
         }
         assert_eq!(
             *app.level_counts.as_ref(),
-            levels::counts_for(&app.file, None).counts,
+            levels::counts_for(Arc::clone(&app.file), None).counts,
             "重建后计数 == 新文件全量重算"
         );
         assert_eq!(app.level_counts.get(Level::Error), 1);
