@@ -2,6 +2,10 @@
 
 > Plan: `tasks/plan-async-open.md` (D1–D5 决策与依赖图)。Spec: `docs/specs/SPEC-async-open.md`。
 > 每任务完成 = 验收条件全勾 + 三件套绿; 按序推进, Checkpoint 处人工过目。
+>
+> **勾选口径 (2026-09-12 补记)**: T1–T5 的任务级 Acceptance 清单当时未逐条勾,
+> 以各任务**标题的 ✅** 与 Checkpoint 的机器项为准 (T6 的机器项是逐条勾的对照写法)。
+> 所断言的事实 (三件套绿 / 40 测试 / 人工五项验收通过) 已于 2026-09-12 复核。
 
 ## T1: OpenJob 基础设施 (src/open.rs) ✅ 2026-09-08
 
