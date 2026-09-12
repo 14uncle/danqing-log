@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use danqing::theme::{DarkTheme, LightTheme, Theme};
-use danqing::{Color, Shadow, Easing};
+use danqing::{Color, Easing, Shadow};
 
 /// 主题模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,24 +179,60 @@ impl Theme for LogTheme {
             Self::Dark => DarkTheme.scrim(),
         }
     }
-    fn font_size_small(&self) -> u16 { LightTheme.font_size_small() }
-    fn font_size_body(&self) -> u16 { LightTheme.font_size_body() }
-    fn font_size_heading(&self) -> u16 { LightTheme.font_size_heading() }
-    fn control_height(&self) -> f32 { LightTheme.control_height() }
-    fn spacing_xs(&self) -> f32 { LightTheme.spacing_xs() }
-    fn spacing_sm(&self) -> f32 { LightTheme.spacing_sm() }
-    fn spacing_md(&self) -> f32 { LightTheme.spacing_md() }
-    fn spacing_lg(&self) -> f32 { LightTheme.spacing_lg() }
-    fn spacing_xl(&self) -> f32 { LightTheme.spacing_xl() }
-    fn radius_sm(&self) -> f32 { LightTheme.radius_sm() }
-    fn radius_md(&self) -> f32 { LightTheme.radius_md() }
-    fn radius_lg(&self) -> f32 { LightTheme.radius_lg() }
-    fn radius_xl(&self) -> f32 { LightTheme.radius_xl() }
-    fn shadow_sm(&self) -> Shadow { LightTheme.shadow_sm() }
-    fn shadow_md(&self) -> Shadow { LightTheme.shadow_md() }
-    fn shadow_lg(&self) -> Shadow { LightTheme.shadow_lg() }
-    fn easing_standard(&self) -> Easing { LightTheme.easing_standard() }
-    fn easing_accelerate(&self) -> Easing { LightTheme.easing_accelerate() }
+    fn font_size_small(&self) -> u16 {
+        LightTheme.font_size_small()
+    }
+    fn font_size_body(&self) -> u16 {
+        LightTheme.font_size_body()
+    }
+    fn font_size_heading(&self) -> u16 {
+        LightTheme.font_size_heading()
+    }
+    fn control_height(&self) -> f32 {
+        LightTheme.control_height()
+    }
+    fn spacing_xs(&self) -> f32 {
+        LightTheme.spacing_xs()
+    }
+    fn spacing_sm(&self) -> f32 {
+        LightTheme.spacing_sm()
+    }
+    fn spacing_md(&self) -> f32 {
+        LightTheme.spacing_md()
+    }
+    fn spacing_lg(&self) -> f32 {
+        LightTheme.spacing_lg()
+    }
+    fn spacing_xl(&self) -> f32 {
+        LightTheme.spacing_xl()
+    }
+    fn radius_sm(&self) -> f32 {
+        LightTheme.radius_sm()
+    }
+    fn radius_md(&self) -> f32 {
+        LightTheme.radius_md()
+    }
+    fn radius_lg(&self) -> f32 {
+        LightTheme.radius_lg()
+    }
+    fn radius_xl(&self) -> f32 {
+        LightTheme.radius_xl()
+    }
+    fn shadow_sm(&self) -> Shadow {
+        LightTheme.shadow_sm()
+    }
+    fn shadow_md(&self) -> Shadow {
+        LightTheme.shadow_md()
+    }
+    fn shadow_lg(&self) -> Shadow {
+        LightTheme.shadow_lg()
+    }
+    fn easing_standard(&self) -> Easing {
+        LightTheme.easing_standard()
+    }
+    fn easing_accelerate(&self) -> Easing {
+        LightTheme.easing_accelerate()
+    }
 }
 
 /// 配置文件路径。

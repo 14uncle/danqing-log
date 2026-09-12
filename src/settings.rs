@@ -1,8 +1,8 @@
 //! @author 十四叔
 //! @date 2026/09/06
 //!
-//! 轻量设置卡: danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (关于/版本/反馈)。
-//! 关闭: ✕ 按钮 / Esc (app 级两阶段) / 点遮罩。
+//! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (关于/版本/反馈)。
+//! 关闭：✕ 按钮 / Esc (app 级两阶段) / 点遮罩。
 
 use std::any::Any;
 
@@ -11,20 +11,19 @@ use danqing::widget::{
     Row, Text, Widget,
 };
 use danqing::{
-    Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size,
-    TextBatch, Theme,
+    Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch, Theme,
 };
 
-use crate::config::{self, AppTheme};
 use crate::LogApp;
 use crate::Msg;
+use crate::config::{self, AppTheme};
 
 /// 卡片宽度。
 const CARD_WIDTH: f32 = 360.0;
 /// 正文字号。
 const BODY_SIZE: u16 = 14;
 
-/// 设置卡浮层: danqing::Overlay 承载 scrim/居中/模态门控 (簇C 下沉)。
+/// 设置卡浮层：danqing::Overlay 承载 scrim/居中/模态门控 (簇 C 下沉)。
 pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
     Overlay::themed(&t, Center::new(settings_card(theme)).fill_max())
@@ -32,7 +31,7 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
-/// 玻璃卡片: 关闭行 + 关于 + 版本行 + 主题切换 + 反馈链接。
+/// 玻璃卡片：关闭行 + 关于 + 版本行 + 主题切换 + 反馈链接。
 fn settings_card(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
     let pad = Edges {
@@ -41,28 +40,35 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
         bottom: 16.0,
         left: 24.0,
     };
+    // 内容区宽度 = 卡片宽 - 左右 padding
+    let content_w = CARD_WIDTH - pad.left - pad.right;
     UiBox::new(t.surface())
         .radius(12.0)
         .border_color(t.border())
         .child(Padding::new(
             pad,
             Column::new()
-                .gap(12.0)
-                .cross_stretch()
+                .gap(16.0)
+                .cross_center()
                 .child(close_row())
                 .child(about_section())
-                .child(version_row())
-                .child(theme_dropdown())
+                .child(content_row(version_row(), content_w))
+                .child(content_row(theme_dropdown(), content_w))
                 .child(feedback_row()),
         ))
         .width(CARD_WIDTH)
 }
 
-/// 关闭行: 右对齐 ✕。
+/// 内容行：固定宽度居中，内部左对齐。
+fn content_row(inner: impl Widget + 'static, width: f32) -> impl Widget {
+    Center::new(UiBox::new(Color::TRANSPARENT).width(width).child(inner))
+}
+
+/// 关闭行：右对齐 ✕。
 fn close_row() -> impl Widget {
     Row::new()
-        .cross_stretch()
-        .fill(UiBox::new(Color::TRANSPARENT).height(1.0), 1)
+        .cross_center()
+        .fill(UiBox::new(Color::TRANSPARENT), 1)
         .child(
             CloseButton::new()
                 .on_click(|| Msg::CloseSettings)
@@ -71,7 +77,7 @@ fn close_row() -> impl Widget {
         )
 }
 
-/// 关于区: 产品名 + 版本号 + 设计一句话。
+/// 关于区：产品名 + 版本号 + 设计一句话。
 fn about_section() -> impl Widget {
     Column::new()
         .gap(6.0)
@@ -93,20 +99,29 @@ fn about_section() -> impl Widget {
         ))
 }
 
-/// 版本行: 更新提示 (有新版时显示「有新版本 vX.Y.Z」+ 前往下载按钮)。
+/// 版本行：更新提示 (有新版时显示「有新版本 vX.Y.Z」+ 前往下载按钮)。
 fn version_row() -> impl Widget {
     VersionRow::new()
 }
 
 /// 反馈链接行。
 fn feedback_row() -> impl Widget {
-    Link::new("问题反馈", "https://github.com/14uncle/danqing-log/issues")
+    Center::new(Link::new(
+        "问题反馈",
+        "https://github.com/14uncle/danqing-log/issues",
+    ))
 }
 
 /// 主题切换下拉选择器。
+///
+/// 自足组件: 展开、弹层渲染、键盘导航、点外收起全部由 `Dropdown` 自管
+/// (danqing fb4939f 起弹层走框架弹层通道), 应用侧只留一个选中回调。
+/// 迁移前这里是「控件 + 一个 45 行的 Overlay 装配函数 + 3 个 Msg + 2 个状态
+/// 字段」, 与 danqing showcase 同一份样板。
 fn theme_dropdown() -> impl Widget {
     Row::new()
-        .cross_stretch()
+        .gap(8.0)
+        .cross_center()
         .child(
             Text::new("主题".to_string())
                 .font_size(BODY_SIZE)
@@ -114,18 +129,19 @@ fn theme_dropdown() -> impl Widget {
         )
         .child(
             Dropdown::new(AppTheme::options())
-                .on_select(Msg::SelectTheme)
-                .bind_selected(|app: &LogApp| app.theme.index()),
+                .width(120.0)
+                .bind_selected(|app: &LogApp| app.theme.index())
+                .on_select(Msg::SelectTheme),
         )
 }
 
-/// 版本行: 有新版时显示提示 + 按钮; 无新版时空白。
+/// 版本行：有新版时显示提示 + 按钮; 无新版时空白。
 struct VersionRow {
     hint_status: String,
     hint_action: &'static str,
     has_hint: bool,
     btn_hover: bool,
-    /// Cell 跨 paint/event 共享: paint 测量后写入, event 命中检测读取;
+    /// Cell 跨 paint/event 共享：paint 测量后写入，event 命中检测读取;
     /// 依赖 paint 在 event 之前调用 (danqing 保证此顺序)。
     btn_area: std::cell::Cell<Rect>,
     text_secondary: Color,
@@ -248,8 +264,8 @@ impl Widget for VersionRow {
     }
 }
 
-/// 可点击链接行: 整行宽幽灵按钮 —— 常显下划线 (裸小字链接发现性太差),
-/// hover 整行底色反馈, 命中区整行 32px。
+/// 可点击链接行：整行宽幽灵按钮 —— 常显下划线 (裸小字链接发现性太差),
+/// hover 整行底色反馈，命中区整行 32px。
 struct Link {
     text: String,
     url: String,
@@ -292,14 +308,14 @@ impl Widget for Link {
         if self.hovered {
             rects.push_rect(area, self.hover_bg, 6.0);
         }
-        // 文本整行居中, 下划线随行
+        // 文本整行居中，下划线随行
         let text_w = texts.measure(&self.text, BODY_SIZE);
         let text_x = area.origin.x + (area.size.width - text_w) / 2.0;
         let baseline = area.origin.y
             + (LINK_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
             + texts.ascent(f32::from(BODY_SIZE));
         texts.push_text(&self.text, text_x, baseline, BODY_SIZE, self.accent);
-        // 常显下划线: 链接身份不依赖 hover 才发现
+        // 常显下划线：链接身份不依赖 hover 才发现
         let underline_y = baseline + texts.descent(f32::from(BODY_SIZE)) + 1.0;
         rects.push_rect(
             Rect::from_xywh(text_x, underline_y, text_w, 1.0),

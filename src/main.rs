@@ -208,7 +208,9 @@ pub(crate) enum Msg {
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     Notice(String),
+    // ---- 主题下拉 ----
     /// 通过下拉选择器选择主题 (索引)。
+    /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管, 不再经应用消息。
     SelectTheme(usize),
     /// 退出应用 (托盘菜单)。
     Quit,
@@ -1028,15 +1030,17 @@ impl App for LogApp {
     /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
     /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
     fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
-        // 设置卡打开时 Esc 前置关闭 (评审 R2): LogView 持焦后, 框架对未消费
-        // 的 Escape 只清焦不回退应用层, 不经此前置关卡需按两次 —— S3 回归。
-        if self.settings_open {
-            if let Event::Key {
-                key: Key::Named(NamedKey::Escape),
-                pressed: true,
-                ..
-            } = event
-            {
+        // Esc 前置：设置卡 > (后续留给搜索/过滤栏)
+        if let Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            ..
+        } = event
+        {
+            if self.settings_open {
+                // 本函数在焦点分发前运行 (无论有无焦点)，所以卡内主题下拉展开
+                // 时按 Esc 也走这条路径：整卡通关，而非先收下拉。与「设置卡
+                // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
         }

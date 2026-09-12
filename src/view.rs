@@ -1460,14 +1460,16 @@ impl Bar {
     fn handle_escape(&self, active: ActiveBar, msgs: &mut MsgQueue) -> EventResult {
         match active {
             ActiveBar::Filter => {
-                if self.filter_ti.value().is_empty() {
+                // 有已应用过滤 或 输入框有文字 → 清除; 都没有 → 仅清焦
+                if self.filter_applied.is_empty() && self.filter_ti.value().is_empty() {
                     return EventResult::Ignored;
                 }
                 msgs.push(Box::new(Msg::ClearFilter));
                 EventResult::Consumed
             }
             ActiveBar::Search => {
-                if self.search_ti.value().is_empty() {
+                // 有搜索结果 或 输入框有文字 → 清除; 都没有 → 仅清焦
+                if self.search_query.is_empty() && self.search_ti.value().is_empty() {
                     return EventResult::Ignored;
                 }
                 msgs.push(Box::new(Msg::ClearSearch));
@@ -1549,8 +1551,15 @@ mod tests {
         );
         // 其余列一律正文色 (降灰设计已被用户验收判死: 白底小字看不清,
         // klogg/LogViewPlus/Daucloud 对 ts/req_id 均用正文色)
-        assert_eq!(cell_color("ts", "2026-09-05"), Color::rgb(0.12, 0.12, 0.12), "ts 正文色");
-        assert_eq!(cell_color("msg", "request completed"), Color::rgb(0.12, 0.12, 0.12));
+        assert_eq!(
+            cell_color("ts", "2026-09-05"),
+            Color::rgb(0.12, 0.12, 0.12),
+            "ts 正文色"
+        );
+        assert_eq!(
+            cell_color("msg", "request completed"),
+            Color::rgb(0.12, 0.12, 0.12)
+        );
         assert_eq!(
             cell_color("logger", "auth-service"),
             Color::rgb(0.12, 0.12, 0.12),
