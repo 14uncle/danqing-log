@@ -1472,6 +1472,54 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// 轮转/重建: 计数随重建**全量重算**, 且列名与子句表跟着换 ——
+    /// JSONL 变明文后必须降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
+    #[test]
+    fn apply_rebuild_recomputes_counts_and_switches_column() {
+        let mut app = LogApp::new_empty();
+        let p1 = temp_log(b"{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n");
+        let f1 = LogFile::open(&p1).unwrap();
+        app.level_counts = Arc::new(levels::count_levels_field(&f1, "level"));
+        app.level_queries = levels::level_queries_for("level");
+        app.level_column = Some("level".into());
+        app.file = Arc::new(f1);
+        app.has_file = true;
+        assert!(
+            app.level_queries[Level::Error as usize].is_some(),
+            "起点: JSONL 可点"
+        );
+
+        // 轮转后内容变明文 → worker 交全量计数 + 无级别列
+        let p2 = temp_log(b"2026-09-05 ERROR plain one\n2026-09-05 WARN plain two\n");
+        let f2 = LogFile::open(&p2).unwrap();
+        let rebuilt_counts = levels::count_levels(&f2);
+        let out = OpenOutcome {
+            file: f2,
+            schema: None,
+            incremental_hits: None,
+            rebuilt: true,
+            level_counts: rebuilt_counts,
+            level_column: None,
+        };
+        app.apply_rebuild(&p2, out);
+
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::count_levels(&app.file),
+            "重建后计数 == 新文件全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Warn), 1);
+        assert_eq!(app.level_counts.total(), 2);
+        assert!(app.level_column.is_none(), "列名换掉, 不沿用旧的");
+        assert!(
+            app.level_queries.iter().all(Option::is_none),
+            "明文 → 子句表清空 (降级只读)"
+        );
+        std::fs::remove_file(&p1).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后

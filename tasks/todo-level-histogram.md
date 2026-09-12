@@ -218,15 +218,31 @@
 
 ## Phase 3: 增量与生存
 
-- [ ] **T6: tail 追加增量计数 + 轮转/重建重算**
+- [x] **T6: tail 追加增量计数 + 轮转/重建重算** ✅ 2026-09-12
   - 说明: 追加只算新行并累加 (用 `LevelCounts` 的增量接口);
     轮转/截断重建随重建重算; 计数与视图**同批次原子换入** (沿用 live-tail 快照一致性)
   - Acceptance: 单测对拍 —— 「全量计数」==「追加 N 行后的计数」(明文与 JSONL 各一组);
     重建后计数 == 重建后文件的全量计数
   - Verify: `cargo test`
   - Depends: T3, T4
-  - Files: `src/main.rs`, `src/open.rs`, `src/levels.rs`
-  - Scope: M
+  - Files: `src/main.rs`, `src/levels.rs` (生产路径已在 T3/T4 落地, 本任务补等价性证明)
+  - Scope: S (原估 M)
+  - 实测: 47 lib + 24 main + 8 genlog = **79 绿**, clippy 0。
+
+    **T3/T4 已把增量落进生产路径, T6 交付的是等价性证明** —— T3 就在
+    `apply_appended` 落点做了增量合并 (`count_levels_from` / `count_levels_field_from`),
+    因为那是 250ms 同步热路径, 全量重算会冻帧; 见 T3 实测②。
+
+    **多轮对拍** (`assert_incremental_matches_full`, 明文与 JSONL 字段口径各跑一遍):
+    100 行起, 连跑 5 轮追加 (每轮 10 或 25 行, 桶分布在 ERROR/WARN 间交替),
+    每轮断言「旧计数 + 新行增量 == 对当前文件的全量重算」且「6 桶之和 == 总行数」。
+    单轮对拍容易碰巧过, 连跑五轮且桶分布每轮不同才逼得出「漏行 / 重计 /
+    忘记合并」这类错法。
+
+    **重建换格式** (`apply_rebuild_recomputes_counts_and_switches_column`):
+    起点 JSONL 可点 → 轮转后内容变明文 → 断言计数等于新文件全量重算、列名被换掉
+    (不沿用旧的)、子句表清空 (降级只读)。这条堵的是「拿旧列名的子句去点新文件
+    会筛出 0 行」—— 即 T4 那条「口径必须全程一致」不变量的反面。
 
 ## Phase 4: 交互收尾
 

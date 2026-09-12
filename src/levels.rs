@@ -932,6 +932,90 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// 多轮追加: 每轮「旧计数 + 新行增量」必须等于对当前文件的**全量重算**。
+    ///
+    /// 这是 tail 期间侧栏可信的唯一依据 —— 单轮对拍容易碰巧过, 连跑五轮且
+    /// 每轮桶分布都不同 (交替 ERROR / WARN) 才逼出「漏行 / 重计 / 忘记合并」
+    /// 这类错法。
+    fn assert_incremental_matches_full(jsonl: bool) {
+        let line_of = |round: usize, i: usize| -> String {
+            let lv = if round.is_multiple_of(2) {
+                "ERROR"
+            } else {
+                "WARN"
+            };
+            if jsonl {
+                format!("{{\"level\":\"{lv}\",\"round\":{round},\"i\":{i}}}\n")
+            } else {
+                format!(
+                    "2026-09-05 12:{:02}:{:02} {lv} tail {round}-{i}\n",
+                    round,
+                    i % 60
+                )
+            }
+        };
+        let col = "level";
+        let count_full = |f: &LogFile| {
+            if jsonl {
+                count_levels_field(f, col)
+            } else {
+                count_levels(f)
+            }
+        };
+        let count_delta = |f: &LogFile, from: u64| {
+            if jsonl {
+                count_levels_field_from(f, col, from)
+            } else {
+                count_levels_from(f, from)
+            }
+        };
+
+        let mut init = String::new();
+        for i in 0..100 {
+            init.push_str(&line_of(0, i));
+        }
+        let p = temp_file(init.as_bytes());
+        let mut file = LogFile::open(&p).unwrap();
+        let mut acc = count_full(&file);
+        assert_eq!(acc.total(), 100, "起始 {jsonl} 行");
+
+        for round in 1..=5 {
+            let before = file.line_count();
+            let batch = if round % 2 == 0 { 10 } else { 25 };
+            let mut add = String::new();
+            for i in 0..batch {
+                add.push_str(&line_of(round, i));
+            }
+            {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+                f.write_all(add.as_bytes()).unwrap();
+            }
+            file = LogFile::append_from(&file, &p).unwrap();
+            assert_eq!(file.line_count(), before + batch as u64);
+
+            acc.merge(&count_delta(&file, before));
+            assert_eq!(
+                acc,
+                count_full(&file),
+                "jsonl={jsonl} 第 {round} 轮: 增量累加 != 全量重算"
+            );
+            assert_eq!(acc.total(), file.line_count(), "6 桶之和 == 总行数");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 明文口径的增量等价 (多轮)。
+    #[test]
+    fn incremental_matches_full_plain_text() {
+        assert_incremental_matches_full(false);
+    }
+
+    /// JSONL 字段口径的增量等价 (多轮)。
+    #[test]
+    fn incremental_matches_full_jsonl_field() {
+        assert_incremental_matches_full(true);
+    }
+
     /// 增量: 字段口径「全量」==「前 N 行 + 后段增量」。
     #[test]
     fn field_counting_incremental_matches_full() {
