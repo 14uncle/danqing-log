@@ -2,7 +2,7 @@
 //! @date 2026/09/06
 //!
 //! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + **不透明**卡
-//! (多页签: 快捷键 / 关于)。
+//! (多页签: 常规 / 快捷键 / 关于)。
 //!
 //! 为什么分页签: 单列堆叠在加上「快捷键」段后会把卡片顶得很高 (矮窗口下顶到边),
 //! 而两页签各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
@@ -26,9 +26,11 @@ use crate::config::{self, AppTheme};
 const CARD_WIDTH: f32 = 360.0;
 /// 页签**内容区**的固定高度 —— 两页签必须同高, 否则切换时卡片会跳。
 ///
-/// 取「最高那一页 + 余量」: 关于页在**有更新提示**时约 208px, 故取 216。
+/// 取「最高那一页 + 余量」: 当前最高是**关于**页 (有更新提示时约 171px)。
+/// 216 留了约 45px 余量 —— 不是随手取的: **常规**页已知会长 (v1.x 的授权行,
+/// 见 `docs/ROADMAP-v1x.md`), 届时不必再动这个常量。
 /// 高度加在内容上而不是整个 Tabs 上 —— 这样 tab 栏与面板间距是外加的,
-/// 两页签的高度基准才一致。
+/// 各页签的高度基准才一致。
 /// **新增页签时若内容超过此值会被裁切**, 届时同步调大这个常量。
 const PANEL_CONTENT_H: f32 = 216.0;
 /// 正文字号。
@@ -71,9 +73,11 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 .child(close_row())
                 .child(
                     Tabs::new(&t)
-                        // 关于放最后 (产品线惯例); 首屏落在快捷键页
+                        // 常规在前 (设置卡的首屏 = 设置), 关于放最后 (产品线惯例)
+                        .tab("常规")
                         .tab("快捷键")
                         .tab("关于")
+                        .child(general_panel())
                         .child(shortcuts_panel(content_w))
                         .child(about_panel(content_w))
                         // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
@@ -85,7 +89,21 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
         .width(CARD_WIDTH)
 }
 
-/// 「关于」页签: 产品名/版本/一句话 + 主题 + 版本检查 + 反馈。
+/// 「常规」页签: 可配置项的家 (目前只有主题)。
+///
+/// 单列一行的确是空 —— v1 也确实只有这一个开关。留在原处(`关于`页)才是错的:
+/// 那儿是**只读**的产品身份页, 把可点击的开关混进去, 用户没法一眼分辨
+/// 「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
+fn general_panel() -> impl Widget {
+    panel_box(
+        Column::new()
+            .gap(16.0)
+            .cross_center()
+            .child(theme_dropdown()),
+    )
+}
+
+/// 「关于」页签: 产品名/版本/一句话 + 版本检查 + 反馈。
 fn about_panel(content_w: f32) -> impl Widget {
     panel_box(
         Column::new()
@@ -93,7 +111,6 @@ fn about_panel(content_w: f32) -> impl Widget {
             .cross_center()
             .child(about_section())
             .child(content_row(version_row(), content_w))
-            .child(theme_dropdown())
             .child(feedback_row()),
     )
 }
