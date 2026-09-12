@@ -17,12 +17,20 @@
   (trial / 买断基建仍留 v1.x)。**推论: v1.0 两渠道皆免费层 → 无购买路径 → 前提③ (首单外检)
   只能在 v1.x 付费层上线后判定**。同批: README 全篇重写 (原稿停在 core-viewer 首版 `5f22ec6`,
   仍自称 POC 阶段且 4 条边界 3 条已失效) + 清 SPEC/ROADMAP 陈旧项
-- 当前: **v1.0 收尾** —— 代码功能已闭环, 余工作面 ① 等级直方图 (待 spec) ② MSIX 打包 +
-  Store 上架物料 ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag ④ 对外文案/截图素材。
-  **未获用户指示不 commit/push**
+- 2026-09-12 (**level-histogram T1–T8 全绿, 未 commit push**): **级别计数侧栏交付**
+  —— 6 桶 (FATAL/ERROR/WARN/INFO/DEBUG/其他) + 对数横条 + JSONL 点选筛选 + `Ctrl+L` 显隐。
+  spec → plan → build 走完, 机器部分闭环。三项实现中的关键改判见
+  `tasks/todo-level-histogram.md`: **D6** (计数不进索引趟, 索引耗时 77/88ms 基线不受影响
+  —— 做了 stash 对拍的真 A/B)、**字段口径改前缀匹配** (`col=X*`, 让计数与筛选结果
+  逐桶相等成为构造保证 —— 字节全等的 `level=WARN` 在文件写 `WARNING` 时会筛出 0 行)、
+  **窄窗自动折叠** (原 Open Question 二选一)。计数成本: 1GB 明文 94ms / JSONL 行口径 76ms /
+  JSONL 字段口径 112ms。**待人工验收 + review**
+- 当前: **v1.0 收尾** —— 余工作面 ① ~~等级直方图~~ (已交付, 待验收) ② MSIX 打包 +
+  Store 上架物料 (待打包方案调研) ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
+  ④ 对外文案/截图素材。**未获用户指示不 push**
 - 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
-- 测试基线: **40 绿** (16 lib + 16 main + 8 genlog), 2026-09-12 实测 (引擎拆分后口径;
-  lib = expand/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
+- 测试基线: **84 绿** (47 lib + 29 main + 8 genlog), 2026-09-12 实测 (level-histogram 后口径;
+  lib = expand/levels/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读
@@ -54,8 +62,15 @@
 - `src/main.rs` + `src/view.rs` — GUI (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
 - ~~`src/encoding.rs`~~ — 编码检测/转码 (2026-09-10 独立为兄弟 crate `danqing-encoding`, danqing 通过 `pub use danqing_encoding as encoding` re-export)
 - `src/search.rs` — AsyncJob (worker+tick拾取泛化) + SearchNav 命中导航
+- `src/levels.rs` — **级别分类与计数** (level-histogram 纯逻辑层): 6 桶分类器
+  (行口径 `classify_level` 子串 / 字段口径 `classify_field_value` 前缀 —— **两者有意不同**,
+  各自与自己的可点行为对齐)、`LevelCounts`、`count_ranges` 并行骨架、level 类列识别与点选子句
+- `src/histogram.rs` — **级别计数侧栏组件** (6 行 + 对数横条 + 点选); 是 LogView 的
+  **sibling** (`Row[Histogram(Fit), LogView.fill]`), 不侵入 LogView 坐标数学
 - `src/settings.rs` — 轻量设置卡 (scrim 遮罩 + 玻璃卡: 关于/版本/反馈/主题下拉)
-- `src/config.rs` — 配置持久化 (主题; `dirs::config_dir()/danqing-log/config.toml`, `AppTheme::load/save`)
+- `src/config.rs` — 配置持久化 (**整个 config.toml 的单真身** `Config { theme, histogram }`;
+  `dirs::config_dir()/danqing-log/config.toml`)。**写入必须整文件同源** —— 分头写会让
+  「改主题」抹掉侧栏开关; `load_from/save_to` 接路径参数供测试用 (不碰用户真配置)
 - `src/tray.rs` — 系统托盘右键菜单 (设置 / 退出; 自定义 ID 10/11 避与框架 1/2/3 冲突)
 - `src/app_update.rs` — 更新检查接线 (薄封装 `danqing::update`)
 - `src/expand.rs` — 展开行模型 (行内子行嵌套展开的显示行↔文件行双向映射, 前缀和)

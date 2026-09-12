@@ -284,20 +284,42 @@
     **⑤ 键位**: `Ctrl+L` 走 `app_key_filter` 前置 (与 Ctrl+T 同级), 故过滤/搜索栏
     聚焦时也生效。与既有 Ctrl 组合 (T/F/O/B/G) 无冲突。
 
-- [ ] **T8: 文档收口**
+- [x] **T8: 文档收口** ✅ 2026-09-12
   - 说明: `CLAUDE.md` 状态段 + 结构段 (`levels.rs` / `histogram.rs` 两个新模块);
     `docs/ROADMAP-v1x.md` §一 勾销「等级直方图」并注明已交付;
     `README.md` 功能段补一行; `SPEC.md` 地图已加 (本次 plan 前已完成)
   - Acceptance: 四处文档与实现一致, 无残留「待做」措辞
   - Verify: 人工通读对照
   - Depends: T1–T7
-  - Files: `CLAUDE.md`, `docs/ROADMAP-v1x.md`, `README.md`
+  - Files: `CLAUDE.md`, `docs/ROADMAP-v1x.md`, `README.md`, `docs/specs/SPEC-level-histogram.md`
   - Scope: S
+  - 实测: 四处均改。`CLAUDE.md` 测试基线 40 → **84** 绿 (口径同步); 结构段补
+    `levels.rs` / `histogram.rs` 两条并改写 `config.rs` 条目 (单真身 + 整文件同源写);
+    `README.md` 补功能条 + `Ctrl+L` 键位 + 「DEBUG/其他不可点」边界;
+    `ROADMAP-v1x.md` §一 已交付清单加项、改判块注明当日交付、§五 勾销。
+    spec 的 Open Questions 同步关闭 (留待裁项仅「DEBUG 桶可点性」)。
 
 ### Checkpoint D: 完成
 
-- [ ] 三件套绿 (`cargo fmt` + `cargo clippy --all-targets -- -D warnings` + `cargo test`)
-- [ ] 数字落档: 并行计数墙钟 (1GB 明文 / JSONL), 与基线索引耗时对照
-- [ ] spec 成功判据逐条对照过单
-- [ ] 人工验收清单全过 (用户实机)
-- [ ] 进 review 阶段
+- [x] 三件套绿 (`cargo fmt` + `cargo clippy --all-targets -- -D warnings` + `cargo test`)
+- [x] 数字落档 —— 全部实测不估算:
+
+  | 指标 | 1GB 明文 | 1GB JSONL |
+  |---|---|---|
+  | 索引 (**不得变动**, D6 判据) | 95 / 92 / 95 ms | 121 / 96 / 101 ms |
+  | 索引 (stash 掉计数代码对拍) | 93 / 93 / 95 ms | 92 / 90 / 95 ms |
+  | 计数 行口径 | 94 ms | 76 ms |
+  | 计数 字段口径 | — | 112 ms (9090 MiB/s) |
+
+  索引两侧同噪声域 → **D6 成立 (有证据, 非推理)**。附带发现: 09-11 基线 77/88ms
+  今日复现不出 (同一二进制跑出 81→95 的漂移), 属机器状态 —— **后续索引对照须做
+  同会话 A/B, 不拿历史数字比**。
+- [ ] spec 成功判据逐条对照过单 (机器项已对照; 详见下方人工项)
+- [ ] **人工验收清单全过 (用户实机)** —— 待办, 清单如下:
+  1. 明文 1GB 打开 → 侧栏出现, 6 行数字与过滤结果交叉核对一致; 0 计数桶仍显示
+  2. JSONL 1GB 打开 → 点 ERROR 柱条 → **底栏行数与柱条数字一致**; 再点清除
+  3. 纯文本模式柱条只读 (点击无响应); 「其他」行两种模式都不可点
+  4. tail 追加后计数随之变化; 外部截断/轮转后计数与重建结果一致
+  5. `Ctrl+L` 显隐即时生效; **重启后开关状态保持**; 窄窗自动折叠
+  6. 深浅两套主题下 6 行均可辨识
+- [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`)
