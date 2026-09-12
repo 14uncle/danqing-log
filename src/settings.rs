@@ -42,7 +42,10 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
-/// 玻璃卡片：关闭行 + 关于 + 版本行 + 主题切换 + 反馈链接。
+/// 设置卡片：关闭行 + 页签 (快捷键 / 关于)。
+///
+/// 卡面上**不再**另有关于区/版本行 —— 自 2026-09-13 起这两样各就其位在
+/// 「关于」页签里, 摆在页签外会与页签内容同屏重复 (用户指出)。
 fn settings_card(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
     let pad = Edges {
@@ -66,11 +69,6 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 .gap(16.0)
                 .cross_center()
                 .child(close_row())
-                .child(about_section())
-                .child(content_row(version_row(), content_w))
-                // 主题行不套 content_row (那是「占满内容宽 + 内部左对齐」):
-                // 让 「主题 + 下拉」按内容整体收缩, 交给 Column 的 cross_center 居中,
-                // 与关于区三行/反馈链接同处一条中轴。
                 .child(
                     Tabs::new(&t)
                         // 关于放最后 (产品线惯例); 首屏落在快捷键页
