@@ -246,16 +246,43 @@
 
 ## Phase 4: 交互收尾
 
-- [ ] **T7: `Ctrl+L` 显隐 + config 持久化 + 主题适配 + 窄窗口**
+- [x] **T7: `Ctrl+L` 显隐 + config 持久化 + 主题适配 + 窄窗口** ✅ 2026-09-12
   - 说明: `Ctrl+L` 切换侧栏 (与既有 Ctrl 组合不冲突); 开关落 `config.toml`
     (复用 `src/config.rs` 现有通道); 6 行在深浅两套主题下均可辨识 (走 `Theme` trait);
-    窄窗口下走定下的策略 (自动折叠 or 内容区保最小宽度)
+    窄窗口下自动折叠
   - Acceptance: `Ctrl+L` 显隐即时生效; 重启后开关状态保持;
     深浅主题切换后 6 行均可辨识; 窄窗口不破版
   - Verify: `cargo test` + 手动重启验证持久化
   - Depends: T3
   - Files: `src/main.rs`, `src/config.rs`, `src/histogram.rs`
   - Scope: M
+  - 实测: 47 lib + 29 main + 8 genlog = **84 绿**, clippy 0; 明文/JSONL release 冒烟存活。
+
+    **① `config.rs` 重构为单真身 (顺手堵一个既有隐患)**: 原 `AppTheme::save` 是
+    **整文件覆盖写**, 只写 `[theme]` 一行。直接加第二个键的话, 用户改主题会顺手
+    抹掉侧栏开关 (或反过来)。改为 `Config { theme, histogram }` 单结构 + 单一
+    写入点, 两个键同源写; 并加 `load_from/save_to` 接路径参数 —— 否则测试会写到
+    `dirs::config_dir()` 即**用户的真配置文件**上。
+    键格式: `[theme] mode` + `[view] histogram`。缺键取默认 (old 文件仅 `[theme]`
+    仍可读, 向后兼容), 由 `legacy_file_without_view_section_still_loads` 钉住。
+
+    **② 窄窗 = 自动折叠 (原 Open Question 二选一, 定为折叠)**: 内容宽 < 640px
+    时侧栏宽度归零, 优先保内容区 —— 新用户未必知道有 `Ctrl+L`, 卡在没法看的
+    布局里比看不到直方图糟。
+
+    **③ 判定只留一处**: `effective_width(visible, available)` 是唯一的显隐判定,
+    paint/event 不重判 visible, 只看 layout 给的 `area.size.width`
+    (`< 1.0` 即不画/放行事件) —— 不存在「宽度 0 却还在画 / 还在吃点击」的漏判。
+    `collapsed_sidebar_ignores_events` 钉住折叠态**放行**而非吞掉事件
+    (零宽侧栏吃掉落在内容区的点击是隐形 bug)。
+
+    **④ 主题**: 文字/生效行底色走 `Theme` trait (`text_primary`/`text_secondary`/
+    `surface_variant`); 横条复用 `view.rs` 的四个语义色, 与**行着色同源** ——
+    深色下两者一起明暗, 不会出现「侧栏看得清但行看不清」的错配。四个语义色
+    都是中高明度值, 在深底上可辨 (未做深色实机目视, 待人工)。
+
+    **⑤ 键位**: `Ctrl+L` 走 `app_key_filter` 前置 (与 Ctrl+T 同级), 故过滤/搜索栏
+    聚焦时也生效。与既有 Ctrl 组合 (T/F/O/B/G) 无冲突。
 
 - [ ] **T8: 文档收口**
   - 说明: `CLAUDE.md` 状态段 + 结构段 (`levels.rs` / `histogram.rs` 两个新模块);

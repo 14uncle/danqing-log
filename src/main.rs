@@ -179,6 +179,8 @@ pub(crate) struct LogApp {
     settings_open: bool,
     /// 主题模式 (浅色/深色)。
     theme: config::AppTheme,
+    /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
+    histogram_visible: bool,
 }
 
 /// 应用消息。
@@ -209,8 +211,10 @@ pub(crate) enum Msg {
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
     // ---- level-histogram 侧栏 ----
-    /// 点侧栏柱条: 套用 `level=<NAME>` 过滤; 已是当前生效项则清除 (切换语义)。
+    /// 点侧栏柱条: 套用该桶的过滤子句; 已是当前生效项则清除 (切换语义)。
     ApplyLevelFilter(Level),
+    /// `Ctrl+L`: 侧栏显隐 (落 config.toml)。
+    ToggleHistogram,
     // ---- S2–S4 设置卡 ----
     /// 打开设置卡。
     OpenSettings,
@@ -235,6 +239,7 @@ pub(crate) enum Msg {
 impl LogApp {
     /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
     fn new_empty() -> Self {
+        let cfg = config::Config::load();
         Self {
             window_sender: None,
             file: Arc::new(LogFile::empty()),
@@ -271,8 +276,22 @@ impl LogApp {
             open_job: None,
             loading_label: None,
             settings_open: false,
-            theme: config::AppTheme::load(),
+            theme: cfg.theme,
+            histogram_visible: cfg.histogram,
         }
+    }
+
+    /// 把当前设置写回 `config.toml`。
+    ///
+    /// 必须走整文件写入 —— [`config::Config`] 的两个键同源, 分头写会让
+    /// 「改主题」顺手抹掉侧栏开关 (config.rs 的 `round_trip_preserves_both_keys`
+    /// 钉着这条)。
+    fn save_config(&self) {
+        config::Config {
+            theme: self.theme,
+            histogram: self.histogram_visible,
+        }
+        .save();
     }
 
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
@@ -958,6 +977,10 @@ impl App for LogApp {
             Msg::ToggleMode => self.toggle_mode(),
             // ---- level-histogram 侧栏 ----
             Msg::ApplyLevelFilter(l) => self.apply_level_filter(l),
+            Msg::ToggleHistogram => {
+                self.histogram_visible = !self.histogram_visible;
+                self.save_config();
+            }
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
                 self.settings_open = true;
@@ -979,7 +1002,7 @@ impl App for LogApp {
             }
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
-                self.theme.save();
+                self.save_config();
             }
             Msg::Quit => {
                 if let Some(sender) = &self.window_sender {
@@ -1153,6 +1176,10 @@ impl App for LogApp {
         }
         if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
             return Some(Msg::ToggleMode);
+        }
+        // Ctrl+L 侧栏显隐: 走前置过滤而非 event(), 故栏聚焦时也生效 (与 Ctrl+T 同级)
+        if s.eq_ignore_ascii_case("l") {
+            return Some(Msg::ToggleHistogram);
         }
         if s.eq_ignore_ascii_case("o") {
             // Ctrl+O 全局：弹文件选择器，选中返回 OpenFile msg

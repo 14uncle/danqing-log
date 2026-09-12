@@ -1,16 +1,81 @@
 //! @author 十四叔
 //! @date 2026/09/11
 //!
-//! 配置文件读写: 主题持久化。
+//! 配置文件读写: 主题 + 视图开关。
 //!
 //! 配置路径: `dirs::config_dir()` / `danqing-log/config.toml`
-//! 格式: `[theme] mode = "light"` 或 `"dark"`
+//! 格式: `[theme] mode = "light"` + `[view] histogram = true`
+//!
+//! 解析是**朴素子串判定** (不引 toml 依赖), 与既有风格一致; 写入由
+//! [`Config::save_to`] 一次性覆盖整文件 —— 所以两个键**必须同源写**,
+//! 各存各的会让「改主题」顺手抹掉侧栏开关。
+//!
+//! 缺键一律取默认值, 故旧版只有 `[theme]` 的配置文件仍可读 (向后兼容)。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use danqing::theme::{DarkTheme, LightTheme, Theme};
 use danqing::{Color, Easing, Shadow};
+
+/// 整个 `config.toml` 的唯一真身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Config {
+    pub(crate) theme: AppTheme,
+    /// 级别计数侧栏是否显示 (`Ctrl+L` 切换)。
+    pub(crate) histogram: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            theme: AppTheme::Light,
+            histogram: true,
+        }
+    }
+}
+
+impl Config {
+    /// 从真实配置路径加载。
+    pub(crate) fn load() -> Self {
+        Self::load_from(&config_path())
+    }
+
+    /// 存到真实配置路径。
+    pub(crate) fn save(self) {
+        self.save_to(&config_path());
+    }
+
+    /// 从指定路径加载 (测试用: 不碰用户真配置)。
+    pub(crate) fn load_from(path: &Path) -> Self {
+        let mut c = Self::default();
+        if let Ok(content) = fs::read_to_string(path) {
+            if content.contains("mode = \"dark\"") {
+                c.theme = AppTheme::Dark;
+            }
+            if content.contains("histogram = false") {
+                c.histogram = false;
+            }
+        }
+        c
+    }
+
+    /// 存到指定路径 (测试用)。
+    pub(crate) fn save_to(self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let mode = match self.theme {
+            AppTheme::Light => "light",
+            AppTheme::Dark => "dark",
+        };
+        let content = format!(
+            "[theme]\nmode = \"{mode}\"\n\n[view]\nhistogram = {}\n",
+            self.histogram
+        );
+        let _ = fs::write(path, content);
+    }
+}
 
 /// 主题模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,31 +85,6 @@ pub(crate) enum AppTheme {
 }
 
 impl AppTheme {
-    /// 从配置文件加载，默认 Light。
-    pub(crate) fn load() -> Self {
-        let path = config_path();
-        if let Ok(content) = fs::read_to_string(&path) {
-            if content.contains("mode = \"dark\"") {
-                return Self::Dark;
-            }
-        }
-        Self::Light
-    }
-
-    /// 保存到配置文件。
-    pub(crate) fn save(self) {
-        let path = config_path();
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let mode = match self {
-            Self::Light => "light",
-            Self::Dark => "dark",
-        };
-        let content = format!("[theme]\nmode = \"{mode}\"\n");
-        let _ = fs::write(&path, content);
-    }
-
     /// 选项索引 (Dropdown 用)。
     pub(crate) fn index(self) -> usize {
         match self {
@@ -241,4 +281,66 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("danqing-log")
         .join("config.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 临时配置路径 (不碰用户真配置 —— 测试往那儿写会抹掉人家的设置)。
+    fn temp_cfg(content: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "danqing-log-cfg-{}-{}.toml",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        if !content.is_empty() {
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+        p
+    }
+
+    /// 往返: 存下来的**两个键**都要能读回来。
+    /// 少写一个键 = 用户改了主题、侧栏开关被静默重置 (或反过来)。
+    #[test]
+    fn round_trip_preserves_both_keys() {
+        let p = temp_cfg("");
+        for cfg in [
+            Config {
+                theme: AppTheme::Dark,
+                histogram: false,
+            },
+            Config {
+                theme: AppTheme::Light,
+                histogram: true,
+            },
+        ] {
+            cfg.save_to(&p);
+            assert_eq!(Config::load_from(&p), cfg, "往返不等: {cfg:?}");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 旧版只有 `[theme]` 的配置文件仍可读, 缺键取默认值。
+    #[test]
+    fn legacy_file_without_view_section_still_loads() {
+        let p = temp_cfg("[theme]\nmode = \"dark\"\n");
+        let c = Config::load_from(&p);
+        assert_eq!(c.theme, AppTheme::Dark, "旧键要认");
+        assert!(c.histogram, "缺键取默认: 显示");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 无配置文件 → 全默认, 不 panic。
+    #[test]
+    fn missing_file_yields_defaults() {
+        let p = temp_cfg("");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(Config::load_from(&p), Config::default());
+        assert_eq!(Config::default().theme, AppTheme::Light);
+        assert!(Config::default().histogram);
+    }
 }

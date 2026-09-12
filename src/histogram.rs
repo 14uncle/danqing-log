@@ -41,6 +41,24 @@ const BAR_H: f32 = 6.0;
 const BAR_GAP: f32 = 3.0;
 /// 非零计数的最小可见条宽 (对数刻度下 1 与 1e6 也只差一档)。
 const MIN_BAR_W: f32 = 2.0;
+/// 容得下侧栏的最小窗口内容宽: 再窄就自动折叠, 优先保内容区。
+const MIN_CONTENT_WIDTH: f32 = 640.0;
+
+/// 侧栏的有效宽度: 关掉 (`Ctrl+L`), 或窗口窄到容不下 → 0。
+///
+/// 窄窗自动折叠的必要性: 侧栏是固定宽, 窗口 400px 时内容区只剩 288px,
+/// 而新用户未必知道有 `Ctrl+L` —— 卡在没法看的布局里比看不到直方图糟。
+/// `available` 是**整个 Row 的可用宽** (Fit 子项拿到的是宽松约束)。
+///
+/// paint/event 不重判这个函数, 而是看 layout 给出的实际宽度 (`area.size.width`)
+/// —— 判定只有一处, 不存在「宽度 0 却还在画/还在吃点击」的漏判。
+pub(crate) fn effective_width(visible: bool, available: f32) -> f32 {
+    if visible && available >= MIN_CONTENT_WIDTH {
+        HIST_WIDTH
+    } else {
+        0.0
+    }
+}
 
 /// 第 `i` 行的命中矩形 (序同 [`Level::ALL`])。
 fn row_rect(area: Rect, i: usize) -> Rect {
@@ -88,6 +106,8 @@ pub(crate) struct LevelHistogram {
     counts: LevelCounts,
     /// 每桶的点选子句 (来自当前文件的级别类列; 全 None = 只读侧栏)。
     queries: LevelQueries,
+    /// 用户开关 (`Ctrl+L`)。关掉时宽度归零, 与「窄窗自动折叠」同一条路径。
+    visible: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
     // 主题色在 sync 期解析并缓存, paint 期零查表 (与 view.rs 同款)。
@@ -103,6 +123,7 @@ impl LevelHistogram {
         Self {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
+            visible: true,
             active: None,
             bg: Color::rgb(1.0, 1.0, 1.0),
             text_primary: Color::rgb(0.12, 0.12, 0.12),
@@ -139,6 +160,7 @@ impl Widget for LevelHistogram {
         self.active_bg = t.surface_variant();
         self.counts = *app.level_counts.as_ref();
         self.queries = app.level_queries.clone();
+        self.visible = app.histogram_visible;
         // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
         self.active = Level::ALL.iter().copied().find(|l| {
@@ -149,11 +171,20 @@ impl Widget for LevelHistogram {
     }
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
-        let h = constraints.max().height;
-        Size::new(HIST_WIDTH, if h.is_finite() { h } else { 0.0 })
+        let max = constraints.max();
+        let h = if max.height.is_finite() {
+            max.height
+        } else {
+            0.0
+        };
+        Size::new(effective_width(self.visible, max.width), h)
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        // 归零即不画 —— 与 layout 的判定同一依据 (宽度), 不重复判断 visible。
+        if area.size.width < 1.0 {
+            return;
+        }
         // 整条填主题背景 —— 底栏只画 1px 分隔线不画自己的底色, 故底色在此
         // 与 LogView 的底完全一致, 侧栏与内容区之间无缝。
         rects.push_rect(area, self.bg, 0.0);
@@ -213,6 +244,9 @@ impl Widget for LevelHistogram {
     }
 
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        if area.size.width < 1.0 {
+            return EventResult::Ignored;
+        }
         let Event::MouseInput {
             pressed: true,
             position,
@@ -239,6 +273,43 @@ impl Widget for LevelHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 有效宽度: 开着且够宽才给 112; 关掉或过窄一律 0。
+    #[test]
+    fn effective_width_collapses_on_toggle_and_narrow_window() {
+        assert_eq!(effective_width(true, 1200.0), HIST_WIDTH, "开着且够宽");
+        assert_eq!(
+            effective_width(true, MIN_CONTENT_WIDTH),
+            HIST_WIDTH,
+            "恰好够宽"
+        );
+        assert_eq!(effective_width(false, 1200.0), 0.0, "Ctrl+L 关掉");
+        assert_eq!(
+            effective_width(true, MIN_CONTENT_WIDTH - 1.0),
+            0.0,
+            "窄窗自动折叠: 优先保内容区"
+        );
+        assert_eq!(effective_width(false, 100.0), 0.0, "两者叠加仍是 0");
+    }
+
+    /// 折叠态 (宽度 0): 不吞事件、不发消息 —— 否则零宽侧栏会吃掉落在内容区的点击。
+    #[test]
+    fn collapsed_sidebar_ignores_events() {
+        let mut w = LevelHistogram::new();
+        let area = Rect::from_xywh(0.0, 0.0, 0.0, 600.0);
+        let ev = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point { x: 0.0, y: 20.0 },
+        };
+        let mut q = MsgQueue::default();
+        assert_eq!(
+            w.event(&ev, area, &mut q),
+            EventResult::Ignored,
+            "折叠态应放行而非吞掉"
+        );
+        assert!(q.is_empty(), "折叠态不得发消息");
+    }
 
     /// 只读侧栏 (全 None 子句表) 下点击必须被吞掉, 且不发出任何消息 ——
     /// 否则点空侧栏会穿透去选中底下的日志行。
