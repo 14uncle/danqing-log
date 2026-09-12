@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Result;
 
 use crate::jsonl::{self, Clause, Schema};
+use crate::levels::{self, LevelCounts};
 use crate::logfile::{AppendOutcome, IndexHooks, LogFile};
 use crate::search::AsyncJob;
 
@@ -44,6 +45,14 @@ pub struct OpenOutcome {
     /// 追加退化全量重建 (review R3: UTF-16/缩容兜底) —— 落点须按 Rebuild
     /// 重置链分派, 不能凭发起意图走 Append 链。
     pub rebuilt: bool,
+    /// 级别计数 (level-histogram): 在 worker 内算好, 与 file 同批交付 ——
+    /// UI 侧不存在「行数已更新、计数还是旧的」窗口。
+    ///
+    /// **语义按臂而定**: Fresh / Rebuild / 追加退化重建臂 = **全量**;
+    /// 真增量臂 (巨量追平) = **新增行 `[old.line_count(), new)` 的增量**,
+    /// 由落点 ([`crate::main`] 的 `apply_appended`) 与旧计数合并。
+    /// 分派依据是 [`Self::rebuilt`]。
+    pub level_counts: LevelCounts,
 }
 
 /// 打开作业: worker 线程跑 open (+JSONL 检出), 应用层 tick poll 拾取。
@@ -81,11 +90,14 @@ impl OpenJob {
                 } else {
                     None
                 };
+                // 计数在索引趟之外单独一趟并行扫描 (D6); 随 file 一起交卷
+                let level_counts = levels::count_levels(&file);
                 Ok(OpenOutcome {
                     file,
                     schema,
                     incremental_hits: None,
                     rebuilt: false,
+                    level_counts,
                 })
             })
         });
@@ -137,11 +149,19 @@ impl OpenJob {
                     }
                     _ => None,
                 };
+                // 退化重建臂 → 全量 (内容换过格式); 真增量臂 → 只算旧行数之后的
+                // 新行, 落点与旧计数合并 (增量, 免得每次追平重扫全文件)
+                let level_counts = if rebuilt {
+                    levels::count_levels(&file)
+                } else {
+                    levels::count_levels_from(&file, old.line_count())
+                };
                 Ok(OpenOutcome {
                     file,
                     schema,
                     incremental_hits,
                     rebuilt,
+                    level_counts,
                 })
             })
         });
@@ -220,6 +240,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::levels::Level;
     use std::io::Write;
     use std::time::{Duration, Instant};
 
@@ -357,5 +378,66 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("old")).ok();
+    }
+
+    /// Fresh 臂: 产物带全文件级别计数, 且 6 桶之和 == 总行数。
+    #[test]
+    fn fresh_outcome_carries_full_level_counts() {
+        let path = temp_file(
+            b"2026-09-05 12:00:01 FATAL a\n\
+              2026-09-05 12:00:02 ERROR b\n\
+              2026-09-05 12:00:03 WARN c\n\
+              2026-09-05 12:00:04 INFO d\n\
+              2026-09-05 12:00:05 DEBUG e\n\
+              2026-09-05 12:00:06 TRACE f\n\
+              2026-09-05 12:00:07 plain\n",
+        );
+        let mut job = OpenJob::launch(OpenKind::Fresh, &path);
+        let out = wait_outcome(&mut job).expect("Fresh 打开成功");
+        assert_eq!(out.level_counts.get(Level::Fatal), 1);
+        assert_eq!(out.level_counts.get(Level::Error), 1);
+        assert_eq!(out.level_counts.get(Level::Warn), 1);
+        assert_eq!(out.level_counts.get(Level::Info), 1);
+        assert_eq!(
+            out.level_counts.get(Level::DebugTrace),
+            2,
+            "DEBUG+TRACE 同桶"
+        );
+        assert_eq!(out.level_counts.get(Level::Other), 1);
+        assert_eq!(
+            out.level_counts.total(),
+            out.file.line_count(),
+            "6 桶之和 == 总行数"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 追平臂: 级别计数是**新行的增量**, 不是全量 —— 落点负责与旧计数合并。
+    /// 语义若写成全量, 落点再合并一次就会翻倍; 写成增量却当全量用则丢失旧数据。
+    #[test]
+    fn append_outcome_levels_are_a_delta_not_a_total() {
+        let path = temp_file(b"2026-09-05 12:00:01 ERROR first\n");
+        let old = Arc::new(LogFile::open(&path).unwrap());
+        assert_eq!(old.line_count(), 1, "旧快照 1 行");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"2026-09-05 12:00:02 INFO two\n2026-09-05 12:00:03 ERROR three\n")
+                .unwrap();
+        }
+        let mut job = OpenJob::launch_append(&path, old, 64, None);
+        let out = wait_outcome(&mut job).expect("追平成功");
+        assert!(!out.rebuilt, "纯追加不走重建臂");
+        assert_eq!(out.file.line_count(), 3);
+        assert_eq!(out.level_counts.total(), 2, "只含新增的两行");
+        assert_eq!(out.level_counts.get(Level::Info), 1);
+        assert_eq!(
+            out.level_counts.get(Level::Error),
+            1,
+            "只数新行里的那条 ERROR"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -77,7 +77,7 @@ fn header_line() -> Color {
     LightTheme.divider()
 }
 /// INFO / 3xx 蓝。
-fn info_fg() -> Color {
+pub(crate) fn info_fg() -> Color {
     Color::rgb(0.22, 0.46, 0.74)
 }
 /// 2xx 绿。
@@ -85,15 +85,15 @@ fn ok_fg() -> Color {
     Color::rgb(0.16, 0.56, 0.32)
 }
 /// WARN / 4xx 琥珀。
-fn warn_fg() -> Color {
+pub(crate) fn warn_fg() -> Color {
     Color::rgb(0.72, 0.50, 0.02)
 }
 /// ERROR / 5xx 红。
-fn err_fg() -> Color {
+pub(crate) fn err_fg() -> Color {
     Color::rgb(0.76, 0.21, 0.21)
 }
 /// DEBUG / TRACE 灰。
-fn trace_fg() -> Color {
+pub(crate) fn trace_fg() -> Color {
     Color::rgb(0.56, 0.56, 0.60)
 }
 

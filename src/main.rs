@@ -18,6 +18,7 @@
 
 mod app_update;
 mod config;
+mod histogram;
 mod settings;
 mod tray;
 mod view;
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use danqing::theme::{ScenePalette, SceneTheme};
-use danqing::widget::{Column, LogoKind, Node, Stack, TitleBar, node};
+use danqing::widget::{Column, LogoKind, Node, Row, Stack, TitleBar, node};
 use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
@@ -36,6 +37,7 @@ use danqing::{
 use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
+use danqing_log::levels::{self, Level, LevelCounts};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
 use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
 use danqing_log::search::{AsyncJob, SearchNav};
@@ -123,6 +125,9 @@ pub(crate) struct LogApp {
     mode: ViewMode,
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
+    /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
+    /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
+    level_counts: Arc<LevelCounts>,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
     /// 已应用的过滤查询。
@@ -197,6 +202,9 @@ pub(crate) enum Msg {
     ClearFilter,
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
+    // ---- level-histogram 侧栏 ----
+    /// 点侧栏柱条: 套用 `level=<NAME>` 过滤; 已是当前生效项则清除 (切换语义)。
+    ApplyLevelFilter(Level),
     // ---- S2–S4 设置卡 ----
     /// 打开设置卡。
     OpenSettings,
@@ -231,6 +239,7 @@ impl LogApp {
             status: String::new(),
             mode: ViewMode::Raw,
             schema: None,
+            level_counts: Arc::new(LevelCounts::default()),
             filtered: None,
             filter_applied: String::new(),
             filter_clear_rev: 0,
@@ -369,7 +378,11 @@ impl LogApp {
             }
             // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
-                Ok(new) => self.apply_appended(new, None),
+                Ok(new) => {
+                    // 只数新行 —— 这里在 UI 线程上, 全量重算会冻帧
+                    let delta = levels::count_levels_from(&new, self.file.line_count());
+                    self.apply_appended(new, None, delta);
+                }
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
             }
         } else {
@@ -393,10 +406,16 @@ impl LogApp {
         // review C1: 旧内容上的在途 filter/search 结果不得贴到新内容
         self.filter_job.invalidate();
         self.search_job.invalidate();
-        let OpenOutcome { file, schema, .. } = out;
+        let OpenOutcome {
+            file,
+            schema,
+            level_counts,
+            ..
+        } = out;
         let base_status = status_text(path, &file);
         let new_count = file.line_count();
         self.file = Arc::new(file);
+        self.level_counts = Arc::new(level_counts);
         // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
         self.schema = schema.map(Arc::new);
         self.mode = if self.schema.is_some() {
@@ -436,6 +455,7 @@ impl LogApp {
         let OpenOutcome {
             file: new_file,
             schema,
+            level_counts,
             ..
         } = out;
         let base_status = status_text(&new_path, &new_file);
@@ -464,6 +484,7 @@ impl LogApp {
         self.base_status = base_status;
         self.mode = mode;
         self.schema = schema;
+        self.level_counts = Arc::new(level_counts);
         self.top_row = 0.0;
         self.selected = 0;
         self.filtered = None;
@@ -486,9 +507,20 @@ impl LogApp {
     /// Append 换入 (同步小追加 / 追平 worker 交卷同链): 增量过滤 + follow 滚底。
     /// `worker_hits` = worker 已算好的增量命中 (review R2: 巨量追平过滤下沉);
     /// None = 本地扫 (同步小追加, 毫秒级)。
-    fn apply_appended(&mut self, new: LogFile, worker_hits: Option<Vec<u64>>) {
+    fn apply_appended(
+        &mut self,
+        new: LogFile,
+        worker_hits: Option<Vec<u64>>,
+        level_delta: LevelCounts,
+    ) {
         let old_line_count = self.file.line_count();
         self.file = Arc::new(new);
+        // 计数是**增量**: 追加只数了新行, 与旧计数合并 (全量重算在同步热路径上
+        // 等于每次追加卡一次全文件扫描)。合并与文件换入同批次, 故侧栏永远
+        // 对应此刻这份文件。
+        let mut counts = *self.level_counts.as_ref();
+        counts.merge(&level_delta);
+        self.level_counts = Arc::new(counts);
         match worker_hits {
             Some(hits) => self.merge_filter_hits(hits),
             None => self.append_filter_hits(old_line_count),
@@ -519,9 +551,10 @@ impl LogApp {
                         let OpenOutcome {
                             file,
                             incremental_hits,
+                            level_counts,
                             ..
                         } = out;
-                        self.apply_appended(file, incremental_hits);
+                        self.apply_appended(file, incremental_hits, level_counts);
                     }
                 }
             },
@@ -547,6 +580,22 @@ impl LogApp {
                 }
                 self.refresh_status();
             }
+        }
+    }
+
+    /// 点侧栏柱条: 套用 `level=<NAME>` 过滤 (复用既有过滤通路, 零新语法);
+    /// 点的已是当前生效项 → 清除 (切换语义)。
+    ///
+    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE) 在侧栏侧已挡, 此处再兜一层 ——
+    /// 消息源不止一处时不会漏。
+    fn apply_level_filter(&mut self, level: Level) {
+        let Some(q) = histogram::level_query(level) else {
+            return;
+        };
+        if self.filter_applied == q {
+            self.update(Msg::ApplyFilter(String::new()));
+        } else {
+            self.update(Msg::ApplyFilter(q.to_string()));
         }
     }
 
@@ -875,6 +924,8 @@ impl App for LogApp {
             Msg::FocusSearch => self.open_search(),
             Msg::ClearFilter => self.clear_filter(),
             Msg::ToggleMode => self.toggle_mode(),
+            // ---- level-histogram 侧栏 ----
+            Msg::ApplyLevelFilter(l) => self.apply_level_filter(l),
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
                 self.settings_open = true;
@@ -908,8 +959,12 @@ impl App for LogApp {
     }
 
     fn view(&self) -> Node {
-        // 顶层：Stack[Column[TitleBar.embed(Bar), LogView.fill], Overlay(设置卡)]。
-        // 设置卡浮层在最上层，关闭时零高不拦截事件。
+        // 顶层：Stack[Column[TitleBar.embed(Bar), Row[Histogram(Fit), LogView.fill]],
+        // Overlay(设置卡)]。设置卡浮层在最上层，关闭时零高不拦截事件。
+        //
+        // 侧栏做成 LogView 的 **sibling** (weight 0 = 取自身 layout 的固定宽),
+        // 而非塞进 LogView 内部 —— 后者要改它的 gutter/x 偏移/命中测试/横滚范围
+        // 一整套坐标数学, sibling 方案下 LogView 只是拿到一个更窄的 area。
         node(
             Stack::new()
                 .child(
@@ -928,7 +983,12 @@ impl App for LogApp {
                                         .bind_clear_search(|app: &LogApp| app.search_clear_rev),
                                 ),
                         )
-                        .fill(view::LogView::new(), 1),
+                        .fill(
+                            Row::new()
+                                .fill(histogram::LevelHistogram::new(), 0)
+                                .fill(view::LogView::new(), 1),
+                            1,
+                        ),
                 )
                 .child(settings::settings_overlay(self.theme)),
         )
@@ -1258,6 +1318,38 @@ mod tests {
         path
     }
 
+    /// 追加换入: 级别计数是**增量合并**, 不是覆盖 —— 写成覆盖会让每次追加
+    /// 之后侧栏只剩新行的数字。终值必须等于对新文件全量重算的结果。
+    #[test]
+    fn apply_appended_merges_level_counts_incrementally() {
+        let mut app = LogApp::new_empty();
+        // 起点: 已打开的文件含 1 条 ERROR + 1 条 INFO
+        let p1 = temp_log(b"2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n");
+        let f1 = LogFile::open(&p1).unwrap();
+        app.level_counts = Arc::new(levels::count_levels(&f1));
+        app.file = Arc::new(f1);
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+
+        // 追加后: 第 3 行是新来的 ERROR, 落点只交 [2, 3) 的增量
+        let p2 = temp_log(
+            b"2026-09-05 12:00:01 ERROR one\n\
+              2026-09-05 12:00:02 INFO two\n\
+              2026-09-05 12:00:03 ERROR three\n",
+        );
+        let f2 = LogFile::open(&p2).unwrap();
+        let delta = levels::count_levels_from(&f2, 2);
+        assert_eq!(delta.total(), 1, "增量只含新行");
+        app.apply_appended(f2, None, delta);
+
+        assert_eq!(app.level_counts.get(Level::Error), 2, "旧 1 + 新 1");
+        assert_eq!(app.level_counts.get(Level::Info), 1);
+        assert_eq!(app.level_counts.total(), 3);
+        // 增量结果 == 对新文件全量重算 (这条是增量正确性的定义)
+        assert_eq!(*app.level_counts.as_ref(), levels::count_levels(&app.file));
+        std::fs::remove_file(&p1).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
@@ -1284,11 +1376,14 @@ mod tests {
         });
         // 两个 worker 阻塞中 (结果必未到达) → 换入新文件 (invalidate 发生)
         let p = temp_log(b"new\nfile\n");
+        let f = LogFile::open(&p).unwrap();
+        let level_counts = levels::count_levels(&f);
         let out = OpenOutcome {
-            file: LogFile::open(&p).unwrap(),
+            file: f,
             schema: None,
             incremental_hits: None,
             rebuilt: false,
+            level_counts,
         };
         app.apply_fresh(p.clone(), out);
         // 放行 worker 交付, 长窗轮询: 结果必须永不到达

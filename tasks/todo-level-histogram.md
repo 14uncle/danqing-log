@@ -73,23 +73,51 @@
 
 ## Phase 1: 明文垂直切片
 
-- [ ] **T3: 接进 OpenJob + 应用状态 + 侧栏组件 (明文端到端)**
+- [x] **T3: 接进 OpenJob + 应用状态 + 侧栏组件 (明文端到端)** ✅ 2026-09-12
   - 说明: worker 内计明文计数 → `OpenOutcome` 增 `level_counts` → 应用层状态字段 →
     新增侧栏组件渲染 6 行 (级别名 + 计数 + 对数横条, 复用既有语义色);
     顶层布局改 `Column[TitleBar.embed(Bar), Row[Histogram, LogView.fill]]`
     —— **`src/view.rs` 不改**, LogView 只拿到更窄的 area
   - Acceptance: 1GB 明文打开 → 侧栏出现, 6 行数字与人工核对 (过滤结果交叉核对) 一致;
-    0 计数桶仍显示; 侧栏底部留 ⠀STATUS_HEIGHT 使状态栏视觉通栏;
-    索引期间不显示脏数 (无「行数已更新、计数还是旧的」窗口)
+    0 计数桶仍显示; 索引期间不显示脏数 (无「行数已更新、计数还是旧的」窗口)
   - Verify: `cargo test` + 手动开 1GB 明文比对
   - Depends: T1, T2
-  - Files: `src/open.rs`, `src/main.rs`, `src/histogram.rs` (新增), `src/lib.rs`
+  - Files: `src/open.rs`, `src/main.rs`, `src/histogram.rs` (新增), `src/view.rs` (仅四处 `fn` 放宽为 `pub(crate)`)
   - Scope: M
+  - 实测: 37 lib + 21 main + 8 genlog = **66 绿**, clippy 0。
+    启动冒烟 (release, 各 8–10s 存活至超时, 无 panic): 明文 1GB ✓ / JSONL 1GB ✓ / 空态 ✓。
+    JSONL 检出 10 列含 `level` (T4 的列名落点)。
+
+    **三处与 spec 文字的偏离 (均为实现中发现, 记录待复核)**
+
+    ① **侧栏不留 `STATUS_HEIGHT` 内边距** (spec Acceptance 原文要求留)。读码发现
+    底栏**不画自己的底色**, 只画 1px 分隔线 —— 故侧栏整条填 `background()` 就与
+    内容区无缝, 不需要为「状态栏视觉通栏」做任何事。少一处跨模块常量耦合。
+    实际效果: 侧栏是通高导轨, 底栏分隔线自 x=112 起。
+
+    ② **增量计数提前到 T3, 未留到 T6**。`apply_appended` 是 tail 每 250ms 就可能走的
+    **UI 线程同步热路径**, 在那儿全量重算等于每次追加卡一次全文件扫描 (1GB ≈ 94ms)。
+    故 T3 就加了 `levels::count_levels_from(file, from)` 并在落点做增量合并;
+    T6 收缩为「重建重算 + 增量等价单测」。
+
+    ③ **`DEBUG/TRACE` 合并桶不可点** (spec D3 说 JSONL 模式可点)。结构性原因:
+    该桶合并了 DEBUG 与 TRACE 两个**字段值**, 而 `level=` 是等值过滤, 单子句表达不了
+    「DEBUG 或 TRACE」(空格分词是 AND, 裸词是整行子串)。故可点桶实为 4 个
+    (FATAL/ERROR/WARN/INFO)。**要让它可点须把该桶拆成两行 —— 那是改 spec D1**,
+    待用户裁。
+
+    **测试**: `fresh_outcome_carries_full_level_counts` (6 桶之和 == 总行数);
+    `append_outcome_levels_are_a_delta_not_a_total` (钉死「追平臂交付增量而非全量」
+    —— 语义反了会让计数翻倍或丢旧数据);
+    `apply_appended_merges_level_counts_incrementally` (增量合并终值 == 全量重算);
+    histogram 侧 4 个纯函数测试 (对数刻度 / 命中测试 / 可点桶语法唯一 / 行矩形不重叠)。
 
 ### Checkpoint B: 明文端到端
 
-- [ ] 1GB 明文侧栏数字与人工核对一致
-- [ ] 无脏数窗口
+- [x] 机器部分: 66 测试绿, clippy 0; 明文/JSONL/空态三路径启动冒烟存活
+- [ ] **人工验收 (待用户)**: 1GB 明文侧栏出现, 6 行数字与过滤结果交叉核对一致;
+      0 计数桶仍显示; 无脏数窗口
+- [x] 无脏数窗口 (结构保证: 计数随 `file` 同批交卷, 不存在中间态)
 
 ## Phase 2: JSONL 垂直切片
 

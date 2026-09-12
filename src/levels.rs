@@ -170,6 +170,14 @@ const PARALLEL_COUNT_MIN_LINES: u64 = 100_000;
 /// 起一堆线程做同一个小活。
 const MAX_COUNT_THREADS: usize = 16;
 
+/// 默认并行度 (空文件/小文件由调用方降到 1)。
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX_COUNT_THREADS)
+}
+
 /// 全文件级别计数 (明文口径: 逐行 [`classify_level`])。
 ///
 /// 顺序/并行的选择对调用方透明; 结果与顺序遍历逐行分类**完全一致**
@@ -179,34 +187,55 @@ pub fn count_levels(file: &LogFile) -> LevelCounts {
     let threads = if total < PARALLEL_COUNT_MIN_LINES {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(MAX_COUNT_THREADS)
+        default_threads()
     };
-    count_levels_with_threads(file, threads)
+    count_range_parallel(file, 0, total, threads)
+}
+
+/// 增量计数: 只数 `[from, line_count)` 的行。
+///
+/// tail 追加的落点用这个 —— 追加是**每 250ms 就可能发生**的同步热路径,
+/// 在那儿全量重算等于每次追加卡一次全文件扫描 (1GB ≈ 94ms)。
+/// 小增量 (常态 KB 级) 直接顺序算; 巨量追平走并行分段。
+pub fn count_levels_from(file: &LogFile, from: u64) -> LevelCounts {
+    let total = file.line_count();
+    if from >= total {
+        return LevelCounts::default();
+    }
+    let len = total - from;
+    let threads = if len < PARALLEL_COUNT_MIN_LINES {
+        1
+    } else {
+        default_threads()
+    };
+    count_range_parallel(file, from, len, threads)
 }
 
 /// 指定线程数的计数 (测试用: 小 fixture 强制分段以覆盖段边界)。
-///
-/// 语义: `threads == 1` 或空文件走顺序; 否则把 `[0, line_count)` 切成至多
-/// `threads` 段, 每段用 [`LogFile::lines_from`] 自行迭代分类后归并。
-/// 分段起点定位是 O(log) 二分, 不引入线性开销。
 pub fn count_levels_with_threads(file: &LogFile, threads: usize) -> LevelCounts {
     let total = file.line_count();
-    let threads = (threads.max(1) as u64).min(total.max(1));
-    if total == 0 || threads <= 1 {
-        return count_range(file, 0, total);
+    count_range_parallel(file, 0, total, threads)
+}
+
+/// 并行分段计数骨架: 把 `[from, from + len)` 切成至多 `threads` 段,
+/// 各段用 [`LogFile::lines_from`] 自行迭代分类后归并。
+///
+/// 分段起点定位是 O(log) 二分 (`lines_from` 内部), 不引入线性开销。
+fn count_range_parallel(file: &LogFile, from: u64, len: u64, threads: usize) -> LevelCounts {
+    let threads = (threads.max(1) as u64).min(len.max(1));
+    if len == 0 || threads <= 1 {
+        return count_range(file, from, len);
     }
 
     // 均分段: ceil 保证段数不超过 threads; 末段用 min 收窄, 不越界。
-    let seg = total.div_ceil(threads);
+    let seg = len.div_ceil(threads);
+    let end = from + len;
     let mut ranges = Vec::with_capacity(threads as usize);
-    let mut start = 0u64;
-    while start < total {
-        let len = seg.min(total - start);
-        ranges.push((start, len));
-        start += len;
+    let mut start = from;
+    while start < end {
+        let l = seg.min(end - start);
+        ranges.push((start, l));
+        start += l;
     }
 
     // scope 借用 `&LogFile` 即可 —— 现有代码已把 `Arc<LogFile>` 跨线程移动
