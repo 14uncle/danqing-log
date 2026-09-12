@@ -6,7 +6,7 @@
 
 ## Phase 0: 风险尖兵
 
-- [ ] **T1: 分类器 `classify_level`**
+- [x] **T1: 分类器 `classify_level`** ✅ 2026-09-12
   - 说明: 单一谓词 `classify_level(&[u8]) -> Level`, 6 桶按优先级首个命中即定;
     明文传行首 200 字节, JSONL 传字段值, 两条路径共用 (口径统一靠它)
   - Acceptance: 6 桶 (FATAL/ERROR/WARN/INFO/DEBUG+TRACE/其他);
@@ -16,6 +16,12 @@
   - Verify: `cargo test`
   - Files: `src/levels.rs` (新增), `src/lib.rs`
   - Scope: S
+  - 实测: 11 个 levels 单测绿; 全量 **51 绿** (27 lib + 16 main + 8 genlog), clippy 0。
+    两处实现决策: ① **大小写敏感** (与 `level_color`/`level_cell_color` 一致) ——
+    `"finished with no errors found"` 归「其他」, 否则正文会污染 ERROR 计数;
+    代价是小写 `"error:"` 不识别, 已在 doc comment 记明。② **FATAL 与 ERROR 拆桶**
+    (既有 `err_fg` 两者同色, 但 FATAL 才是「一眼」要抓的)。
+    「6 桶之和 == 总行数」是计数函数的性质, 对拍留 T2。
 
 - [ ] **T2: 并行计数 `count_levels` + 索引零回归实测** ⚠️ **高风险, 决定后续形态**
   - 说明: `[0, line_count)` 切 N 段, `std::thread::scope` + `lines_from(seg_start)`

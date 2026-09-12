@@ -7,5 +7,6 @@
 
 pub use danqing_logfile::{jsonl, logfile};
 pub mod expand;
+pub mod levels;
 pub mod open;
 pub mod search;
