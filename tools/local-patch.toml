@@ -1,0 +1,20 @@
+# 本机联动开发用 —— **不常驻** (默认态是关)。
+#
+# 用法 (兄弟仓有未 push 的改动、需要本地即时生效时):
+#     cp tools/local-patch.toml .cargo/config.toml
+# 用完删掉 .cargo/config.toml 即回到默认态。
+#
+# 为什么要有这一步 (2026-09-13 实测):
+#   patch 生效时 cargo 会把 Cargo.lock 里钉住的 rev **改写回 path 记录**,
+#   而 path 态的 lock 给不了外人复现。二者不可兼得, 故选「默认关」——
+#   提交进仓库的 lock 永远钉着 rev, 只在联动开发时临时打开。
+#   忘了打开的代价是**兄弟仓的本地改动静默不生效**: 改兄弟仓前第一件事就是 cp。
+#
+# 注: 指向本地路径的 patch **绝不能**回到 Cargo.toml —— 外部克隆会因仓库外的
+#   ../danqing 直接构建不了 (这正是 2026-09-13 修掉的问题)。
+
+[patch."https://github.com/14uncle/danqing"]
+danqing = { path = "../danqing" }
+
+[patch."https://github.com/14uncle/danqing-logfile"]
+danqing-logfile = { path = "../danqing-logfile" }

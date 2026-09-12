@@ -19,3 +19,6 @@ desktop.ini
 
 # Local Claude Code settings
 /.claude/settings.local*.json*
+
+# 本机联动依赖替换 (含本地 ../ 路径, 不进仓库)
+/.cargo/config.toml

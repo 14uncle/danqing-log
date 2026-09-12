@@ -84,10 +84,25 @@
   (常规 36 / 快捷键 125 / 关于 133.5, 有更新提示 165.5) —— 原 216 的「留余量给常规页长」
   理由是错的: 常规页是最矮那页, 贴上限的关于页内容固定。**教训**: 布局数值别估算,
   量了再写; 估算的余量会变成用户能看见的空白
+- 2026-09-13: **修发布阻塞: `[patch]` 提交在 Cargo.toml → 外部克隆构建不了** ——
+  起因是查「发布包会不会拿到旧引擎」。查证两点: ① 提交进仓库的 `[patch]` 指向仓库外的
+  `../danqing`, 外人克隆直接失败; ② `Cargo.lock` 里 danqing / danqing-logfile **一个
+  rev 都没钉**(只有 path 记录) —— 于是农场 CLAUDE.md「Cargo.lock 钉 rev 保可复现」那句
+  **是假的** (danqing-pomodoro 同款签名, 不是本仓独有)。修法: patch 移出 `Cargo.toml`
+  进 gitignore 的 `.cargo/config.toml` (模板 `tools/local-patch.toml`, **默认关**) +
+  `cargo update` 钉上 rev, 并**实测**验证了无 patch 状态下 cargo 真从 GitHub 拉
+  `danqing#3d5e5e10` / `danqing-logfile#baee0a8b` 编译、98 测试全绿。
+  **方法论教训 (第三次了)**: 我对「patch 与 pinned lock 能否共存」连下两个相反结论,
+  两次都是推理不是实测; 最终靠 `cargo metadata` 与 `cargo test` 的**对照**才定案
+  (**metadata 不改写 lock, test 会** —— 拿 metadata 当验证会得出相反答案)。
+  **对照组比单个证据可靠**, 与 level-histogram 那次同一个教训。
+- **同日 push**: danqing `dev` (1 笔, 纯文档) / danqing-logfile `master` (3 笔, 含
+  9312→34ms 那个修复) / 本仓 `dev` (32 笔) —— 三仓全部推上远端。
+  **仍未做**: 农场根 CLAUDE.md 与其余三仓仍是旧模型 ([patch] 提交在 Cargo.toml), 待裁决是否全线铺开
 - 当前: **v1.0 收尾** —— 余工作面 ① ~~等级直方图~~ (已交付验收) ② MSIX 打包 +
   Store 上架物料 (待打包方案调研) ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
   ④ 对外文案/截图素材。**未获用户指示不 push**
-- 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
+- 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
 - 测试基线: **98 绿** (51 lib + 39 main + 8 genlog), 2026-09-13 实测 (含设置卡溢出守卫
   与 `VERSION_ROW_H` 同源两条; lib = expand/levels/open/search, main = view/main/settings;
   引擎 51 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
@@ -108,9 +123,39 @@
 ## Tech Stack
 
 - Rust 1.85+, edition 2024 (工具链 stable-x86_64-pc-windows-gnu, rustup override 已设)
-- UI 框架: danqing — git 依赖 (Cargo.lock 钉 rev), 本机经 `[patch]` 段用本地 `../danqing`
+- UI 框架: danqing — git 依赖; 引擎: danqing-logfile — git 依赖。**两者都由 `Cargo.lock`
+  钉住 rev (`source = "git+…#<sha>"`)**, 提交进仓库的 `Cargo.toml` **不含 `[patch]`**
 - 引擎: memmap2 (mmap) + memchr (SIMD 行索引) + regex::bytes (全文搜索)
 - 编译产物: 各仓独立 `target/` —— 2026-09-10 去掉 `../.cargo-target` 共享 (RustRover 多仓并发编译触发 race condition), `.cargo/config.toml` 中 `target-dir` 行已注释
+- **本地联动 patch 默认关** (2026-09-13 定, 见「依赖关系」节): 要改兄弟仓时
+  `cp tools/local-patch.toml .cargo/config.toml`
+
+## 依赖与联动 (2026-09-13 定)
+
+**提交进仓库的形态**: `Cargo.toml` **纯 git 依赖 (不含 `[patch]`)** + `Cargo.lock` 钉住
+danqing / danqing-logfile 的 rev (`source = "git+…#<sha>"`)。外部克隆能构建, `--locked`
+能复现。这是 2026-09-13 修掉的: 此前 `[patch]` 提交在 `Cargo.toml` 里、指向仓库外的
+`../danqing`, **外人克隆直接构建不了** —— 与「GitHub 免费开源」的承诺直接冲突。
+
+**本地联动 patch 默认关**: `.cargo/config.toml` 已 gitignore, 模板在
+`tools/local-patch.toml`。要改兄弟仓、须本地改动即时生效时才开:
+
+```
+cp tools/local-patch.toml .cargo/config.toml     # 开
+rm .cargo/config.toml                            # 关 (回默认态)
+```
+
+**为什么必须默认关 (2026-09-13 实测)**: patch 生效时 cargo 会把 `Cargo.lock` 里钉住的
+rev **改写回 path 记录** —— 实测 `cargo test` 跑完 pinned → path, 且改回的正是 path 态。
+(注意 `cargo metadata` **不会**改写, 拿它当验证会得出相反结论 —— 这次就先被骗了一次。)
+path 态的 lock 给不了外人复现, 而 pinned 与「本地用未 push 的兄弟仓代码」**不可兼得**,
+故取「默认关」。**代价记住**: 忘了开 patch 时, 兄弟仓的本地改动会**静默不生效** ——
+改兄弟仓前第一件事就是 `cp`。
+
+**联动落地链路** (动兄弟仓代码时):
+1. 兄弟仓改完 → 三件套 → **先 push 兄弟仓** (rev 得先在远端存在, 否则下面 pin 不上)
+2. 本仓 (patch 关着) `cargo update -p danqing` / `-p danqing-logfile` → 提交 `Cargo.lock`
+3. 两仓分别提交, message 注明关联
 
 ## 结构
 
