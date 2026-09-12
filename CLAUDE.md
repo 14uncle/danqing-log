@@ -8,9 +8,10 @@
 - 2026-09-06: jsonl-table / live-tail 闭环 (均 spec→plan→build→review + 人工验收); app-chrome A1–A5 + settings S1–S5 落地; 过滤/搜索栏已重构成真 TextInput (IME 三补丁删除); 切浅色主题 (白底不回头) + 命名「丹青日志 LogLens」+ Ctrl+O
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修
 - 2026-09-08 (已 commit): 字号 14 / 启动默认最大化 / **分段并行索引 1GB 冷 1028→584ms, 热 439→113ms** / 浅色可读性对齐竞品
-- 2026-09-08 (**未 commit**): **async-open + text-selection-copy 机器部分全闭环** (spec→plan→build 走完, 三件套绿); 工作区含 `src/open.rs` / `src/selection.rs` 新模块 + SPEC/plan/todo 文档 + 5 文件改动; text-selection T1 含 danqing 引擎改动 `App::propagate_unhandled_keys()` (danqing 工作区同未 commit)
-- 当前: **等用户人工验收 + 提交授权**。遗留人工项 —— async-open: 10GB 冷开复核 / 索引中 Ctrl+O 取消体感 / 索引中关窗干净退出 / 轮转重建旧内容可见 (copytruncate+create 两流派) / Loading 文案定档; text-selection: 实机五种姿势 (双击选词/框选/跨行/表格行复制/焦点切换)
-- 获授权后的联动顺序: danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联
+- 2026-09-08 (后已 commit `961c03b`): **async-open + text-selection-copy 机器部分全闭环** (spec→plan→build 走完, 三件套绿); `src/open.rs` 新模块 + SPEC/plan/todo 文档 + 5 文件改动; text-selection T1 含 danqing 引擎改动 `App::propagate_unhandled_keys()`
+- 2026-09-12 (**已 commit, 未 push**): **定价重裁** —— 免费层 = 看懂 (单文件全功能) / 付费层 = 批量·留存·交付 (**v1.x 起 $29 个人 · $59 企业**买断); 渠道分层 GitHub 永久免费开源 / MS Store 走 trial 且**过期降级不变砖**; 付费层清单落档 `docs/ROADMAP-v1x.md`。同时收口全仓 8 处过时报价 + 删引擎拆分残留 **2266 行死代码** (47 测试静默不跑)
+- 当前: **等用户人工验收**。遗留人工项 —— async-open: 10GB 冷开复核 / 索引中 Ctrl+O 取消体感 / 索引中关窗干净退出 / 轮转重建旧内容可见 (copytruncate+create 两流派) / Loading 文案定档; text-selection: 实机五种姿势 (双击选词/框选/跨行/表格行复制/焦点切换)
+- 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
 - 测试基线: **40 绿** (16 lib + 16 main + 8 genlog), 2026-09-12 实测 (引擎拆分后口径;
   lib = expand/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
@@ -32,7 +33,7 @@
 - Rust 1.85+, edition 2024 (工具链 stable-x86_64-pc-windows-gnu, rustup override 已设)
 - UI 框架: danqing — git 依赖 (Cargo.lock 钉 rev), 本机经 `[patch]` 段用本地 `../danqing`
 - 引擎: memmap2 (mmap) + memchr (SIMD 行索引) + regex::bytes (全文搜索)
-- 共享编译产物: `.cargo/config.toml` → `../.cargo-target` (全家共用)
+- 编译产物: 各仓独立 `target/` —— 2026-09-10 去掉 `../.cargo-target` 共享 (RustRover 多仓并发编译触发 race condition), `.cargo/config.toml` 中 `target-dir` 行已注释
 
 ## 结构
 
@@ -48,7 +49,7 @@
 - `src/app_update.rs` — 更新检查接线 (薄封装 `danqing::update`)
 - `src/expand.rs` — 展开行模型 (行内子行嵌套展开的显示行↔文件行双向映射, 前缀和)
 - `src/open.rs` — 异步打开管道 OpenJob (启动/Ctrl+O·拖拽/轮转重建/巨量追平四路径统一进 worker)
-- `src/selection.rs` — 文本选区纯逻辑 (token 边界/规范化/复制拼装, 偏移=解码行字节)
+- ~~`src/selection.rs`~~ — 文本选区纯逻辑 (token 边界/规范化/复制拼装, 偏移=解码行字节)。2026-09-11 迁移 danqing (commit `34c6a77`, 簇F 联动), 现为 `danqing::text::selection`
 - `src/bin/logbench.rs` — 无窗口基准 (截图弹药的数字源)
 - `src/bin/mmap_lab.rs` — mmap 存活期外部修改实验台 (T3 数据源)
 - `src/bin/genlog.rs` — 确定性测试数据生成
