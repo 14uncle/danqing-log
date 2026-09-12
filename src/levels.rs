@@ -265,6 +265,32 @@ pub fn update_for_append(
     c
 }
 
+/// 后台计数作业的产物: 一份全文件计数 + 它用的口径列 (`None` = 行口径)。
+///
+/// 计数**不与打开管道同批交付** —— 它是打开路径上最重的一段 (1GB 约 100ms,
+/// 而在某些文件上可以远超), 不该挡在用户看到内容之前。见 `main.rs` 的
+/// `launch_levels_job` 与 [`counts_for`]。
+pub struct LevelsOutcome {
+    pub counts: LevelCounts,
+    /// 本份计数用的口径列 (回传给应用层, 作业自足描述)。
+    pub column: Option<String>,
+}
+
+/// 按口径算一份全文件计数 —— 后台计数作业的作业体。
+///
+/// 与打开管道解耦: 打开只负责把文件与列名交出来, 计数由独立作业完成,
+/// 完成经 tick 拾取后才换入侧栏。
+pub fn counts_for(file: &LogFile, column: Option<&str>) -> LevelsOutcome {
+    let counts = match column {
+        Some(c) => count_levels_field(file, c),
+        None => count_levels(file),
+    };
+    LevelsOutcome {
+        counts,
+        column: column.map(str::to_string),
+    }
+}
+
 /// 各桶计数。索引序 = [`Level::ALL`] 序 (即严重度降序)。
 ///
 /// 用定长数组而非 HashMap: 桶数是编译期常量, 查表 O(1) 且无哈希开销 ——

@@ -134,6 +134,15 @@ pub(crate) struct LogApp {
     /// 侧栏每桶的点选子句 (None = 该行不可点)。明文/无级别类列时全 None。
     /// 子句只依赖列名 (前缀口径无 per-file 观察值), 故追加换入时无需重算。
     level_queries: LevelQueries,
+    /// 后台级别计数作业。
+    ///
+    /// **计数不在打开管道里** (2026-09-12 用户实机反馈后改): 字段口径的
+    /// `extract_field` 要在整行里找 `"level":`, 成本随行内容走; 对某些文件它是
+    /// 打开路径上最重的一段, 挡在内容显示之前就是「索引 92ms 却等十几秒」。
+    /// 现在打开只交出口径列名, 计数由这里的作业后台完成, 侧栏随后补入。
+    levels_job: AsyncJob<levels::LevelsOutcome>,
+    /// 计数是否仍在算 —— 侧栏据此显示「计算中」而非把 0 当数读。
+    levels_pending: bool,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
     /// 已应用的过滤查询。
@@ -253,6 +262,8 @@ impl LogApp {
             level_counts: Arc::new(LevelCounts::default()),
             level_column: None,
             level_queries: levels::no_level_queries(),
+            levels_job: AsyncJob::new(),
+            levels_pending: false,
             filtered: None,
             filter_applied: String::new(),
             filter_clear_rev: 0,
@@ -290,6 +301,36 @@ impl LogApp {
             .as_deref()
             .map_or_else(levels::no_level_queries, levels::level_queries_for);
         self.level_column = column;
+    }
+
+    /// 起一个后台计数作业 (换文件 / 重建后调用; 口径列名须已由
+    /// [`Self::adopt_level_column`] 定好)。
+    ///
+    /// 计数未就绪期间侧栏**只读且不显示数字** —— 把 0 显示出来会被读成
+    /// 「这个文件真的没有 ERROR」, 那是假信息。
+    fn launch_levels_job(&mut self) {
+        self.levels_job.invalidate();
+        self.levels_pending = true;
+        self.level_counts = Arc::new(LevelCounts::default());
+        self.level_queries = levels::no_level_queries();
+        let file = Arc::clone(&self.file);
+        let column = self.level_column.clone();
+        self.levels_job
+            .launch(move || levels::counts_for(&file, column.as_deref()));
+    }
+
+    /// 计数作业交付: 换入计数与子句表。
+    fn pickup_levels_job(&mut self) {
+        let Some(out) = self.levels_job.poll() else {
+            return;
+        };
+        self.level_counts = Arc::new(out.counts);
+        self.level_queries = out
+            .column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = out.column;
+        self.levels_pending = false;
     }
 
     /// 把当前设置写回 `config.toml`。
@@ -416,25 +457,13 @@ impl LogApp {
                     delta,
                     filter,
                     self.level_column.clone(),
-                    *self.level_counts,
                 ));
                 self.refresh_status();
                 return;
             }
             // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
-                Ok(new) => {
-                    // 重叠一行的绝对量更新 (不是纯增量): 这里在 UI 线程上, 全量重算
-                    // 会冻帧, 而纯增量又会漏掉被补全的半行 (review R1)。
-                    // 口径必须与当前显示的一致 (字段 vs 行), 否则侧栏会混两种数法。
-                    let counts = levels::update_for_append(
-                        &self.file,
-                        &new,
-                        *self.level_counts,
-                        self.level_column.as_deref(),
-                    );
-                    self.apply_appended(new, None, counts);
-                }
+                Ok(new) => self.apply_appended(new, None),
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
             }
         } else {
@@ -461,16 +490,15 @@ impl LogApp {
         let OpenOutcome {
             file,
             schema,
-            level_counts,
             level_column,
             ..
         } = out;
         let base_status = status_text(path, &file);
         let new_count = file.line_count();
         self.file = Arc::new(file);
-        self.level_counts = Arc::new(level_counts);
-        // 格式可能整体换了 → 列名与子句表跟着换 (不沿用旧的)
+        // 格式可能整体换了 → 列名与子句表跟着换 (不沿用旧的); 计数重新后台算
         self.adopt_level_column(level_column);
+        self.launch_levels_job();
         // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
         self.schema = schema.map(Arc::new);
         self.mode = if self.schema.is_some() {
@@ -510,7 +538,6 @@ impl LogApp {
         let OpenOutcome {
             file: new_file,
             schema,
-            level_counts,
             level_column,
             ..
         } = out;
@@ -540,8 +567,8 @@ impl LogApp {
         self.base_status = base_status;
         self.mode = mode;
         self.schema = schema;
-        self.level_counts = Arc::new(level_counts);
         self.adopt_level_column(level_column);
+        self.launch_levels_job();
         self.top_row = 0.0;
         self.selected = 0;
         self.filtered = None;
@@ -564,12 +591,7 @@ impl LogApp {
     /// Append 换入 (同步小追加 / 追平 worker 交卷同链): 增量过滤 + follow 滚底。
     /// `worker_hits` = worker 已算好的增量命中 (review R2: 巨量追平过滤下沉);
     /// None = 本地扫 (同步小追加, 毫秒级)。
-    fn apply_appended(
-        &mut self,
-        new: LogFile,
-        worker_hits: Option<Vec<u64>>,
-        level_counts: LevelCounts,
-    ) {
+    fn apply_appended(&mut self, new: LogFile, worker_hits: Option<Vec<u64>>) {
         let old_line_count = self.file.line_count();
         // 重算起点**退一行**: 旧快照末行可能以无换行结尾、被本次追加补全改判
         // (review R1)。计数与过滤必须同起点同区间, 否则柱条数字与筛选结果
@@ -581,9 +603,22 @@ impl LogApp {
         // 之间被别的追加换掉。**若将来允许并发追加, 这个摘/补对称会静默失效**
         // (摘多了漏行、摘少了重计), 届时须把 `from` 随产物一起交回来。
         let from = old_line_count.saturating_sub(1);
+        // 计数: 已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量, 便宜);
+        // 未就绪 (后台作业还在算旧快照) → 作废并在新文件上重起, 免得交出一份
+        // 与当前文件不符的数。**先算再换入**, 因为 update_for_append 需要旧快照。
+        let recomputed = (!self.levels_pending).then(|| {
+            levels::update_for_append(
+                &self.file,
+                &new,
+                *self.level_counts,
+                self.level_column.as_deref(),
+            )
+        });
         self.file = Arc::new(new);
-        // 计数是**绝对量** (worker 已在重叠区间上做过减旧加新), 故覆盖而非合并
-        self.level_counts = Arc::new(level_counts);
+        match recomputed {
+            Some(c) => self.level_counts = Arc::new(c),
+            None => self.launch_levels_job(),
+        }
         // 过滤: 先摘掉将被重算区间的旧命中, 再合并新命中 (否则重叠行出现两次)
         self.drop_filter_hits_from(from);
         match worker_hits {
@@ -625,10 +660,9 @@ impl LogApp {
                             let OpenOutcome {
                                 file,
                                 incremental_hits,
-                                level_counts,
                                 ..
                             } = out;
-                            self.apply_appended(file, incremental_hits, level_counts);
+                            self.apply_appended(file, incremental_hits);
                         }
                     }
                 }
@@ -1252,6 +1286,7 @@ impl App for LogApp {
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
     fn tick(&mut self, _ctx: &AnimationCtx) {
         self.pickup_open_job();
+        self.pickup_levels_job();
         if let Some(out) = self.filter_job.poll() {
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
@@ -1438,55 +1473,68 @@ mod tests {
         path
     }
 
-    /// 追加换入: 计数是**绝对量**, 落点覆盖 —— 而不是与旧计数合并。
-    ///
-    /// 契约从「增量合并」收敛成「覆盖绝对量」是 review R1 的连带结果:
-    /// 「这份是增量还是全量」要在每个落点判断, 判错一次就是计数翻倍或旧数据全丢。
+    /// 追加换入: 计数由落点按「重叠一行」增量更新, 终值必须等于对新文件的全量重算。
     #[test]
-    fn apply_appended_takes_absolute_counts() {
+    fn apply_appended_updates_counts_incrementally() {
         let mut app = LogApp::new_empty();
-        let p1 = temp_log(
-            b"2026-09-05 12:00:01 ERROR one
-2026-09-05 12:00:02 INFO two
-",
-        );
+        let p1 =
+            temp_log("2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n".as_bytes());
         let f1 = LogFile::open(&p1).unwrap();
         app.level_counts = Arc::new(levels::count_levels(&f1));
         app.file = Arc::new(f1);
+        app.levels_pending = false;
         assert_eq!(app.level_counts.get(Level::Error), 1, "起点 1 条 ERROR");
 
         let p2 = temp_log(
-            b"2026-09-05 12:00:01 ERROR one
-              2026-09-05 12:00:02 INFO two
-              2026-09-05 12:00:03 ERROR three
-",
+            "2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n2026-09-05 12:00:03 ERROR three\n"
+                .as_bytes(),
         );
         let f2 = LogFile::open(&p2).unwrap();
-        let absolute = levels::count_levels(&f2);
-        app.apply_appended(f2, None, absolute);
+        app.apply_appended(f2, None);
 
-        assert_eq!(*app.level_counts.as_ref(), absolute, "覆盖, 不是合并");
-        assert_eq!(app.level_counts.get(Level::Error), 2);
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::count_levels(&app.file),
+            "增量更新 == 对新文件全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 2, "旧 1 + 新 1");
         assert_eq!(app.level_counts.total(), 3);
         std::fs::remove_file(&p1).ok();
         std::fs::remove_file(&p2).ok();
     }
 
+    /// **计数未就绪时追加**: 不得在旧快照上做增量 (那会交出一份与当前文件不符的数),
+    /// 而是作废并重起作业; 侧栏保持「计算中」。
+    #[test]
+    fn apply_appended_restarts_job_when_counts_pending() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("2026-09-05 12:00:01 ERROR one\n".as_bytes());
+        let f1 = LogFile::open(&p).unwrap();
+        app.file = Arc::new(f1);
+        app.levels_pending = true; // 模拟后台作业仍在算旧快照
+        app.level_counts = Arc::new(LevelCounts::default());
+
+        let f2 = LogFile::open(&p).unwrap();
+        app.apply_appended(f2, None);
+        assert!(app.levels_pending, "仍未就绪");
+        assert_eq!(
+            app.level_counts.total(),
+            0,
+            "不得把旧快照的增量贴到新文件上"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
     /// **R1 回归 (应用层)**: 旧快照末行无换行、被追加补全改判时, 计数与过滤必须
     /// **同时**覆盖那一行 —— 只改一侧就会让柱条数字与筛选结果分岔 (D2 红线)。
-    ///
-    /// 这条同时走通同步追加路径的全部三步: `update_for_append` 算绝对量 →
-    /// `drop_filter_hits_from` 摘旧命中 → `append_filter_hits` 从重叠起点重跑。
     #[test]
     fn apply_appended_covers_completed_half_line_on_both_sides() {
         let mut app = LogApp::new_empty();
-        let p = temp_log(
-            b"X
-2026-09-05 12:00:01 ",
-        );
+        let p = temp_log("X\n2026-09-05 12:00:01 ".as_bytes());
         let f1 = LogFile::open(&p).unwrap();
         app.level_counts = Arc::new(levels::count_levels(&f1));
         app.file = Arc::new(f1);
+        app.levels_pending = false;
         assert_eq!(app.level_counts.get(Level::Error), 0, "半行未成词");
 
         // 已应用的过滤 + 已建立(空)的过滤表, 模拟 tail 中途
@@ -1495,16 +1543,11 @@ mod tests {
 
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-            f.write_all(
-                b"ERROR disk
-",
-            )
-            .unwrap();
+            f.write_all(b"ERROR disk\n").unwrap();
         }
         let f2 = LogFile::open(&p).unwrap();
         assert_eq!(f2.line_count(), 2, "补全半行不增行数");
-        let absolute = levels::update_for_append(&app.file, &f2, *app.level_counts, None);
-        app.apply_appended(f2, None, absolute);
+        app.apply_appended(f2, None);
 
         assert_eq!(
             app.level_counts.get(Level::Error),
@@ -1525,7 +1568,6 @@ mod tests {
         );
         std::fs::remove_file(&p).ok();
     }
-
     /// **T5 端到端一致性 (D2 红线的应用层落点)**: 点柱条 → 真实过滤管道 →
     /// 筛出行数 == 柱条数字。
     ///
@@ -1575,12 +1617,70 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 轮转/重建: 计数随重建**全量重算**, 且列名与子句表跟着换 ——
-    /// JSONL 变明文后必须降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
+    /// **本次事故的回归 (2026-09-12)**: 打开**不得**等计数。
+    ///
+    /// 事由: 计数原先与文件同批交付, 而字段口径的 `extract_field` 要在整行里找
+    /// `"level":`, 成本随行内容走 —— 用户实机打开 1GB JSONL 时, 状态栏写
+    /// 「索引 92ms」却等了十几秒 (那十几秒全在 worker 里数级别)。
+    /// 修法: 打开只交出口径列名, 计数交独立后台作业, 侧栏随后补入。
+    ///
+    /// 这条钉住三件事: ① 落地后侧栏处于「未就绪」而非拿 0 冒充; ② 此时只读
+    /// (不得拿空子句表去点); ③ 作业交付后计数等于全量重算。
     #[test]
-    fn apply_rebuild_recomputes_counts_and_switches_column() {
+    fn apply_fresh_does_not_block_on_level_counting() {
         let mut app = LogApp::new_empty();
-        let p1 = temp_log(b"{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n");
+        let p = temp_log(
+            "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
+        );
+        let f = LogFile::open(&p).unwrap();
+        let out = OpenOutcome {
+            file: f,
+            schema: jsonl::discover_schema(&LogFile::open(&p).unwrap()),
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: Some("level".into()),
+        };
+        app.apply_fresh(p.clone(), out);
+
+        // ① 落地即返回: 计数未就绪
+        assert!(app.levels_pending, "打开不得等计数 —— 落地时计数必未就绪");
+        assert_eq!(app.level_counts.total(), 0, "不得拿 0 冒充真实计数");
+        // ② 未就绪期间侧栏只读 (空子句表), 点不到任何一行
+        assert!(
+            app.level_queries.iter().all(Option::is_none),
+            "计数未就绪 → 侧栏只读"
+        );
+
+        // ③ 等后台作业交付
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷 (悬挂?)");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(&app.file, Some("level")).counts,
+            "交付的计数 == 全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Info), 1);
+        assert_eq!(
+            app.level_queries[Level::Error as usize].as_deref(),
+            Some("level=ERROR*"),
+            "就绪后子句表随口径一起到位"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 轮转/重建: 计数重新后台算, 且列名与子句表跟着换 —— JSONL 变明文后必须
+    /// 降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
+    #[test]
+    fn apply_rebuild_switches_column_and_recounts() {
+        let mut app = LogApp::new_empty();
+        let p1 = temp_log(
+            "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
+        );
         let f1 = LogFile::open(&p1).unwrap();
         app.level_counts = Arc::new(levels::count_levels_field(&f1, "level"));
         app.level_queries = levels::level_queries_for("level");
@@ -1592,37 +1692,41 @@ mod tests {
             "起点: JSONL 可点"
         );
 
-        // 轮转后内容变明文 → worker 交全量计数 + 无级别列
-        let p2 = temp_log(b"2026-09-05 ERROR plain one\n2026-09-05 WARN plain two\n");
-        let f2 = LogFile::open(&p2).unwrap();
-        let rebuilt_counts = levels::count_levels(&f2);
+        // 轮转后内容变明文 → 口径列随之作废
+        let p2 = temp_log("2026-09-05 ERROR plain one\n2026-09-05 WARN plain two\n".as_bytes());
         let out = OpenOutcome {
-            file: f2,
+            file: LogFile::open(&p2).unwrap(),
             schema: None,
             incremental_hits: None,
             rebuilt: true,
-            level_counts: rebuilt_counts,
             level_column: None,
         };
         app.apply_rebuild(&p2, out);
 
-        assert_eq!(
-            *app.level_counts.as_ref(),
-            levels::count_levels(&app.file),
-            "重建后计数 == 新文件全量重算"
-        );
-        assert_eq!(app.level_counts.get(Level::Error), 1);
-        assert_eq!(app.level_counts.get(Level::Warn), 1);
-        assert_eq!(app.level_counts.total(), 2);
+        assert!(app.levels_pending, "重建后计数重新后台算");
         assert!(app.level_column.is_none(), "列名换掉, 不沿用旧的");
         assert!(
             app.level_queries.iter().all(Option::is_none),
             "明文 → 子句表清空 (降级只读)"
         );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(&app.file, None).counts,
+            "重建后计数 == 新文件全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Warn), 1);
+        assert_eq!(app.level_counts.total(), 2);
         std::fs::remove_file(&p1).ok();
         std::fs::remove_file(&p2).ok();
     }
-
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
@@ -1650,13 +1754,11 @@ mod tests {
         // 两个 worker 阻塞中 (结果必未到达) → 换入新文件 (invalidate 发生)
         let p = temp_log(b"new\nfile\n");
         let f = LogFile::open(&p).unwrap();
-        let level_counts = levels::count_levels(&f);
         let out = OpenOutcome {
             file: f,
             schema: None,
             incremental_hits: None,
             rebuilt: false,
-            level_counts,
             level_column: None,
         };
         app.apply_fresh(p.clone(), out);

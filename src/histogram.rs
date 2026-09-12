@@ -108,6 +108,12 @@ pub(crate) struct LevelHistogram {
     queries: LevelQueries,
     /// 用户开关 (`Ctrl+L`)。关掉时宽度归零, 与「窄窗自动折叠」同一条路径。
     visible: bool,
+    /// 计数是否仍在后台算。
+    ///
+    /// 未就绪时**必须显示「…」而不是 0** —— 0 会被读成「这个文件真的没有 ERROR」,
+    /// 那是假信息。计数改为后台作业后, 这个窗口是常态 (见 main.rs 的
+    /// `launch_levels_job`)。
+    pending: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
     // 主题色在 sync 期解析并缓存, paint 期零查表 (与 view.rs 同款)。
@@ -124,6 +130,7 @@ impl LevelHistogram {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
             visible: true,
+            pending: false,
             active: None,
             bg: Color::rgb(1.0, 1.0, 1.0),
             text_primary: Color::rgb(0.12, 0.12, 0.12),
@@ -161,6 +168,7 @@ impl Widget for LevelHistogram {
         self.counts = *app.level_counts.as_ref();
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
+        self.pending = app.levels_pending;
         // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
         self.active = Level::ALL.iter().copied().find(|l| {
@@ -220,7 +228,11 @@ impl Widget for LevelHistogram {
                 self.text_secondary
             };
             texts.push_text(level.label(), bar_x, baseline, LABEL_SIZE, color);
-            let count = self.counts.get(*level).to_string();
+            let count = if self.pending {
+                "…".to_string()
+            } else {
+                self.counts.get(*level).to_string()
+            };
             let count_w = texts.measure(&count, LABEL_SIZE);
             texts.push_text(
                 &count,
@@ -230,8 +242,12 @@ impl Widget for LevelHistogram {
                 self.text_secondary,
             );
 
-            // 对数横条
-            let frac = bar_fraction(self.counts.get(*level), max);
+            // 对数横条 (计数未就绪时不画: 空条比假条诚实)
+            let frac = if self.pending {
+                0.0
+            } else {
+                bar_fraction(self.counts.get(*level), max)
+            };
             if frac > 0.0 {
                 let w = (bar_full_w * frac).max(MIN_BAR_W);
                 rects.push_rect(
