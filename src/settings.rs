@@ -1,14 +1,17 @@
 //! @author 十四叔
 //! @date 2026/09/06
 //!
-//! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (关于/版本/反馈)。
+//! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (多页签: 关于 / 快捷键)。
+//!
+//! 为什么分页签: 单列堆叠在加上「快捷键」段后会把卡片顶得很高 (矮窗口下顶到边),
+//! 而两页签各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
 //! 关闭：✕ 按钮 / Esc (app 级两阶段) / 点遮罩。
 
 use std::any::Any;
 
 use danqing::widget::{
     Box as UiBox, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay, Padding,
-    Row, Text, Widget,
+    Row, Tabs, Text, Widget,
 };
 use danqing::{
     Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch, Theme,
@@ -56,11 +59,35 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 // 主题行不套 content_row (那是「占满内容宽 + 内部左对齐」):
                 // 让 「主题 + 下拉」按内容整体收缩, 交给 Column 的 cross_center 居中,
                 // 与关于区三行/反馈链接同处一条中轴。
-                .child(theme_dropdown())
-                .child(shortcuts_section(content_w))
-                .child(feedback_row()),
+                .child(
+                    Tabs::new(&t)
+                        .tab("关于")
+                        .tab("快捷键")
+                        .child(about_panel(content_w))
+                        .child(shortcuts_panel(content_w))
+                        // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
+                        // 第一页更省事), 且 Esc/点遮罩关闭不丢。
+                        .bind(|app: &LogApp| app.settings_tab)
+                        .on_change(Msg::SelectSettingsTab),
+                ),
         ))
         .width(CARD_WIDTH)
+}
+
+/// 「关于」页签: 产品名/版本/一句话 + 主题 + 版本检查 + 反馈。
+fn about_panel(content_w: f32) -> impl Widget {
+    Column::new()
+        .gap(16.0)
+        .cross_center()
+        .child(about_section())
+        .child(content_row(version_row(), content_w))
+        .child(theme_dropdown())
+        .child(feedback_row())
+}
+
+/// 「快捷键」页签。
+fn shortcuts_panel(content_w: f32) -> impl Widget {
+    shortcuts_section(content_w)
 }
 
 /// 内容行：固定宽度居中，内部左对齐。
@@ -126,7 +153,7 @@ fn shortcuts_section(content_w: f32) -> impl Widget {
         ("Ctrl+B  ·  Ctrl+G", "切换书签 / 下一书签"),
     ];
     let mut col = Column::new().gap(4.0).cross_stretch().child(Center::new(
-        Text::new("快捷键".to_string())
+        Text::new("完整清单见 README".to_string())
             .font_size(BODY_SIZE)
             .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
     ));

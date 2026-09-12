@@ -190,6 +190,8 @@ pub(crate) struct LogApp {
     theme: config::AppTheme,
     /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
     histogram_visible: bool,
+    /// 设置卡当前页签 (0 = 关于 / 1 = 快捷键)。留在应用状态里: 重开卡片停在上次那页。
+    settings_tab: usize,
 }
 
 /// 应用消息。
@@ -217,6 +219,8 @@ pub(crate) enum Msg {
     FocusSearch,
     /// Esc 清除过滤。
     ClearFilter,
+    /// 设置卡切页签 (0 = 关于 / 1 = 快捷键)。
+    SelectSettingsTab(usize),
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
     // ---- level-histogram 侧栏 ----
@@ -289,6 +293,7 @@ impl LogApp {
             settings_open: false,
             theme: cfg.theme,
             histogram_visible: cfg.histogram,
+            settings_tab: 0,
         }
     }
 
@@ -1088,6 +1093,9 @@ impl App for LogApp {
             }
             Msg::CloseSettings => {
                 self.settings_open = false;
+            }
+            Msg::SelectSettingsTab(i) => {
+                self.settings_tab = i;
             }
             Msg::OpenUrl(url) => {
                 if let Err(err) = open::that(&url) {
