@@ -53,6 +53,10 @@ pub struct OpenOutcome {
     /// 由落点 ([`crate::main`] 的 `apply_appended`) 与旧计数合并。
     /// 分派依据是 [`Self::rebuilt`]。
     pub level_counts: LevelCounts,
+    /// 计数所用的级别类列名 (`None` = 走行口径)。落点据此重建点选子句,
+    /// 也据此决定后续增量追加该走哪条口径 —— 口径必须全程一致, 否则
+    /// 同一个侧栏里会混进两种数法。
+    pub level_column: Option<String>,
 }
 
 /// 打开作业: worker 线程跑 open (+JSONL 检出), 应用层 tick poll 拾取。
@@ -90,14 +94,24 @@ impl OpenJob {
                 } else {
                     None
                 };
-                // 计数在索引趟之外单独一趟并行扫描 (D6); 随 file 一起交卷
-                let level_counts = levels::count_levels(&file);
+                // 计数在索引趟之外单独一趟并行扫描 (D6); 随 file 一起交卷。
+                // 口径按模式分 (spec D2): JSONL 且有级别类列 → 按字段值;
+                // 否则按行首子串。两者各自与自己的可点行为对齐。
+                let level_column = schema
+                    .as_ref()
+                    .and_then(levels::find_level_column)
+                    .map(str::to_string);
+                let level_counts = match &level_column {
+                    Some(col) => levels::count_levels_field(&file, col),
+                    None => levels::count_levels(&file),
+                };
                 Ok(OpenOutcome {
                     file,
                     schema,
                     incremental_hits: None,
                     rebuilt: false,
                     level_counts,
+                    level_column,
                 })
             })
         });
@@ -121,6 +135,7 @@ impl OpenJob {
         old: Arc<LogFile>,
         new_bytes: u64,
         filter: Option<(Vec<Clause>, u64)>,
+        level_column: Option<String>,
     ) -> Self {
         let JobParts {
             mut job,
@@ -149,12 +164,28 @@ impl OpenJob {
                     }
                     _ => None,
                 };
-                // 退化重建臂 → 全量 (内容换过格式); 真增量臂 → 只算旧行数之后的
-                // 新行, 落点与旧计数合并 (增量, 免得每次追平重扫全文件)
-                let level_counts = if rebuilt {
-                    levels::count_levels(&file)
+                // 退化重建臂 → 全量 + 按新格式重认列 (格式可能换了, review R4 同源);
+                // 真增量臂 → 只算旧行数之后的新行, 落点与旧计数合并。
+                // 真增量臂的列名由调用方传入 —— 该臂 schema 恒 None (沿用应用层现值),
+                // worker 自己拿不到; 而口径必须与已显示的那份一致。
+                let (level_counts, level_column) = if rebuilt {
+                    let col = schema
+                        .as_ref()
+                        .and_then(levels::find_level_column)
+                        .map(str::to_string);
+                    let c = match &col {
+                        Some(name) => levels::count_levels_field(&file, name),
+                        None => levels::count_levels(&file),
+                    };
+                    (c, col)
                 } else {
-                    levels::count_levels_from(&file, old.line_count())
+                    let c = match &level_column {
+                        Some(name) => {
+                            levels::count_levels_field_from(&file, name, old.line_count())
+                        }
+                        None => levels::count_levels_from(&file, old.line_count()),
+                    };
+                    (c, level_column)
                 };
                 Ok(OpenOutcome {
                     file,
@@ -162,6 +193,7 @@ impl OpenJob {
                     incremental_hits,
                     rebuilt,
                     level_counts,
+                    level_column,
                 })
             })
         });
@@ -346,7 +378,7 @@ mod tests {
                 .unwrap();
         }
         let clauses = jsonl::parse_query("level=ERROR");
-        let mut job = OpenJob::launch_append(&path, old, 50, Some((clauses, 3)));
+        let mut job = OpenJob::launch_append(&path, old, 50, Some((clauses, 3)), None);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(!out.rebuilt, "真增量臂");
         assert_eq!(out.file.line_count(), 5);
@@ -367,7 +399,7 @@ mod tests {
         std::fs::rename(&path, path.with_extension("old")).expect("映射存活期改名合法 (T3)");
         // 同路径更小的新文件 (JSONL, 格式也换了) → 缩容兜底
         std::fs::write(&path, b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
-        let mut job = OpenJob::launch_append(&path, old, 10, None);
+        let mut job = OpenJob::launch_append(&path, old, 10, None, None);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(out.rebuilt, "缩容 → Rebuilt 分派");
         assert!(out.schema.is_some(), "重建臂重新发现 schema");
@@ -427,7 +459,7 @@ mod tests {
             f.write_all(b"2026-09-05 12:00:02 INFO two\n2026-09-05 12:00:03 ERROR three\n")
                 .unwrap();
         }
-        let mut job = OpenJob::launch_append(&path, old, 64, None);
+        let mut job = OpenJob::launch_append(&path, old, 64, None, None);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(!out.rebuilt, "纯追加不走重建臂");
         assert_eq!(out.file.line_count(), 3);

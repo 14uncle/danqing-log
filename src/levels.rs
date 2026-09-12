@@ -10,6 +10,7 @@
 //! 是有意的降噪策略 (用户 2026-09-06 验收); 而计数必须有 INFO 桶当基线 —— 没有基线
 //! 就看不出错误有多稀少。两者有意不共用, 详见 spec 的 Never 项。
 
+use crate::jsonl::{self, Schema};
 use crate::logfile::LogFile;
 
 /// 级别桶 (严重度降序, 顺序即侧栏显示序)。
@@ -125,6 +126,109 @@ pub fn classify_level(line: &[u8]) -> Level {
     Level::Other
 }
 
+/// 级别类列名清单 (小写比对): 列发现的首见顺序里找这些名字。
+///
+/// 只认清单内的名字是**有意的保守**: 猜错列 (比如把 `msg` 当级别) 会给出
+/// 一份看似合理实则全错的计数, 比「找不到 → 降级只读」糟得多。
+const LEVEL_COLUMN_NAMES: [&str; 6] = [
+    "level",
+    "severity",
+    "lvl",
+    "loglevel",
+    "log_level",
+    "priority",
+];
+
+/// 字段值分类: **前缀匹配**, 与过滤子句 `Op::Prefix` 同语义。
+///
+/// 为什么不复用 [`classify_level`] (子串匹配): 计数口径必须与**点下去之后的
+/// 筛选结果**一致, 否则柱条数字与实际行数打架 (spec D2 一致性红线)。
+/// 过滤的等值比较是**字节全等**, 若计数按子串, 文件里写 `WARNING` 时柱条数得到
+/// 而 `level=WARN` 筛出 0 行。改成前缀匹配 + 子句用 `level=WARN*` 之后,
+/// 两边对同一 token 走同一个判断 —— 一致性是构造保证, 不是碰巧。
+///
+/// 六个 token 首字母互不相同 (F/E/W/I/D/T), 故前缀匹配天然互斥, 无需优先级。
+pub fn classify_field_value(value: &[u8]) -> Level {
+    // 首字母互斥 (F/E/W/I/D/T) → 一次分派 + 一次前缀校验, 无优先级问题。
+    match value.first() {
+        Some(b'F') if value.starts_with(b"FATAL") => Level::Fatal,
+        Some(b'E') if value.starts_with(b"ERROR") => Level::Error,
+        Some(b'W') if value.starts_with(b"WARN") => Level::Warn,
+        Some(b'I') if value.starts_with(b"INFO") => Level::Info,
+        Some(b'D') if value.starts_with(b"DEBUG") => Level::DebugTrace,
+        Some(b'T') if value.starts_with(b"TRACE") => Level::DebugTrace,
+        _ => Level::Other,
+    }
+}
+
+/// 从列定义里找级别类列 (见 [`LEVEL_COLUMN_NAMES`])。找不到 → None (降级只读)。
+pub fn find_level_column(schema: &Schema) -> Option<&str> {
+    schema.columns.iter().find_map(|c| {
+        let name = c.name.as_str();
+        LEVEL_COLUMN_NAMES
+            .iter()
+            .any(|k| name.eq_ignore_ascii_case(k))
+            .then_some(name)
+    })
+}
+
+/// 该桶的点选子句 (前缀通配 `col=TOKEN*`); 无单子句可表达的桶 → None。
+pub fn field_query(column: &str, level: Level) -> Option<String> {
+    let token = match level {
+        Level::Fatal => "FATAL",
+        Level::Error => "ERROR",
+        Level::Warn => "WARN",
+        Level::Info => "INFO",
+        // 合并桶: 一个 level= 子句表达不了「DEBUG 或 TRACE」(空格分词是 AND);
+        // 要让它可点须把该桶拆成两行 = 改 spec D1。
+        Level::DebugTrace => return None,
+        Level::Other => return None,
+    };
+    Some(format!("{column}={token}*"))
+}
+
+/// 每桶的点选子句表 (索引序同 [`Level::ALL`])。
+/// 明文 / 无级别类列时全 `None` → 侧栏只读。
+pub type LevelQueries = [Option<String>; Level::ALL.len()];
+
+/// 由字段列名生成点选子句表。
+pub fn level_queries_for(column: &str) -> LevelQueries {
+    std::array::from_fn(|i| field_query(column, Level::ALL[i]))
+}
+
+/// 全 `None` 的子句表 (只读侧栏)。
+pub fn no_level_queries() -> LevelQueries {
+    std::array::from_fn(|_| None)
+}
+
+/// JSONL 字段口径全文件计数。
+///
+/// 明文文件或 JSONL 但无级别类列时**不要**调这个 —— 前者没有字段概念,
+/// 后者 `column` 无从取得; 两条路径各自与自己的可点行为对齐 (spec D2)。
+pub fn count_levels_field(file: &LogFile, column: &str) -> LevelCounts {
+    count_levels_field_from(file, column, 0)
+}
+
+/// JSONL 字段口径增量计数: 只数 `[from, line_count)` 的行。
+///
+/// 无级别字段的行 (含非 JSONL 行) 一律归 `其他` —— 「6 桶之和 == 总行数」
+/// 这条不变量对字段口径同样成立。
+pub fn count_levels_field_from(file: &LogFile, column: &str, from: u64) -> LevelCounts {
+    let total = file.line_count();
+    if from >= total {
+        return LevelCounts::default();
+    }
+    let len = total - from;
+    let threads = if len < PARALLEL_COUNT_MIN_LINES {
+        1
+    } else {
+        default_threads()
+    };
+    let classify =
+        |line: &[u8]| jsonl::extract_field(line, column).map_or(Level::Other, classify_field_value);
+    count_ranges(file, from, len, threads, &classify)
+}
+
 /// 各桶计数。索引序 = [`Level::ALL`] 序 (即严重度降序)。
 ///
 /// 用定长数组而非 HashMap: 桶数是编译期常量, 查表 O(1) 且无哈希开销 ——
@@ -218,13 +322,22 @@ pub fn count_levels_with_threads(file: &LogFile, threads: usize) -> LevelCounts 
 }
 
 /// 并行分段计数骨架: 把 `[from, from + len)` 切成至多 `threads` 段,
-/// 各段用 [`LogFile::lines_from`] 自行迭代分类后归并。
+/// 各段用 [`LogFile::lines_from`] 自行迭代, 按 `classify` 分类后归并。
+///
+/// 分类器做成参数而非写死 [`classify_level`], 因为两条口径要复用它:
+/// 行口径直接分类行内容, 字段口径先 `extract_field` 再分类字段值。
 ///
 /// 分段起点定位是 O(log) 二分 (`lines_from` 内部), 不引入线性开销。
-fn count_range_parallel(file: &LogFile, from: u64, len: u64, threads: usize) -> LevelCounts {
+fn count_ranges(
+    file: &LogFile,
+    from: u64,
+    len: u64,
+    threads: usize,
+    classify: &(dyn Fn(&[u8]) -> Level + Sync),
+) -> LevelCounts {
     let threads = (threads.max(1) as u64).min(len.max(1));
     if len == 0 || threads <= 1 {
-        return count_range(file, from, len);
+        return count_range_with(file, from, len, classify);
     }
 
     // 均分段: ceil 保证段数不超过 threads; 末段用 min 收窄, 不越界。
@@ -244,7 +357,7 @@ fn count_range_parallel(file: &LogFile, from: u64, len: u64, threads: usize) -> 
     std::thread::scope(|s| {
         let handles: Vec<_> = ranges
             .iter()
-            .map(|&(start, len)| s.spawn(move || count_range(file, start, len)))
+            .map(|&(start, len)| s.spawn(move || count_range_with(file, start, len, classify)))
             .collect();
         for h in handles {
             // worker panic 就让它冒泡 (调用方 OpenJob 有 catch_unwind 兜成 Err);
@@ -260,14 +373,31 @@ fn count_range_parallel(file: &LogFile, from: u64, len: u64, threads: usize) -> 
     acc
 }
 
-/// 单段顺序计数: 从 `start` 行起数 `len` 行。
+/// 行口径的并行分段计数 (分类器固定为 [`classify_level`])。
+fn count_range_parallel(file: &LogFile, from: u64, len: u64, threads: usize) -> LevelCounts {
+    count_ranges(file, from, len, threads, &classify_level)
+}
+
+/// 行口径的单段顺序计数 (顺序版参照物; 生产路径走 [`count_levels`] 的并行骨架,
+/// 这里只给对拍单测当基准)。
+#[cfg(test)]
 fn count_range(file: &LogFile, start: u64, len: u64) -> LevelCounts {
+    count_range_with(file, start, len, &classify_level)
+}
+
+/// 单段顺序计数: 从 `start` 行起数 `len` 行, 按 `classify` 分类。
+fn count_range_with(
+    file: &LogFile,
+    start: u64,
+    len: u64,
+    classify: &(dyn Fn(&[u8]) -> Level + Sync),
+) -> LevelCounts {
     let mut c = LevelCounts::default();
     if len == 0 {
         return c;
     }
     for (_no, line) in file.lines_from(start).take(len as usize) {
-        c.add(classify_level(line));
+        c.add(classify(line));
     }
     c
 }
@@ -616,6 +746,204 @@ mod tests {
             assert_eq!(c.get(Level::Error), 1);
             assert_eq!(c.total(), 1);
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- T4: JSONL 字段口径 ----
+
+    /// 字段值走**前缀**匹配: 这是与过滤 `Op::Prefix` 同构的那一半。
+    #[test]
+    fn field_value_matches_by_prefix() {
+        assert_eq!(classify_field_value(b"ERROR"), Level::Error);
+        assert_eq!(classify_field_value(b"ERRORS"), Level::Error, "前缀含");
+        assert_eq!(
+            classify_field_value(b"WARNING"),
+            Level::Warn,
+            "别名靠前缀吃到"
+        );
+        assert_eq!(classify_field_value(b"INFO"), Level::Info);
+        assert_eq!(classify_field_value(b"FATAL"), Level::Fatal);
+        assert_eq!(classify_field_value(b"DEBUG"), Level::DebugTrace);
+        assert_eq!(classify_field_value(b"TRACE"), Level::DebugTrace);
+        // 非前缀的都不认 —— 与过滤侧 starts_with 一致
+        assert_eq!(classify_field_value(b"XERROR"), Level::Other, "非前缀不认");
+        assert_eq!(
+            classify_field_value(b"ERR"),
+            Level::Other,
+            "ERR 不是 ERROR 的前缀方向"
+        );
+        assert_eq!(classify_field_value(b"error"), Level::Other, "大小写敏感");
+        assert_eq!(classify_field_value(b""), Level::Other);
+    }
+
+    /// **D2 红线 (对抗样本)**: `level=INFO` 但正文含 `error` 的行必须计入 INFO 桶。
+    ///
+    /// 按行子串计数会把它算进 ERROR —— 而点该柱条应用的 `level=ERROR` 是字段
+    /// 过滤, 筛出来的结果里没有它, 柱条数字与行数当场打架。
+    #[test]
+    fn field_counting_ignores_message_body() {
+        let p = temp_file(
+            b"{\"level\":\"INFO\",\"msg\":\"handle error failed\"}\n\
+              {\"level\":\"INFO\",\"msg\":\"another ERROR in prose\"}\n",
+        );
+        let f = LogFile::open(&p).unwrap();
+        // 行口径会看见正文里的 ERROR (小写的不算, 大写的算)
+        assert_eq!(
+            count_levels(&f).get(Level::Info),
+            1,
+            "行口径: 第二条被正文抢走"
+        );
+        // 字段口径不受正文影响
+        let c = count_levels_field(&f, "level");
+        assert_eq!(c.get(Level::Info), 2, "两条都是 INFO");
+        assert_eq!(c.get(Level::Error), 0, "正文里的 ERROR 不得污染");
+        assert_eq!(c.total(), 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 列名识别: 认清单内的, 不认其它。
+    #[test]
+    fn find_level_column_recognises_only_known_names() {
+        let p = temp_file(
+            b"{\"level\":\"INFO\",\"msg\":\"a\",\"sev\":\"x\"}\n\
+              {\"level\":\"ERROR\",\"msg\":\"b\",\"sev\":\"y\"}\n",
+        );
+        let f = LogFile::open(&p).unwrap();
+        let schema = jsonl::discover_schema(&f).expect("JSONL schema");
+        assert_eq!(find_level_column(&schema), Some("level"));
+
+        // 只有 severity 时认 severity
+        let p2 = temp_file(
+            b"{\"severity\":\"WARN\",\"msg\":\"a\"}\n{\"severity\":\"INFO\",\"msg\":\"b\"}\n",
+        );
+        let f2 = LogFile::open(&p2).unwrap();
+        let s2 = jsonl::discover_schema(&f2).expect("JSONL schema");
+        assert_eq!(find_level_column(&s2), Some("severity"));
+
+        // 没有级别类列 → None (调用方降级只读)
+        let p3 = temp_file(b"{\"ts\":\"1\",\"msg\":\"a\"}\n{\"ts\":\"2\",\"msg\":\"b\"}\n");
+        let f3 = LogFile::open(&p3).unwrap();
+        let s3 = jsonl::discover_schema(&f3).expect("JSONL schema");
+        assert_eq!(find_level_column(&s3), None, "猜错列不如不猜");
+        for q in [p, p2, p3] {
+            let _ = std::fs::remove_file(&q);
+        }
+    }
+
+    /// 子句表: 四档可点、两档 None; 且索引与 `Level::ALL` 对齐。
+    #[test]
+    fn level_queries_table_is_aligned_and_sparse() {
+        let q = level_queries_for("severity");
+        assert_eq!(q[Level::Error as usize].as_deref(), Some("severity=ERROR*"));
+        assert_eq!(q[Level::Info as usize].as_deref(), Some("severity=INFO*"));
+        assert_eq!(q[Level::DebugTrace as usize], None);
+        assert_eq!(q[Level::Other as usize], None);
+        assert_eq!(q.iter().filter(|x| x.is_some()).count(), 4, "四档可点");
+
+        assert!(no_level_queries().iter().all(Option::is_none));
+    }
+
+    /// 点选子句是前缀通配; `其他` 桶无子句。
+    #[test]
+    fn field_query_is_prefix_wildcard() {
+        assert_eq!(
+            field_query("level", Level::Error).as_deref(),
+            Some("level=ERROR*")
+        );
+        assert_eq!(
+            field_query("severity", Level::Warn).as_deref(),
+            Some("severity=WARN*")
+        );
+        assert_eq!(
+            field_query("level", Level::DebugTrace),
+            None,
+            "合并桶表达不了「DEBUG 或 TRACE」"
+        );
+        assert_eq!(field_query("level", Level::Other), None, "其他桶无子句");
+    }
+
+    /// **D2 红线的端到端钉子**: 字段计数与过滤命中数**逐桶相等**。
+    ///
+    /// 这条断言的就是 spec 的一致性红线 —— 不是「差不多」, 是同一个数字。
+    #[test]
+    fn field_counts_equal_filter_hits_bucket_by_bucket() {
+        let content = b"{\"level\":\"INFO\",\"msg\":\"started\"}\n\
+                        {\"level\":\"INFO\",\"msg\":\"handle error failed\"}\n\
+                        {\"level\":\"ERROR\",\"msg\":\"disk full\"}\n\
+                        {\"level\":\"WARNING\",\"msg\":\"slow query\"}\n\
+                        {\"level\":\"ERR\",\"msg\":\"odd spelling\"}\n\
+                        {\"severity\":\"DEBUG\",\"msg\":\"no level field\"}\n\
+                        {\"level\":\"error\",\"msg\":\"lowercase\"}\n";
+        let p = temp_file(content);
+        let f = LogFile::open(&p).unwrap();
+        assert_eq!(f.line_count(), 7);
+
+        let counts = count_levels_field(&f, "level");
+        assert_eq!(counts.get(Level::Info), 2, "含正文写 error 的那条");
+        assert_eq!(counts.get(Level::Error), 1);
+        assert_eq!(counts.get(Level::Warn), 1, "WARNING 靠前缀吃到");
+        assert_eq!(counts.get(Level::Fatal), 0);
+        assert_eq!(
+            counts.get(Level::DebugTrace),
+            0,
+            "DEBUG 在 severity 列, 不算"
+        );
+        assert_eq!(
+            counts.get(Level::Other),
+            3,
+            "ERR + 无 level 字段 + 小写 error"
+        );
+        assert_eq!(counts.total(), 7, "6 桶之和 == 总行数");
+
+        for l in Level::ALL {
+            let Some(q) = field_query("level", l) else {
+                continue;
+            };
+            let hits = jsonl::run_filter(&f, &jsonl::parse_query(&q));
+            assert_eq!(
+                hits.len() as u64,
+                counts.get(l),
+                "{q} 的命中数 != 柱条数字 (D2 红线)"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 字段口径的并行 == 顺序 (与行口径同款对拍)。
+    #[test]
+    fn field_counting_parallel_equals_sequential() {
+        let mut content = Vec::new();
+        for i in 0..3000 {
+            let lv = match i % 4 {
+                0 => "INFO",
+                1 => "ERROR",
+                2 => "WARNING",
+                _ => "plain-word",
+            };
+            content.extend_from_slice(format!("{{\"level\":\"{lv}\",\"i\":{i}}}\n").as_bytes());
+        }
+        let p = temp_file(&content);
+        let f = LogFile::open(&p).unwrap();
+        let want = count_levels_field_from(&f, "level", 0);
+        assert_eq!(want.total(), 3000);
+        assert_eq!(want.get(Level::Info), 750);
+        assert_eq!(want.get(Level::Warn), 750, "WARNING 计入 WARN");
+        assert_eq!(want.get(Level::Other), 750);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 增量: 字段口径「全量」==「前 N 行 + 后段增量」。
+    #[test]
+    fn field_counting_incremental_matches_full() {
+        let mut content = Vec::new();
+        for i in 0..500 {
+            content.extend_from_slice(format!("{{\"level\":\"ERROR\",\"i\":{i}}}\n").as_bytes());
+        }
+        let p = temp_file(&content);
+        let f = LogFile::open(&p).unwrap();
+        let mut acc = count_levels_field_from(&f, "level", 0);
+        acc.merge(&count_levels_field_from(&f, "level", 500));
+        assert_eq!(acc, count_levels_field(&f, "level"));
         let _ = std::fs::remove_file(&p);
     }
 

@@ -156,13 +156,44 @@ fn main() {
         f64::INFINITY
     };
     println!(
-        "计数墙钟       : {} ms ({thr:.0} MiB/s)",
+        "行口径墙钟     : {} ms ({thr:.0} MiB/s)",
         elapsed.as_millis()
     );
     for l in levels::Level::ALL {
         println!("{:<14} : {}", l.label(), counts.get(l));
     }
     println!("合计           : {} 行", counts.total());
+
+    // JSONL 字段口径: 应用层走这条 (按级别类列的字段值, 而非行首子串)。
+    // 与 run_filter 的 74ms 量级对照 —— 同一套 extract_field 通路。
+    if jsonl::detect(&file)
+        && let Some(schema) = jsonl::discover_schema(&file)
+        && let Some(col) = levels::find_level_column(&schema)
+    {
+        let t = Instant::now();
+        let fc = levels::count_levels_field(&file, col);
+        let el = t.elapsed();
+        let secs = el.as_secs_f64();
+        let thr = if secs > 0.0 {
+            mib / secs
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "字段口径墙钟   : {} ms ({thr:.0} MiB/s)  列={col}",
+            el.as_millis()
+        );
+        for l in levels::Level::ALL {
+            let q = levels::field_query(col, l);
+            println!(
+                "{:<14} : {:>9}   {}",
+                l.label(),
+                fc.get(l),
+                q.unwrap_or_else(|| "(只读)".into())
+            );
+        }
+        println!("字段口径合计   : {} 行", fc.total());
+    }
 
     println!("\n== 总计 ==");
     println!("端到端 (打开+全部基准): {} ms", t_all.elapsed().as_millis());

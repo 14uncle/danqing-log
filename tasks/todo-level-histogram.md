@@ -121,16 +121,59 @@
 
 ## Phase 2: JSONL 垂直切片
 
-- [ ] **T4: level 类列识别 + 字段计数 + 对抗样本单测**
+- [x] **T4: level 类列识别 + 字段计数 + 对抗样本单测** ✅ 2026-09-12
   - 说明: 从 `Schema.columns` 找 level 类列 (名清单本任务定), 命中则按
-    `extract_field` 取字段值喂 `classify_level`; 列发现为 None 或无 level 类列 →
-    **降级只读** (不退回子串计数, 否则撞 D2 一致性红线)
+    `extract_field` 取字段值分类; 列发现为 None 或无 level 类列 → **降级只读**
   - Acceptance: **`{"level":"INFO","msg":"handle error failed"}` 计入 INFO 桶**
     (钉死 D2 红线); 无 level 类列的 JSONL → 直方图降级只读且不误报
   - Verify: `cargo test`
   - Depends: T3
-  - Files: `src/levels.rs`, `src/open.rs`
-  - Scope: S
+  - Files: `src/levels.rs`, `src/open.rs`, `src/main.rs`, `src/histogram.rs`, `src/bin/logbench.rs`
+  - Scope: M (原估 S; 见下「口径必须同构」一条, 实际牵动了子句生成与 app 状态)
+  - 实测: 45 lib + 21 main + 8 genlog = **74 绿**, clippy 0。
+
+    **① 关键发现: 计数谓词必须与过滤谓词同构, 否则撞 D2 红线**
+
+    读码发现过滤的扁平等值是**字节全等** (`jsonl.rs` 的 `token_matches`: `Op::Eq =>
+    token == target.as_bytes()`), 而最初设想「字段值按 [`classify_level`] 子串分类 +
+    点选子句写死 `level=WARN`」在真文件上会分岔: 文件里写 `WARNING` 时柱条数得到,
+    `level=WARN` 却筛出 0 行。
+
+    解法是把字段口径改成**前缀匹配**, 点选子句用**前缀通配** `level=WARN*`
+    (`Op::Prefix => token.starts_with(target)`)。两者对同一 token 走同一判断,
+    **一致性成了构造保证而非碰巧**, 且不需要 per-file 观察值。六个 token 首字母
+    互不相同 → 前缀匹配天然互斥, 连优先级都不需要。
+
+    六个 token 的字段分类独立成 `classify_field_value`, 与行口径的 `classify_level`
+    **有意不同** (前者前缀、后者子串 + 200 字节窗口), 因为两者的对齐对象不同:
+    行口径对齐「行首有没有级别词」, 字段口径对齐「`col=X*` 能筛出哪些行」。
+
+    **② D2 红线的两级验证**
+
+    - 单测 `field_counts_equal_filter_hits_bucket_by_bucket`: 对 7 行对抗 fixture
+      (含 `level=INFO` 而正文写 error、`WARNING` 别名、`ERR` 非规范拼写、小写 `error`、
+      无 level 字段但 severity=DEBUG) 逐桶断言 `run_filter(子句).len() == 柱条数字`。
+    - **真 1GB JSONL 复验** (logbench): FATAL 4760 / ERROR 43464 / WARN 96262 /
+      INFO 4544133 / DEBUG 145086 —— 五桶与对应 `level=X*` 的命中行数**逐个相同**。
+
+    **③ 口径必须全程一致 (新加的不变量)**: `OpenOutcome` 增 `level_column`,
+    落点据此重建子句表,**也据此决定后续增量追加走哪条口径** —— 混用会让同一个
+    侧栏里出现两种数法。巨量追平臂的 worker 拿不到 schema (该臂恒 None, 沿用应用层
+    现值), 故列名由 `launch_append` 显式传入。
+
+    **④ 列名清单**: `level` / `severity` / `lvl` / `loglevel` / `log_level` / `priority`
+    (大小写不敏感)。只认清单内的名字是**有意的保守** —— 猜错列会给出看似合理实则
+    全错的计数, 比「找不到 → 降级只读」糟得多。
+
+    **⑤ 性能落档**: 1GB JSONL 行口径 76ms / **字段口径 112ms** (9090 MiB/s,
+    与 `run_filter` 的 74ms 同量级); 明文 1GB 行口径 94ms。logbench 增字段口径段,
+    连子句一并打印 (可点/只读一眼可辨)。
+
+    **⑥ 一处保守取舍待裁**: 合并的 `DEBUG` 桶**不可点** —— `level=DEBUG*` 表达不了
+    TRACE。本 fixture 恰好只有 DEBUG 没有 TRACE, 故它的柱条数与 `level=DEBUG*` 命中数
+    都是 145086 (巧合成立)。真出现 TRACE 的文件就不成立, 故仍保守判只读。
+    若要它可点, 两条路: 拆成两行 (改 spec D1) 或按实际值判定可点性 (引入 per-file
+    观察值)。**待用户裁。**
 
 - [ ] **T5: 点选联动 + 一致性端到端验证**
   - 说明: 侧栏命中区 → `Msg::ApplyLevelFilter(Level)` → 套用既有 `level=<NAME>`

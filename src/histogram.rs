@@ -20,7 +20,7 @@ use danqing::{
     Color, Constraints, Event, MouseButton, Point, Rect, RectBatch, Size, TextBatch, Theme,
 };
 
-use danqing_log::levels::{Level, LevelCounts};
+use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
 
 use crate::view;
 use crate::{LogApp, Msg};
@@ -41,22 +41,6 @@ const BAR_H: f32 = 6.0;
 const BAR_GAP: f32 = 3.0;
 /// 非零计数的最小可见条宽 (对数刻度下 1 与 1e6 也只差一档)。
 const MIN_BAR_W: f32 = 2.0;
-
-/// 桶 → 过滤语法 (`level=NAME`); 无对应语法者返回 None。
-///
-/// `DebugTrace` 返回 None 是**结构性**的: 它合并了 DEBUG 与 TRACE 两个字段值
-/// (spec D1: 两者同色, 拆开无信息增量), 而 `level=` 是等值过滤, 单子句表达不了
-/// 「DEBUG 或 TRACE」——空格分词是 AND, 裸词是整行子串, 都不行。
-/// 故该行纯展示。若日后要可点, 需把它拆成两行 (spec D1 需改)。
-pub(crate) fn level_query(level: Level) -> Option<&'static str> {
-    match level {
-        Level::Fatal => Some("level=FATAL"),
-        Level::Error => Some("level=ERROR"),
-        Level::Warn => Some("level=WARN"),
-        Level::Info => Some("level=INFO"),
-        Level::DebugTrace | Level::Other => None,
-    }
-}
 
 /// 第 `i` 行的命中矩形 (序同 [`Level::ALL`])。
 fn row_rect(area: Rect, i: usize) -> Rect {
@@ -102,10 +86,10 @@ fn bucket_color(level: Level, text_secondary: Color) -> Color {
 /// 级别计数侧栏。
 pub(crate) struct LevelHistogram {
     counts: LevelCounts,
-    /// 当前生效的 `level=` 过滤对应的桶 (行高亮); None = 无。
+    /// 每桶的点选子句 (来自当前文件的级别类列; 全 None = 只读侧栏)。
+    queries: LevelQueries,
+    /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
-    /// 是否可点 (JSONL 表格模式; 原始文本模式柱条纯展示, spec D3)。
-    clickable: bool,
     // 主题色在 sync 期解析并缓存, paint 期零查表 (与 view.rs 同款)。
     bg: Color,
     text_primary: Color,
@@ -118,8 +102,8 @@ impl LevelHistogram {
     pub(crate) fn new() -> Self {
         Self {
             counts: LevelCounts::default(),
+            queries: levels::no_level_queries(),
             active: None,
-            clickable: false,
             bg: Color::rgb(1.0, 1.0, 1.0),
             text_primary: Color::rgb(0.12, 0.12, 0.12),
             text_secondary: Color::rgb(0.40, 0.40, 0.42),
@@ -154,14 +138,14 @@ impl Widget for LevelHistogram {
         self.text_secondary = t.text_secondary();
         self.active_bg = t.surface_variant();
         self.counts = *app.level_counts.as_ref();
-        // 可点 = JSONL 表格模式 (D3: 原始文本模式没有字段过滤语法可用)
-        self.clickable = app.schema.is_some();
-        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR`
+        self.queries = app.level_queries.clone();
+        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
-        self.active = Level::ALL
-            .iter()
-            .copied()
-            .find(|l| level_query(*l) == Some(app.filter_applied.as_str()));
+        self.active = Level::ALL.iter().copied().find(|l| {
+            self.queries[*l as usize]
+                .as_deref()
+                .is_some_and(|q| q == app.filter_applied)
+        });
     }
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
@@ -185,7 +169,7 @@ impl Widget for LevelHistogram {
             let baseline = row_y + texts.ascent(f32::from(LABEL_SIZE));
 
             // 生效行: 整行淡底 (比给横条换色更醒目, 且不动语义色)
-            if self.active == Some(*level) && self.clickable {
+            if self.active == Some(*level) {
                 rects.push_rect(
                     Rect::from_xywh(
                         area.origin.x + 2.0,
@@ -198,8 +182,8 @@ impl Widget for LevelHistogram {
                 );
             }
 
-            // 级别名 (左) + 计数 (右对齐)
-            let color = if self.clickable && level_query(*level).is_some() {
+            // 级别名 (左) + 计数 (右对齐) —— 可点行用正文色, 只读行降噪
+            let color = if self.queries[*level as usize].is_some() {
                 self.text_primary
             } else {
                 self.text_secondary
@@ -242,9 +226,9 @@ impl Widget for LevelHistogram {
             return EventResult::Ignored;
         };
         let level = Level::ALL[i];
-        // 不可点 = 原始文本模式, 或该桶无过滤语法 (DEBUG/其他) —— 吞掉点击,
+        // 不可点 = 明文模式 / 无级别类列 / 该桶无单子句 (DEBUG/其他) —— 吞掉点击,
         // 不让它穿透到底下的列表 (点在有东西的地方不该毫无回应地选中底下的行)。
-        if !self.clickable || level_query(level).is_none() {
+        if self.queries[level as usize].is_none() {
             return EventResult::Consumed;
         }
         msgs.push(Box::new(Msg::ApplyLevelFilter(level)));
@@ -256,25 +240,31 @@ impl Widget for LevelHistogram {
 mod tests {
     use super::*;
 
-    /// 可点桶恰为 4 个, 且语法两两不同 —— 否则点一行会跳到另一行。
+    /// 只读侧栏 (全 None 子句表) 下点击必须被吞掉, 且不发出任何消息 ——
+    /// 否则点空侧栏会穿透去选中底下的日志行。
     #[test]
-    fn clickable_buckets_have_distinct_queries() {
-        let mut seen = std::collections::HashSet::new();
-        for l in Level::ALL {
-            if let Some(q) = level_query(l) {
-                assert!(seen.insert(q), "{l:?} 的过滤语法与前面重复: {q}");
-            }
+    fn readonly_sidebar_swallows_clicks_without_message() {
+        let mut w = LevelHistogram::new();
+        assert!(w.queries.iter().all(Option::is_none), "新建即只读");
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        for i in 0..Level::ALL.len() {
+            let r = row_rect(area, i);
+            let ev = Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point {
+                    x: r.origin.x + 4.0,
+                    y: r.origin.y + 4.0,
+                },
+            };
+            let mut q = MsgQueue::default();
+            assert_eq!(
+                w.event(&ev, area, &mut q),
+                EventResult::Consumed,
+                "第 {i} 行点击应被吞"
+            );
+            assert!(q.is_empty(), "只读侧栏不得发消息");
         }
-        assert_eq!(seen.len(), 4, "FATAL/ERROR/WARN/INFO 四个可点");
-        assert_eq!(level_query(Level::Fatal), Some("level=FATAL"));
-        assert_eq!(level_query(Level::Info), Some("level=INFO"));
-        // 合并桶与兜底桶无单一子句可表达 (见 level_query 文档)
-        assert_eq!(
-            level_query(Level::DebugTrace),
-            None,
-            "DEBUG/TRACE 合并且不可点"
-        );
-        assert_eq!(level_query(Level::Other), None, "其他桶不可点");
     }
 
     /// 对数刻度: 0 → 0; 最大 → 1; 单行计数仍可见; 单调不减。

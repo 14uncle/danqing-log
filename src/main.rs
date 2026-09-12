@@ -37,7 +37,7 @@ use danqing::{
 use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
-use danqing_log::levels::{self, Level, LevelCounts};
+use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
 use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
 use danqing_log::search::{AsyncJob, SearchNav};
@@ -128,6 +128,12 @@ pub(crate) struct LogApp {
     /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
     /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
     level_counts: Arc<LevelCounts>,
+    /// 计数所用的级别类列名 (None = 行口径)。追加时据此选同一条口径 ——
+    /// 口径混用会让同一个侧栏里出现两种数法。
+    level_column: Option<String>,
+    /// 侧栏每桶的点选子句 (None = 该行不可点)。明文/无级别类列时全 None。
+    /// 子句只依赖列名 (前缀口径无 per-file 观察值), 故追加换入时无需重算。
+    level_queries: LevelQueries,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
     /// 已应用的过滤查询。
@@ -240,6 +246,8 @@ impl LogApp {
             mode: ViewMode::Raw,
             schema: None,
             level_counts: Arc::new(LevelCounts::default()),
+            level_column: None,
+            level_queries: levels::no_level_queries(),
             filtered: None,
             filter_applied: String::new(),
             filter_clear_rev: 0,
@@ -372,15 +380,26 @@ impl LogApp {
                 } else {
                     None
                 };
-                self.open_job = Some(OpenJob::launch_append(&self.path, old, delta, filter));
+                self.open_job = Some(OpenJob::launch_append(
+                    &self.path,
+                    old,
+                    delta,
+                    filter,
+                    self.level_column.clone(),
+                ));
                 self.refresh_status();
                 return;
             }
             // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
                 Ok(new) => {
-                    // 只数新行 —— 这里在 UI 线程上, 全量重算会冻帧
-                    let delta = levels::count_levels_from(&new, self.file.line_count());
+                    // 只数新行 —— 这里在 UI 线程上, 全量重算会冻帧。
+                    // 口径必须与当前显示的一致 (字段 vs 行), 否则侧栏会混两种数法。
+                    let old_count = self.file.line_count();
+                    let delta = match &self.level_column {
+                        Some(col) => levels::count_levels_field_from(&new, col, old_count),
+                        None => levels::count_levels_from(&new, old_count),
+                    };
                     self.apply_appended(new, None, delta);
                 }
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
@@ -410,12 +429,18 @@ impl LogApp {
             file,
             schema,
             level_counts,
+            level_column,
             ..
         } = out;
         let base_status = status_text(path, &file);
         let new_count = file.line_count();
         self.file = Arc::new(file);
         self.level_counts = Arc::new(level_counts);
+        // 格式可能整体换了 → 列名与子句表跟着换 (不沿用旧的)
+        self.level_queries = level_column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = level_column;
         // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
         self.schema = schema.map(Arc::new);
         self.mode = if self.schema.is_some() {
@@ -456,6 +481,7 @@ impl LogApp {
             file: new_file,
             schema,
             level_counts,
+            level_column,
             ..
         } = out;
         let base_status = status_text(&new_path, &new_file);
@@ -485,6 +511,10 @@ impl LogApp {
         self.mode = mode;
         self.schema = schema;
         self.level_counts = Arc::new(level_counts);
+        self.level_queries = level_column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = level_column;
         self.top_row = 0.0;
         self.selected = 0;
         self.filtered = None;
@@ -583,19 +613,21 @@ impl LogApp {
         }
     }
 
-    /// 点侧栏柱条: 套用 `level=<NAME>` 过滤 (复用既有过滤通路, 零新语法);
+    /// 点侧栏柱条: 套用该桶的过滤子句 (复用既有过滤通路, 零新语法);
     /// 点的已是当前生效项 → 清除 (切换语义)。
     ///
-    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE) 在侧栏侧已挡, 此处再兜一层 ——
-    /// 消息源不止一处时不会漏。
+    /// 子句来自 `level_queries` —— 它是**按当前文件的级别类列**生成的,
+    /// 不是写死的 `level=X`: 列名可能是 severity/lvl, 值可能是 WARNING。
+    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE / 明文模式) 在侧栏侧已挡,
+    /// 此处再兜一层 —— 消息源不止一处时不会漏。
     fn apply_level_filter(&mut self, level: Level) {
-        let Some(q) = histogram::level_query(level) else {
+        let Some(q) = self.level_queries[level as usize].clone() else {
             return;
         };
         if self.filter_applied == q {
             self.update(Msg::ApplyFilter(String::new()));
         } else {
-            self.update(Msg::ApplyFilter(q.to_string()));
+            self.update(Msg::ApplyFilter(q));
         }
     }
 
@@ -1384,6 +1416,7 @@ mod tests {
             incremental_hits: None,
             rebuilt: false,
             level_counts,
+            level_column: None,
         };
         app.apply_fresh(p.clone(), out);
         // 放行 worker 交付, 长窗轮询: 结果必须永不到达
