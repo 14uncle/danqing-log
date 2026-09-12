@@ -1,7 +1,8 @@
 //! @author 十四叔
 //! @date 2026/09/06
 //!
-//! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + 玻璃卡 (多页签: 关于 / 快捷键)。
+//! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + **不透明**卡
+//! (多页签: 快捷键 / 关于)。
 //!
 //! 为什么分页签: 单列堆叠在加上「快捷键」段后会把卡片顶得很高 (矮窗口下顶到边),
 //! 而两页签各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
@@ -23,6 +24,13 @@ use crate::config::{self, AppTheme};
 
 /// 卡片宽度。
 const CARD_WIDTH: f32 = 360.0;
+/// 页签**内容区**的固定高度 —— 两页签必须同高, 否则切换时卡片会跳。
+///
+/// 取「最高那一页 + 余量」: 关于页在**有更新提示**时约 208px, 故取 216。
+/// 高度加在内容上而不是整个 Tabs 上 —— 这样 tab 栏与面板间距是外加的,
+/// 两页签的高度基准才一致。
+/// **新增页签时若内容超过此值会被裁切**, 届时同步调大这个常量。
+const PANEL_CONTENT_H: f32 = 216.0;
 /// 正文字号。
 const BODY_SIZE: u16 = 14;
 
@@ -45,7 +53,11 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
     };
     // 内容区宽度 = 卡片宽 - 左右 padding
     let content_w = CARD_WIDTH - pad.left - pad.right;
-    UiBox::new(t.surface())
+    // 卡片底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
+    // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是 `rgba(…,0.10)`
+    // —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
+    // 必然是实色)。用户要求面板背景不透明, 故用它, 靠 border 与底层区分。
+    UiBox::new(t.background())
         .radius(12.0)
         .border_color(t.border())
         .child(Padding::new(
@@ -61,10 +73,11 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 // 与关于区三行/反馈链接同处一条中轴。
                 .child(
                     Tabs::new(&t)
-                        .tab("关于")
+                        // 关于放最后 (产品线惯例); 首屏落在快捷键页
                         .tab("快捷键")
-                        .child(about_panel(content_w))
+                        .tab("关于")
                         .child(shortcuts_panel(content_w))
+                        .child(about_panel(content_w))
                         // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
                         // 第一页更省事), 且 Esc/点遮罩关闭不丢。
                         .bind(|app: &LogApp| app.settings_tab)
@@ -76,18 +89,27 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
 
 /// 「关于」页签: 产品名/版本/一句话 + 主题 + 版本检查 + 反馈。
 fn about_panel(content_w: f32) -> impl Widget {
-    Column::new()
-        .gap(16.0)
-        .cross_center()
-        .child(about_section())
-        .child(content_row(version_row(), content_w))
-        .child(theme_dropdown())
-        .child(feedback_row())
+    panel_box(
+        Column::new()
+            .gap(16.0)
+            .cross_center()
+            .child(about_section())
+            .child(content_row(version_row(), content_w))
+            .child(theme_dropdown())
+            .child(feedback_row()),
+    )
+}
+
+/// 把一页的内容套进固定高度的透明盒 —— 两页签同高的实现点。
+fn panel_box(inner: impl Widget + 'static) -> impl Widget {
+    UiBox::new(Color::TRANSPARENT)
+        .height(PANEL_CONTENT_H)
+        .child(inner)
 }
 
 /// 「快捷键」页签。
 fn shortcuts_panel(content_w: f32) -> impl Widget {
-    shortcuts_section(content_w)
+    panel_box(shortcuts_section(content_w))
 }
 
 /// 内容行：固定宽度居中，内部左对齐。
