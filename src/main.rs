@@ -605,24 +605,34 @@ impl LogApp {
         };
         let job = self.open_job.take().expect("在途 job");
         match res {
-            Ok(out) => match job.kind() {
-                OpenKind::Fresh => self.apply_fresh(job.path().to_path_buf(), out),
-                OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
-                OpenKind::Append => {
-                    if out.rebuilt {
-                        // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
-                        self.apply_rebuild(job.path(), out);
-                    } else {
-                        let OpenOutcome {
-                            file,
-                            incremental_hits,
-                            level_counts,
-                            ..
-                        } = out;
-                        self.apply_appended(file, incremental_hits, level_counts);
+            Ok(out) => {
+                // 落地耗时 (自发起): 与 worker 的 `perf open_phases` 对照 ——
+                // 两者相减即「交付 + 拾取」的延迟; 若落地很快而用户仍等很久,
+                // 瓶颈就在落地之后的渲染, 不在这条管道。
+                log::info!(
+                    "perf open_landed: {:?} 自发起 (kind={:?})",
+                    job.elapsed_since_launch(),
+                    job.kind()
+                );
+                match job.kind() {
+                    OpenKind::Fresh => self.apply_fresh(job.path().to_path_buf(), out),
+                    OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
+                    OpenKind::Append => {
+                        if out.rebuilt {
+                            // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
+                            self.apply_rebuild(job.path(), out);
+                        } else {
+                            let OpenOutcome {
+                                file,
+                                incremental_hits,
+                                level_counts,
+                                ..
+                            } = out;
+                            self.apply_appended(file, incremental_hits, level_counts);
+                        }
                     }
                 }
-            },
+            }
             Err(e) => {
                 // 「索引已取消」= 主动取消, 静默; 失败语义按 kind 分流 (保旧行为):
                 // Fresh 失败 notice + 留空态/旧视图; Rebuild/Append 静默,

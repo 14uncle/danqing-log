@@ -75,6 +75,9 @@ pub struct OpenJob {
     cancel: Arc<AtomicBool>,
     kind: OpenKind,
     path: PathBuf,
+    /// 发起时刻 —— 用于「产物落地耗时」日志: 与 worker 内部的分阶段计时对照,
+    /// 可把「worker 慢」与「落地后渲染慢」分开。
+    launched_at: std::time::Instant,
 }
 
 impl OpenJob {
@@ -90,12 +93,19 @@ impl OpenJob {
         let path_buf = path.to_path_buf();
         job.launch(move || {
             run_catched(move || {
+                // 分阶段计时: 状态栏的「索引 N ms」只是 `LogFile::open` 的耗时,
+                // **不含**其后的列发现与级别计数 —— 用户看到的等待与那个数字
+                // 不符时, 唯一能定位的就是这组日志。
+                let t_phase = std::time::Instant::now();
                 let file = LogFile::open_with_hooks(&path_buf, &hooks)?;
+                let t_index = t_phase.elapsed();
+                let t_phase = std::time::Instant::now();
                 let schema = if jsonl::detect(&file) {
                     jsonl::discover_schema(&file)
                 } else {
                     None
                 };
+                let t_schema = t_phase.elapsed();
                 // 计数在索引趟之外单独一趟并行扫描 (D6); 随 file 一起交卷。
                 // 口径按模式分 (spec D2): JSONL 且有级别类列 → 按字段值;
                 // 否则按行首子串。两者各自与自己的可点行为对齐。
@@ -103,10 +113,19 @@ impl OpenJob {
                     .as_ref()
                     .and_then(levels::find_level_column)
                     .map(str::to_string);
+                let t_phase = std::time::Instant::now();
                 let level_counts = match &level_column {
                     Some(col) => levels::count_levels_field(&file, col),
                     None => levels::count_levels(&file),
                 };
+                log::info!(
+                    "perf open_phases: 索引 {}ms · 列发现 {}ms · 级别计数 {}ms ({} 行, 口径={})",
+                    t_index.as_millis(),
+                    t_schema.as_millis(),
+                    t_phase.elapsed().as_millis(),
+                    file.line_count(),
+                    level_column.as_deref().unwrap_or("行"),
+                );
                 Ok(OpenOutcome {
                     file,
                     schema,
@@ -124,6 +143,7 @@ impl OpenJob {
             cancel,
             kind,
             path: path.to_path_buf(),
+            launched_at: std::time::Instant::now(),
         }
     }
 
@@ -207,6 +227,7 @@ impl OpenJob {
             cancel,
             kind: OpenKind::Append,
             path: path.to_path_buf(),
+            launched_at: std::time::Instant::now(),
         }
     }
 
@@ -228,6 +249,11 @@ impl OpenJob {
     /// 目标路径 (换入时更新应用层 path / 状态文案)。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 自发起至今的耗时 (产物落地日志用)。
+    pub fn elapsed_since_launch(&self) -> std::time::Duration {
+        self.launched_at.elapsed()
     }
 }
 
