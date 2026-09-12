@@ -25,12 +25,24 @@
   逐桶相等成为构造保证 —— 字节全等的 `level=WARN` 在文件写 `WARNING` 时会筛出 0 行)、
   **窄窗自动折叠** (原 Open Question 二选一)。计数成本: 1GB 明文 94ms / JSONL 行口径 76ms /
   JSONL 字段口径 112ms。**待人工验收 + review**
+- 2026-09-12 (**用户实机报回归 → 定位并修复**): 打开 1GB JSONL 状态栏写「索引 92ms」
+  却要等 ~10s 内容才出。**慢的不是索引也不是级别计数, 是列发现** —— 它按 512 **行**
+  采样且用 serde_json 完整解析每行, 成本随**行宽**无界 (实测 200 MiB / 563 KiB 行 /
+  每行上万小对象: 列发现 **3.17s**, serde 解析这种形状只有 ~60 MB/s; 外推 1GB ≈ 16s)。
+  修在兄弟 crate `danqing-logfile`: 采样加**字节预算** (4 MiB / 2 MiB, 行宽 ≤ 8 KiB 时
+  不生效 → 普通日志零影响) + 值宽度探测有界化 (原来为算一个最终 `clamp(4,32)` 的宽度,
+  对每个字符串 `chars().count()` 走完全文、对每个对象/数组先 `to_string()` 整棵序列化)。
+  修后同一文件 3.17s → 71ms。**本次事故的教训**: 状态栏那个「索引 N ms」只是
+  `LogFile::open` 的耗时, **不含**其后的列发现与级别计数 —— 「数字与视觉不符」的根因
+  是那个数字从来不等于用户在等的时间。故同时给进度显示加**阶段感知**
+  (`OpenPhase`: 索引 → 列发现中 → 级别计数中), 后两段不再伪装成卡住的 99%。
 - 当前: **v1.0 收尾** —— 余工作面 ① ~~等级直方图~~ (已交付, 待验收) ② MSIX 打包 +
   Store 上架物料 (待打包方案调研) ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
   ④ 对外文案/截图素材。**未获用户指示不 push**
 - 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
-- 测试基线: **84 绿** (47 lib + 29 main + 8 genlog), 2026-09-12 实测 (level-histogram 后口径;
-  lib = expand/levels/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
+- 测试基线: **90 绿** (51 lib + 31 main + 8 genlog), 2026-09-12 实测 (含列发现字节预算
+  与阶段感知之后的口径; lib = expand/levels/open/search, main = view/main;
+  引擎 50 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读

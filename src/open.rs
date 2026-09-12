@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use anyhow::Result;
 
@@ -61,6 +61,41 @@ pub struct OpenOutcome {
     pub level_column: Option<String>,
 }
 
+/// 打开管道的阶段 (进度显示用)。
+///
+/// 状态栏的「索引 N ms」只是第 0 段的耗时, **不含**列发现与级别计数 ——
+/// 后两段没有细粒度进度, 若不在文案里说出来, 界面就会卡在「99%」不动,
+/// 用户看到的等待于是和那个数字对不上 (2026-09-12 用户反馈)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OpenPhase {
+    /// 建索引 (有细粒度字节进度)。
+    Index = 0,
+    /// JSONL 列发现 (serde 解析采样, 成本随行宽)。
+    Schema = 1,
+    /// 级别计数 (一趟并行扫描)。
+    Levels = 2,
+}
+
+impl OpenPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Schema,
+            2 => Self::Levels,
+            _ => Self::Index,
+        }
+    }
+
+    /// 显示名; `Index` 返回 None —— 那时有百分比可显示, 不该抢掉它。
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Index => None,
+            Self::Schema => Some("列发现中"),
+            Self::Levels => Some("级别计数中"),
+        }
+    }
+}
+
 /// 打开作业: worker 线程跑 open (+JSONL 检出), 应用层 tick poll 拾取。
 ///
 /// 生命周期由 `Option<OpenJob>` 表达: Some 在途, None 无作业/已取消。
@@ -78,6 +113,8 @@ pub struct OpenJob {
     /// 发起时刻 —— 用于「产物落地耗时」日志: 与 worker 内部的分阶段计时对照,
     /// 可把「worker 慢」与「落地后渲染慢」分开。
     launched_at: std::time::Instant,
+    /// 当前阶段 (worker 写, UI 读) —— 进度显示用, 见 [`OpenPhase`]。
+    phase: Arc<AtomicU8>,
 }
 
 impl OpenJob {
@@ -89,7 +126,9 @@ impl OpenJob {
             progress,
             cancel,
             hooks,
+            phase,
         } = job_parts();
+        let phase_w = Arc::clone(&phase);
         let path_buf = path.to_path_buf();
         job.launch(move || {
             run_catched(move || {
@@ -99,6 +138,7 @@ impl OpenJob {
                 let t_phase = std::time::Instant::now();
                 let file = LogFile::open_with_hooks(&path_buf, &hooks)?;
                 let t_index = t_phase.elapsed();
+                phase_w.store(OpenPhase::Schema as u8, Ordering::Relaxed);
                 let t_phase = std::time::Instant::now();
                 let schema = if jsonl::detect(&file) {
                     jsonl::discover_schema(&file)
@@ -113,6 +153,7 @@ impl OpenJob {
                     .as_ref()
                     .and_then(levels::find_level_column)
                     .map(str::to_string);
+                phase_w.store(OpenPhase::Levels as u8, Ordering::Relaxed);
                 let t_phase = std::time::Instant::now();
                 let level_counts = match &level_column {
                     Some(col) => levels::count_levels_field(&file, col),
@@ -144,6 +185,7 @@ impl OpenJob {
             kind,
             path: path.to_path_buf(),
             launched_at: std::time::Instant::now(),
+            phase,
         }
     }
 
@@ -165,7 +207,9 @@ impl OpenJob {
             progress,
             cancel,
             hooks,
+            phase,
         } = job_parts();
+        let phase_w = Arc::clone(&phase);
         let path_buf = path.to_path_buf();
         job.launch(move || {
             run_catched(move || {
@@ -195,6 +239,7 @@ impl OpenJob {
                 // 退化重建臂 → 按新格式重认列 + 全量; 真增量臂 → 重叠一行的**绝对量**
                 // 更新 (列名由调用方传入: 该臂 schema 恒 None, worker 拿不到, 而口径
                 // 必须与已显示的那份一致)。
+                phase_w.store(OpenPhase::Levels as u8, Ordering::Relaxed);
                 let (level_counts, level_column) = if rebuilt {
                     let col = schema
                         .as_ref()
@@ -228,6 +273,7 @@ impl OpenJob {
             kind: OpenKind::Append,
             path: path.to_path_buf(),
             launched_at: std::time::Instant::now(),
+            phase,
         }
     }
 
@@ -251,6 +297,11 @@ impl OpenJob {
         &self.path
     }
 
+    /// 当前阶段的显示名; `None` = 仍在建索引 (那时有百分比可显示)。
+    pub fn phase_name(&self) -> Option<&'static str> {
+        OpenPhase::from_u8(self.phase.load(Ordering::Relaxed)).name()
+    }
+
     /// 自发起至今的耗时 (产物落地日志用)。
     pub fn elapsed_since_launch(&self) -> std::time::Duration {
         self.launched_at.elapsed()
@@ -270,11 +321,13 @@ struct JobParts {
     progress: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     hooks: IndexHooks,
+    phase: Arc<AtomicU8>,
 }
 
 fn job_parts() -> JobParts {
     let progress = Arc::new(AtomicU64::new(0));
     let cancel = Arc::new(AtomicBool::new(false));
+    let phase = Arc::new(AtomicU8::new(OpenPhase::Index as u8));
     let hooks = IndexHooks {
         progress: Some(Arc::clone(&progress)),
         cancel: Some(Arc::clone(&cancel)),
@@ -284,6 +337,7 @@ fn job_parts() -> JobParts {
         progress,
         cancel,
         hooks,
+        phase,
     }
 }
 

@@ -732,6 +732,12 @@ impl LogApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // 索引之后的阶段 (列发现 / 级别计数) 没有细粒度字节进度 —— 继续显示百分比
+        // 就会卡在 99% 不动, 用户看到的等待于是和状态栏那个「索引 N ms」对不上
+        // (2026-09-12 用户反馈)。如实报阶段名, 把这段等待显性化。
+        if let Some(phase) = job.phase_name() {
+            return Some((phase, name, "…".to_string()));
+        }
         let verb = match job.kind() {
             OpenKind::Fresh => "正在索引",
             OpenKind::Rebuild => "重建中",
