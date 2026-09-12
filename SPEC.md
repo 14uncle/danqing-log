@@ -20,10 +20,15 @@ v1 单二进制全功能 (付费层刀法留 v1.x, 2026-09-05 用户裁决)。
 | `app-chrome` | 标题栏窗件 (框架 TitleBar 嵌槽, 过滤+搜索进 titlebar) | core-viewer, danqing titlebar-embed |
 | `settings` | 设置入口 + 轻量设置卡 (底部状态栏入口, 版本检查) | app-chrome, danqing update |
 | `async-open` | 异步打开管道 (启动/reload/重建/巨量追加后台索引) + 进度反馈 + 取消 | core-viewer, live-tail |
+| `level-histogram` | 级别计数侧栏 (全文件级别分布 + 点选筛选联动); **2026-09-12 立项, v1.0 收尾批** | core-viewer, jsonl-table, async-open, live-tail |
 
 构建序: `core-viewer` → `live-tail` ∥ `jsonl-table` → `app-chrome` → `settings`
-→ `async-open` (改写 live-tail 同步打开形态, 排其之后)。
+→ `async-open` (改写 live-tail 同步打开形态, 排其之后) → `level-histogram`。
 意图文档付费层 (多文件时间戳合并/过滤器会话/导出) 不在 MVP, 归 v1.x。
+
+> **v1.0 收尾批模块** (2026-09-12 新增, 不属原 MVP 三段式): `level-histogram` 已立 spec;
+> `msix-store` (MSIX 打包 + Store 上架物料) 待打包方案调研后立 spec。两者相互独立,
+> 依赖方向见各自 spec。
 
 ## Tech Stack
 
@@ -32,7 +37,8 @@ v1 单二进制全功能 (付费层刀法留 v1.x, 2026-09-05 用户裁决)。
   联动改动先 push danqing 再 `cargo update -p danqing` 提交 lock, 顺序不能反
 - 引擎: memmap2 (mmap) + memchr (SIMD) + regex::bytes + serde_json (`preserve_order` 必须,
   否则 Object 是 BTreeMap 字典序, 列序失真)
-- 共享编译产物: `.cargo/config.toml` → `../.cargo-target` (全家共用)
+- 编译产物: 各仓独立 `target/` —— 2026-09-10 去掉 `../.cargo-target` 共享 (RustRover
+  多仓并发编译触发 race condition), `.cargo/config.toml` 中 `target-dir` 行已注释
 
 ## Commands
 
@@ -49,15 +55,17 @@ powershell -NoProfile -File tools/package_portable.ps1       # 打包 → ../rel
 ## Project Structure
 
 ```
-src/             → 库 + 应用 (当前: lib.rs / logfile.rs / jsonl.rs / main.rs / view.rs)
-src/bin/         → logbench (基准) / genlog (测试数据)
+src/             → 库 + 应用 (lib.rs / main.rs / view.rs / open.rs / search.rs /
+                    expand.rs / settings.rs / config.rs / tray.rs / app_update.rs)
+src/bin/         → logbench (基准) / genlog (测试数据) / mmap_lab (mmap 存活期实验台)
 docs/specs/      → 模块 spec (本文件地图是索引)
-tools/           → package_portable.ps1
-assets/          → logo (占位, 命名定稿后换真 LOGO)
+tools/           → package_portable.ps1 / export-logo.py
+assets/          → logo.svg + 7 档 PNG + logo.ico (2026-09-06 定稿)
 ```
 
-core-viewer 预期演化 (plan 阶段细化, 非承诺): `src/engine/` (mmap/索引/编码/搜索)
-与 `src/app/` (GUI/交互) 分层; POC 的 logfile.rs 是种子不是包袱, 可重写。
+引擎层 (mmap/行索引/全文搜索/JSONL 列化 与 编码检测转码) 已于 2026-09-10 拆为兄弟 crate
+`danqing-logfile` / `danqing-encoding`, 经 `lib.rs` re-export 消费; 仓内不再有
+`logfile.rs` / `jsonl.rs` / `encoding.rs` (2026-09-12 删除拆分残留副本 2266 行)。
 
 ## Code Style
 
