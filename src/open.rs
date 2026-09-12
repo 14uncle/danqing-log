@@ -48,10 +48,12 @@ pub struct OpenOutcome {
     /// 级别计数 (level-histogram): 在 worker 内算好, 与 file 同批交付 ——
     /// UI 侧不存在「行数已更新、计数还是旧的」窗口。
     ///
-    /// **语义按臂而定**: Fresh / Rebuild / 追加退化重建臂 = **全量**;
-    /// 真增量臂 (巨量追平) = **新增行 `[old.line_count(), new)` 的增量**,
-    /// 由落点 ([`crate::main`] 的 `apply_appended`) 与旧计数合并。
-    /// 分派依据是 [`Self::rebuilt`]。
+    /// **四臂一律是绝对量** (与 `file` 对应的全文件计数), 落点只需覆盖。
+    ///
+    /// 之所以不做「增量 vs 全量」的按臂语义 (初版如此, review R1 后统一):
+    /// 那种契约要在每个落点判断「这份是增量还是全量」, 判错一次就是计数翻倍
+    /// 或旧数据全丢。改成一律绝对量之后, 误用空间消失; 增量省下的扫描由
+    /// [`crate::levels::update_for_append`] 在 worker 内完成 (重叠一行)。
     pub level_counts: LevelCounts,
     /// 计数所用的级别类列名 (`None` = 走行口径)。落点据此重建点选子句,
     /// 也据此决定后续增量追加该走哪条口径 —— 口径必须全程一致, 否则
@@ -136,6 +138,7 @@ impl OpenJob {
         new_bytes: u64,
         filter: Option<(Vec<Clause>, u64)>,
         level_column: Option<String>,
+        old_counts: LevelCounts,
     ) -> Self {
         let JobParts {
             mut job,
@@ -157,17 +160,21 @@ impl OpenJob {
                 } else {
                     None
                 };
-                // 增量过滤只在真增量臂有意义 (重建臂走 Rebuild 链, 过滤全清)
+                // 增量过滤只在真增量臂有意义 (重建臂走 Rebuild 链, 过滤全清)。
+                // 起点**退一行**: 旧快照末行可能以无换行结尾、并被本次追加补全改判
+                // (review R1)。落点会先摘掉 `>= 该起点` 的旧命中, 故重跑重叠行不会
+                // 重复计入 —— 计数与过滤必须同起点, 否则 D2 红线当场破裂。
                 let incremental_hits = match (&filter, rebuilt) {
-                    (Some((clauses, old_line_count)), false) => {
-                        Some(jsonl::run_filter_from(&file, clauses, *old_line_count))
-                    }
+                    (Some((clauses, old_line_count)), false) => Some(jsonl::run_filter_from(
+                        &file,
+                        clauses,
+                        old_line_count.saturating_sub(1),
+                    )),
                     _ => None,
                 };
-                // 退化重建臂 → 全量 + 按新格式重认列 (格式可能换了, review R4 同源);
-                // 真增量臂 → 只算旧行数之后的新行, 落点与旧计数合并。
-                // 真增量臂的列名由调用方传入 —— 该臂 schema 恒 None (沿用应用层现值),
-                // worker 自己拿不到; 而口径必须与已显示的那份一致。
+                // 退化重建臂 → 按新格式重认列 + 全量; 真增量臂 → 重叠一行的**绝对量**
+                // 更新 (列名由调用方传入: 该臂 schema 恒 None, worker 拿不到, 而口径
+                // 必须与已显示的那份一致)。
                 let (level_counts, level_column) = if rebuilt {
                     let col = schema
                         .as_ref()
@@ -179,12 +186,8 @@ impl OpenJob {
                     };
                     (c, col)
                 } else {
-                    let c = match &level_column {
-                        Some(name) => {
-                            levels::count_levels_field_from(&file, name, old.line_count())
-                        }
-                        None => levels::count_levels_from(&file, old.line_count()),
-                    };
+                    let c =
+                        levels::update_for_append(&old, &file, old_counts, level_column.as_deref());
                     (c, level_column)
                 };
                 Ok(OpenOutcome {
@@ -378,7 +381,8 @@ mod tests {
                 .unwrap();
         }
         let clauses = jsonl::parse_query("level=ERROR");
-        let mut job = OpenJob::launch_append(&path, old, 50, Some((clauses, 3)), None);
+        let old_counts = levels::count_levels(&old);
+        let mut job = OpenJob::launch_append(&path, old, 50, Some((clauses, 3)), None, old_counts);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(!out.rebuilt, "真增量臂");
         assert_eq!(out.file.line_count(), 5);
@@ -399,7 +403,8 @@ mod tests {
         std::fs::rename(&path, path.with_extension("old")).expect("映射存活期改名合法 (T3)");
         // 同路径更小的新文件 (JSONL, 格式也换了) → 缩容兜底
         std::fs::write(&path, b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
-        let mut job = OpenJob::launch_append(&path, old, 10, None, None);
+        let old_counts = levels::count_levels(&old);
+        let mut job = OpenJob::launch_append(&path, old, 10, None, None, old_counts);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(out.rebuilt, "缩容 → Rebuilt 分派");
         assert!(out.schema.is_some(), "重建臂重新发现 schema");
@@ -444,11 +449,17 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// 追平臂: 级别计数是**新行的增量**, 不是全量 —— 落点负责与旧计数合并。
-    /// 语义若写成全量, 落点再合并一次就会翻倍; 写成增量却当全量用则丢失旧数据。
+    /// 追平臂: 产物是**绝对量** (与新文件对应的全文件计数), 落点覆盖即可。
+    ///
+    /// 契约从「按臂而定 (增量 / 全量)」收敛成「一律绝对量」是 review R1 的连带结果:
+    /// 那种契约要在每个落点判断「这份是增量还是全量」, 判错一次就是计数翻倍或旧数据
+    /// 全丢。这条钉住新契约, 并验证「重叠一行」不会把旧行算两遍。
     #[test]
-    fn append_outcome_levels_are_a_delta_not_a_total() {
-        let path = temp_file(b"2026-09-05 12:00:01 ERROR first\n");
+    fn append_outcome_levels_are_absolute() {
+        let path = temp_file(
+            b"2026-09-05 12:00:01 ERROR first
+",
+        );
         let old = Arc::new(LogFile::open(&path).unwrap());
         assert_eq!(old.line_count(), 1, "旧快照 1 行");
         {
@@ -456,20 +467,71 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            f.write_all(b"2026-09-05 12:00:02 INFO two\n2026-09-05 12:00:03 ERROR three\n")
-                .unwrap();
+            f.write_all(
+                b"2026-09-05 12:00:02 INFO two
+2026-09-05 12:00:03 ERROR three
+",
+            )
+            .unwrap();
         }
-        let mut job = OpenJob::launch_append(&path, old, 64, None, None);
+        let old_counts = levels::count_levels(&old);
+        assert_eq!(old_counts.get(Level::Error), 1, "旧快照那条 ERROR");
+        let mut job = OpenJob::launch_append(&path, old, 64, None, None, old_counts);
         let out = wait_outcome(&mut job).expect("追平成功");
         assert!(!out.rebuilt, "纯追加不走重建臂");
         assert_eq!(out.file.line_count(), 3);
-        assert_eq!(out.level_counts.total(), 2, "只含新增的两行");
+        assert_eq!(
+            out.level_counts,
+            levels::count_levels(&out.file),
+            "必须是绝对量, 且 == 对新文件全量重算"
+        );
+        assert_eq!(out.level_counts.total(), 3);
+        assert_eq!(
+            out.level_counts.get(Level::Error),
+            2,
+            "旧 1 + 新 1; 重叠一行不得把旧行算两遍"
+        );
         assert_eq!(out.level_counts.get(Level::Info), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **R1 回归 (worker 路径)**: 旧快照末行无换行, 追平把它补全并改判 ——
+    /// 产物必须覆盖那一行 (纯增量会漏掉它)。
+    #[test]
+    fn append_outcome_covers_completed_half_line() {
+        let path = temp_file(
+            b"X
+2026-09-05 12:00:01 ",
+        );
+        let old = Arc::new(LogFile::open(&path).unwrap());
+        assert_eq!(old.line_count(), 2);
+        let old_counts = levels::count_levels(&old);
+        assert_eq!(old_counts.get(Level::Error), 0, "半行未成词 → 其他");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(
+                b"ERROR disk
+",
+            )
+            .unwrap();
+        }
+        let mut job = OpenJob::launch_append(&path, old, 64, None, None, old_counts);
+        let out = wait_outcome(&mut job).expect("追平成功");
+        assert_eq!(out.file.line_count(), 2, "补全半行不增行数");
+        assert_eq!(
+            out.level_counts,
+            levels::count_levels(&out.file),
+            "绝对量 == 全量重算"
+        );
         assert_eq!(
             out.level_counts.get(Level::Error),
             1,
-            "只数新行里的那条 ERROR"
+            "被补全的半行必须被重算"
         );
+        assert_eq!(out.level_counts.get(Level::Other), 1, "只剩开头那行 X");
         std::fs::remove_file(&path).ok();
     }
 }

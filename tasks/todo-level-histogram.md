@@ -323,7 +323,7 @@
   5. `Ctrl+L` 显隐即时生效; **重启后开关状态保持**; 窄窗自动折叠
   6. 深浅两套主题下 6 行均可辨识
 - [x] 进 review 阶段 (`/agent-skills:code-review-and-quality`) ✅ 2026-09-12
-      —— 结论 **Request changes** (一条 Required 待用户裁, 其余已修), 详见下节
+      —— 结论 **Request changes** (一条 Required 已按用户裁决修毕), 详见下节
 
 ---
 
@@ -361,19 +361,40 @@
 6. **[Nit] 落点四行重复** —— `apply_fresh` / `apply_rebuild` 逐字重复的列名采纳逻辑
    抽成 `LogApp::adopt_level_column`。
 
-**待用户裁 (Required, 未修)**
+**Required (已修) —— 增量漏计「被补全的半行」**
 
-- **增量漏计「被补全的半行」**: 旧快照末行若**无换行**结尾, 外部补全且补全内容在行首
-  200 字节内引入级别词 → 增量起点 `[old_line_count, new)` 不含该行, 该行永不重算。
-  **已第一手复现**: 明文 全量 ERROR=1/其他=1 vs 增量 ERROR=0/其他=2;
-  过滤 全量=1 vs 增量(从旧行数起)=0。
-  **两侧同源漂移 (漏同一行) → D2 红线此刻仍成立**; 故**只修计数会当场打破 D2**。
-  修法: (a) frontier 行「减旧类 + 加新类」两侧同修 —— 过滤侧可能触及兄弟 crate 的
-  `run_filter_from` 语义, 需 `LevelCounts` 减法与命中表去重; (b) 检测旧尾非 `\n` 即
-  退回全量重算 —— 过滤侧 1GB ≈ 74ms 在 UI 线程会冻帧。
-  触发窗口窄 (切点落在级别词内部那几个字节), 且「6 桶之和 == 行数」仍成立 (其他检查
-  兜不住)。**当前处置: 记入 spec 已知局限, 不阻塞人工验收。** 待用户定: 立即修 / 记局限。
-- **合并的 DEBUG 桶可点性** (T4 ⑥ 遗留) —— 同上, 倾向暂不动。
+review 发现并第一手复现: 旧快照末行若**无换行**结尾, 外部补全且补全内容在行首
+200 字节内引入级别词 → 增量起点 `[old_line_count, new)` 不含该行, 该行永不重算。
+复现数据: 明文 全量 ERROR=1/其他=1 vs 增量 ERROR=0/其他=2; 过滤 全量=1 vs 增量 0。
+
+**用户裁决: 现在修两侧** (排除「只修计数」—— 两侧同源漂移故 D2 此刻仍成立,
+只改一侧会当场打破红线)。修法:
+
+- `levels::update_for_append(old, new, old_counts, column)` —— 重算起点**退一行**
+  (即 `old_counts − 旧重叠区间 + 新重叠区间`)。旧尾本就完整时减旧加新相抵,
+  故**无条件启用**安全, 不必先判断旧尾是不是 `
+` (少一个判据就少一类 bug)。
+  另加 `LevelCounts::sub` (饱和减)。
+- 过滤侧同起点: `drop_filter_hits_from(from)` 先摘掉 `>= from` 的旧命中, 再
+  `append_filter_hits(from)` 重跑同区间。摘/补必须同 `from`, 否则重叠行漏算或重算。
+- **连带收敛**: `OpenOutcome.level_counts` 从「按臂而定 (增量/全量)」改为
+  **一律绝对量** —— 那种契约要在每个落点判断「这份是增量还是全量」, 判错一次就是
+  计数翻倍或旧数据全丢; 改成绝对量后误用空间消失 (agent C 原本把旧契约的优点
+  记为「最扎实的一笔」, 但改为绝对量更强)。
+
+**并发前提 (已核并写入注释)**: worker 用发起时的旧行数、落点用落地时的, 二者能
+相等靠 `poll_growth` 开头的 `open_job.is_some()` 门禁 —— 在途期间不叠加任何 tail
+动作。**若将来允许并发追加, 摘/补对称会静默失效**, 届时须把 `from` 随产物交回。
+
+**回归测试 (4 条 + 多轮对拍插一轮)**:
+`update_for_append_covers_completed_half_line` (明文 + 字段两支) /
+`update_for_append_is_idempotent_on_complete_tail` (旧尾完整时相抵) /
+`update_for_append_from_empty_old_file` /
+`append_outcome_covers_completed_half_line` (worker 路径) /
+`apply_appended_covers_completed_half_line_on_both_sides` (应用层两侧 + D2 断言);
+多轮对拍改为走**生产入口**且第 3 轮落半行、第 4 轮补全。
+
+**仍未裁 (非阻塞)**: 合并的 DEBUG 桶可点性 —— 倾向暂不动。
 
 **既有问题 (非本模块引入, 仅 FYI)**
 

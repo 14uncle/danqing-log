@@ -229,6 +229,42 @@ pub fn count_levels_field_from(file: &LogFile, column: &str, from: u64) -> Level
     count_ranges(file, from, len, threads, &classify)
 }
 
+/// 追加的**绝对**计数更新: 在 `old_counts` 基础上, 用「重叠一行」重算
+/// `[old.line_count()-1, new.line_count())` 并交付新的绝对计数。
+///
+/// 为什么必须重叠一行 (review R1, 已复现): 旧快照的末行可能**以无换行结尾**,
+/// 外部把那一行补全时会把它改判 (例如从「其他」变成 ERROR)。纯增量
+/// `[old.line_count(), new)` **不含该行**, 于是那一行永不重算, 侧栏静默偏低
+/// 且随 tail 时长累积。从 `old.line_count()-1` 起重算即可覆盖它。
+///
+/// 旧快照本就以换行结尾时, 那一行的重算结果不变 (减旧类 == 加新类), 故
+/// **无条件启用是安全的** —— 不需要先判断旧尾是不是 `\n`, 也就不会因为判据
+/// 写错而再多一类 bug。
+///
+/// 交付绝对量 (而非增量) 是有意的: 调用方只需覆盖, 不存在「增删当全量」
+/// 或「全量当增量」的误用空间。
+pub fn update_for_append(
+    old: &LogFile,
+    new: &LogFile,
+    old_counts: LevelCounts,
+    column: Option<&str>,
+) -> LevelCounts {
+    let from = old.line_count().saturating_sub(1);
+    let mut c = old_counts;
+    // 退掉重叠区间在旧文件上的分类, 再按新文件重算同一区间
+    match column {
+        Some(col) => {
+            c.sub(&count_levels_field_from(old, col, from));
+            c.merge(&count_levels_field_from(new, col, from));
+        }
+        None => {
+            c.sub(&count_levels_from(old, from));
+            c.merge(&count_levels_from(new, from));
+        }
+    }
+    c
+}
+
 /// 各桶计数。索引序 = [`Level::ALL`] 序 (即严重度降序)。
 ///
 /// 用定长数组而非 HashMap: 桶数是编译期常量, 查表 O(1) 且无哈希开销 ——
@@ -242,6 +278,16 @@ impl LevelCounts {
     /// 记一行。
     pub fn add(&mut self, level: Level) {
         self.counts[level as usize] += 1;
+    }
+
+    /// 减去另一份计数 (追加时把重叠区间的旧分类退掉)。
+    ///
+    /// **饱和减**: 在正确的前提下不会下溢, 但真下溢时宁可钳到 0,
+    /// 不要回绕成天文数字那样更难查的现象。
+    pub fn sub(&mut self, other: &LevelCounts) {
+        for (a, b) in self.counts.iter_mut().zip(other.counts.iter()) {
+            *a = a.saturating_sub(*b);
+        }
     }
 
     /// 合并另一份计数 (并行分段归并用)。
@@ -969,13 +1015,6 @@ mod tests {
                 count_levels(f)
             }
         };
-        let count_delta = |f: &LogFile, from: u64| {
-            if jsonl {
-                count_levels_field_from(f, col, from)
-            } else {
-                count_levels_from(f, from)
-            }
-        };
 
         let mut init = String::new();
         for i in 0..100 {
@@ -987,24 +1026,44 @@ mod tests {
         assert_eq!(acc.total(), 100, "起始 {jsonl} 行");
 
         for round in 1..=5 {
-            let before = file.line_count();
-            let batch = if round % 2 == 0 { 10 } else { 25 };
-            let mut add = String::new();
-            for i in 0..batch {
-                add.push_str(&line_of(round, i));
-            }
+            // 第 3 轮只落一个**无换行的半行** (级别词被切开); 第 4 轮把它补全 ——
+            // review R1 的触发形态。纯增量会漏掉这一行, 重叠一行才不会。
+            let add: String = match round {
+                3 => {
+                    if jsonl {
+                        "{\"level\":\"ERR".to_string()
+                    } else {
+                        "2026-09-05 12:03:00 ".to_string()
+                    }
+                }
+                4 => {
+                    let head = if jsonl {
+                        "OR\",\"round\":4,\"i\":0}
+"
+                    } else {
+                        "ERROR round4-i0
+"
+                    };
+                    format!("{head}{}", line_of(4, 1))
+                }
+                _ => {
+                    let batch: usize = if round % 2 == 0 { 10 } else { 25 };
+                    (0..batch).map(|i| line_of(round, i)).collect()
+                }
+            };
             {
                 let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
                 f.write_all(add.as_bytes()).unwrap();
             }
-            file = LogFile::append_from(&file, &p).unwrap();
-            assert_eq!(file.line_count(), before + batch as u64);
+            let prev = file;
+            file = LogFile::append_from(&prev, &p).unwrap();
 
-            acc.merge(&count_delta(&file, before));
+            // 走**生产入口**, 而非在测试里手工 merge 增量
+            acc = update_for_append(&prev, &file, acc, jsonl.then_some(col));
             assert_eq!(
                 acc,
                 count_full(&file),
-                "jsonl={jsonl} 第 {round} 轮: 增量累加 != 全量重算"
+                "jsonl={jsonl} 第 {round} 轮: 追加更新 != 全量重算"
             );
             assert_eq!(acc.total(), file.line_count(), "6 桶之和 == 总行数");
         }
@@ -1021,6 +1080,91 @@ mod tests {
     #[test]
     fn incremental_matches_full_jsonl_field() {
         assert_incremental_matches_full(true);
+    }
+
+    // ---- review R1: 追加的绝对计数更新 ----
+
+    /// **R1 回归**: 旧快照末行以**无换行**结尾, 外部把它补全并改判 ——
+    /// `update_for_append` 必须覆盖那一行。明文与 JSONL 字段口径各一遍。
+    #[test]
+    fn update_for_append_covers_completed_half_line() {
+        // 明文: 半行 `... 12:00:01 ` 被补成 `... 12:00:01 ERROR disk`
+        let p1 = temp_file(b"X\n2026-09-05 12:00:01 ");
+        let old1 = LogFile::open(&p1).unwrap();
+        assert_eq!(old1.line_count(), 2, "半行已是一行");
+        let c1 = count_levels(&old1);
+        assert_eq!(c1.get(Level::Error), 0, "半行未成词 → 其他");
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p1).unwrap();
+            f.write_all(b"ERROR disk\n").unwrap();
+        }
+        let new1 = LogFile::append_from(&old1, &p1).unwrap();
+        assert_eq!(new1.line_count(), 2, "补全半行不增行数");
+        let got1 = update_for_append(&old1, &new1, c1, None);
+        assert_eq!(got1, count_levels(&new1), "补全后半行必须被重算 (明文)");
+        assert_eq!(got1.get(Level::Error), 1);
+
+        // JSONL 字段口径: 半行 `{"level":"ERR` 被补成完整对象
+        let p2 = temp_file(b"{\"level\":\"ERR");
+        let old2 = LogFile::open(&p2).unwrap();
+        assert_eq!(old2.line_count(), 1);
+        let c2 = count_levels_field(&old2, "level");
+        assert_eq!(c2.get(Level::Error), 0, "半行取不到字段 → 其他");
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p2).unwrap();
+            f.write_all(b"OR\",\"m\":\"x\"}\n").unwrap();
+        }
+        let new2 = LogFile::append_from(&old2, &p2).unwrap();
+        assert_eq!(new2.line_count(), 1, "补全半行不增行数");
+        let got2 = update_for_append(&old2, &new2, c2, Some("level"));
+        assert_eq!(
+            got2,
+            count_levels_field(&new2, "level"),
+            "补全后半行必须被重算 (字段口径)"
+        );
+        assert_eq!(got2.get(Level::Error), 1);
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    /// 旧快照末行**完整** (以换行结尾) 时, 重叠一行是幂等的 ——
+    /// 这正是「无条件启用安全」的依据, 不必先判断旧尾是不是 `\n`。
+    #[test]
+    fn update_for_append_is_idempotent_on_complete_tail() {
+        let p = temp_file(b"INFO one\nERROR two\n");
+        let old = LogFile::open(&p).unwrap();
+        let c = count_levels(&old);
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"WARN three\n").unwrap();
+        }
+        let new = LogFile::append_from(&old, &p).unwrap();
+        let got = update_for_append(&old, &new, c, None);
+        assert_eq!(got, count_levels(&new));
+        assert_eq!(got.get(Level::Info), 1);
+        assert_eq!(got.get(Level::Error), 1);
+        assert_eq!(got.get(Level::Warn), 1);
+        assert_eq!(got.total(), 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 空旧文件 (无重叠行可言) 不能因此漏计。
+    #[test]
+    fn update_for_append_from_empty_old_file() {
+        let p = temp_file(b"");
+        let old = LogFile::open(&p).unwrap();
+        assert_eq!(old.line_count(), 0);
+        let c = count_levels(&old);
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"ERROR one\nINFO two\n").unwrap();
+        }
+        let new = LogFile::append_from(&old, &p).unwrap();
+        let got = update_for_append(&old, &new, c, None);
+        assert_eq!(got, count_levels(&new));
+        assert_eq!(got.total(), 2);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 增量: 字段口径「全量」==「前 N 行 + 后段增量」。

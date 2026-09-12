@@ -416,6 +416,7 @@ impl LogApp {
                     delta,
                     filter,
                     self.level_column.clone(),
+                    *self.level_counts,
                 ));
                 self.refresh_status();
                 return;
@@ -423,14 +424,16 @@ impl LogApp {
             // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
                 Ok(new) => {
-                    // 只数新行 —— 这里在 UI 线程上, 全量重算会冻帧。
+                    // 重叠一行的绝对量更新 (不是纯增量): 这里在 UI 线程上, 全量重算
+                    // 会冻帧, 而纯增量又会漏掉被补全的半行 (review R1)。
                     // 口径必须与当前显示的一致 (字段 vs 行), 否则侧栏会混两种数法。
-                    let old_count = self.file.line_count();
-                    let delta = match &self.level_column {
-                        Some(col) => levels::count_levels_field_from(&new, col, old_count),
-                        None => levels::count_levels_from(&new, old_count),
-                    };
-                    self.apply_appended(new, None, delta);
+                    let counts = levels::update_for_append(
+                        &self.file,
+                        &new,
+                        *self.level_counts,
+                        self.level_column.as_deref(),
+                    );
+                    self.apply_appended(new, None, counts);
                 }
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
             }
@@ -565,19 +568,27 @@ impl LogApp {
         &mut self,
         new: LogFile,
         worker_hits: Option<Vec<u64>>,
-        level_delta: LevelCounts,
+        level_counts: LevelCounts,
     ) {
         let old_line_count = self.file.line_count();
+        // 重算起点**退一行**: 旧快照末行可能以无换行结尾、被本次追加补全改判
+        // (review R1)。计数与过滤必须同起点同区间, 否则柱条数字与筛选结果
+        // 当场分岔 —— 即 D2 红线破裂, 而这正是 review 前两侧同步漂移掩盖掉的那个形态。
+        //
+        // 这里与 worker 各自独立算出同一个 `from` (worker 用发起时的旧行数, 这里用
+        // 落地时的) —— 二者能相等，靠的是 `poll_growth` 开头的 `open_job.is_some()`
+        // 门禁: 在途期间不叠加任何 tail 动作, 故 `self.file` 不会在 launch 与落地
+        // 之间被别的追加换掉。**若将来允许并发追加, 这个摘/补对称会静默失效**
+        // (摘多了漏行、摘少了重计), 届时须把 `from` 随产物一起交回来。
+        let from = old_line_count.saturating_sub(1);
         self.file = Arc::new(new);
-        // 计数是**增量**: 追加只数了新行, 与旧计数合并 (全量重算在同步热路径上
-        // 等于每次追加卡一次全文件扫描)。合并与文件换入同批次, 故侧栏永远
-        // 对应此刻这份文件。
-        let mut counts = *self.level_counts.as_ref();
-        counts.merge(&level_delta);
-        self.level_counts = Arc::new(counts);
+        // 计数是**绝对量** (worker 已在重叠区间上做过减旧加新), 故覆盖而非合并
+        self.level_counts = Arc::new(level_counts);
+        // 过滤: 先摘掉将被重算区间的旧命中, 再合并新命中 (否则重叠行出现两次)
+        self.drop_filter_hits_from(from);
         match worker_hits {
             Some(hits) => self.merge_filter_hits(hits),
-            None => self.append_filter_hits(old_line_count),
+            None => self.append_filter_hits(from),
         }
         if self.follow {
             self.top_row = self.max_top();
@@ -655,8 +666,8 @@ impl LogApp {
         }
     }
 
-    /// 实时过滤：增量行追加命中表 (只跑新行，不全量重跑)。
-    fn append_filter_hits(&mut self, old_line_count: u64) {
+    /// 实时过滤：增量行追加命中表 (只跑 `[from, …)`，不全量重跑)。
+    fn append_filter_hits(&mut self, from: u64) {
         if self.filter_applied.is_empty() {
             return;
         }
@@ -664,8 +675,27 @@ impl LogApp {
             return;
         }
         let clauses = jsonl::parse_query(&self.filter_applied);
-        let new_hits = jsonl::run_filter_from(&self.file, &clauses, old_line_count);
+        let new_hits = jsonl::run_filter_from(&self.file, &clauses, from);
         self.merge_filter_hits(new_hits);
+    }
+
+    /// 摘掉过滤表中 `>= from` 的旧命中 —— 它们落在本次重算区间内, 会被重新跑出来。
+    ///
+    /// 必须与 [`Self::append_filter_hits`] 的起点**同一个 `from`**: 重叠行若只摘不补
+    /// 就漏, 只补不摘就重, 两种都让底栏行数与侧栏柱条一起偏 (且一起偏就意味着
+    /// D2 的对照检查看不出来)。
+    fn drop_filter_hits_from(&mut self, from: u64) {
+        let Some(existing) = &self.filtered else {
+            return;
+        };
+        // 表按行号升序 (过滤产出即有序), 故二分找到第一个 >= from 的位置
+        let keep = existing.partition_point(|&l| l < from);
+        if keep == existing.len() {
+            return; // 无命中落在重算区间, 无需摘
+        }
+        let mut kept = existing.as_ref()[..keep].to_vec();
+        kept.shrink_to_fit();
+        self.filtered = Some(Arc::new(kept));
     }
 
     /// 合并增量命中进过滤表 (本地扫描与 worker 下沉共用合并半段, review R2)。
@@ -1333,6 +1363,7 @@ fn run(path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn clamp_top_bounds() {
@@ -1382,76 +1413,91 @@ mod tests {
         path
     }
 
-    /// 追加换入: 级别计数是**增量合并**, 不是覆盖 —— 写成覆盖会让每次追加
-    /// 之后侧栏只剩新行的数字。终值必须等于对新文件全量重算的结果。
+    /// 追加换入: 计数是**绝对量**, 落点覆盖 —— 而不是与旧计数合并。
+    ///
+    /// 契约从「增量合并」收敛成「覆盖绝对量」是 review R1 的连带结果:
+    /// 「这份是增量还是全量」要在每个落点判断, 判错一次就是计数翻倍或旧数据全丢。
     #[test]
-    fn apply_appended_merges_level_counts_incrementally() {
+    fn apply_appended_takes_absolute_counts() {
         let mut app = LogApp::new_empty();
-        // 起点: 已打开的文件含 1 条 ERROR + 1 条 INFO
-        let p1 = temp_log(b"2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n");
+        let p1 = temp_log(
+            b"2026-09-05 12:00:01 ERROR one
+2026-09-05 12:00:02 INFO two
+",
+        );
         let f1 = LogFile::open(&p1).unwrap();
         app.level_counts = Arc::new(levels::count_levels(&f1));
         app.file = Arc::new(f1);
-        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Error), 1, "起点 1 条 ERROR");
 
-        // 追加后: 第 3 行是新来的 ERROR, 落点只交 [2, 3) 的增量
         let p2 = temp_log(
-            b"2026-09-05 12:00:01 ERROR one\n\
-              2026-09-05 12:00:02 INFO two\n\
-              2026-09-05 12:00:03 ERROR three\n",
+            b"2026-09-05 12:00:01 ERROR one
+              2026-09-05 12:00:02 INFO two
+              2026-09-05 12:00:03 ERROR three
+",
         );
         let f2 = LogFile::open(&p2).unwrap();
-        let delta = levels::count_levels_from(&f2, 2);
-        assert_eq!(delta.total(), 1, "增量只含新行");
-        app.apply_appended(f2, None, delta);
+        let absolute = levels::count_levels(&f2);
+        app.apply_appended(f2, None, absolute);
 
-        assert_eq!(app.level_counts.get(Level::Error), 2, "旧 1 + 新 1");
-        assert_eq!(app.level_counts.get(Level::Info), 1);
+        assert_eq!(*app.level_counts.as_ref(), absolute, "覆盖, 不是合并");
+        assert_eq!(app.level_counts.get(Level::Error), 2);
         assert_eq!(app.level_counts.total(), 3);
-        // 增量结果 == 对新文件全量重算 (这条是增量正确性的定义)
-        assert_eq!(*app.level_counts.as_ref(), levels::count_levels(&app.file));
         std::fs::remove_file(&p1).ok();
         std::fs::remove_file(&p2).ok();
     }
 
-    /// 点选联动: 点柱条套用该桶子句; 再点同一行 = 清除; 无子句的桶点不动。
+    /// **R1 回归 (应用层)**: 旧快照末行无换行、被追加补全改判时, 计数与过滤必须
+    /// **同时**覆盖那一行 —— 只改一侧就会让柱条数字与筛选结果分岔 (D2 红线)。
     ///
-    /// 「点不动」必须是真的不动 —— 若把过滤改成空串, 用户点在「其他」上会
-    /// 意外清掉自己正在看的过滤。
+    /// 这条同时走通同步追加路径的全部三步: `update_for_append` 算绝对量 →
+    /// `drop_filter_hits_from` 摘旧命中 → `append_filter_hits` 从重叠起点重跑。
     #[test]
-    fn level_filter_toggles_and_ignores_queryless_buckets() {
+    fn apply_appended_covers_completed_half_line_on_both_sides() {
         let mut app = LogApp::new_empty();
         let p = temp_log(
-            b"{\"level\":\"ERROR\",\"msg\":\"a\"}\n\
-              {\"level\":\"INFO\",\"msg\":\"b\"}\n",
+            b"X
+2026-09-05 12:00:01 ",
         );
-        let f = LogFile::open(&p).unwrap();
-        app.level_counts = Arc::new(levels::count_levels_field(&f, "level"));
-        app.level_queries = levels::level_queries_for("level");
-        app.file = Arc::new(f);
-        app.has_file = true;
+        let f1 = LogFile::open(&p).unwrap();
+        app.level_counts = Arc::new(levels::count_levels(&f1));
+        app.file = Arc::new(f1);
+        assert_eq!(app.level_counts.get(Level::Error), 0, "半行未成词");
 
-        // 首次点击 → 套用前缀通配子句 (不是字节全等的 level=ERROR)
-        app.apply_level_filter(Level::Error);
-        assert_eq!(app.filter_applied, "level=ERROR*");
+        // 已应用的过滤 + 已建立(空)的过滤表, 模拟 tail 中途
+        app.filter_applied = "ERROR".into();
+        app.filtered = Some(Arc::new(Vec::new()));
 
-        // 再点同一行 → 清除 (切换语义)
-        app.apply_level_filter(Level::Error);
-        assert_eq!(app.filter_applied, "", "再点生效行 = 清除");
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(
+                b"ERROR disk
+",
+            )
+            .unwrap();
+        }
+        let f2 = LogFile::open(&p).unwrap();
+        assert_eq!(f2.line_count(), 2, "补全半行不增行数");
+        let absolute = levels::update_for_append(&app.file, &f2, *app.level_counts, None);
+        app.apply_appended(f2, None, absolute);
 
-        // 无子句的桶: 不动过滤 (也不误套别的)
-        app.apply_level_filter(Level::Error);
-        assert_eq!(app.filter_applied, "level=ERROR*");
-        app.apply_level_filter(Level::Other);
-        assert_eq!(app.filter_applied, "level=ERROR*", "其他桶点不动");
-        app.apply_level_filter(Level::DebugTrace);
-        assert_eq!(app.filter_applied, "level=ERROR*", "合并桶点不动");
-
-        // 明文模式 (子句表全 None) → 点不动
-        app.level_queries = levels::no_level_queries();
-        app.apply_level_filter(Level::Info);
-        assert_eq!(app.filter_applied, "level=ERROR*", "只读侧栏点不动");
-
+        assert_eq!(
+            app.level_counts.get(Level::Error),
+            1,
+            "被补全的半行必须改判"
+        );
+        assert_eq!(app.level_counts.get(Level::Other), 1, "只剩开头那行 X");
+        let shown = app.filtered.as_ref().expect("过滤表仍在");
+        assert_eq!(
+            shown.len() as u64,
+            app.level_counts.get(Level::Error),
+            "D2 红线: 筛出行数必须 == 柱条数字"
+        );
+        assert_eq!(
+            shown.as_slice(),
+            [1],
+            "第 1 行 (0-based) 是那条补全的 ERROR"
+        );
         std::fs::remove_file(&p).ok();
     }
 

@@ -127,16 +127,22 @@ JSONL 模式下点柱条即可跳到该级别的筛选结果。
 
 ## 已知局限
 
-- **增量漏计「被补全的半行」** (2026-09-12 review 发现并复现, **未修**):
-  旧快照末行若以**无换行**结尾, 外部把它补全 (且补全内容在行首 200 字节内引入
-  级别词) 时, 增量起点 `[old_line_count, new)` 不含该行, 故该行**永不重算**。
-  复现: `"X\n2026-09-05 12:00:01 "` → 补 `"ERROR disk\n"` 后, 全量重算
-  ERROR=1/其他=1, 而增量路径停在 其他=2。
-  **注意**: 增量**过滤** (`run_filter_from`) 以同一个旧行数为起点, 有**完全相同的
-  漂移** —— 两者漏的是同一行, 故 **D2 红线此刻仍成立**。因此
-  **只修计数会当场打破 D2**, 必须两侧同修。
-  触发窗口窄 (切点落在级别词内部的那几个字节), 且「6 桶之和 == 行数」仍成立
-  (所以其他检查兜不住)。修法见 `tasks/todo-level-histogram.md` 的 review 段。
+- ~~增量漏计「被补全的半行」~~ —— **2026-09-12 review 发现、复现并已修**。
+  旧快照末行若以无换行结尾, 外部把它补全时会改判该行 (半行 `... 12:00:01 `
+  补成 `... 12:00:01 ERROR disk`), 而纯增量 `[old_line_count, new)` 不含该行,
+  于是它永不重算 —— tail 长会话下侧栏静默偏低。
+  修法: **重算起点退一行** (`levels::update_for_append`), 即
+  `old_counts − 旧重叠区间分类 + 新重叠区间分类`; 旧尾本就完整时减旧加新相抵,
+  故**无条件启用**安全 (不需要先判旧尾是不是 `\n`)。
+  计数与过滤**必须同起点**: 过滤侧先摘掉 `>= 起点` 的旧命中再重跑同区间
+  (`main.rs` 的 `drop_filter_hits_from` + `append_filter_hits`), 否则重叠行
+  漏算或重算 —— 前者正是 review 前两侧同步漂移掩盖掉的形态。
+  连带收敛: `OpenOutcome.level_counts` 从「按臂而定 (增量/全量)」改为
+  **一律绝对量**, 落点只覆盖, 「增量当全量用」的误用空间消失。
+  回归: `update_for_append_covers_completed_half_line` (明文 + 字段两支)、
+  `append_outcome_covers_completed_half_line` (worker 路径)、
+  `apply_appended_covers_completed_half_line_on_both_sides` (应用层两侧 + D2)、
+  以及多轮对拍里插入的「半行 → 补全」一轮。
 - 前缀口径偏宽 (`ERRORS`/`INFORMATIONAL` 计入 ERROR/INFO 桶) —— 这是 D7 换来
   「`WARNING` 能命中」的代价, 一致但柱条标签略微夸大所计内容。
 
