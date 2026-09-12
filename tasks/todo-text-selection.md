@@ -33,8 +33,8 @@
   - Files: `src/view.rs`, `src/main.rs` | M
 
 ### Checkpoint: 功能闭环
-- [ ] 三件套绿 (fmt + clippy + test)
-- [ ] 实机五种姿势人工验收: 双击选词 / 框选 / 跨行 / 表格行复制 / 焦点切换 (用户上手)
+- [x] 三件套绿 (fmt + clippy + test) ✅ 2026-09-12 (实测: fmt 无输出 / clippy 0 警告 / 40 测试绿)
+- [x] 实机五种姿势人工验收: 双击选词 / 框选 / 跨行 / 表格行复制 / 焦点切换 ✅ 2026-09-12 (用户上手)
 
 - [x] **T5: 验收回归** — logbench 基线复核 (数字不劣于 SPEC.md 实测基线); 边界姿势: GBK 行选区、空选区 Ctrl+C、Esc 清选区、选区与搜索命中交叠、水平滚动后命中测试。
   - Acceptance: logbench 无回归; 边界姿势逐项过; 三件套绿

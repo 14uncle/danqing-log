@@ -9,8 +9,9 @@
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修
 - 2026-09-08 (已 commit): 字号 14 / 启动默认最大化 / **分段并行索引 1GB 冷 1028→584ms, 热 439→113ms** / 浅色可读性对齐竞品
 - 2026-09-08 (后已 commit `961c03b`): **async-open + text-selection-copy 机器部分全闭环** (spec→plan→build 走完, 三件套绿); `src/open.rs` 新模块 + SPEC/plan/todo 文档 + 5 文件改动; text-selection T1 含 danqing 引擎改动 `App::propagate_unhandled_keys()`
-- 2026-09-12 (**已 commit, 未 push**): **定价重裁** —— 免费层 = 看懂 (单文件全功能) / 付费层 = 批量·留存·交付 (**v1.x 起 $29 个人 · $59 企业**买断); 渠道分层 GitHub 永久免费开源 / MS Store 走 trial 且**过期降级不变砖**; 付费层清单落档 `docs/ROADMAP-v1x.md`。同时收口全仓 8 处过时报价 + 删引擎拆分残留 **2266 行死代码** (47 测试静默不跑)
-- 当前: **等用户人工验收**。遗留人工项 —— async-open: 10GB 冷开复核 / 索引中 Ctrl+O 取消体感 / 索引中关窗干净退出 / 轮转重建旧内容可见 (copytruncate+create 两流派) / Loading 文案定档; text-selection: 实机五种姿势 (双击选词/框选/跨行/表格行复制/焦点切换)
+- 2026-09-12 (**已 commit push**): **定价重裁** —— 免费层 = 看懂 (单文件全功能) / 付费层 = 批量·留存·交付 (**v1.x 起 $29 个人 · $59 企业**买断); 渠道分层 GitHub 永久免费开源 / MS Store 走 trial 且**过期降级不变砖**; 付费层清单落档 `docs/ROADMAP-v1x.md`。同时收口全仓 8 处过时报价 + 删引擎拆分残留 **2266 行死代码** (47 测试静默不跑)
+- 2026-09-12 (**未 commit**): **人工验收全部通过** (用户实机) —— async-open 五项 (10GB 冷开全程可响应 / 索引中 Ctrl+O 取消 / 索引中关窗干净退出 / 轮转重建旧内容可见 / Loading 文案**按现状定档** `{pct}% · {done}/{total} MiB`) + text-selection 五种姿势 (双击选词/框选/跨行/表格行复制/焦点切换)。**v1 功能闭环 + 验收闭环均已完成**
+- 当前: **等发布决策** —— v1 已功能闭环且验收通过; 余前提③ (发布后首单外检) 只能在发布后判定。发布动作 (打包 / 上架 MS Store / 对外文案) 未获指示, 待用户发起
 - 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
 - 测试基线: **40 绿** (16 lib + 16 main + 8 genlog), 2026-09-12 实测 (引擎拆分后口径;
   lib = expand/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
