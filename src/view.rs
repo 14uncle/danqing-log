@@ -894,7 +894,7 @@ impl Widget for LogView {
             AUX_FONT_SIZE,
             th.text_secondary(),
         );
-        // 设置入口 (S2): ⚙ 关于 — 位置计数左侧, hover 可辨
+        // 设置入口 (S2): ⚙ 设置 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 设置";
         let settings_w = texts.measure(settings_label, AUX_FONT_SIZE);
         let settings_x = area.origin.x + area.size.width - SCROLLBAR_W - 10.0 - settings_w;

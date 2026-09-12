@@ -5,7 +5,7 @@
 //! (多页签: 常规 / 快捷键 / 关于)。
 //!
 //! 为什么分页签: 单列堆叠在加上「快捷键」段后会把卡片顶得很高 (矮窗口下顶到边),
-//! 而两页签各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
+//! 而分页签后每一页各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
 //! 关闭：✕ 按钮 / Esc (app 级两阶段) / 点遮罩。
 
 use std::any::Any;
@@ -24,15 +24,31 @@ use crate::config::{self, AppTheme};
 
 /// 卡片宽度。
 const CARD_WIDTH: f32 = 360.0;
-/// 页签**内容区**的固定高度 —— 两页签必须同高, 否则切换时卡片会跳。
+/// 卡片左右内边距。
+const CARD_PAD_X: f32 = 24.0;
+
+/// 内容区宽度 = 卡片宽 - 左右内边距。
 ///
-/// 取「最高那一页 + 余量」: 当前最高是**关于**页 (有更新提示时约 171px)。
-/// 216 留了约 45px 余量 —— 不是随手取的: **常规**页已知会长 (v1.x 的授权行,
-/// 见 `docs/ROADMAP-v1x.md`), 届时不必再动这个常量。
+/// 抽成函数而不是在 `settings_card` 里就地算: **测试必须用同一个宽度**,
+/// 换一个宽度去量页签内容等于没量。
+fn content_width() -> f32 {
+    CARD_WIDTH - CARD_PAD_X * 2.0
+}
+/// 页签**内容区**的固定高度 —— 各页签必须同高, 否则切换时卡片会跳。
+///
+/// 取「最高那一页 + 余量」, 数值来自**实测** (`panel_contents_fit_fixed_height`
+/// 量的就是这三页): 常规 36 / 快捷键 125 / 关于 133.5 (有更新提示 165.5)。
+/// 180 = 165.5 + 14.5 余量。
+///
+/// 曾取 216, 理由写的是「常规页 v1.x 要加授权行, 留余量免得再动常量」——
+/// **那条理由是错的**: 常规页实测只有 36px, 加两行也够不着上限; 真正贴着上限的
+/// 是关于页, 而关于页的内容是固定的、不会长。空留的 50px 全变成了卡片下沿的空白。
 /// 高度加在内容上而不是整个 Tabs 上 —— 这样 tab 栏与面板间距是外加的,
 /// 各页签的高度基准才一致。
-/// **新增页签时若内容超过此值会被裁切**, 届时同步调大这个常量。
-const PANEL_CONTENT_H: f32 = 216.0;
+/// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
+/// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
+/// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
+const PANEL_CONTENT_H: f32 = 180.0;
 /// 正文字号。
 const BODY_SIZE: u16 = 14;
 
@@ -44,7 +60,7 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
-/// 设置卡片：关闭行 + 页签 (快捷键 / 关于)。
+/// 设置卡片：关闭行 + 页签 (常规 / 快捷键 / 关于)。
 ///
 /// 卡面上**不再**另有关于区/版本行 —— 自 2026-09-13 起这两样各就其位在
 /// 「关于」页签里, 摆在页签外会与页签内容同屏重复 (用户指出)。
@@ -52,12 +68,11 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
     let pad = Edges {
         top: 24.0,
-        right: 24.0,
+        right: CARD_PAD_X,
         bottom: 16.0,
-        left: 24.0,
+        left: CARD_PAD_X,
     };
-    // 内容区宽度 = 卡片宽 - 左右 padding
-    let content_w = CARD_WIDTH - pad.left - pad.right;
+    let content_w = content_width();
     // 卡片底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
     // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是 `rgba(…,0.10)`
     // —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
@@ -73,13 +88,17 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 .child(close_row())
                 .child(
                     Tabs::new(&t)
-                        // 常规在前 (设置卡的首屏 = 设置), 关于放最后 (产品线惯例)
+                        // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
+                        // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 关于)。
+                        // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
+                        // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
+                        // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例)。
                         .tab("常规")
                         .tab("快捷键")
                         .tab("关于")
-                        .child(general_panel())
-                        .child(shortcuts_panel(content_w))
-                        .child(about_panel(content_w))
+                        .child(panel_box(general_content()))
+                        .child(panel_box(shortcuts_section(content_w)))
+                        .child(panel_box(about_content(content_w)))
                         // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
                         // 第一页更省事), 且 Esc/点遮罩关闭不丢。
                         .bind(|app: &LogApp| app.settings_tab)
@@ -94,42 +113,43 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
 /// 单列一行的确是空 —— v1 也确实只有这一个开关。留在原处(`关于`页)才是错的:
 /// 那儿是**只读**的产品身份页, 把可点击的开关混进去, 用户没法一眼分辨
 /// 「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
-fn general_panel() -> impl Widget {
-    panel_box(
-        Column::new()
-            .gap(16.0)
-            .cross_center()
-            .child(theme_dropdown()),
-    )
+fn general_content() -> impl Widget {
+    Column::new()
+        .gap(16.0)
+        .cross_center()
+        .child(theme_dropdown())
 }
 
-/// 「关于」页签: 产品名/版本/一句话 + 版本检查 + 反馈。
-fn about_panel(content_w: f32) -> impl Widget {
-    panel_box(
-        Column::new()
-            .gap(16.0)
-            .cross_center()
-            .child(about_section())
-            .child(content_row(version_row(), content_w))
-            .child(feedback_row()),
-    )
+/// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
+fn about_content(content_w: f32) -> impl Widget {
+    Column::new()
+        .gap(16.0)
+        .cross_center()
+        .child(about_section())
+        .child(content_row(version_row(), content_w))
+        .child(feedback_row())
 }
 
-/// 把一页的内容套进固定高度的透明盒 —— 两页签同高的实现点。
+/// 把一页的内容套进固定高度的透明盒 —— 各页签同高的实现点。
+///
+/// 各页的**内容**由 `*_content` / `shortcuts_section` 单独返回 (不带这个盒子),
+/// 好让 `panel_contents_fit_fixed_height` 能独立量它们的自然高度。
 fn panel_box(inner: impl Widget + 'static) -> impl Widget {
     UiBox::new(Color::TRANSPARENT)
         .height(PANEL_CONTENT_H)
         .child(inner)
 }
 
-/// 「快捷键」页签。
-fn shortcuts_panel(content_w: f32) -> impl Widget {
-    panel_box(shortcuts_section(content_w))
-}
-
-/// 内容行：固定宽度居中，内部左对齐。
+/// 内容行：把内容收成固定宽度。
+///
+/// **不要在这里套 `Center`** (2026-09-13 去掉的): `Center` 在**两个轴上**都居中,
+/// 而它若正好是 `panel_box` 的直接子级 —— 快捷键页就是这样 —— 整块内容会被
+/// **垂直**居中, tab 栏下面凭空多出 `(PANEL_CONTENT_H - 内容高)/2` 的空档
+/// (用户报的「快捷键内容和 tab 间隔大」, 快捷键页那会儿是 45px)。
+/// 水平居中的活儿不必它干: 各页 Column 有 `cross_center`, 且这里的
+/// `width` 就等于可用宽 (`content_width()` = 卡片宽 - 左右 padding), 本来就填满。
 fn content_row(inner: impl Widget + 'static, width: f32) -> impl Widget {
-    Center::new(UiBox::new(Color::TRANSPARENT).width(width).child(inner))
+    UiBox::new(Color::TRANSPARENT).width(width).child(inner)
 }
 
 /// 关闭行：右对齐 ✕。
@@ -178,7 +198,7 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// 快捷键一览 —— 「用户怎么知道有这个键」在界面上的唯一归处
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 ///
-/// 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 已经是「关于/版本/反馈」的入口,
+/// 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 是「设置卡」的唯一入口,
 /// 用户找说明会来这儿。只列**猜不出来**的那几个组合键 (方向键/翻页键不必教);
 /// 完整清单在 README。
 fn shortcuts_section(content_w: f32) -> impl Widget {
@@ -250,6 +270,10 @@ fn theme_dropdown() -> impl Widget {
         )
 }
 
+/// 版本行高 —— 只在**有更新提示**时占位, 无提示时返回 0。
+/// 抽成常量: `panel_contents_fit_fixed_height` 要拿它算关于页的最坏高度。
+const VERSION_ROW_H: f32 = 32.0;
+
 /// 版本行：有新版时显示提示 + 按钮; 无新版时空白。
 struct VersionRow {
     hint_status: String,
@@ -295,7 +319,7 @@ impl Widget for VersionRow {
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
         if self.has_hint {
-            Size::new(constraints.max().width, 32.0)
+            Size::new(constraints.max().width, VERSION_ROW_H)
         } else {
             Size::new(constraints.max().width, 0.0)
         }
@@ -306,7 +330,7 @@ impl Widget for VersionRow {
             return;
         }
         let baseline = area.origin.y
-            + (32.0 - texts.line_height(f32::from(BODY_SIZE))) / 2.0
+            + (VERSION_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
             + texts.ascent(f32::from(BODY_SIZE));
         // 状态文案
         texts.push_text(
@@ -333,7 +357,7 @@ impl Widget for VersionRow {
             btn_color,
         );
         self.btn_area
-            .set(Rect::from_xywh(btn_x, area.origin.y, btn_w, 32.0));
+            .set(Rect::from_xywh(btn_x, area.origin.y, btn_w, VERSION_ROW_H));
     }
 
     fn event(&mut self, event: &Event, area: Rect, _msgs: &mut MsgQueue) -> EventResult {
@@ -482,5 +506,60 @@ pub(crate) fn handle_settings_key(key: &Key) -> Option<Msg> {
         Some(Msg::CloseSettings)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 布局一个组件, 返回它**自报的自然高度**(不受固定高盒子影响)。
+    fn natural_height(w: &mut impl Widget, c: Constraints, texts: &mut TextBatch) -> f32 {
+        w.layout(c, texts).height
+    }
+
+    /// 固定高盒子是「各页签同高」的实现, 但它**不会裁切** —— 内容超高会溢出,
+    /// 画到卡片外面去 (框架的 `Box`/`Column` 都不裁剪)。这条测试就是那句话的
+    /// 可执行版本: 谁把某一页加高到越过 `PANEL_CONTENT_H`, 这里立刻红,
+    /// 而不是等他肉眼在卡片外沿发现多出来一行。
+    #[test]
+    fn panel_contents_fit_fixed_height() {
+        let w = content_width();
+        let c = Constraints::loose(Size::new(w, 10_000.0));
+        let mut texts = TextBatch::default();
+
+        let mut general = general_content();
+        let mut shortcuts = shortcuts_section(w);
+        let mut about = about_content(w);
+
+        let cases = [
+            ("常规", natural_height(&mut general, c, &mut texts)),
+            ("快捷键", natural_height(&mut shortcuts, c, &mut texts)),
+            // 关于页会随「有新版本」长出一行, 按**最坏情况**(提示存在)算
+            (
+                "关于(含更新提示)",
+                natural_height(&mut about, c, &mut texts) + VERSION_ROW_H,
+            ),
+        ];
+        for (name, h) in cases {
+            assert!(
+                h <= PANEL_CONTENT_H,
+                "{name} 页自然高度 {h} > PANEL_CONTENT_H={PANEL_CONTENT_H}: \
+                 会溢出固定盒、画到卡片外 —— 请调大该常量"
+            );
+        }
+    }
+
+    /// 版本行的实测高度必须等于 `VERSION_ROW_H` —— 上一条拿它当最坏情况增量,
+    /// 常量与实现脱钩就等于白算。
+    #[test]
+    fn version_row_height_matches_const() {
+        let mut row = VersionRow::new();
+        row.has_hint = true;
+        let mut texts = TextBatch::default();
+        let h = row
+            .layout(Constraints::loose(Size::new(300.0, 100.0)), &mut texts)
+            .height;
+        assert_eq!(h, VERSION_ROW_H);
     }
 }

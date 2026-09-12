@@ -190,7 +190,10 @@ pub(crate) struct LogApp {
     theme: config::AppTheme,
     /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
     histogram_visible: bool,
-    /// 设置卡当前页签 (0 = 关于 / 1 = 快捷键)。留在应用状态里: 重开卡片停在上次那页。
+    /// 设置卡当前页签**下标** —— 序号含义见 `settings.rs` 里 `.tab()` 处 (**唯一真身**,
+    /// 别在这里另列一份, 加页签时会漂)。越界值无需在此防御: 框架 `Tabs` 自行钳制
+    /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
+    /// 留在应用状态里: 重开卡片停在上次那页。
     settings_tab: usize,
 }
 
@@ -219,7 +222,7 @@ pub(crate) enum Msg {
     FocusSearch,
     /// Esc 清除过滤。
     ClearFilter,
-    /// 设置卡切页签 (0 = 关于 / 1 = 快捷键)。
+    /// 设置卡切页签 (下标含义见 `settings.rs` 的 `.tab()` 处)。
     SelectSettingsTab(usize),
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
