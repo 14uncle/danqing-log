@@ -16,7 +16,7 @@ use danqing_log::levels;
 use danqing_log::logfile::LogFile;
 
 /// 分段表小标题 (集中一处: 这几段由脚本拼接进本文件, 反斜杠转义易出错)。
-const PHASES_BANNER: &str = "\n== 打开管道分段 (GUI worker 实际做的四段) ==";
+const PHASES_BANNER: &str = "\n== 打开管道分段 (GUI worker 实际做的五段) ==";
 const LEVELS_BANNER: &str = "\n== 级别计数 (与上面分段同一份结果) ==";
 const QUERIES_BANNER: &str = "\n== 点选子句 (与柱条数字同口径) ==";
 
@@ -59,6 +59,7 @@ fn main() {
         }
     };
     let s = file.stats();
+    let open_wall = t_all.elapsed(); // LogFile::open 的总墙钟
     let mib = s.file_bytes as f64 / (1024.0 * 1024.0);
 
     println!("== 打开 ==");
@@ -76,9 +77,18 @@ fn main() {
         s.index_bytes as f64 / (1024.0 * 1024.0),
         s.index_bytes
     );
+    // open 的总墙钟 vs 它内部被计时的部分: 两者之差是**没被计入任何数字**的耗时
+    // (UTF-16 的 read + transcode 就在这里 —— 状态栏的「mmap」「索引」都不含它)
+    println!("open 总墙钟    : {} ms", open_wall.as_millis());
+    if s.preprocess > std::time::Duration::ZERO {
+        println!(
+            "  └ 其中转码   : {} ms   (UTF-16 读整文件 + 转码; **不进 mmap/索引**)",
+            s.preprocess.as_millis()
+        );
+    }
     println!("行数           : {}", s.line_count);
 
-    // 打开管道的**真实四段** (2026-09-12): 状态栏那个「索引 N ms」只是
+    // 打开管道的**真实五段** (2026-09-12): 状态栏那个「索引 N ms」只是
     // `LogFile::open` 里 build_line_index 那一段 —— 不含 map/检测/列发现/级别计数。
     // 用户报「索引 92ms 却等了十几秒」时, 就是靠这段定位到列发现的。
     // 同一命令即可复查, 不必进 GUI 翻日志。
@@ -107,7 +117,11 @@ fn main() {
 
     println!("{}", PHASES_BANNER);
     println!(
-        "索引           : {:>7} ms   <- 状态栏「索引 N ms」报的就是这一段",
+        "前置(读+转码)  : {:>7} ms   <- 仅 UTF-16; **不进「索引」也不进 mmap**",
+        s.preprocess.as_millis()
+    );
+    println!(
+        "建索引         : {:>7} ms   <- 状态栏原来只报这一段",
         s.index.as_millis()
     );
     println!(
@@ -125,8 +139,8 @@ fn main() {
         level_column.as_deref().unwrap_or("行")
     );
     println!(
-        "四段合计       : {:>7} ms",
-        s.index.as_millis() + t_detect.as_millis() + t_schema.as_millis() + t_levels.as_millis()
+        "五段合计       : {:>7} ms   (= open 总墙钟 + 检测 + 列发现 + 计数)",
+        s.open.as_millis() + t_detect.as_millis() + t_schema.as_millis() + t_levels.as_millis()
     );
 
     if let Some(q) = &filter {

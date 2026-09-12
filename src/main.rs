@@ -1332,8 +1332,17 @@ fn status_text(path: &Path, file: &LogFile) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // 报**打开总墙钟**在先, 行索引在后。
+    //
+    // 原来只报「索引 N ms」, 而它不含 UTF-16 的读整文件 + 转码 —— 实测 100 MiB
+    // UTF-16LE: 报「索引 7 ms」而实际 open 200 ms (**13 倍**), GB 级按比例是秒级。
+    // 「数字和视觉不符」的这类反馈, 根子就是报了个不等于等待时间的数字。
+    let mut load = format!("打开 {} ms", s.open.as_millis());
+    if s.preprocess > Duration::ZERO {
+        load.push_str(&format!(" (转码 {} ms)", s.preprocess.as_millis()));
+    }
     format!(
-        "{name} · {} · {:.1} MiB · {} 行 · mmap {} us · 索引 {} ms ({:.0} MiB/s)",
+        "{name} · {} · {:.1} MiB · {} 行 · {load} · mmap {} us · 索引 {} ms ({:.0} MiB/s)",
         s.encoding.label(),
         s.file_bytes as f64 / (1024.0 * 1024.0),
         s.line_count,
