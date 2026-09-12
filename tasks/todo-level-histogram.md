@@ -175,23 +175,46 @@
     若要它可点, 两条路: 拆成两行 (改 spec D1) 或按实际值判定可点性 (引入 per-file
     观察值)。**待用户裁。**
 
-- [ ] **T5: 点选联动 + 一致性端到端验证**
-  - 说明: 侧栏命中区 → `Msg::ApplyLevelFilter(Level)` → 套用既有 `level=<NAME>`
-    过滤语法; 再次点击当前生效行 = 清除; 当前生效的 `level=` 过滤行高亮;
-    `其他` 桶不可点 (无对应语法)
+- [x] **T5: 点选联动 + 一致性端到端验证** ✅ 2026-09-12
+  - 说明: 侧栏命中区 → `Msg::ApplyLevelFilter(Level)` → 套用该桶子句;
+    再次点击当前生效行 = 清除; 当前生效行整行高亮;
+    无子句的桶不可点 (吞掉点击, 不穿透到底下列表)
   - Acceptance: 点 ERROR 柱条 → 表格筛出该级别, **底栏行数与柱条数字一致**;
     再点一次 → 清除; 原始文本模式柱条纯展示 (点击无响应);
     `其他` 桶两种模式都不可点
   - Verify: `cargo test` + 手动 1GB JSONL 端到端
   - Depends: T4
-  - Files: `src/histogram.rs`, `src/main.rs`
-  - Scope: M
+  - Files: `src/histogram.rs`, `src/main.rs` (均为 T3/T4 已建结构的补齐)
+  - Scope: S
+  - 实测: 45 lib + 23 main + 8 genlog = **76 绿**, clippy 0; release 冒烟存活。
+
+    **子句形态与 spec 文字的出入**: spec 写「套用 `level=<NAME>`」, 实际是
+    `col=<TOKEN>*` (前缀通配) 且 `col` 取自当前文件的级别类列 —— 这是 T4
+    「计数谓词必须与过滤谓词同构」的直接结果, 见 T4 实测①。spec 该句待复核。
+
+    **两条端到端测试** (不依赖鼠标, 直接驱动真实代码路径):
+    - `level_filter_toggles_and_ignores_queryless_buckets`: 首次点击 → 套
+      `level=ERROR*`; 再点 → 清空; `其他`/`DEBUG`/明文三种情况**点不动**
+      (「点不动」必须真不动 —— 若把过滤改成空串, 用户点在「其他」上会意外
+      清掉正在看的过滤)。
+    - `clicking_a_bar_filters_to_exactly_the_bar_count`: 走**真实 AsyncJob 过滤
+      管道**, 对 ERROR/INFO/WARNING 三桶各断言「筛出行数 == 柱条数字 == 100」。
+      其中 WARNING 是关键样本 —— 它证明别名靠前缀通配被吃到 (字节全等的
+      `level=WARN` 会筛出 0 行, 即 D2 红线破裂的原始形态)。
+    - 只读侧栏点击吞消息由 histogram 的 `readonly_sidebar_swallows_clicks_without_message` 钉住。
+
+    **仍待人工**: 真实鼠标点柱条 + 视觉上「底栏行数与柱条数字一致」的体感确认。
 
 ### Checkpoint C: JSONL 端到端 + 一致性红线
 
-- [ ] 对抗样本归桶正确
-- [ ] 点柱条后底栏行数 == 柱条数字
-- [ ] 无 level 类列时降级只读
+- [x] 对抗样本归桶正确 (含 INFO 桶而正文写 error / WARNING 别名 / ERR 非规范 /
+      小写 error / 无 level 字段但 severity=DEBUG, 共 7 行 fixture)
+- [x] 点柱条后筛出行数 == 柱条数字 —— 两级验证: 引擎层逐桶相等单测 +
+      真 1GB JSONL 五桶复验 (4760/43464/96262/4544133/145086 逐个相同) +
+      应用层真实管道三桶断言
+- [x] 无 level 类列时降级只读 (子句表全 None → 点击吞消息不发 Msg)
+- [ ] **人工验收 (待用户)**: 真实鼠标点柱条, 目视底栏行数与柱条数字一致;
+      再点同一条目视过滤被清除
 
 ## Phase 3: 增量与生存
 

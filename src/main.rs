@@ -1382,6 +1382,96 @@ mod tests {
         std::fs::remove_file(&p2).ok();
     }
 
+    /// 点选联动: 点柱条套用该桶子句; 再点同一行 = 清除; 无子句的桶点不动。
+    ///
+    /// 「点不动」必须是真的不动 —— 若把过滤改成空串, 用户点在「其他」上会
+    /// 意外清掉自己正在看的过滤。
+    #[test]
+    fn level_filter_toggles_and_ignores_queryless_buckets() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log(
+            b"{\"level\":\"ERROR\",\"msg\":\"a\"}\n\
+              {\"level\":\"INFO\",\"msg\":\"b\"}\n",
+        );
+        let f = LogFile::open(&p).unwrap();
+        app.level_counts = Arc::new(levels::count_levels_field(&f, "level"));
+        app.level_queries = levels::level_queries_for("level");
+        app.file = Arc::new(f);
+        app.has_file = true;
+
+        // 首次点击 → 套用前缀通配子句 (不是字节全等的 level=ERROR)
+        app.apply_level_filter(Level::Error);
+        assert_eq!(app.filter_applied, "level=ERROR*");
+
+        // 再点同一行 → 清除 (切换语义)
+        app.apply_level_filter(Level::Error);
+        assert_eq!(app.filter_applied, "", "再点生效行 = 清除");
+
+        // 无子句的桶: 不动过滤 (也不误套别的)
+        app.apply_level_filter(Level::Error);
+        assert_eq!(app.filter_applied, "level=ERROR*");
+        app.apply_level_filter(Level::Other);
+        assert_eq!(app.filter_applied, "level=ERROR*", "其他桶点不动");
+        app.apply_level_filter(Level::DebugTrace);
+        assert_eq!(app.filter_applied, "level=ERROR*", "合并桶点不动");
+
+        // 明文模式 (子句表全 None) → 点不动
+        app.level_queries = levels::no_level_queries();
+        app.apply_level_filter(Level::Info);
+        assert_eq!(app.filter_applied, "level=ERROR*", "只读侧栏点不动");
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// **T5 端到端一致性 (D2 红线的应用层落点)**: 点柱条 → 真实过滤管道 →
+    /// 筛出行数 == 柱条数字。
+    ///
+    /// 引擎层的逐桶相等已由 `levels.rs` 的 `field_counts_equal_filter_hits_...`
+    /// 钉住; 这条补的是「应用层真的把对的那个子句发出去了」——
+    /// 子句生成、toggle 语义、AsyncJob 管道都不脱节。
+    #[test]
+    fn clicking_a_bar_filters_to_exactly_the_bar_count() {
+        let mut app = LogApp::new_empty();
+        // 300 行: ERROR / INFO / WARNING 各 100。WARNING 是关键样本 ——
+        // 它验证别名靠前缀通配被吃到 (字节全等的 level=WARN 会筛出 0 行)。
+        let mut content = Vec::new();
+        for i in 0..300 {
+            let lv = match i % 3 {
+                0 => "ERROR",
+                1 => "INFO",
+                _ => "WARNING",
+            };
+            content.extend_from_slice(format!("{{\"level\":\"{lv}\",\"i\":{i}}}\n").as_bytes());
+        }
+        let p = temp_log(&content);
+        let f = LogFile::open(&p).unwrap();
+        app.level_counts = Arc::new(levels::count_levels_field(&f, "level"));
+        app.level_queries = levels::level_queries_for("level");
+        app.file = Arc::new(f);
+        app.has_file = true;
+
+        for level in [Level::Error, Level::Info, Level::Warn] {
+            app.filter_applied.clear(); // 避开 toggle 分支, 单纯验「套用后筛多少」
+            app.apply_level_filter(level);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let lines = loop {
+                if let Some(out) = app.filter_job.poll() {
+                    break out.lines;
+                }
+                assert!(Instant::now() < deadline, "过滤 job 5s 未交卷 (悬挂?)");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                lines.len() as u64,
+                app.level_counts.get(level),
+                "{level:?}: 筛出行数 != 柱条数字 —— D2 红线在应用层破裂"
+            );
+            assert_eq!(lines.len(), 100, "{level:?}: 300 行三轮 → 各 100");
+        }
+
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
