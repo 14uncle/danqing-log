@@ -1133,6 +1133,30 @@ const BAR_PAD_X: f32 = 10.0;
 const BAR_LABEL_GAP: f32 = 8.0;
 /// 栏顶部内偏移 (视觉下沉, 避紧贴标题栏底边)。
 const BAR_TOP_OFFSET: f32 = 3.0;
+/// 过滤栏空态占位 (未应用过滤时; 应用后换成 "已应用: ..." 提示, 故须可复原)。
+const FILTER_PLACEHOLDER: &str =
+    "输入如 level=ERROR status=50* (AND · 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回";
+/// 搜索栏空态占位 (同上, 应用后换成查询词提示)。
+const SEARCH_PLACEHOLDER: &str = "输入正则 · Enter 应用 · Esc 关闭 (GBK/Latin-1 文件退化为字面量)";
+
+/// 过滤占位文字: 已应用 → 提示词; 未应用 (含 Esc 清除后) → 复原空态文案。
+fn filter_placeholder_text(applied: &str) -> String {
+    if applied.is_empty() {
+        FILTER_PLACEHOLDER.to_string()
+    } else {
+        format!("已应用: {applied} · Esc 清除 · Ctrl+T 切回")
+    }
+}
+
+/// 搜索占位文字, 语义同上。
+fn search_placeholder_text(query: &str) -> String {
+    if query.is_empty() {
+        SEARCH_PLACEHOLDER.to_string()
+    } else {
+        format!("{query} · Enter 下一命中 · Shift+Enter 上一 · Esc 关闭")
+    }
+}
+
 /// 「清空输入」绑定闭包: 从应用状态读 clear revision。
 type ClearBinding = Box<dyn Fn(&dyn Any) -> u64>;
 
@@ -1193,14 +1217,14 @@ impl Bar {
 
     fn fresh_filter() -> TextInput {
         Self::base_input().placeholder(
-            "输入如 level=ERROR status=50* (AND · 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回",
+            FILTER_PLACEHOLDER,
             Color::rgb(0.45, 0.45, 0.48), // placeholder_fg
         )
     }
 
     fn fresh_search() -> TextInput {
         Self::base_input().placeholder(
-            "输入正则 · Enter 应用 · Esc 关闭 (GBK/Latin-1 文件退化为字面量)",
+            SEARCH_PLACEHOLDER,
             Color::rgb(0.45, 0.45, 0.48), // placeholder_fg
         )
     }
@@ -1310,10 +1334,18 @@ impl Widget for Bar {
         }
 
         // 应用态 → 占位文字 (空态显示 "已应用" 提示; 有输入时占位消失)。
-        self.filter_applied = app.filter_applied.clone();
-        self.search_query = app.search_query.clone();
-        self.set_filter_placeholder();
-        self.set_search_placeholder();
+        // 仅在应用值真变化时重设: 初值由 fresh_* 给, 之后归空须复原文案,
+        // 值未变则跳过 (sync 每帧跑, 免每帧重建占位串)。
+        let filter_applied = app.filter_applied.clone();
+        if filter_applied != self.filter_applied {
+            self.filter_applied = filter_applied;
+            self.set_filter_placeholder();
+        }
+        let search_query = app.search_query.clone();
+        if search_query != self.search_query {
+            self.search_query = search_query;
+            self.set_search_placeholder();
+        }
     }
 
     fn animate(&mut self, ctx: &danqing::AnimationCtx) {
@@ -1480,28 +1512,37 @@ impl Bar {
     }
 
     fn set_filter_placeholder(&mut self) {
-        if self.filter_applied.is_empty() {
-            return;
-        }
-        let msg = format!("已应用: {} · Esc 清除 · Ctrl+T 切回", self.filter_applied);
-        self.filter_ti.set_placeholder(msg);
+        self.filter_ti
+            .set_placeholder(filter_placeholder_text(&self.filter_applied));
     }
 
     fn set_search_placeholder(&mut self) {
-        if self.search_query.is_empty() {
-            return;
-        }
-        let msg = format!(
-            "{} · Enter 下一命中 · Shift+Enter 上一 · Esc 关闭",
-            self.search_query
-        );
-        self.search_ti.set_placeholder(msg);
+        self.search_ti
+            .set_placeholder(search_placeholder_text(&self.search_query));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归: Esc 清除过滤后占位须复原空态文案, 不能留上次的 "已应用: ..."。
+    #[test]
+    fn filter_placeholder_resets_when_cleared() {
+        let applied = filter_placeholder_text("level=ERROR");
+        assert!(applied.contains("level=ERROR"), "应用后提示词: {applied}");
+        let cleared = filter_placeholder_text("");
+        assert_eq!(cleared, FILTER_PLACEHOLDER, "清除后复原空态文案");
+    }
+
+    /// 回归: 同上, 搜索栏。
+    #[test]
+    fn search_placeholder_resets_when_cleared() {
+        let applied = search_placeholder_text(r"\d{4}");
+        assert!(applied.contains(r"\d{4}"), "应用后显示查询词: {applied}");
+        let cleared = search_placeholder_text("");
+        assert_eq!(cleared, SEARCH_PLACEHOLDER, "清除后复原空态文案");
+    }
 
     #[test]
     fn level_color_prefers_error_over_info() {
