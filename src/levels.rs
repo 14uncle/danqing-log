@@ -288,10 +288,21 @@ pub struct LevelsOutcome {
 /// 与打开管道解耦: 打开只负责把文件与列名交出来, 计数由独立作业完成,
 /// 完成经 tick 拾取后才换入侧栏。
 pub fn counts_for(file: std::sync::Arc<LogFile>, column: Option<&str>) -> LevelsOutcome {
+    // 这条日志是刻意留的: 计数移出打开管道后, 它的耗时**在任何界面数字里都看不见**
+    // —— 侧栏只显示结果。用户报「计数要十几秒」时, 这就是唯一能定位的地方。
+    // 连可用并行度一并记下 (计数的并行度取自它, 少核机器上差别很大)。
+    let t0 = std::time::Instant::now();
     let counts = match column {
         Some(c) => count_levels_field(&file, c),
         None => count_levels(&file),
     };
+    log::info!(
+        "perf levels_job: 计数 {}ms ({} 行, 口径={}, 可用并行度 {})",
+        t0.elapsed().as_millis(),
+        file.line_count(),
+        column.unwrap_or("行"),
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    );
     LevelsOutcome {
         counts,
         column: column.map(str::to_string),
