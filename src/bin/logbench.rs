@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use danqing_log::jsonl;
+use danqing_log::levels;
 use danqing_log::logfile::LogFile;
 
 /// 默认基准模式: 从「纯字面高频」到「结构正则」递增难度。
@@ -141,6 +142,27 @@ fn main() {
         elapsed.as_millis(),
         elapsed.as_micros() as f64 / RANDOM_SAMPLE as f64,
     );
+
+    // 级别计数 (level-histogram T2): 独立于索引趟的一趟并行扫描,
+    // 索引耗时不受其影响 —— 两个数字必须分开测, 否则无法验证 D6。
+    println!("\n== 级别计数 ==");
+    let t = Instant::now();
+    let counts = levels::count_levels(&file);
+    let elapsed = t.elapsed();
+    let secs = elapsed.as_secs_f64();
+    let thr = if secs > 0.0 {
+        mib / secs
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "计数墙钟       : {} ms ({thr:.0} MiB/s)",
+        elapsed.as_millis()
+    );
+    for l in levels::Level::ALL {
+        println!("{:<14} : {}", l.label(), counts.get(l));
+    }
+    println!("合计           : {} 行", counts.total());
 
     println!("\n== 总计 ==");
     println!("端到端 (打开+全部基准): {} ms", t_all.elapsed().as_millis());
