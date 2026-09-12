@@ -49,13 +49,27 @@
   打开管道日志随之只剩 `索引 · 列发现` 两段。
   **这一项我先前自己撤销过** (理由是「全链 200ms 不值得拆」), 用户的实机数据推翻了
   那个判断 —— 计数在真文件上可以远超我的测量。
+- 2026-09-13 (**用户实机给出决定性数据 → 计数成本真因找到并修掉**): 用户给出
+  「debug 构建、同机、20 线程可用」下的两条对照 —— 字段口径 **9312ms** (1GB JSONL,
+  483 万行) vs 行口径 **417ms** (1GB 明文, 635 万行), **22 倍**; 而字段口径扫的
+  字节**更少**(找到 `"level":` 即返回)。故慢的不是扫描, 是**每行的两次构造**:
+  `field_needle` 每行分配一个 `Vec`, 且 `memchr::memmem::find` 是**懒构造** ——
+  每次调用都为 needle 重做一遍 prefilter 分析。修在兄弟 crate: 新增
+  `jsonl::FieldExtractor` (needle 与 `Finder` 各建一次逐行复用), 顺手把
+  `Compiled::Flat` 里同款问题一并修掉 (过滤路径也受益)。
+  本机: 字段口径 91ms → **24ms** (3.8x), 且快于行口径 (24 vs 70ms); 真实 app 路径
+  (debug) `perf levels_job`: 86ms → **23ms**。**这是我在 review 阶段主动延期的
+  Optional 项** (嫌要动兄弟 crate), 代价是用户替我付了三轮排查。
+  **方法论教训**: 我前四次归因全错, 每次都是拿自己机器上的测量去套用户的文件;
+  真正定位靠的是用户给的**两条同机对照**(字段 vs 行、debug、同一台机器) ——
+  **对照组比绝对值有用得多**。
 - 当前: **v1.0 收尾** —— 余工作面 ① ~~等级直方图~~ (已交付, 待验收) ② MSIX 打包 +
   Store 上架物料 (待打包方案调研) ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
   ④ 对外文案/截图素材。**未获用户指示不 push**
 - 联动顺序 (仅当 danqing 有**代码**改动): danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联。danqing 仅文档改动时**不触发**
 - 测试基线: **92 绿** (51 lib + 33 main + 8 genlog), 2026-09-12 实测 (含列发现字节预算 /
   阶段感知 / 计数改后台作业之后的口径; lib = expand/levels/open/search, main = view/main;
-  引擎 50 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
+  引擎 51 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读

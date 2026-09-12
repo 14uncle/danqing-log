@@ -224,8 +224,11 @@ pub fn count_levels_field_from(file: &LogFile, column: &str, from: u64) -> Level
     } else {
         default_threads()
     };
-    let classify =
-        |line: &[u8]| jsonl::extract_field(line, column).map_or(Level::Other, classify_field_value);
+    // 预构造一次 (needle + memmem prefilter), 逐行复用 —— 逐行重建是实测 20 倍
+    // 以上的成本差价 (用户实机: 字段口径 9312ms vs 行口径 417ms),
+    // 见 `jsonl::FieldExtractor` 的文档。
+    let fx = jsonl::FieldExtractor::new(column);
+    let classify = |line: &[u8]| fx.extract(line).map_or(Level::Other, classify_field_value);
     count_ranges(file, from, len, threads, &classify)
 }
 
