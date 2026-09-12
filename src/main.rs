@@ -281,6 +281,17 @@ impl LogApp {
         }
     }
 
+    /// 采纳一份产物带来的计数口径: 列名与据此生成的点选子句表。
+    ///
+    /// 抽成一处而非在 `apply_fresh` / `apply_rebuild` 各写一遍 —— 两处的写法
+    /// 必须永远一致 (口径与子句表不同步 = 点某行筛到另一行), 重复即隐患。
+    fn adopt_level_column(&mut self, column: Option<String>) {
+        self.level_queries = column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = column;
+    }
+
     /// 把当前设置写回 `config.toml`。
     ///
     /// 必须走整文件写入 —— [`config::Config`] 的两个键同源, 分头写会让
@@ -456,10 +467,7 @@ impl LogApp {
         self.file = Arc::new(file);
         self.level_counts = Arc::new(level_counts);
         // 格式可能整体换了 → 列名与子句表跟着换 (不沿用旧的)
-        self.level_queries = level_column
-            .as_deref()
-            .map_or_else(levels::no_level_queries, levels::level_queries_for);
-        self.level_column = level_column;
+        self.adopt_level_column(level_column);
         // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
         self.schema = schema.map(Arc::new);
         self.mode = if self.schema.is_some() {
@@ -530,10 +538,7 @@ impl LogApp {
         self.mode = mode;
         self.schema = schema;
         self.level_counts = Arc::new(level_counts);
-        self.level_queries = level_column
-            .as_deref()
-            .map_or_else(levels::no_level_queries, levels::level_queries_for);
-        self.level_column = level_column;
+        self.adopt_level_column(level_column);
         self.top_row = 0.0;
         self.selected = 0;
         self.filtered = None;

@@ -52,7 +52,7 @@ const MIN_CONTENT_WIDTH: f32 = 640.0;
 ///
 /// paint/event 不重判这个函数, 而是看 layout 给出的实际宽度 (`area.size.width`)
 /// —— 判定只有一处, 不存在「宽度 0 却还在画/还在吃点击」的漏判。
-pub(crate) fn effective_width(visible: bool, available: f32) -> f32 {
+fn effective_width(visible: bool, available: f32) -> f32 {
     if visible && available >= MIN_CONTENT_WIDTH {
         HIST_WIDTH
     } else {

@@ -315,7 +315,12 @@ pub fn count_levels_from(file: &LogFile, from: u64) -> LevelCounts {
     count_range_parallel(file, from, len, threads)
 }
 
-/// 指定线程数的计数 (测试用: 小 fixture 强制分段以覆盖段边界)。
+/// 指定线程数的计数 —— **测试专用守卫口**: 小 fixture 上强制分段以覆盖段边界。
+///
+/// 不作公开 API: `threads` 只被钳到 `line_count` 而非 `MAX_COUNT_THREADS`,
+/// 传一个大数 + 小文件会 spawn 出 `line_count` 个线程。生产路径 (按
+/// `default_threads()` 钳到 ≤16) 不需要它, 暴露出去纯属 footgun。
+#[cfg(test)]
 pub fn count_levels_with_threads(file: &LogFile, threads: usize) -> LevelCounts {
     let total = file.line_count();
     count_range_parallel(file, 0, total, threads)
@@ -360,8 +365,10 @@ fn count_ranges(
             .map(|&(start, len)| s.spawn(move || count_range_with(file, start, len, classify)))
             .collect();
         for h in handles {
-            // worker panic 就让它冒泡 (调用方 OpenJob 有 catch_unwind 兜成 Err);
-            // 静默吞掉会交付一份错的计数。
+            // worker panic 就让它冒泡。**不要**指望调用方一定有 catch_unwind:
+            // release profile 是 `panic = "abort"`, 那时进程直接终止; 而
+            // main.rs 的 tail 同步追加路径本就没有 catch_unwind。所以这里是
+            // 「panic 不静默」而非「panic 可恢复」——静默吞掉会交付一份错的计数。
             parts.push(h.join().expect("计数 worker panic"));
         }
     });

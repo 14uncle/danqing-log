@@ -322,4 +322,67 @@
   4. tail 追加后计数随之变化; 外部截断/轮转后计数与重建结果一致
   5. `Ctrl+L` 显隐即时生效; **重启后开关状态保持**; 窄窗自动折叠
   6. 深浅两套主题下 6 行均可辨识
-- [ ] 进 review 阶段 (`/agent-skills:code-review-and-quality`)
+- [x] 进 review 阶段 (`/agent-skills:code-review-and-quality`) ✅ 2026-09-12
+      —— 结论 **Request changes** (一条 Required 待用户裁, 其余已修), 详见下节
+
+---
+
+## review 阶段 (2026-09-12, `/agent-skills:code-review-and-quality`)
+
+**方式**: 按 skill 的多模型模式, 把五个焦点分给**三个独立上下文的审查者**并行证伪
+(作者自查有盲区), 同时作者自过架构/规范/规模轴。
+
+**审查者确认为「成立」的 (有证据, 非「看起来没问题」)**
+
+| 声明 | 证据 |
+|---|---|
+| D2 一致性 = 构造保证 | 两侧是**同一提取函数 + 同一谓词**, 可证恒等 (首字节守卫冗余, `starts_with` 已蕴含); 12 方向排除 (嵌套首命中/重复 key/转义与未转义假 `"level":`/unicode 转义/非字符串值/值带空白/CRLF/列错配/并行/增量) + 31 行对抗语料实测 |
+| 分类器等价 | **~35.6M 例差分 fuzz 零分岔** (含 A–Z 五元组穷举 14.9M、200 字节边界扫描), 附结构证明: `FEW`/`IDT` 恰覆盖 6 个首字节, `from = at + 1` **逐字节**推进故重叠/被包含的命中也必被访问, 位集优先级与早退序无关 |
+| 并行分段 | len=0/1/`<threads`/整除处算术均正确, 段数不超 threads, `seg>=1` 保证终止; `lines_from` 确为 O(log) 二分, **无**从 0 前扫的隐藏线性 |
+| 增量派发 | 四条路径 (Fresh/Rebuild/真增量/退化重建) × `rebuilt` 逐一对核**无缝隙**; `apply_appended` 的 merge 在 `self.file` 换入后、`match worker_hits` 之前, 无分支可跳过 |
+| UI 线程 32MB 同步扫描不冻帧 | **实测 3ms** (33.5MB / 151k 行, 含线程 spawn 开销) |
+| 配置无丢键路径 | 全仓唯一写入口 `save_config` 构造完整 `Config` 再整文件写; `AppTheme::save` 已彻底移除; 测试全走 `load_from/save_to` 不碰用户真配置 |
+
+**已修 (本批)**
+
+1. **[Required, 文档] spec 判据不可评** —— 「索引与 2026-09-11 基线一致」今日不可复现
+   (同二进制 81–95ms 漂移), 照字面判会得假结论。已改述为「同会话 A/B 无差异」并落实测数据。
+2. **[Nit] config 朴素子串判定两个方向的错** —— 注释里的 `histogram = false` 会静默隐藏
+   侧栏; 无空格的 `mode="dark"` 被无视。已改按行解析 (跳注释/`split_once('=')`/trim),
+   补 2 测试 (`whitespace_free_assignment_is_honoured` /
+   `commented_out_assignment_is_ignored`)。
+3. **[Optional] `panic = "abort"` 让「catch_unwind 兜底」在 release 下不存在** ——
+   `Cargo.toml:36` 属实 (已核)。`levels.rs` 的注释原文在宣称一个 release 下不成立的
+   保证, 已改为「panic 不静默」而非「panic 可恢复」, 并点明 UI 线程那条路**没有**
+   catch_unwind。当前**不可达** (审查者穷举未找到能 panic 的输入), 属注释纠偏。
+4. **[Optional] `count_levels_with_threads` 是 pub 且可 spawn 到 line_count 线程** ——
+   已加 `#[cfg(test)]` (它本就只是测试守卫口)。
+5. **[Nit] `effective_width` 可见性虚高** —— `pub(crate)` → 私有。
+6. **[Nit] 落点四行重复** —— `apply_fresh` / `apply_rebuild` 逐字重复的列名采纳逻辑
+   抽成 `LogApp::adopt_level_column`。
+
+**待用户裁 (Required, 未修)**
+
+- **增量漏计「被补全的半行」**: 旧快照末行若**无换行**结尾, 外部补全且补全内容在行首
+  200 字节内引入级别词 → 增量起点 `[old_line_count, new)` 不含该行, 该行永不重算。
+  **已第一手复现**: 明文 全量 ERROR=1/其他=1 vs 增量 ERROR=0/其他=2;
+  过滤 全量=1 vs 增量(从旧行数起)=0。
+  **两侧同源漂移 (漏同一行) → D2 红线此刻仍成立**; 故**只修计数会当场打破 D2**。
+  修法: (a) frontier 行「减旧类 + 加新类」两侧同修 —— 过滤侧可能触及兄弟 crate 的
+  `run_filter_from` 语义, 需 `LevelCounts` 减法与命中表去重; (b) 检测旧尾非 `\n` 即
+  退回全量重算 —— 过滤侧 1GB ≈ 74ms 在 UI 线程会冻帧。
+  触发窗口窄 (切点落在级别词内部那几个字节), 且「6 桶之和 == 行数」仍成立 (其他检查
+  兜不住)。**当前处置: 记入 spec 已知局限, 不阻塞人工验收。** 待用户定: 立即修 / 记局限。
+- **合并的 DEBUG 桶可点性** (T4 ⑥ 遗留) —— 同上, 倾向暂不动。
+
+**既有问题 (非本模块引入, 仅 FYI)**
+
+- `FileStat::is_stale` 在生产路径是死代码: 引擎的过期语义与应用层手写的三分支判据
+  是两套, 改引擎时容易走岔。
+- UTF-16 文件小幅增长走同步路径时 `AppendOutcome::Rebuilt` 被当纯增量, **跳过 Rebuild
+  重置链** (filter/bookmark/search 不清); 同一文件增长 ≥32MB 时走 worker 会清。
+  同一文件同一次增长因大小不同而换入语义不同。计数本身正确 (prefix 对齐)。
+- `extract_field` **每行分配一个 needle `Vec`** (`danqing-logfile/src/jsonl.rs` 内
+  `field_needle` 在每次调用里重建) —— 在 1GB 字段口径这条最需要快的路径上每行一次堆分配。
+  实测 112ms 即含这份开销; 修法需兄弟 crate 暴露预建 needle 入口 (跨仓)。
+- 生效行高亮是**精确串匹配**: 手打 `level=ERROR` (不带 `*`) 不点亮任何行 (点击路径不受影响)。

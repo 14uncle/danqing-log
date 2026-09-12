@@ -47,14 +47,33 @@ impl Config {
     }
 
     /// 从指定路径加载 (测试用: 不碰用户真配置)。
+    ///
+    /// **按行解析**而非整串 `contains` (review 后修正): 子串判定有两个方向的错 ——
+    /// ① 误判: 注释里的 `# histogram = false` 会静默隐藏侧栏, 值里含该子串同理;
+    /// ② 漏判: 用户写成 `mode="dark"` (无空格) 会被无视, 与意图相反。
+    /// 跳过注释与空行、`split_once('=')`、左右 trim 并去掉引号即可, 仍零依赖。
     pub(crate) fn load_from(path: &Path) -> Self {
         let mut c = Self::default();
-        if let Ok(content) = fs::read_to_string(path) {
-            if content.contains("mode = \"dark\"") {
-                c.theme = AppTheme::Dark;
+        let Ok(content) = fs::read_to_string(path) else {
+            return c;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // 注释与空行不参与
             }
-            if content.contains("histogram = false") {
-                c.histogram = false;
+            // `[theme]` / `[view]` 这类节头没有 '=' —— 直接跳过
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
+                "mode" if value == "dark" => c.theme = AppTheme::Dark,
+                "mode" if value == "light" => c.theme = AppTheme::Light,
+                // 只认字面 false; 其余 (含缺值/垃圾) 取默认「显示」—— 缺省可见
+                // 比因为一个写错的值就静默消失安全。
+                "histogram" => c.histogram = value != "false",
+                _ => {}
             }
         }
         c
@@ -331,6 +350,27 @@ mod tests {
         let c = Config::load_from(&p);
         assert_eq!(c.theme, AppTheme::Dark, "旧键要认");
         assert!(c.histogram, "缺键取默认: 显示");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 写法宽容: 无空格的 `mode="dark"` 也要认 (整串子串判定会漏掉它,
+    /// 结果是用户设了深色却留在浅色 —— 与意图相反)。
+    #[test]
+    fn whitespace_free_assignment_is_honoured() {
+        let p = temp_cfg("[theme]\nmode=\"dark\"\n\n[view]\nhistogram=false\n");
+        let c = Config::load_from(&p);
+        assert_eq!(c.theme, AppTheme::Dark, "无空格写法要认");
+        assert!(!c.histogram, "无空格写法要认");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 注释里的赋值**不得**生效 —— 否则用户写一句笔记就把侧栏静默弄没了。
+    #[test]
+    fn commented_out_assignment_is_ignored() {
+        let p = temp_cfg("# histogram = false\n[theme]\n# mode = \"dark\"\n");
+        let c = Config::load_from(&p);
+        assert!(c.histogram, "注释掉的 histogram 不得生效");
+        assert_eq!(c.theme, AppTheme::Light, "注释掉的 mode 不得生效");
         let _ = std::fs::remove_file(&p);
     }
 
