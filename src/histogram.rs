@@ -43,6 +43,8 @@ const BAR_GAP: f32 = 3.0;
 const MIN_BAR_W: f32 = 2.0;
 /// 容得下侧栏的最小窗口内容宽: 再窄就自动折叠, 优先保内容区。
 const MIN_CONTENT_WIDTH: f32 = 640.0;
+/// 「清除筛选」行与 6 个桶之间的间距 (行序号 = 6, 见 [`row_rect`])。
+const CLEAR_ROW_GAP: f32 = 10.0;
 
 /// 侧栏的有效宽度: 关掉 (`Ctrl+L`), 或窗口窄到容不下 → 0。
 ///
@@ -60,19 +62,26 @@ fn effective_width(visible: bool, available: f32) -> f32 {
     }
 }
 
-/// 第 `i` 行的命中矩形 (序同 [`Level::ALL`])。
+/// 「清除筛选」行的序号 (紧接 6 个桶之后)。
+const CLEAR_ROW: usize = Level::ALL.len();
+
+/// 第 `i` 行的命中矩形: `0..6` 是桶 (序同 [`Level::ALL`]), [`CLEAR_ROW`] 是
+/// 清除行 (仅在有生效筛选时出现, 见 paint)。
 fn row_rect(area: Rect, i: usize) -> Rect {
-    Rect::from_xywh(
-        area.origin.x,
-        area.origin.y + PAD_Y + i as f32 * ROW_H,
-        area.size.width,
-        ROW_H,
-    )
+    let y = if i == CLEAR_ROW {
+        area.origin.y + PAD_Y + Level::ALL.len() as f32 * ROW_H + CLEAR_ROW_GAP
+    } else {
+        area.origin.y + PAD_Y + i as f32 * ROW_H
+    };
+    Rect::from_xywh(area.origin.x, y, area.size.width, ROW_H)
 }
 
 /// 命中测试: 点落在第几行; 行外 (或行号越界) → None。
+///
+/// 纯几何 —— 是否**可点**由状态决定 (子句表有无 / 有没有生效的筛选),
+/// 见 [`LevelHistogram::is_row_clickable`]。
 fn row_at(area: Rect, p: Point) -> Option<usize> {
-    (0..Level::ALL.len()).find(|i| row_rect(area, *i).contains(p))
+    (0..=CLEAR_ROW).find(|i| row_rect(area, *i).contains(p))
 }
 
 /// 横条宽度比例 (0..=1), 对数刻度 (底 10)。
@@ -116,12 +125,20 @@ pub(crate) struct LevelHistogram {
     pending: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
+    /// 鼠标悬停的行 (仅**可点**的行会进这里)。
+    ///
+    /// 人工验收反馈: 没有 hover 反馈, 用户不知道哪些行能点 (spec 原 Open Question
+    /// 「倾向不做 hover」由此改判)。**只在可点行上给反馈**是有意的 —— 反馈本身
+    /// 就把「哪几行能点」教给了用户。
+    hover: std::cell::Cell<Option<usize>>,
     // 主题色在 sync 期解析并缓存, paint 期零查表 (与 view.rs 同款)。
     bg: Color,
     text_primary: Color,
     text_secondary: Color,
     /// 生效行底色 (主题的行底色, 与内容区选中行同源)。
     active_bg: Color,
+    /// 强调色 —— hover 反馈用它 (与「生效行」的底色是两个通道, 不会混)。
+    accent: Color,
 }
 
 impl LevelHistogram {
@@ -132,10 +149,23 @@ impl LevelHistogram {
             visible: true,
             pending: false,
             active: None,
+            hover: std::cell::Cell::new(None),
             bg: Color::rgb(1.0, 1.0, 1.0),
             text_primary: Color::rgb(0.12, 0.12, 0.12),
             text_secondary: Color::rgb(0.40, 0.40, 0.42),
             active_bg: Color::rgb(0.93, 0.93, 0.94),
+            accent: Color::rgb(0.18, 0.35, 0.60),
+        }
+    }
+
+    /// 该行此刻是否可点: 桶行看子句表, 清除行看有没有生效的筛选。
+    ///
+    /// 只有可点的行才给 hover 反馈 —— 反馈本身即「哪几行能点」的说明书,
+    /// 故这个判定必须与 [`Self::event`] 的可点判定**同源**, 不许各写一套。
+    fn is_row_clickable(&self, i: usize) -> bool {
+        match i {
+            CLEAR_ROW => self.active.is_some(),
+            _ => self.queries[i].is_some(),
         }
     }
 
@@ -165,6 +195,7 @@ impl Widget for LevelHistogram {
         self.text_primary = t.text_primary();
         self.text_secondary = t.text_secondary();
         self.active_bg = t.surface_variant();
+        self.accent = t.accent();
         self.counts = *app.level_counts.as_ref();
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
@@ -221,8 +252,15 @@ impl Widget for LevelHistogram {
                 );
             }
 
-            // 级别名 (左) + 计数 (右对齐) —— 可点行用正文色, 只读行降噪
-            let color = if self.queries[*level as usize].is_some() {
+            // 级别名 (左) + 计数 (右对齐)
+            //  - 只读行: 次要色降噪 (点不动, 不该显得可交互)
+            //  - 可点行: 正文色
+            //  - 悬停的可点行: 强调色 —— 人工验收要求「让用户知道是可点击对象」
+            let clickable = self.queries[*level as usize].is_some();
+            let hovered = clickable && self.hover.get() == Some(i);
+            let color = if hovered {
+                self.accent
+            } else if clickable {
                 self.text_primary
             } else {
                 self.text_secondary
@@ -239,7 +277,11 @@ impl Widget for LevelHistogram {
                 right - count_w,
                 baseline,
                 LABEL_SIZE,
-                self.text_secondary,
+                if hovered {
+                    self.accent
+                } else {
+                    self.text_secondary
+                },
             );
 
             // 对数横条 (计数未就绪时不画: 空条比假条诚实)
@@ -257,11 +299,68 @@ impl Widget for LevelHistogram {
                 );
             }
         }
+
+        // 有生效筛选时多一行「✕ 清除筛选」—— 人工验收的第二条反馈: 用户点完级别
+        // 想退回全部数据时, 唯一的办法是去过滤框按 Esc。这行把回路摆在明处
+        // (再点生效那行也能清, 但那是隐式的)。
+        if self.active.is_some() {
+            let ry = row_rect(area, CLEAR_ROW).origin.y;
+            let baseline = ry + texts.ascent(f32::from(LABEL_SIZE));
+            let hovered = self.hover.get() == Some(CLEAR_ROW);
+            if hovered {
+                rects.push_rect(
+                    Rect::from_xywh(
+                        area.origin.x + 2.0,
+                        ry - 2.0,
+                        area.size.width - 4.0,
+                        ROW_H - 2.0,
+                    ),
+                    self.active_bg,
+                    3.0,
+                );
+            }
+            texts.push_text(
+                "✕ 清除筛选",
+                bar_x,
+                baseline,
+                LABEL_SIZE,
+                if hovered {
+                    self.text_primary
+                } else {
+                    self.accent
+                },
+            );
+        }
+
+        // 底部提示: 收起侧栏只有 `Ctrl+L` 一个入口, 而界面上没有任何可见控件 ——
+        // 人工验收反馈「用户怎么知道按 Ctrl+L」。放导轨底部, 不挤占计数区。
+        let hint = "Ctrl+L 收起";
+        texts.push_text(
+            hint,
+            bar_x,
+            area.origin.y + area.size.height - 8.0,
+            LABEL_SIZE,
+            self.text_secondary,
+        );
     }
 
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
         if area.size.width < 1.0 {
             return EventResult::Ignored;
+        }
+        // hover: 只在**可点**行上留痕。反馈本身就是「哪几行能点」的说明书 ——
+        // 人工验收反馈「鼠标挪上去 UI 没有反馈」, 这条即其修法。
+        match event {
+            Event::CursorMoved(p) => {
+                self.hover
+                    .set(row_at(area, *p).filter(|i| self.is_row_clickable(*i)));
+                return EventResult::Ignored;
+            }
+            Event::CursorLeft => {
+                self.hover.set(None);
+                return EventResult::Ignored;
+            }
+            _ => {}
         }
         let Event::MouseInput {
             pressed: true,
@@ -275,13 +374,20 @@ impl Widget for LevelHistogram {
         let Some(i) = row_at(area, *position) else {
             return EventResult::Ignored;
         };
-        let level = Level::ALL[i];
-        // 不可点 = 明文模式 / 无级别类列 / 该桶无单子句 (DEBUG/其他) —— 吞掉点击,
+        // 不可点 (明文模式 / 无子句的桶 / 没有生效筛选时的清除行) —— 吞掉点击,
         // 不让它穿透到底下的列表 (点在有东西的地方不该毫无回应地选中底下的行)。
-        if self.queries[level as usize].is_none() {
+        if !self.is_row_clickable(i) {
             return EventResult::Consumed;
         }
-        msgs.push(Box::new(Msg::ApplyLevelFilter(level)));
+        if i == CLEAR_ROW {
+            // 「✕ 清除筛选」走与「再点生效行」同一套切换语义 (可点判定已保证
+            // active 为 Some)。
+            if let Some(l) = self.active {
+                msgs.push(Box::new(Msg::ApplyLevelFilter(l)));
+            }
+            return EventResult::Consumed;
+        }
+        msgs.push(Box::new(Msg::ApplyLevelFilter(Level::ALL[i])));
         EventResult::Consumed
     }
 }
@@ -325,6 +431,104 @@ mod tests {
             "折叠态应放行而非吞掉"
         );
         assert!(q.is_empty(), "折叠态不得发消息");
+    }
+
+    /// 清除行在 6 个桶**之下**, 且不与之重叠 —— 否则点桶会误触清除。
+    #[test]
+    fn clear_row_sits_below_the_buckets() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let last_bucket = row_rect(area, Level::ALL.len() - 1);
+        let clear = row_rect(area, CLEAR_ROW);
+        assert!(
+            clear.origin.y >= last_bucket.origin.y + last_bucket.size.height,
+            "清除行必须完全在最后一个桶之下"
+        );
+        // 命中测试也要能落到它
+        let p = Point {
+            x: clear.origin.x + 4.0,
+            y: clear.origin.y + 4.0,
+        };
+        assert_eq!(row_at(area, p), Some(CLEAR_ROW));
+    }
+
+    /// **hover 只落在可点行上** —— 这条是「让用户知道是可点击对象」的实现依据:
+    /// 反馈本身即说明书, 故只读行不能有反馈 (否则教错)。
+    #[test]
+    fn hover_only_lands_on_clickable_rows() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let mut q = MsgQueue::default();
+
+        // 只读侧栏 (全 None): 任何行都不该留 hover
+        let mut ro = LevelHistogram::new();
+        for i in 0..=CLEAR_ROW {
+            let r = row_rect(area, i);
+            let ev = Event::CursorMoved(Point {
+                x: r.origin.x + 4.0,
+                y: r.origin.y + 4.0,
+            });
+            ro.event(&ev, area, &mut q);
+        }
+        assert_eq!(ro.hover.get(), None, "只读侧栏不得给 hover 反馈");
+
+        // JSONL 口径: 有子句的四行可点, DEBUG/其他 与「清除行」(无生效筛选) 不可点
+        let mut w = LevelHistogram::new();
+        w.queries = levels::level_queries_for("level");
+        for (i, level) in Level::ALL.iter().enumerate() {
+            let r = row_rect(area, i);
+            let ev = Event::CursorMoved(Point {
+                x: r.origin.x + 4.0,
+                y: r.origin.y + 4.0,
+            });
+            w.event(&ev, area, &mut q);
+            let want = if levels::field_query("level", *level).is_some() {
+                Some(i)
+            } else {
+                None
+            };
+            assert_eq!(w.hover.get(), want, "{level:?} 的 hover 反馈不对");
+        }
+        // 没有生效筛选时, 清除行不可点 → 不给 hover
+        let r = row_rect(area, CLEAR_ROW);
+        w.event(
+            &Event::CursorMoved(Point {
+                x: r.origin.x + 4.0,
+                y: r.origin.y + 4.0,
+            }),
+            area,
+            &mut q,
+        );
+        assert_eq!(w.hover.get(), None, "无生效筛选时清除行不可点");
+        assert_eq!(
+            w.event(&Event::CursorLeft, area, &mut q),
+            EventResult::Ignored
+        );
+        assert_eq!(w.hover.get(), None, "移出后 hover 清空");
+    }
+
+    /// 「✕ 清除筛选」行点击要发出消息 (走与「再点生效行」同一套切换语义)。
+    #[test]
+    fn clear_row_click_emits_message() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let mut w = LevelHistogram::new();
+        w.queries = levels::level_queries_for("level");
+        w.active = Some(Level::Error); // 模拟 `level=ERROR*` 已生效
+
+        let r = row_rect(area, CLEAR_ROW);
+        let ev = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point {
+                x: r.origin.x + 4.0,
+                y: r.origin.y + 4.0,
+            },
+        };
+        let mut q = MsgQueue::default();
+        assert_eq!(
+            w.event(&ev, area, &mut q),
+            EventResult::Consumed,
+            "点击清除行应被消费"
+        );
+        assert!(!q.is_empty(), "清除行点击必须发出消息");
     }
 
     /// 只读侧栏 (全 None 子句表) 下点击必须被吞掉, 且不发出任何消息 ——

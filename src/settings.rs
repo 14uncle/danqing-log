@@ -57,6 +57,7 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 // 让 「主题 + 下拉」按内容整体收缩, 交给 Column 的 cross_center 居中,
                 // 与关于区三行/反馈链接同处一条中轴。
                 .child(theme_dropdown())
+                .child(shortcuts_section(content_w))
                 .child(feedback_row()),
         ))
         .width(CARD_WIDTH)
@@ -105,6 +106,53 @@ fn about_section() -> impl Widget {
 /// 版本行：更新提示 (有新版时显示「有新版本 vX.Y.Z」+ 前往下载按钮)。
 fn version_row() -> impl Widget {
     VersionRow::new()
+}
+
+/// 快捷键固定键列宽 (成列才好扫; 与作用之间留出对齐感)。
+const SHORTCUT_KEY_W: f32 = 120.0;
+
+/// 快捷键一览 —— 「用户怎么知道有这个键」在界面上的唯一归处
+/// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
+///
+/// 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 已经是「关于/版本/反馈」的入口,
+/// 用户找说明会来这儿。只列**猜不出来**的那几个组合键 (方向键/翻页键不必教);
+/// 完整清单在 README。
+fn shortcuts_section(content_w: f32) -> impl Widget {
+    const KEYS: [(&str, &str); 5] = [
+        ("Ctrl+O", "打开文件"),
+        ("Ctrl+F  ·  /", "搜索"),
+        ("Ctrl+T", "表格 / 原始模式互切"),
+        ("Ctrl+L", "级别侧栏 显示 / 收起"),
+        ("Ctrl+B  ·  Ctrl+G", "切换书签 / 下一书签"),
+    ];
+    let mut col = Column::new().gap(4.0).cross_stretch().child(Center::new(
+        Text::new("快捷键".to_string())
+            .font_size(BODY_SIZE)
+            .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+    ));
+    for (k, a) in KEYS {
+        col = col.child(shortcut_row(k, a));
+    }
+    content_row(col, content_w)
+}
+
+/// 一行「键 → 作用」: 键固定列宽, 作用在右。
+fn shortcut_row(key: &'static str, action: &'static str) -> impl Widget {
+    Row::new()
+        .cross_center()
+        .fill(
+            UiBox::new(Color::TRANSPARENT).width(SHORTCUT_KEY_W).child(
+                Text::new(key.to_string())
+                    .font_size(BODY_SIZE)
+                    .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+            ),
+            0,
+        )
+        .child(
+            Text::new(action.to_string())
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+        )
 }
 
 /// 反馈链接行。
