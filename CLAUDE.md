@@ -58,8 +58,10 @@
   `jsonl::FieldExtractor` (needle 与 `Finder` 各建一次逐行复用), 顺手把
   `Compiled::Flat` 里同款问题一并修掉 (过滤路径也受益)。
   本机: 字段口径 91ms → **24ms** (3.8x), 且快于行口径 (24 vs 70ms); 真实 app 路径
-  (debug) `perf levels_job`: 86ms → **23ms**。**这是我在 review 阶段主动延期的
-  Optional 项** (嫌要动兄弟 crate), 代价是用户替我付了三轮排查。
+  (debug) `perf levels_job`: 86ms → **23ms**。
+  **用户机器实测确认: `perf levels_job: 计数 34ms` —— 9312ms → 34ms (274x)。事故闭环。**
+  **这是我在 review 阶段主动延期的 Optional 项** (嫌要动兄弟 crate), 代价是用户
+  替我付了三轮排查。
   **方法论教训**: 我前四次归因全错, 每次都是拿自己机器上的测量去套用户的文件;
   真正定位靠的是用户给的**两条同机对照**(字段 vs 行、debug、同一台机器) ——
   **对照组比绝对值有用得多**。
