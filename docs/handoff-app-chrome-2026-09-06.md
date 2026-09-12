@@ -104,6 +104,10 @@ danqing-log v1 三模块闭环后, 用户反馈「UI 很丑 / 无最小最大化
 ## 收尾提示
 
 - 发布前: 推 danqing-log + 补 screenshot 弹药 + 命名/LOGO 定稿(clipboard 先例)。**发布命名未定**,
-  仓库工作名 danqing-log。付费层($45/$95 买断 vs SPEC「v1 全功能免费」)张力待定, 见 intent。
+  仓库工作名 danqing-log。
+- ~~付费层($45/$95 买断 vs SPEC「v1 全功能免费」)张力待定~~ **2026-09-12 已裁决销案**:
+  v1 免费开源(免费层 = 看懂类全功能), 付费层自 v1.x 起 **$29 个人 / $59 企业**买断;
+  渠道分层(GitHub 永久免费 / MS Store trial, 且**过期降级到免费层不变砖**)。
+  完整清单见 `ROADMAP-v1x.md`, 裁决理由见 `../../danqing/docs/intent/log-viewer-poc.md`。
 - 框架 review 遗留(可选, 非阻塞): update-check 的 I2(运输层测试)/O1(每帧锁+String 分配)/O2·O3;
   `title_bar.rs` 体量 1944 行(或可抽副模块)。

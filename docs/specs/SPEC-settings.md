@@ -66,8 +66,11 @@ src/main.rs       ← Msg: OpenSettings/CloseSettings/OpenUrl/UpdateAction; focu
   版本行/反馈只读; 卡用 scrim 浮层(不发明新原语)。
 - **Ask first**: 做可编辑设置项(本期只读: 只有关于/版本/反馈, 无任何可配置开关);
   引入 MS Store 轨更新/授权(暂无 store 轨, 留 v1.x); 加 tab/MultiPanel(仅当未来有真设置项)。
-- **Never**: 不把快捷键表放进设置(用户已移除); 不在设置卡放付费墙(v1 全功能免费);
-  不抄一份 update 后端(必须走框架 `danqing::update`)。
+- **Never**: 不把快捷键表放进设置(用户已移除); 不抄一份 update 后端(必须走框架 `danqing::update`)。
+- **~~Never~~ 修订 (2026-09-12)**: ~~不在设置卡放付费墙(v1 全功能免费)~~ —— 原措辞与新分层冲突:
+  **免费层 ≠ 全功能**(免费层 = 看懂, 付费层 = 批量/留存/交付, 见 `../ROADMAP-v1x.md`)。
+  本期的真实约束是 **v1 不含任何付费/授权 UI**(v1 只有免费层)。MS Store 的 trial/授权状态展示
+  归 v1.x —— 届时设置卡会新增授权行, 那时再放开这条。
 
 ## Success Criteria
 
