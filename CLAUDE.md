@@ -11,7 +11,8 @@
 - 2026-09-08 (**未 commit**): **async-open + text-selection-copy 机器部分全闭环** (spec→plan→build 走完, 三件套绿); 工作区含 `src/open.rs` / `src/selection.rs` 新模块 + SPEC/plan/todo 文档 + 5 文件改动; text-selection T1 含 danqing 引擎改动 `App::propagate_unhandled_keys()` (danqing 工作区同未 commit)
 - 当前: **等用户人工验收 + 提交授权**。遗留人工项 —— async-open: 10GB 冷开复核 / 索引中 Ctrl+O 取消体感 / 索引中关窗干净退出 / 轮转重建旧内容可见 (copytruncate+create 两流派) / Loading 文案定档; text-selection: 实机五种姿势 (双击选词/框选/跨行/表格行复制/焦点切换)
 - 获授权后的联动顺序: danqing 先提交 push → 本仓 `cargo update -p danqing` → 两仓分别提交, message 注明关联
-- 测试基线: **99 绿** (79 lib + 12 main + 8 genlog), 2026-09-08 实测
+- 测试基线: **40 绿** (16 lib + 16 main + 8 genlog), 2026-09-12 实测 (引擎拆分后口径;
+  lib = expand/open/search, main = view/main; 引擎 47 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读
@@ -35,8 +36,11 @@
 
 ## 结构
 
-- `src/logfile.rs` — 引擎层 (mmap/行索引/搜索), 全部碾压主张在此 (2026-09-10 拆为兄弟 crate `danqing-logfile`, 此处 re-export)
-- `src/jsonl.rs` — 前提②引擎: JSONL 检测/列发现/memmem 字段提取/字段过滤 (零 parse; serde_json 需 preserve_order 保首见列序) (同拆至 `danqing-logfile`)
+- ~~`src/logfile.rs` / `src/jsonl.rs`~~ — 引擎层 (mmap/行索引/搜索, 全部碾压主张) 与
+  前提②引擎 (JSONL 检测/列发现/memmem 字段提取/字段过滤, 零 parse; serde_json 需
+  preserve_order 保首见列序)。2026-09-10 拆为兄弟 crate `danqing-logfile`, 经 `lib.rs` 的
+  `pub use danqing_logfile::{jsonl, logfile}` re-export; **2026-09-12 删除仓内残留副本**
+  —— 拆分时漏删, 两份 2266 行已与兄弟 crate 分叉, 且 47 个测试静默不跑 (无 `mod` 声明 = 无人编译)
 - `src/main.rs` + `src/view.rs` — GUI (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
 - ~~`src/encoding.rs`~~ — 编码检测/转码 (2026-09-10 独立为兄弟 crate `danqing-encoding`, danqing 通过 `pub use danqing_encoding as encoding` re-export)
 - `src/search.rs` — AsyncJob (worker+tick拾取泛化) + SearchNav 命中导航
