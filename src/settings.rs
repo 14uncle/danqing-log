@@ -53,7 +53,10 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 .child(close_row())
                 .child(about_section())
                 .child(content_row(version_row(), content_w))
-                .child(content_row(theme_dropdown(), content_w))
+                // 主题行不套 content_row (那是「占满内容宽 + 内部左对齐」):
+                // 让 「主题 + 下拉」按内容整体收缩, 交给 Column 的 cross_center 居中,
+                // 与关于区三行/反馈链接同处一条中轴。
+                .child(theme_dropdown())
                 .child(feedback_row()),
         ))
         .width(CARD_WIDTH)
