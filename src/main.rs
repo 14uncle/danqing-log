@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use danqing::theme::{ScenePalette, SceneTheme};
+use danqing::theme::{ScenePalette, SceneTheme, Theme};
 use danqing::widget::{Column, LogoKind, Node, Row, Stack, TitleBar, node};
 use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
@@ -104,6 +104,20 @@ fn title_theme(theme: config::AppTheme) -> SceneTheme {
             backdrop_dark: Color::rgb(0.06, 0.06, 0.08),
         }),
     }
+}
+
+/// 窗口清屏色 —— **单点定义, 启动与切主题都取它**。
+///
+/// 为什么必须是单点: 清屏色有两条来路 (启动的 `WindowConfig`、运行时的
+/// `set_clear_color`), 各算一份就会漂 —— 本仓已有先例 (设置卡页签序号曾在两个文件
+/// 各抄一份、双双漂掉)。
+///
+/// 为什么它值得存在: 标题栏那条亮带**就是**清屏色。框架 `TitleBar` 的背景是有意的
+/// `TRANSPARENT` (`danqing/src/widget/title_bar.rs`, 且有测试锁死), 让窗口底色透出;
+/// 内容区反而看不见它 (被不透明的 `th.background()` 盖住)。所以清屏色不跟随主题时,
+/// 症状恰好是「暗色下标题栏一条白板」。
+fn window_clear_color(theme: config::AppTheme) -> Color {
+    theme.theme().background()
 }
 
 /// 应用状态本体 (danqing App)。
@@ -1114,6 +1128,11 @@ impl App for LogApp {
             }
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
+                // 通知窗口换底色。**这一步此前从缺** —— 于是切主题后标题栏那条
+                // (透出的清屏色) 纹丝不动, 只有内容区变了色。
+                if let Some(sender) = &self.window_sender {
+                    sender.set_clear_color(window_clear_color(self.theme));
+                }
                 self.save_config();
             }
             Msg::Quit => {
@@ -1438,7 +1457,9 @@ fn run(path: Option<&Path>) -> Result<()> {
     let config = WindowConfig {
         title: "丹青日志 LogLens".to_string(),
         size: Size::new(1100.0, 760.0),
-        clear_color: Color::rgb(0.98, 0.98, 0.98),
+        // 清屏色随配置里的主题 —— 此前写死浅色, 存暗色配置启动也开在白底上
+        // (app 在上一行已从配置读出主题, 只是当时没人问它)。
+        clear_color: window_clear_color(app.theme),
         logo_name: "log".into(),
         maximized: true, // 日志查看器主战场是全屏阅读: 初始最大化
         hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
@@ -1458,6 +1479,30 @@ mod tests {
         assert_eq!(clamp_top(500.0, 100), 99.0, "越界钳到末行");
         assert_eq!(clamp_top(42.5, 100), 42.5, "区间内不变 (保小数偏移)");
         assert_eq!(clamp_top(3.0, 0), 0.0, "空文件归零");
+    }
+
+    #[test]
+    fn window_clear_color_follows_theme() {
+        // 清屏色的**单点定义** (AD1): 启动与切主题都取它, 不许两处各算一份。
+        // 回归的是这个缺陷: 清屏色原本写死浅色, 且全仓**零处** set_clear_color 调用 ——
+        // 于是存暗色配置启动、或运行中切到暗色, 窗口底色纹丝不动。
+        // 标题栏那条亮带**就是**清屏色 (框架 TitleBar 背景是有意的 TRANSPARENT)。
+        use danqing::theme::{DarkTheme, LightTheme, Theme};
+        assert_eq!(
+            window_clear_color(config::AppTheme::Light),
+            LightTheme.background(),
+            "浅色: 清屏色 = 主题背景"
+        );
+        assert_eq!(
+            window_clear_color(config::AppTheme::Dark),
+            DarkTheme.background(),
+            "暗色: 清屏色 = 主题背景"
+        );
+        assert_ne!(
+            window_clear_color(config::AppTheme::Light),
+            window_clear_color(config::AppTheme::Dark),
+            "两主题的清屏色必须不同 —— 相同即等于没跟随 (本缺陷的原始形态)"
+        );
     }
 
     #[test]
