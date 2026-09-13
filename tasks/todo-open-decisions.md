@@ -54,10 +54,9 @@
 用**新增的 `l_star_of`** 而不用对比度 —— 正是上面那个教训的固化。
 **有牙齿**: 还原旧值 → 立刻红 (`0.74 落在 [3, 10] 之外`)。
 
-> **本仓消费待重钉**: 框架那笔 `0d91ed7` 先在本地提交, **push 之后**本仓才能
-> `cargo update -p danqing`。在此之前 lock 仍指 `486d180d` —— **那版没有这个修复**,
-> 即「改了但还没生效」。验证靠联动 patch (`cp tools/local-patch.toml .cargo/config.toml`),
-> 当初就是开着 patch 跑出两仓全绿的 (框架 583 lib / 本仓 112)。
+> **本仓消费已重钉** ✅: 框架 `0d91ed7` push 后 `cargo update -p danqing`
+> (`486d180d` → `0d91ed7e`), 两仓三件套全绿 (框架 583 lib / 本仓 112)。
+> 过程中先开着联动 patch 验过一遍 —— 那是「改了但还没生效」期间的唯一验法。
 
 **Blast radius 实际查过**: 五仓里只有**已终止的** `danqing-clipboard` 用了 1 处,
 其余四仓 (pomodoro / disk / tile / xirang) **零处** —— 实际只影响本仓。

@@ -854,7 +854,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "danqing"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing#486d180d21ce4df81c3313b7ddaa7c64c0b305e0"
+source = "git+https://github.com/14uncle/danqing#0d91ed7e5f05734740ac3a793fce2ac7b9f03bb7"
 dependencies = [
  "arboard",
  "bytemuck",
