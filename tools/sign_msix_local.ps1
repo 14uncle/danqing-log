@@ -23,9 +23,11 @@
 param(
     # 留空 = 自动取 release-archives 里最新的那个包 (避免签错版本)
     [string]$MsixPath = "",
-    # ⚠️ 必须与 build_msix.ps1 的 -PublisherCN 完全一致
-    [string]$PublisherCN = "CN=DanqingLog-LocalTest",
-    [string]$AppName = "14uncle.DanqingLog",
+    # 必须与 build_msix.ps1 的 -PublisherCN **逐字符**相同, 否则装包报 0x8007000B。
+    # 用真实标识 (而非另造一个测试值) 是有意的: 侧载测的就是将来提交的那个包,
+    # 包标识一致, shell 的图标缓存 / AUMID 行为才与商店用户看到的一样。
+    [string]$PublisherCN = "CN=5F2A7EA5-3366-4B8A-8C0D-3BE22575711A",
+    [string]$AppName = "14uncle.57340CE8CAE9E",
     [string]$PfxPassword = "sideload"
 )
 
@@ -61,6 +63,16 @@ Write-Host "=== 1/4 自签名证书 (PFX 幂等复用) ==="
 if (Test-Path $PfxPath) {
     Write-Host "复用已有 PFX (换过证书就必须重跑 trust_cert_machine.ps1)"
     $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($PfxPath, $PfxPassword)
+    # 证书主题必须与 manifest 的 Publisher 逐字符相同, 否则装包报 0x8007000B,
+    # 而那个报错完全看不出「是证书主题对不上」。这里提前拦住并说清怎么办。
+    if ($cert.Subject -ne $PublisherCN) {
+        Write-Host "ERROR: 证书主题与 manifest Publisher 不一致, 装包会报 0x8007000B。"
+        Write-Host "  证书:      $($cert.Subject)"
+        Write-Host "  Publisher: $PublisherCN"
+        Write-Host "  修法: 删掉 $PfxPath, 重跑本脚本 (会按新主题生成证书),"
+        Write-Host "        再跑一次 tools/trust_cert_machine.ps1 (要 UAC)。"
+        exit 1
+    }
 } else {
     $rsa = [System.Security.Cryptography.RSA]::Create(2048)
     $req = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest(

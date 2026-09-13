@@ -8,10 +8,8 @@
 #   powershell -NoProfile -File tools/build_msix.ps1
 #   powershell -NoProfile -File tools/build_msix.ps1 -Version 1.0.0
 #
-# 提交商店前**必须**先回填 Partner Center 给的真实标识 (应用和游戏 -> 产品标识 页):
-#   -PublisherCN "CN=<你的 GUID>"  -AppName "<Identity Name>"
-#   -PublisherDisplayName "<Publisher Display Name>"
-# 默认值是**本地测试用**的假标识, 拿它提交会被拒 (身份对不上)。
+# 默认标识**就是** Partner Center 的真实值 (2026-09-13 回填) —— 直接跑出来的包即可提交。
+# 要改身份走 `-AppName` / `-PublisherCN` / `-PublisherDisplayName` 覆盖。
 #
 # 工具链: makeappx / makepri / signtool 从 tools/sdk-tools 取, **不进仓库**
 # (19MB, 见 .gitignore)。缺了用 nuget 补:
@@ -21,9 +19,11 @@
 param(
     [string]$Version = "",
     [string]$OutDir = "..\release-archives\log\msix",
-    # ⚠️ 以下四个是**本地测试**值。提交商店必须换成 Partner Center 的真实值。
-    [string]$PublisherCN = "CN=DanqingLog-LocalTest",
-    [string]$AppName = "14uncle.DanqingLog",
+    # Partner Center 真实标识 (2026-09-13 回填, 应用和游戏 -> 产品标识 页)。
+    # 三个值**区分大小写、逐字符**匹配, 首次提交通过后**不可更改** —— 别手打, 用这里的默认值。
+    # 注: Publisher 的 GUID 是**账号级**的, 与 danqing-pomodoro 同一个。
+    [string]$PublisherCN = "CN=5F2A7EA5-3366-4B8A-8C0D-3BE22575711A",
+    [string]$AppName = "14uncle.57340CE8CAE9E",
     [string]$DisplayName = "丹青日志 LogLens",
     [string]$PublisherDisplayName = "14uncle",
     [string]$Description = "大文件日志 / JSONL 查看分析器 —— 秒开 1GB, 级别计数一键筛",
