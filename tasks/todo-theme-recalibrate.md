@@ -144,9 +144,45 @@ lib, 后面的集成测试从没被计入。用 `--no-fail-fast` 才看全: 基�
 **这一条把模块 3 从「打磨」抬成了「结构性前提」**: 立项意图里写的是
 「浅色暗色都做」, 而按现在的框架模型, 除标题栏外**没有任何组件能跟随运行时切换**。
 
-**用户裁定 (2026-09-13)**: `Tabs` **不单独补**, 并进模块 3 一起做
-—— 该一次想清楚「哪些组件需要、用什么形式」, 只补 `Tabs` 一个等于把同一个坑
-留给下一个组件。已同步改写 `SPEC-ui-redesign.md` §3 的模块 3 条目。
+**用户裁定 (2026-09-13)**: 先做「结构性」这部分, 并**一次想清楚形式**,
+不要只补 `Tabs` 一个把同一个坑留给下一个组件。已同步改写
+`SPEC-ui-redesign.md` §3 的模块 3 条目。
+
+- [x] **T6: `Tabs` / `Dropdown` 补 per-frame 主题绑定** ✅ 2026-09-13
+  - **形式 (有意统一, 别再发明第二种)**: 沿用 `TitleBar::bind_theme` 的同一形状
+    `bind_theme<S: 'static, T: Theme + 'static>(f: impl Fn(&S) -> T)`。
+    颜色子集各抽私有结构 (`TabColors` / `DropdownColors`) + 一个
+    `from_theme(&impl Theme)`, **`new`/`themed` 与 `bind_theme` 共用这一份** ——
+    两处各写一套口径正是本仓漂过的典型。
+    度量 (字号/高度/圆角/间距) **不刷新** —— 两主题这些值本来就相同, 且动它会牵动布局。
+  - **`Dropdown` 的另一处**: `Dropdown::new()` **内部硬编码 `LightTheme`**
+    (`dropdown.rs`), 暗色下用 `new()` 建出来的下拉框整个是浅色 —— 比「不跟随切换」
+    更早一层。产品改成挂绑定。
+  - 产品侧接入: 设置卡的 `Tabs` 与主题 `Dropdown` 各挂 `.bind_theme(|app| app.theme.theme())`。
+  - 回归锁 `settings_card_tabs_follow_theme_switch`: **先红** —— 报
+    「还剩 **5 处**暗色 text_secondary」, 补完两处绑定后归 **0**。
+    断言刻意用「**旧主题的色一个不剩**」而非「新主题的色存在」: 卡里另有别的
+    `Text` 绑着同一支 token, 用「存在」判会**永真** (本会话已吃过一次这亏)。
+  - Files: `danqing/src/widget/view/tabs.rs`、`danqing/src/widget/form/dropdown.rs`
+    (+ 本仓 `src/settings.rs`)
+  - 结果: 框架 lib 578 绿 / 本仓 **104 绿** (51 + 45 + 8); fmt / clippy 零警告
+
+### 仍未补的组件 (按需, 形式照 T6)
+
+`Box` 有 `bind_color` 可用; 仍只有构造态的是 `Button` / `TextInput` / `TextArea` /
+`Overlay` / `Scrollable` / `Switch` / `IconInput`。
+**判定「哪些还需要」属模块 3** —— 不要一次全补, 补的是产品真正踩到的。
+
+### 落地链 ✅ 2026-09-13
+
+- 框架两笔: `e84798f` (token 重校 + 补修漏掉的集成测试)、`435ad14` (Tabs/Dropdown 绑定)
+  → push `dev` (`e30c00a..435ad14`)
+- 本仓: `416bc2c` / `865daa6` / `85eb7b1` / `b074bf6` / `97af5bb` → push `dev`
+- `rm .cargo/config.toml` 关 patch → `cargo check` 实测从 GitHub 拉
+  `Compiling danqing v0.1.0 (https://github.com/14uncle/danqing#435ad147)`
+- `Cargo.lock` 钉 `danqing#435ad147b4f869185616b64a05b2e5cf6eb09b49`
+  (`danqing-logfile#baee0a8b…` 未动)
+- 对钉住的 rev 重跑三件套: fmt / clippy 零警告 + 本仓 104 绿
 
 ### Checkpoint A: 真机截图过审 (用户)
 

@@ -111,6 +111,11 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                         // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
                         // 第一页更省事), 且 Esc/点遮罩关闭不丢。
                         .bind(|app: &LogApp| app.settings_tab)
+                        // 页签**颜色**必须每帧重取 —— `Tabs::new(&t)` 是构造值,
+                        // 不挂这个绑定的话切主题时页签名会停在旧主题色
+                        // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
+                        // 回归锁: `settings_card_tabs_follow_theme_switch`。
+                        .bind_theme(|app: &LogApp| app.theme.theme())
                         .on_change(Msg::SelectSettingsTab),
                 ),
         ))
@@ -275,6 +280,9 @@ fn theme_dropdown() -> impl Widget {
             Dropdown::new(AppTheme::options())
                 .width(120.0)
                 .bind_selected(|app: &LogApp| app.theme.index())
+                // `Dropdown::new` 内部硬编码 `LightTheme` (dropdown.rs) ——
+                // 构造态颜色同样是烘死的, 必须挂绑定才会跟着切主题走。
+                .bind_theme(|app: &LogApp| app.theme.theme())
                 .on_select(Msg::SelectTheme),
         )
 }
@@ -571,6 +579,50 @@ mod tests {
             .layout(Constraints::loose(Size::new(300.0, 100.0)), &mut texts)
             .height;
         assert_eq!(h, VERSION_ROW_H);
+    }
+
+    /// 切主题后**设置卡里的页签栏文字色也要跟着变**。
+    ///
+    /// 页签栏是 `Tabs`, 它原本**只有 `bind(active_index)`, 没有任何主题绑定** ——
+    /// 构造时烘死的 4 个色不随切换而变: 浅色启动切暗色, 未选中页签名会用浅色主题的
+    /// 深灰压在暗色卡面上, 读不了。
+    ///
+    /// 断言用「**旧主题的色必须一个不剩**」而不是「新主题的色存在」:
+    /// 卡里另有别的 `Text` 绑着同一支 token (版本行 / 快捷键说明), 它们本来就对,
+    /// 拿「存在」判会**永真**。本会话已经吃过一次「断言根本不会失败」的亏。
+    #[test]
+    fn settings_card_tabs_follow_theme_switch() {
+        use danqing::theme::DarkTheme;
+
+        let mut card = settings_card(AppTheme::Dark); // 构造用暗色
+        let mut light_app = crate::LogApp::new_empty();
+        light_app.theme = AppTheme::Light; // 每帧状态是浅色
+        card.sync(&light_app);
+
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 600.0)), &mut texts);
+        card.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        let stale = DarkTheme.text_secondary();
+        let stale = [
+            srgb_to_linear(stale.r),
+            srgb_to_linear(stale.g),
+            srgb_to_linear(stale.b),
+        ];
+        let left = texts
+            .instance_colors()
+            .iter()
+            .filter(|c| {
+                (c.r - stale[0]).abs() < 1e-3
+                    && (c.g - stale[1]).abs() < 1e-3
+                    && (c.b - stale[2]).abs() < 1e-3
+            })
+            .count();
+        assert_eq!(
+            left, 0,
+            "切到浅色后卡里不该还剩暗色主题的 text_secondary —— 有 {left} 处即页签栏没挂 bind_theme"
+        );
     }
 
     /// 设置卡底色必须**每帧**从应用状态重取 —— 与标题栏同款的坑。
