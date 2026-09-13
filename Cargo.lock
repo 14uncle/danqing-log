@@ -854,7 +854,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "danqing"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing#47a5537756fa90ba679d4ac9e08d2a3a86647c16"
+source = "git+https://github.com/14uncle/danqing#db050de70ceb17da11460f2467cd8a3f399e0341"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -890,7 +890,7 @@ source = "git+https://github.com/14uncle/danqing-encoding#d86741caee0ab102cb8d6d
 
 [[package]]
 name = "danqing-log"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "danqing",
