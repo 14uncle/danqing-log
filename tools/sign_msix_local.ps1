@@ -27,7 +27,7 @@ param(
     # 用真实标识 (而非另造一个测试值) 是有意的: 侧载测的就是将来提交的那个包,
     # 包标识一致, shell 的图标缓存 / AUMID 行为才与商店用户看到的一样。
     [string]$PublisherCN = "CN=5F2A7EA5-3366-4B8A-8C0D-3BE22575711A",
-    [string]$AppName = "14uncle.57340CE8CAE9E",
+    [string]$AppName = "14uncle.LogLens",
     [string]$PfxPassword = "sideload"
 )
 

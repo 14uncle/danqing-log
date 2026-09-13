@@ -21,9 +21,12 @@ param(
     [string]$OutDir = "..\release-archives\log\msix",
     # Partner Center 真实标识 (2026-09-13 回填, 应用和游戏 -> 产品标识 页)。
     # 三个值**区分大小写、逐字符**匹配, 首次提交通过后**不可更改** —— 别手打, 用这里的默认值。
-    # 注: Publisher 的 GUID 是**账号级**的, 与 danqing-pomodoro 同一个。
+    # 注: Publisher 的 GUID 是**账号级**的 (与 danqing-pomodoro 同一个), 改产品名不影响它。
+    # Name 曾预留为 `14uncle.57340CE8CAE9E` (显示名「丹青-日志」), 同日改用本名 ——
+    # 理由: 窗口标题 / README / 仓库 / 包内全叫「丹青日志 LogLens」, 只有商店页另叫一个名
+    # 就是本仓一直在打的「同一内容写两处然后漂了」。未发布时改是白改, 发布后就贵了。
     [string]$PublisherCN = "CN=5F2A7EA5-3366-4B8A-8C0D-3BE22575711A",
-    [string]$AppName = "14uncle.57340CE8CAE9E",
+    [string]$AppName = "14uncle.LogLens",
     [string]$DisplayName = "丹青日志 LogLens",
     [string]$PublisherDisplayName = "14uncle",
     [string]$Description = "大文件日志 / JSONL 查看分析器 —— 秒开 1GB, 级别计数一键筛",
