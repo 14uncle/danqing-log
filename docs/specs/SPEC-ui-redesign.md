@@ -141,11 +141,21 @@
   「量 token」改成「量渲染后」。**含 alpha 重校**（模块 1 改了混合空间）。
 - **`danqing:component-polish`** — TitleBar / Tabs / Dropdown / Overlay / TextInput
   的默认观感与 token 对齐。
-- **`log:token-completion`** — 清 `view.rs` 的 `level_color`/`status_color`/`cell_color`
-  兜底近黑、`*_fg` 写死色板、`header_line()` 恒用 `LightTheme.divider()`、
-  `Bar::base_input()` 写死浅色主题、书签金、`title_theme()` 写死调色板（含浅色分支
-  accent 是蓝色 `0.18,0.35,0.60`、与框架玉色 `#0F766E` 不是一套）、
-  `histogram.rs` 初值、`main.rs:1441` clear_color。
+- **`log:token-completion`** — 暗色全链路接完。**范围已于 2026/09/13 逐条核过代码后
+  改写**（原写「12 条残留 + 新发现 4 条」是**错的**：那 12 条里 8 条早已完成,
+  清单停在上一轮结束时）。实际只剩五项 **R1–R5**:
+
+  | | 内容 |
+  |---|---|
+  | **R1** | **`clear_color` 从不跟随主题** —— `main.rs:1441` 写死浅色, 全仓**零处** `set_clear_color`。启动时 `:297` 已读出主题却不采纳, 运行时 `SelectTheme` 也不发通知。标题栏那条亮带**就是它**（框架 `TitleBar` 背景是有意的 `TRANSPARENT`）。**旧清单里根本没有这一条。** |
+  | **R2** | 过滤/搜索栏 ``Bar::base_input()`` 写死浅色主题 + 四个可见色全写死。**需框架加 `TextInput::set_theme`** —— 该组件把主题摊平成字段且无 setter, 跨帧持编辑状态的控件无换主题路径 |
+  | **R3** | `header_line()` 恒用 `LightTheme.divider()` |
+  | **R4** | 书签金 `0.75,0.60,0.10` 写死（旧清单 #7） |
+  | **R5** | `title_theme()` 调色板手抄, 且与 `SPEC-dark-theme.md:168-195` 定稿不符（浅色 accent 是**蓝**, 非框架玉色） |
+
+  **已不在此列**（旧清单 #1–#4 / #8 / #10–#12, 均已完成）、
+  `*_fg` 语义色板（**用户明令本轮不动**, 其暗色可读性转模块 2）。
+  执行计划: `tasks/plan-token-completion.md` + `tasks/todo-token-completion.md`。
 - **`log:layout-rhythm`** — 层次 / 对齐 / 间距节奏 / 分区方式。**密度不变**
   （用户原话「不允许」）。**须先过设计提案门**。
 
@@ -186,6 +196,9 @@
 
 ## 6. 变更记录
 
+- **2026/09/13 (模块 4 摸底)**: 模块 1 落地后对模块 4 逐条核代码, 发现 §3 原写的
+  「12 条残留」**是错的**（8 条已完成）, 已改写为 R1–R5 五项; 并补入旧清单从未列过的
+  `clear_color`（标题栏亮带真因）。执行计划 `tasks/plan-token-completion.md` 待批。
 - **2026/09/13**: 用户批准模块地图（1→2→(3∥4)→5）；批准 `color-pipeline` plan
   及 AD1（CPU 侧转换）/ AD2（`LinearRgba` newtype）。Open Q1/Q3 定案（见上）。
   执行计划落 `tasks/plan-color-pipeline.md` + `tasks/todo-color-pipeline.md`。
