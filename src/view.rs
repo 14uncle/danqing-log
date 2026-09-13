@@ -79,6 +79,26 @@ const CLICK_DIST: f32 = 4.0;
 fn header_line<T: Theme>(th: &T) -> Color {
     th.divider()
 }
+/// 展开块底色 —— 比内容区底**略深**一档, 把子行与真实行分开。
+///
+/// 展开的子行原先与真实行**长得一模一样** (只差没有行号), 用户分不清
+/// 「这坨是第 1 行展开的」还是「又是几行日志」。
+///
+/// **产品语义, 放产品侧** (框架没有「展开块」这个概念), 与 `bookmark_color`
+/// 同一处理 —— 不扩公开 `Theme` trait。SPEC §3 原写「本模块必须给框架加 token」,
+/// 那是基于当时以为要**两个**不透明底色 (内容区 + 展开块) 的判断;
+/// 用户 2026-09-13 把范围收窄到只剩这一件事后, 那条结论不再成立。
+/// 回归锁 `expand_block_bg_is_a_slightly_darker_step_in_both_themes`。
+fn expand_block_bg(theme: crate::config::AppTheme) -> Color {
+    match theme {
+        // 白底 (#F0F8F6) 上略深一档 —— 仍留冷青调, 与主题同温。
+        crate::config::AppTheme::Light => Color::from_srgb8(0xE4, 0xEE, 0xEA),
+        // 近黑底 (#191920) 上再深一档。**余地很窄**: 底色 L* 只有 9.04,
+        // 再深很快就到黑 —— 故取值偏保守, 具体手感待真机截图定 (设计提案门)。
+        crate::config::AppTheme::Dark => Color::from_srgb8(0x11, 0x11, 0x17),
+    }
+}
+
 /// 书签行号色 —— 两主题各一支金。
 ///
 /// **有意不套 `Theme::accent`**: accent 已经用于选中行 / 焦点边框 / 指示线,
@@ -638,7 +658,17 @@ impl Widget for LogView {
             // → 选中 (底色 + 左侧 3px 强调条) / hover (选中行不再叠 hover)
             let row_rect =
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
-            if table && i % 2 == 1 {
+            let (line_no, sub_off) = self.line_at(i);
+            let is_sub_row = sub_off > 0;
+            // 展开块底色**先铺** (2026-09-13): 子行原先与真实行长得一模一样 (只差
+            // 没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
+            // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
+            if is_sub_row {
+                rects.push_rect(row_rect, expand_block_bg(self.theme), 0.0);
+            }
+            if table && i % 2 == 1 && !is_sub_row {
+                // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
+                // 交替条纹会把它切碎、语义又糊回去。
                 rects.push_rect(row_rect, th.surface_variant(), 0.0);
             }
             if i == self.selected && !has_text_sel {
@@ -651,9 +681,8 @@ impl Widget for LogView {
             } else if i == self.hover_row.get() {
                 rects.push_rect(row_rect, th.surface_variant(), 0.0);
             }
-            let (line_no, sub_off) = self.line_at(i);
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
-            if sub_off > 0 {
+            if is_sub_row {
                 if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1)) {
                     let indent = (row.depth as f32 - 1.0) * 16.0;
                     let s = format!("{} = {}", row.label, row.value);
@@ -1593,6 +1622,26 @@ mod tests {
         assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
         let dbg = level_color(b"DEBUG cache miss", &LightTheme);
         assert!(dbg.r < 0.6, "DEBUG 判灰");
+    }
+
+    /// 展开块底色必须比内容区底**略深**, 且两个主题都要成立。
+    ///
+    /// 回归锁 (2026-09-13, 用户裁定「略深」): 展开的子行原先与真实行**长得一模一样**
+    /// (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
+    #[test]
+    fn expand_block_bg_is_a_slightly_darker_step_in_both_themes() {
+        for app in [
+            crate::config::AppTheme::Light,
+            crate::config::AppTheme::Dark,
+        ] {
+            let block = expand_block_bg(app);
+            let bg = app.theme().background();
+            assert_ne!(block, bg, "{app:?}: 展开块必须与内容区底区分得开");
+            assert!(
+                danqing::relative_luminance(block) < danqing::relative_luminance(bg),
+                "{app:?}: 用户裁定是**略深**, 不是略浅"
+            );
+        }
     }
 
     /// 书签行号色: 两主题各一支金, 且**不能**等于次级正文色。
