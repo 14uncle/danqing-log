@@ -375,13 +375,17 @@
   (PFX = `release-archives/log/msix/sideload-signing.pfx`, 20:28) —— 与被删的那个不是同一个。
   `CurrentUser\TrustedPeople` 已删; **`LocalMachine\TrustedPeople` 需提权, 待用户跑**
   (那条才是 MSIX 部署服务真正读的 —— 见 pomodoro 同文件「只认 LocalMachine」那条)。
-  另: 本机 `LocalMachine\TrustedPeople` 还躺着 **5 个 09-01 的 `CN=5F2A7EA5-…`**
-  (pomodoro 侧载期遗留, 同主题不同密钥), **未动** —— 属别仓遗留, 待用户裁。
-  **查证时差点踩雷**: 这 5 个里**有一个是 pomodoro 的在用证书**
-  (`19FA8DF1…` —— 拿 `release-archives/pomodoro/msix/sideload-signing.pfx` 开出来对上的),
+  另 (**2026-09-13 实测计数, 别凭印象**): `LocalMachine\TrustedPeople` 共 5 张 ——
+  在用两张 (`CFC2703D` 本仓 / `19FA8DF1` pomodoro)、本仓孤儿一张 (`61D8E83B`, 待提权删)、
+  pomodoro 的 09-01 遗留两张 (`9645DC09` / `038B9331`);
+  `CurrentUser\TrustedPeople` 剩 7 张 = 上述在用两张 + 同两张 09-01 遗留 +
+  另三张只有它有的旧指纹 (`D9848012` / `B696E9A9` / `2CD02DCD`)。
+  **都未动** —— 属别仓遗留, 待用户裁。
+  **查证时差点踩雷**: 09-01 那批里**有一张正是 pomodoro 的在用证书**
+  (`19FA8DF1` —— 拿 `release-archives/pomodoro/msix/sideload-signing.pfx` 开出来对上的),
   **不能整批删**, 删了 pomodoro 再侧载就是 `0x800B0109`。
-  **同主题多张证书时, 只能靠 PFX 对指纹认亲, 不能靠主题认**。
-  通用做法: 各仓 `release-archives/<产品>/msix/sideload-signing.pfx` 开出来的指纹 = 该仓在用的那张
+  **同主题多张时只能靠 PFX 对指纹认亲, 不能靠主题认** ——
+  各仓 `release-archives/<产品>/msix/sideload-signing.pfx` 开出来的指纹 = 该仓在用的那张
   **本机 `Cert:` PSDrive 不可用** (Security 模块加载失败), 查/删证书一律走 `certutil`
   (`certutil -user -store My` / `-delstore TrustedPeople <sha1>`), 输出经 `iconv -f GBK` 才是中文
 - push 状态 (2026-09-13 收尾批后): 本仓 `dev` **已推** (`2589d47` 截图同源核实 + 本笔收尾批),
