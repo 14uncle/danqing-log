@@ -1235,12 +1235,16 @@ impl Bar {
     }
 
     fn base_input() -> TextInput {
+        // 输入色**不写死**: 原先这里钉了 `themed(&LightTheme)` 加三个写死色
+        // (正文 0.20 / 光标 0.10 / 选区), 空态看不出来 (占位色是中性灰, 两个主题
+        // 上都读得动), 一打字就露 —— 暗色下 (51,51,51) 压在栏底 (38,38,43) 上,
+        // WCAG 对比度 **1.19**, 等于看不见。
+        // 改成随主题走: 构造值只作首帧兜底, `bind_theme` 每帧重取。
+        // 回归锁: `filter_input_color_follows_theme`。
         TextInput::themed(&LightTheme)
+            .bind_theme(|app: &crate::LogApp| app.theme.theme())
             .font_size(FONT_SIZE)
             .chromeless()
-            .color(Color::rgb(0.20, 0.20, 0.20)) // filter_fg
-            .caret_color(Color::rgb(0.10, 0.10, 0.12)) // caret_fg
-            .selection_color(Color::rgba(0.24, 0.42, 0.66, 0.24)) // selection_bg
             .padding(Edges::symmetric(2.0, 0.0))
     }
 
@@ -1321,6 +1325,11 @@ impl Widget for Bar {
             ActiveBar::Search
         };
         self.theme = app.theme;
+
+        // 两个输入框是**字段**而非子节点, 框架不会替它们传播 sync ——
+        // 挂在 `TextInput` 上的 `bind_theme` 不手动踢一脚就不生效。
+        self.filter_ti.sync(state);
+        self.search_ti.sync(state);
 
         // 清空信号: revision 变化时原地 clear。
         if let Some(binding) = &self.filter_clear_binding {
@@ -1566,6 +1575,36 @@ mod tests {
         assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
         let dbg = level_color(b"DEBUG cache miss", &LightTheme);
         assert!(dbg.r < 0.6, "DEBUG 判灰");
+    }
+
+    /// 过滤/搜索栏的输入色必须跟着主题走。
+    ///
+    /// 回归锁 (2026-09-13): `base_input()` 曾写死 `TextInput::themed(&LightTheme)`
+    /// 加三个写死色 (正文 `0.20` / 光标 `0.10` / 选区)。**空态看不出来** ——
+    /// 占位色是中性灰, 在两个主题上都读得动 —— 所以这个问题一直藏到打字才发作:
+    /// 暗色下输入文字 (51,51,51) 压在栏底 (38,38,43) 上, WCAG 对比度 **1.19**。
+    ///
+    /// 断言用 `Bar::sync` 走一遍真实路径: 绑定挂在 `TextInput` 上,
+    /// 但 `Bar` 把它当字段持有, 框架不会替它传播 `sync` —— 漏调一样是白搭。
+    #[test]
+    fn filter_input_color_follows_theme() {
+        let mut bar = Bar::default();
+        let mut app = crate::LogApp::new_empty();
+        app.theme = crate::config::AppTheme::Dark;
+        bar.sync(&app);
+        assert_eq!(
+            bar.filter_ti.text_color(),
+            danqing::theme::DarkTheme.text_primary(),
+            "暗色主题下过滤栏输入文字应是该主题的正文色"
+        );
+
+        app.theme = crate::config::AppTheme::Light;
+        bar.sync(&app);
+        assert_eq!(
+            bar.search_ti.text_color(),
+            danqing::theme::LightTheme.text_primary(),
+            "切回浅色后搜索栏输入文字应跟着变"
+        );
     }
 
     #[test]
