@@ -55,11 +55,11 @@
 
 | # | 模块 id | 仓库 | 职责 | 依赖 | 状态 |
 |---|---------|------|------|------|------|
-| 1 | `danqing:color-pipeline` | danqing | 消除双重编码 + 收敛 `Color` 契约到单点 | — | **已可开工** |
-| 2 | `danqing:theme-recalibrate` | danqing | Light/Dark token 重校；对比度护栏改为量**渲染后**的值 | 1 | 待批 |
-| 3 | `danqing:component-polish` | danqing | TitleBar / Tabs / Dropdown / Overlay / TextInput 默认观感对齐 token | 2 | 待批 |
-| 4 | `log:token-completion` | danqing-log | 12 条残留 + 新发现 4 条，暗色全链路接完 | 2 | 待批 |
-| 5 | `log:layout-rhythm` | danqing-log | 层次 / 对齐 / 间距节奏 / 分区方式（**密度不变**） | 4 | **待设计提案** |
+| 1 | `danqing:color-pipeline` | danqing | 消除双重编码 + 收敛 `Color` 契约到单点 | — | ✅ **完成** |
+| 2 | `danqing:theme-recalibrate` | danqing | Light/Dark token 重校；对比度护栏改为量**渲染后**的值 | 1 | ✅ **完成**（Phase 3 收口 2026-09-13；浅色三支「面」token 的既有缺陷**另立待裁**, 见 `tasks/todo-theme-recalibrate.md` 附五） |
+| 3 | `danqing:component-polish` | danqing | 全框架控件补 per-frame 主题绑定（**范围已由 09-13 决议扩写**，原写 TitleBar/Tabs/Dropdown/Overlay/TextInput 五件） | 2 | ✅ **完成** |
+| 4 | `log:token-completion` | danqing-log | 12 条残留 + 新发现 4 条，暗色全链路接完 | 2 | ✅ **完成** |
+| 5 | `log:layout-rhythm` | danqing-log | 层次 / 对齐 / 间距节奏 / 分区方式（**密度不变**） | 4 | ✅ **完成**（T1/T2 机器 + 验收双绿） |
 
 **构建顺序**: 1 → 2 → （3 ∥ 4）→ 5
 
@@ -150,14 +150,13 @@
   `Handler` 不再重建)。因此**任何在 `view()` 里 `themed(&theme)` 构造的控件,
   都把主题色烘死在启动那一刻**, 运行中切主题不会变。
 
-  而全框架**只有 `TitleBar` 一个**提供了 per-frame 主题绑定
-  (`bind_theme`)。其余 `Box` / `Button` / `Dropdown` / `TextInput` / `TextArea` /
-  `Overlay` / `Scrollable` / `Switch` / `IconInput` **只有构造态 `themed()`**。
+  而全框架**初始只有 `TitleBar` 一个**提供了 per-frame 主题绑定
+  (`bind_theme`)。其余控件**只有构造态 `themed()`**。
 
   **已发生的两个实例**（均已修, 见 `tasks/todo-theme-recalibrate.md` 附二）:
   标题栏文字色停在启动主题（用户实机报「看不清」）; 设置卡底色停在启动主题。
 
-  **仍未解的一个**: 设置卡的 `Tabs` 烘死 `color_active: accent` /
+  **仍未解的一个（现已解决）**: 设置卡的 `Tabs` 烘死 `color_active: accent` /
   `color_inactive: text_secondary` 等 4 色 (`tabs.rs:108-111`), 且 **`Tabs`
   没有任何主题绑定可用**（只有 `bind(active_index)`）。浅色启动切暗色 →
   页签名用浅色主题的深灰压在暗色卡面上, **读不了**。
@@ -170,6 +169,31 @@
 
   **这条直接决定立项意图里「浅色暗色都做」能否成立** —— 现状是除标题栏外
   没有任何组件能跟随运行时切换。
+
+  ##### 决议与落地（2026-09-13）—— 逐组件补 `bind_theme`, 全框架扫一遍
+
+  采纳「逐个补 `bind_theme`」, 不做「主题源」（后者要改 `sync` 契约与全部调用点,
+  收益只是少写几个字段）。**统一形态**（照 `TitleBar::bind_theme`）:
+
+  > 私有 `XxxColors` struct（`from_theme(&impl Theme)` 单点解析）
+  > → struct 加 `theme_binding` 字段 → `themed()` 与 `bind_theme` **共用**
+  > `from_theme`（免得两处各写一套口径）→ `sync` 开头应用绑定。
+
+  **判定标准**（防滥补）: 一个控件需要 `bind_theme`, 当且仅当它**持有随主题变的
+  颜色**且**完全没有每帧通路**。已有 `bind_color` 的 `Box` / `Button`
+  **不再加第二个机制** —— 加了两条路会互相打架。
+
+  | 控件 | 结论 |
+  |---|---|
+  | `TitleBar` / `Tabs` / `Dropdown` / `TextInput` | ✅ 已补 |
+  | `Switch` / `TextArea` / `Overlay` / `Scrollable` / `IconInput` | ✅ 已补（2026-09-13 本轮） |
+  | `Box` / `Button` | ⛔ 有意不加 —— 已有 `bind_color` |
+
+  **一条查证结论, 免得后人重走**: `Overlay` 的 `scrim` 是**唯一**烘死也无害的
+  —— `Theme::scrim()` 默认**刻意与明暗无关**（固定 `rgba(0,0,0,0.35)`,
+  三个内置主题一致）。它的 `bind_theme` 属**对称性**补全, 不是修缺陷;
+  本仓 `settings.rs` 用了 `Overlay` 但**无需接**（接了是守一个不存在的问题）。
+  详见 `tasks/todo-theme-recalibrate.md` 附六。
 - **`log:token-completion`** — 暗色全链路接完。**范围已于 2026/09/13 逐条核过代码后
   改写**（原写「12 条残留 + 新发现 4 条」是**错的**：那 12 条里 8 条早已完成,
   清单停在上一轮结束时）。实际只剩五项 **R1–R5**:
@@ -271,6 +295,15 @@
 
 ## 6. 变更记录
 
+- **2026/09/13 (模块 2 Phase 3 + 模块 3 收口)**: 模块 3 由「五个具名控件」**扩写为
+  全框架扫描**, 并确立统一的 `bind_theme` 形态与**判定标准**（见 §3）; `Switch` /
+  `TextArea` / `Overlay` / `Scrollable` / `IconInput` 五件补齐, `Box`/`Button` 有意不加。
+  模块 2 Phase 3 落地上限守卫 `no_theme_renders_a_translucent_surface_as_a_slab`
+  （两个主题 × 三支半透明表面, **只卡上限**, 已做收紧阈值的有牙齿验证）;
+  「跨主题等量级守卫」**查实后决定不建**（会一上线就误报）。
+  两条查证结论落档: 浅色三支「面」token 是**既有**缺陷、**另立待裁**（附五）;
+  `Overlay` 的 scrim 烘死**无害**、`bind_theme` 属对称性（附六）。
+  模块地图五格状态同步为「完成」。
 - **2026/09/13 (模块 4 摸底)**: 模块 1 落地后对模块 4 逐条核代码, 发现 §3 原写的
   「12 条残留」**是错的**（8 条已完成）, 已改写为 R1–R5 五项; 并补入旧清单从未列过的
   `clear_color`（标题栏亮带真因）。执行计划 `tasks/plan-token-completion.md` 待批。
