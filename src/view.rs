@@ -79,6 +79,43 @@ const CLICK_DIST: f32 = 4.0;
 fn header_line<T: Theme>(th: &T) -> Color {
     th.divider()
 }
+// ============================ 内容区的「面」阶梯 ============================
+//
+// 表格区有六层「面」: 页面底 / 斑马 / 表头(含过滤栏) / hover / 选中 / 展开块。
+// **它们必须整体一起定** —— 各自单独调数值必然撞车 (2026-09-13 用户实机截图审查,
+// 一次照出两处撞车: 暗色表头↔斑马 Δ`L*` 0.08、浅色展开块↔斑马 0.19)。
+//
+// **判据是「对相邻面」, 不是「对页面底」。** 这是那次审查最重要的收获:
+// 记档里写的全是「对页面底 −3.68」这类数, 但屏幕上跟展开块挨着的**不是页面底,
+// 是斑马行** —— 对底合格、对邻居不合格, 于是它一直隐形。
+//
+// 各面的实测 `L*` (取色器从真机截图量的, 不是算的):
+//
+// ```text
+//            浅色             暗色
+//   页面底    96.95            9.04
+//   斑马      93.46 (−3.49)   12.48 (+3.44)
+//   表头      90.32 (−6.62)   18.14 (+9.10)
+//   hover     87.12 (−9.83)   24.21 (+15.17)
+//   选中      86.33 (−10.62)  29.69 (+20.65)
+//   展开块    83.07 (−13.88)   5.26 (−3.79)   ← 与底反向, 是「略深」
+// ```
+//
+// 这张表的每一步都是**解出来的**, 不是挑的: 每面须与页面底 ≥3、且两两 ≥3。
+//
+// 回归锁 `table_surfaces_are_separated_from_their_neighbours` (≥3.0 Δ`L*`)。
+//
+// **已知未达标的一对, 明写在此**: 浅色 hover ↔ 选中 只有 **0.79**。
+// 浅色那段可用明度区间养不起六个两两 ≥3 的面 —— 六个面最少要 15 个 `L*` 点,
+// 而近白底 (96.95) 到还能算「浅色 UI」的区间只剩约 14 点。
+// 二者的区分交给**第二条通道**: 选中是 accent 冷青、hover 是中性灰绿。
+// 真要拉平得重排整条阶梯 (含改框架的 `selection` α), 属独立决策, 没夹带。
+//
+// **暗色那段更窄, 窄到必须让表头往外走**: 底色 `L*` 只有 9.04, 而「底↔斑马↔表头」
+// 两点各要 3.0 就得 6.0 —— 原区间总共只有 6.30, 八个 8-bit 步长就吃掉了余量,
+// 取整后必有一个方向掉到 2.99。故把表头 (框架 `surface_variant`) 提到 +9.10。
+// ==========================================================================
+
 /// 斑马纹底色 —— 表格模式隔行一条, 只做**结构**提示 (「读到哪一行」)。
 ///
 /// **为什么要自己定而不是用 `surface_variant()`** (2026-09-13 用户实机报):
@@ -90,11 +127,17 @@ fn header_line<T: Theme>(th: &T) -> Color {
 /// 回归锁 `row_band_and_hover_are_separate_channels`。
 fn row_band_bg(theme: crate::config::AppTheme) -> Color {
     match theme {
-        // 白底往深走一档 (底色近白, 没有往上提的余地)。
+        // 白底往深走一档 (底色近白, 没有往上提的余地)。ΔL* −3.49。
         crate::config::AppTheme::Light => Color::from_srgb8(0xE6, 0xEE, 0xEC),
-        // 近黑底往亮走一档。此值与 `surface_variant()` 原本的渲染结果几乎相同
-        // (ΔL* +6.3) —— 模块 2 校准过的那条观感**保持不变**。
-        crate::config::AppTheme::Dark => Color::from_srgb8(0x26, 0x26, 0x2D),
+        // 近黑底往亮走一档, ΔL* +3.20。
+        //
+        // **2026-09-13 由 `#26262D` (Δ`L*` +6.38) 收到这里。** 原值是照
+        // `surface_variant()` **当时的**渲染结果取的 (「模块 2 校准过的那条
+        // 保持不变」), 但随后 `surface_variant` 自己被调到 +6.42 —— 两者撞成
+        // **Δ`L*` 0.08, 表头与斑马行完全同色**。收到 +3.20 后与表头差 3.10,
+        // 且顺带让暗色斑马的台阶 (3.20) 与浅色 (3.49) 对齐 —— 原值 6.38 是
+        // 浅色的近两倍, 两个主题本来就不一致。
+        crate::config::AppTheme::Dark => Color::from_srgb8(0x20, 0x20, 0x26),
     }
 }
 
@@ -106,7 +149,7 @@ fn row_band_bg(theme: crate::config::AppTheme) -> Color {
 /// 回归锁 `row_band_and_hover_are_separate_channels`。
 fn row_hover_bg(theme: crate::config::AppTheme) -> Color {
     match theme {
-        crate::config::AppTheme::Light => Color::from_srgb8(0xD6, 0xDE, 0xDC),
+        crate::config::AppTheme::Light => Color::from_srgb8(0xD4, 0xDC, 0xDA),
         crate::config::AppTheme::Dark => Color::from_srgb8(0x39, 0x39, 0x40),
     }
 }
@@ -123,9 +166,19 @@ fn row_hover_bg(theme: crate::config::AppTheme) -> Color {
 /// 回归锁 `expand_block_bg_is_a_slightly_darker_step_in_both_themes`。
 fn expand_block_bg(theme: crate::config::AppTheme) -> Color {
     match theme {
-        // 白底 (#F0F8F6) 上略深一档 —— 仍留冷青调, 与主题同温。
-        crate::config::AppTheme::Light => Color::from_srgb8(0xE4, 0xEE, 0xEA),
-        // 近黑底 (#191920) 上再深一档。**余地很窄**: 底色 L* 只有 9.04,
+        // 白底 (#F0F8F6) 上深一档, ΔL* −13.95 —— 仍留冷青调, 与主题同温。
+        //
+        // **2026-09-13 由 `#E4EEEA` (Δ`L*` −3.68) 加深到这里。** 原值是对
+        // **页面底**取得的, 而表格里紧挨着展开块的**是斑马行** —— 对斑马只有
+        // Δ`L*` **0.19**, 等于没画。T1 想解决的「分不清这坨是展开的还是又几行
+        // 日志」, 在浅色下一直没解决 (暗色对斑马是 10.17, 所以只有浅色坏)。
+        //
+        // 加深多少**不是挑出来的, 是解出来的**: 展开块必须与斑马 (−3.49)、
+        // 表头 (−7.00)、hover (−9.12)、选中 (−10.62) 各差 ≥3。解空间只有
+        // **≤ −13.62** 或 **≥ +2.8** 两段, 中间是空的 —— 原值 −3.68 正掉在空档里。
+        // 用户裁定「保持略深」, 故取深井那一支。
+        crate::config::AppTheme::Light => Color::from_srgb8(0xC8, 0xD1, 0xCD),
+        // 近黑底 (#191920) 上再深一档, ΔL* −3.79。**余地很窄**: 底色 L* 只有 9.04,
         // 再深很快就到黑 —— 故取值偏保守, 具体手感待真机截图定 (设计提案门)。
         crate::config::AppTheme::Dark => Color::from_srgb8(0x11, 0x11, 0x17),
     }
@@ -1872,6 +1925,77 @@ mod tests {
                 "{app:?}: 用户裁定是**略深**, 不是略浅"
             );
         }
+    }
+
+    /// 合成后亮度的 `L*` (输入是 [`composited_luminance`] 的输出)。
+    fn l_star_of(y: f32) -> f32 {
+        if y > 0.008856 {
+            116.0 * y.powf(1.0 / 3.0) - 16.0
+        } else {
+            903.3 * y
+        }
+    }
+
+    /// **表格各「面」必须与相邻面拉开 ≥3 Δ`L*`** —— 这一轮最重要的一条锁。
+    ///
+    /// 触发 (2026-09-13, 用户发真机截图要我做整体审查): 一次照出**两处撞车**——
+    /// 暗色表头 ↔ 斑马 `ΔL*` **0.08**、浅色展开块 ↔ 斑马 **0.19**。两处都
+    /// 「对页面底完全合格」(6.30 / −3.68), 所以既有的那些锁一条都没红。
+    ///
+    /// **根因是判据错了, 不是取值偏了**: 记档里所有台阶都是相对**页面底**量的,
+    /// 但屏幕上跟展开块挨着的不是页面底、是**斑马行**。所以本锁只问邻居:
+    ///
+    /// - 每个面与**页面底** ≥3 (自己得看得见)
+    /// - **两两之间** ≥3 (挨着时得分得开)
+    ///
+    /// **已知例外 (明写在案, 不是漏掉)**: 浅色 `hover` ↔ `选中` 只有 **1.50**。
+    /// 浅色那段可用明度区间养不起六个两两 ≥3 的面 (六个最少要 15 个点, 而近白底
+    /// 到「还能算浅色 UI」只剩约 14 点), 故这一对**不锁** —— 它们的区分交给第二条
+    /// 通道 (选中是 accent 冷青、hover 是中性灰绿)。要真拉平得重排整条阶梯。
+    #[test]
+    fn table_surfaces_are_separated_from_their_neighbours() {
+        const MIN: f32 = 3.0;
+
+        fn check(app: crate::config::AppTheme) {
+            let th = app.theme();
+            let bg = th.background();
+            let base = l_star_of(danqing::relative_luminance(bg));
+            let l = |c: Color| l_star_of(composited_luminance(c, bg));
+
+            let surfaces = [
+                ("页面底", base),
+                ("斑马", l(row_band_bg(app))),
+                ("表头", l(th.surface_variant())),
+                ("hover", l(row_hover_bg(app))),
+                ("选中", l(th.selection())),
+                ("展开块", l(expand_block_bg(app))),
+            ];
+
+            for (name, v) in &surfaces[1..] {
+                assert!(
+                    (v - base).abs() >= MIN,
+                    "{app:?}: {name} 对页面底 ΔL* 只有 {:.2} < {MIN} —— 自己就看不见",
+                    (v - base).abs()
+                );
+            }
+            for i in 1..surfaces.len() {
+                for j in (i + 1)..surfaces.len() {
+                    let (na, va) = surfaces[i];
+                    let (nb, vb) = surfaces[j];
+                    // 已知例外: 浅色 hover ↔ 选中 (见文档注释)。
+                    if na == "hover" && nb == "选中" && app == crate::config::AppTheme::Light {
+                        continue;
+                    }
+                    assert!(
+                        (va - vb).abs() >= MIN,
+                        "{app:?}: {na} ↔ {nb} 的 ΔL* 只有 {:.2} < {MIN} —— 挨在一起时分不开",
+                        (va - vb).abs()
+                    );
+                }
+            }
+        }
+        check(crate::config::AppTheme::Light);
+        check(crate::config::AppTheme::Dark);
     }
 
     /// 书签行号色: 两主题各一支金, 且**不能**等于次级正文色。
