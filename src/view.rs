@@ -79,6 +79,38 @@ const CLICK_DIST: f32 = 4.0;
 fn header_line<T: Theme>(th: &T) -> Color {
     th.divider()
 }
+/// 斑马纹底色 —— 表格模式隔行一条, 只做**结构**提示 (「读到哪一行」)。
+///
+/// **为什么要自己定而不是用 `surface_variant()`** (2026-09-13 用户实机报):
+/// 那支 token 同时被 hover 用着, 两者同色会撞车 —— 悬停奇数行时颜色完全不变,
+/// 悬停偶数行时 hovered 行与左右斑马行连成一片。浅色更糟: 该 token 是
+/// **不透明色** `#EEF6F2`, 与底色 `#F0F8F6` 只差 2/255 (Δ`L*` −0.74), 等于没有。
+///
+/// 与 `bookmark_color` / `expand_block_bg` 同一处理: **产品语义放产品侧**。
+/// 回归锁 `row_band_and_hover_are_separate_channels`。
+fn row_band_bg(theme: crate::config::AppTheme) -> Color {
+    match theme {
+        // 白底往深走一档 (底色近白, 没有往上提的余地)。
+        crate::config::AppTheme::Light => Color::from_srgb8(0xE6, 0xEE, 0xEC),
+        // 近黑底往亮走一档。此值与 `surface_variant()` 原本的渲染结果几乎相同
+        // (ΔL* +6.3) —— 模块 2 校准过的那条观感**保持不变**。
+        crate::config::AppTheme::Dark => Color::from_srgb8(0x26, 0x26, 0x2D),
+    }
+}
+
+/// 行 hover 底色 —— 指针所在行, 必须**一眼看出是它**。
+///
+/// 台阶刻意比斑马**大一档** (浅色 Δ`L*` −9.1 / 斑马 −3.5; 暗色 +15.2 / 斑马 +6.4),
+/// 这样无论 hover 到奇数行还是偶数行, 与相邻斑马行都拉得开 —— 原先两者共用
+/// `surface_variant()`, 三行会连成一整块。
+/// 回归锁 `row_band_and_hover_are_separate_channels`。
+fn row_hover_bg(theme: crate::config::AppTheme) -> Color {
+    match theme {
+        crate::config::AppTheme::Light => Color::from_srgb8(0xD6, 0xDE, 0xDC),
+        crate::config::AppTheme::Dark => Color::from_srgb8(0x39, 0x39, 0x40),
+    }
+}
+
 /// 展开块底色 —— 比内容区底**略深**一档, 把子行与真实行分开。
 ///
 /// 展开的子行原先与真实行**长得一模一样** (只差没有行号), 用户分不清
@@ -669,7 +701,7 @@ impl Widget for LogView {
             if table && i % 2 == 1 && !is_sub_row {
                 // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
                 // 交替条纹会把它切碎、语义又糊回去。
-                rects.push_rect(row_rect, th.surface_variant(), 0.0);
+                rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
             }
             if i == self.selected && !has_text_sel {
                 rects.push_rect(row_rect, th.selection(), 0.0);
@@ -679,7 +711,9 @@ impl Widget for LogView {
                     0.0,
                 );
             } else if i == self.hover_row.get() {
-                rects.push_rect(row_rect, th.surface_variant(), 0.0);
+                // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
+                // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
+                rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
             }
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
             if is_sub_row {
@@ -1622,6 +1656,37 @@ mod tests {
         assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
         let dbg = level_color(b"DEBUG cache miss", &LightTheme);
         assert!(dbg.r < 0.6, "DEBUG 判灰");
+    }
+
+    /// 斑马纹与 hover 必须是**两个通道** —— 原先两者共用 `th.surface_variant()`。
+    ///
+    /// 回归锁 (2026-09-13, 用户实机报): 同色的后果是
+    /// **悬停奇数行时颜色完全不变**; **悬停偶数行时** hovered 行与左右两条斑马行
+    /// 变成同一色, **三行连成一整块**, 读不出指针在哪行。浅色还额外糟一层 ——
+    /// `surface_variant()` 在浅色下 Δ`L*` 只有 **−0.74** (差 2/255), hover 基本看不见。
+    ///
+    /// 断言三件事: 两两不同 (与底色也不同)、**hover 的台阶必须大于斑马的**
+    /// (否则「进到哪一行」读不出来)。
+    #[test]
+    fn row_band_and_hover_are_separate_channels() {
+        for app in [
+            crate::config::AppTheme::Light,
+            crate::config::AppTheme::Dark,
+        ] {
+            let bg = danqing::relative_luminance(app.theme().background());
+            let band = danqing::relative_luminance(row_band_bg(app));
+            let hover = danqing::relative_luminance(row_hover_bg(app));
+            assert_ne!(
+                band, hover,
+                "{app:?}: 斑马与 hover 不能同色 (同色即三行连片)"
+            );
+            assert_ne!(band, bg, "{app:?}: 斑马要与底色分得开");
+            assert_ne!(hover, bg, "{app:?}: hover 要与底色分得开");
+            assert!(
+                (hover - bg).abs() > (band - bg).abs(),
+                "{app:?}: hover 的台阶必须大于斑马的 ({hover:.5} vs {band:.5}, 底 {bg:.5})"
+            );
+        }
     }
 
     /// 展开块底色必须比内容区底**略深**, 且两个主题都要成立。
