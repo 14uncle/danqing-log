@@ -146,25 +146,104 @@ fn bookmark_color(theme: crate::config::AppTheme) -> Color {
     }
 }
 
-/// INFO / 3xx 蓝。
-pub(crate) fn info_fg() -> Color {
-    Color::rgb(0.22, 0.46, 0.74)
+/// 语义色板 (级别/状态着色): **两套, 按底色明暗选**。
+///
+/// 原先这五支是写死的常量, 且清一色是「浅底上的深饱和色」—— 那是**只对浅色成立**
+/// 的取值。暗色下它们压近黑底 (2026-09-13 实测, 对底 `#191920`):
+/// ERROR **3.03** / INFO 3.70 / OK 4.28 / WARN 5.10 / DEBUG 5.46 ——
+/// 除后两支外**全部低于 WCAG AA (4.5)**。用户实机报「ERROR 色看得眼花」,
+/// 一半是这个原因, 另一半是选区带 (见 `danqing` 的
+/// `selection_band_does_not_step_too_far_from_the_background`)。
+///
+/// 暗色那一套按实测挑: 换完后 ERROR 6.32 / WARN 10.47 / OK 10.03 / INFO 6.88 /
+/// DEBUG 6.89, 全部过 AA。
+///
+/// **为什么不扩 `Theme` trait**: 级别/状态是**日志语义**, 不是通用设计 token
+/// (与 [`bookmark_color`] 同一条判据)。放产品侧。
+///
+/// **为什么按底色亮度选而不是按 [`crate::config::AppTheme`] 匹配**: 这五支要压的
+/// 是**底色**, 判据就是「它够不够亮能承受深饱和色」。写死成对 `AppTheme` 的 match,
+/// 等于把这个事实编码成一个人工表, 将来加第三个主题还得记得回来改。
+/// 阈值 0.5 落在两个内置主题的巨大空档里 (浅色底 `L` ≈ 0.93, 暗色底 ≈ 0.010)。
+///
+/// **浅色有两条口径, 且它们不一样 —— 这是查出来的, 不是设计出来的。**
+/// 「整行着色」与「单元格着色」原先各写了一套字面量, 差得不小 (实测 `ΔE76`:
+/// ERROR 3.43 / WARN 4.15 / DEBUG 1.65, JND ≈ 2.3 —— 前两支**可感知**)。
+/// 本轮**原样保留**, 因为用户对浅色的指示是「现值一行不动」, 而这是既有观感、
+/// 用户验收过。合并与否是独立决策, 别顺手做掉。
+/// 暗色是全新的, 没有历史包袱, 故两条路径共用一套。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LevelPalette {
+    /// ERROR / FATAL / 5xx。
+    pub(crate) error: Color,
+    /// WARN / 4xx。
+    pub(crate) warn: Color,
+    /// 2xx。
+    pub(crate) ok: Color,
+    /// INFO / 3xx。
+    pub(crate) info: Color,
+    /// DEBUG / TRACE。
+    pub(crate) trace: Color,
 }
-/// 2xx 绿。
-fn ok_fg() -> Color {
-    Color::rgb(0.16, 0.56, 0.32)
+
+impl LevelPalette {
+    /// 浅色 · **整行着色**口径 (原 `level_color` 里的字面量) —— 原值原样。
+    pub(crate) fn light_line() -> Self {
+        Self {
+            error: Color::rgb(0.75, 0.18, 0.18),
+            warn: Color::rgb(0.70, 0.50, 0.08),
+            ok: Color::rgb(0.16, 0.56, 0.32),
+            info: Color::rgb(0.22, 0.46, 0.74),
+            trace: Color::rgb(0.55, 0.55, 0.58),
+        }
+    }
+
+    /// 浅色 · **单元格/状态**口径 (原 `*_fg()` 函数) —— 原值原样。
+    pub(crate) fn light_cell() -> Self {
+        Self {
+            error: Color::rgb(0.76, 0.21, 0.21),
+            warn: Color::rgb(0.72, 0.50, 0.02),
+            ok: Color::rgb(0.16, 0.56, 0.32),
+            info: Color::rgb(0.22, 0.46, 0.74),
+            trace: Color::rgb(0.56, 0.56, 0.60),
+        }
+    }
+
+    /// 暗色底一套 —— 提亮到近 `400` 档 (Tailwind 色阶的亮度区间)。
+    /// **两条路径共用这一套**: 上面那点分叉是历史遗留, 不值得在暗色里复刻。
+    pub(crate) fn dark() -> Self {
+        Self {
+            error: Color::from_srgb8(0xF8, 0x71, 0x71),
+            warn: Color::from_srgb8(0xFB, 0xBF, 0x24),
+            ok: Color::from_srgb8(0x4A, 0xDE, 0x80),
+            info: Color::from_srgb8(0x60, 0xA5, 0xFA),
+            trace: Color::from_srgb8(0x9C, 0xA3, 0xAF),
+        }
+    }
+
+    /// 按底色亮度挑一套 (整行着色口径)。`th` 只用于判断明暗 —— 色板与主题无关。
+    pub(crate) fn for_line<T: Theme>(th: &T) -> Self {
+        if is_dark_background(th) {
+            Self::dark()
+        } else {
+            Self::light_line()
+        }
+    }
+
+    /// 按底色亮度挑一套 (单元格/状态口径)。
+    pub(crate) fn for_cell<T: Theme>(th: &T) -> Self {
+        if is_dark_background(th) {
+            Self::dark()
+        } else {
+            Self::light_cell()
+        }
+    }
 }
-/// WARN / 4xx 琥珀。
-pub(crate) fn warn_fg() -> Color {
-    Color::rgb(0.72, 0.50, 0.02)
-}
-/// ERROR / 5xx 红。
-pub(crate) fn err_fg() -> Color {
-    Color::rgb(0.76, 0.21, 0.21)
-}
-/// DEBUG / TRACE 灰。
-pub(crate) fn trace_fg() -> Color {
-    Color::rgb(0.56, 0.56, 0.60)
+
+/// 底色算不算「暗」—— 阈值 0.5 落在两个内置主题的巨大空档里
+/// (浅色底 `L` ≈ 0.93, 暗色底 ≈ 0.010)。
+fn is_dark_background<T: Theme>(th: &T) -> bool {
+    danqing::relative_luminance(th.background()) < 0.5
 }
 
 /// 日志级别着色: 行前 200 字节内找级别关键字 (日志行级别几乎都在行首)。
@@ -174,12 +253,13 @@ fn level_color<T: Theme>(line: &[u8], th: &T) -> Color {
     let head = &line[..line.len().min(200)];
     // 长词优先: FATAL 含 "AT" 之类子串碰撞无所谓 (都是错误级), 但 WARN 要先于 INFO 判
     let has = |pat: &[u8]| memchr::memmem::find(head, pat).is_some();
+    let pal = LevelPalette::for_line(th);
     if has(b"FATAL") || has(b"ERROR") {
-        Color::rgb(0.75, 0.18, 0.18)
+        pal.error
     } else if has(b"WARN") {
-        Color::rgb(0.70, 0.50, 0.08)
+        pal.warn
     } else if has(b"DEBUG") || has(b"TRACE") {
-        Color::rgb(0.55, 0.55, 0.58)
+        pal.trace
     } else {
         // 必须走 token: 这里原先写死近黑 `0.12` (= 浅色主题的正文色),
         // 修好双重 gamma 之后它在暗色背景上就是**真的近黑** —— 整列消失。
@@ -192,14 +272,15 @@ fn level_color<T: Theme>(line: &[u8], th: &T) -> Color {
 fn level_cell_color<T: Theme>(v: &str, th: &T) -> Color {
     let b = v.as_bytes();
     let has = |pat: &[u8]| memchr::memmem::find(b, pat).is_some();
+    let pal = LevelPalette::for_cell(th);
     if has(b"FATAL") || has(b"ERROR") {
-        err_fg()
+        pal.error
     } else if has(b"WARN") {
-        warn_fg()
+        pal.warn
     } else if has(b"INFO") {
-        info_fg()
+        pal.info
     } else if has(b"DEBUG") || has(b"TRACE") {
-        trace_fg()
+        pal.trace
     } else {
         th.text_primary() // 同 level_color: 写死近黑会在暗色下消失
     }
@@ -207,11 +288,12 @@ fn level_cell_color<T: Theme>(v: &str, th: &T) -> Color {
 
 /// status 列按首数字分段: 2xx 绿 / 3xx 蓝 / 4xx 琥珀 / 5xx 红。
 fn status_color<T: Theme>(v: &str, th: &T) -> Color {
+    let pal = LevelPalette::for_cell(th);
     match v.as_bytes().first() {
-        Some(b'2') => ok_fg(),
-        Some(b'3') => info_fg(),
-        Some(b'4') => warn_fg(),
-        Some(b'5') => err_fg(),
+        Some(b'2') => pal.ok,
+        Some(b'3') => pal.info,
+        Some(b'4') => pal.warn,
+        Some(b'5') => pal.error,
         _ => th.text_primary(), // 同 level_color: 写死近黑会在暗色下消失
     }
 }
@@ -1658,6 +1740,89 @@ mod tests {
         assert!(dbg.r < 0.6, "DEBUG 判灰");
     }
 
+    /// 线性空间合成后的亮度 (与 GPU 一致)。
+    ///
+    /// **不要改用公开的 `danqing::composite_over`** —— 那个在 **sRGB 空间**混
+    /// (其自身测试 `composite_over_half_white_on_black_is_mid_gray` 把这个行为钉死了),
+    /// 而模块 1 之后 GPU 在**线性空间**混。用它量出来的数**不是屏幕上的数**
+    /// —— 正是「护栏全绿、屏幕全灰」那类事故的入口。框架那边同样有个私有
+    /// `composited_luminance` 走线性, 本函数与它同口径。
+    fn composited_luminance(top: Color, base: Color) -> f32 {
+        use danqing::srgb_to_linear;
+        let mix = |t: f32, b: f32| top.a * t + (1.0 - top.a) * b;
+        0.2126 * mix(srgb_to_linear(top.r), srgb_to_linear(base.r))
+            + 0.7152 * mix(srgb_to_linear(top.g), srgb_to_linear(base.g))
+            + 0.0722 * mix(srgb_to_linear(top.b), srgb_to_linear(base.b))
+    }
+
+    /// 一支配色压在给定背景上的对比度 (背景以**渲染后**的亮度参与)。
+    fn ratio_on(fg: Color, bg_luminance: f32) -> f32 {
+        let l = danqing::relative_luminance(fg);
+        let (hi, lo) = if l >= bg_luminance {
+            (l, bg_luminance)
+        } else {
+            (bg_luminance, l)
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// **暗色的语义色必须过 AA** —— 回归锁 (2026-09-13, 用户实机报)。
+    ///
+    /// 触发: 用户在暗色下选中一行 ERROR, 红字「看得眼花」。查下来一半是选区带
+    /// (已在框架侧锁), 另一半是**这五支从来只有浅色一套值** —— 深饱和色压在近黑底上,
+    /// 实测 ERROR 3.03 / INFO 3.70 / OK 4.28, **全部低于 WCAG AA (4.5)**。
+    ///
+    /// **只卡暗色**: 浅色那套的 WARN 3.18 / DEBUG 2.97 / OK 3.78 同样不过 AA,
+    /// 但那是用户已验收的既有观感, 用户对浅色的指示是「现值一行不动」——
+    /// 拿这条锁去卡浅色等于借护栏之名改浅色主题。**浅色的欠账另立**, 不夹带。
+    ///
+    /// 有牙齿: 修之前 ERROR 3.03, 直接红。
+    #[test]
+    fn dark_semantic_colors_clear_wcag_aa_on_the_dark_background() {
+        const AA: f32 = 4.5;
+        let bg = danqing::relative_luminance(DarkTheme.background());
+        let pal = LevelPalette::for_cell(&DarkTheme);
+        for (name, c) in [
+            ("error", pal.error),
+            ("warn", pal.warn),
+            ("ok", pal.ok),
+            ("info", pal.info),
+            ("trace", pal.trace),
+        ] {
+            let ratio = ratio_on(c, bg);
+            assert!(
+                ratio >= AA,
+                "暗色的 {name} 对底色只有 {ratio:.2} < {AA}: {c:?}"
+            );
+        }
+    }
+
+    /// **选中行上的语义色也要读得出来** —— 这正是用户截图里的那一格。
+    ///
+    /// 底色取**合成后**的选区带 (跟屏幕一致), 不是裸 `background()`。
+    /// 阈值 3.0 低于 AA 的 4.5: 选中是**瞬时态**, 且框架侧的
+    /// `selection_band_does_not_step_too_far_from_the_background` 已经从另一边
+    /// 把选区带的强度卡住了 —— 两条锁一夹, 中间这点余量才守得住。
+    #[test]
+    fn dark_semantic_colors_stay_readable_on_a_selected_row() {
+        const FLOOR: f32 = 3.0;
+        let band = composited_luminance(DarkTheme.selection(), DarkTheme.background());
+        let pal = LevelPalette::for_cell(&DarkTheme);
+        for (name, c) in [
+            ("error", pal.error),
+            ("warn", pal.warn),
+            ("ok", pal.ok),
+            ("info", pal.info),
+            ("trace", pal.trace),
+        ] {
+            let ratio = ratio_on(c, band);
+            assert!(
+                ratio >= FLOOR,
+                "暗色选中行上的 {name} 只有 {ratio:.2} < {FLOOR}: {c:?}"
+            );
+        }
+    }
+
     /// 斑马纹与 hover 必须是**两个通道** —— 原先两者共用 `th.surface_variant()`。
     ///
     /// 回归锁 (2026-09-13, 用户实机报): 同色的后果是
@@ -1821,35 +1986,36 @@ mod tests {
 
     #[test]
     fn cell_color_semantics() {
+        let pal = LevelPalette::for_cell(&LightTheme);
         // level 列: 全级别色带 (INFO 蓝, 与原始模式整行降噪策略不同)
         assert_eq!(
             cell_color("level", "INFO", &LightTheme),
-            info_fg(),
+            pal.info,
             "INFO 蓝"
         );
         assert_eq!(
             cell_color("level", "ERROR", &LightTheme),
-            err_fg(),
+            pal.error,
             "ERROR 红"
         );
         assert_eq!(
             cell_color("severity", "WARN", &LightTheme),
-            warn_fg(),
+            pal.warn,
             "severity 同 level"
         );
         // status 列: 按首数字分段, 非数字值不着色
-        assert_eq!(cell_color("status", "200", &LightTheme), ok_fg(), "2xx 绿");
-        assert_eq!(
-            cell_color("status", "301", &LightTheme),
-            info_fg(),
-            "3xx 蓝"
-        );
+        assert_eq!(cell_color("status", "200", &LightTheme), pal.ok, "2xx 绿");
+        assert_eq!(cell_color("status", "301", &LightTheme), pal.info, "3xx 蓝");
         assert_eq!(
             cell_color("http_status", "404", &LightTheme),
-            warn_fg(),
+            pal.warn,
             "4xx 琥珀"
         );
-        assert_eq!(cell_color("status", "503", &LightTheme), err_fg(), "5xx 红");
+        assert_eq!(
+            cell_color("status", "503", &LightTheme),
+            pal.error,
+            "5xx 红"
+        );
         assert_eq!(
             cell_color("status", "N/A", &LightTheme),
             LightTheme.text_primary(),

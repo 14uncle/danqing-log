@@ -98,14 +98,14 @@ pub(crate) fn bar_fraction(count: u64, max: u64) -> f32 {
     ((1.0 + count as f64).log10() / (1.0 + max as f64).log10()) as f32
 }
 
-/// 桶 → 横条色。前四档复用行/单元格着色的语义色 (`view.rs`), 保证侧栏色带
-/// 与内容色一致; 「其他」桶是「无信息」桶, 由主题的次要色降噪。
-fn bucket_color(level: Level, text_secondary: Color) -> Color {
+/// 桶 → 横条色。前四档复用**单元格着色**的语义色板 (`view::LevelPalette`),
+/// 保证侧栏色带与内容列色一致; 「其他」桶是「无信息」桶, 由主题的次要色降噪。
+fn bucket_color(level: Level, palette: &view::LevelPalette, text_secondary: Color) -> Color {
     match level {
-        Level::Fatal | Level::Error => view::err_fg(),
-        Level::Warn => view::warn_fg(),
-        Level::Info => view::info_fg(),
-        Level::DebugTrace => view::trace_fg(),
+        Level::Fatal | Level::Error => palette.error,
+        Level::Warn => palette.warn,
+        Level::Info => palette.info,
+        Level::DebugTrace => palette.trace,
         Level::Other => text_secondary,
     }
 }
@@ -139,6 +139,9 @@ pub(crate) struct LevelHistogram {
     active_bg: Color,
     /// 强调色 —— hover 反馈用它 (与「生效行」的底色是两个通道, 不会混)。
     accent: Color,
+    /// 语义色板 (横条着色)。与 `text_*` 一样在 sync 期解析 —— 它**随主题变**
+    /// (暗色底要提亮, 见 `view::LevelPalette`)。
+    palette: view::LevelPalette,
 }
 
 impl LevelHistogram {
@@ -155,6 +158,8 @@ impl LevelHistogram {
             text_secondary: Color::rgb(0.40, 0.40, 0.42),
             active_bg: Color::rgb(0.93, 0.93, 0.94),
             accent: Color::rgb(0.18, 0.35, 0.60),
+            // 占位, 与上面几支同款 —— 首帧 sync 就会被真主题覆盖。
+            palette: view::LevelPalette::light_cell(),
         }
     }
 
@@ -196,6 +201,7 @@ impl Widget for LevelHistogram {
         self.text_secondary = t.text_secondary();
         self.active_bg = t.surface_variant();
         self.accent = t.accent();
+        self.palette = view::LevelPalette::for_cell(&t);
         self.counts = *app.level_counts.as_ref();
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
@@ -294,7 +300,7 @@ impl Widget for LevelHistogram {
                 let w = (bar_full_w * frac).max(MIN_BAR_W);
                 rects.push_rect(
                     Rect::from_xywh(bar_x, row_y + line_h + BAR_GAP, w, BAR_H),
-                    bucket_color(*level, self.text_secondary),
+                    bucket_color(*level, &self.palette, self.text_secondary),
                     2.0,
                 );
             }
