@@ -99,9 +99,34 @@
 - **同日 push**: danqing `dev` (1 笔, 纯文档) / danqing-logfile `master` (3 笔, 含
   9312→34ms 那个修复) / 本仓 `dev` (32 笔) —— 三仓全部推上远端。
   **仍未做**: 农场根 CLAUDE.md 与其余三仓仍是旧模型 ([patch] 提交在 Cargo.toml), 待裁决是否全线铺开
-- 当前: **v1.0 收尾** —— 余工作面 ① ~~等级直方图~~ (已交付验收) ② MSIX 打包 +
-  Store 上架物料 (待打包方案调研) ③ 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
-  ④ 对外文案/截图素材。**未获用户指示不 push**
+- 当前: **两条线并行** ——
+  ① **v1.0 收尾**: ~~等级直方图~~ 已交付验收; 余 **(a)** MSIX 打包 + Store 上架物料
+     (待打包方案调研) **(b)** 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
+     **(c)** 对外文案/截图素材
+  ② **UI 视觉重构** (2026-09-13 立项, 意图 `docs/intent/ui-redesign.md`;
+     spec `docs/specs/SPEC-ui-redesign.md`, **模块地图待批**): 卡在
+     「**先出视觉方案给用户过, 过了再写码**」—— 方案未过**不得进 build**。
+     暗色缺陷**已定案**: 根因是**双重 gamma 编码**, 非透明层/清屏色 (那两条是误判)
+  **交叉点**: UI 方案决定商店首图与截图素材 → **② 必须先于 ①(c)**;
+  而 ①(a) 的 MSIX 打包方案调研与之**互不阻塞**, 可并行
+- push 状态: 2026-09-13 三仓已推 (danqing `dev` 1 笔 / danqing-logfile `master` 3 笔 /
+  本仓 `dev` 32 笔), 三仓 working tree 干净、`ahead=0`。**此后仍守「未获用户指示不 push」**
+  —— 上面那批是用户逐项点头后才推的, 不构成默许
+- 2026-09-13: **UI 视觉重构立项** (interview-me 收敛, 用户显式 yes) —— 意图
+  `docs/intent/ui-redesign.md`。要点: 好看到「一眼像个正经工具」/ **含布局** / 浅色暗色都做 /
+  **密度不许降**(用户原话「不允许」) / **框架哪儿挡路动哪儿**(已授权) / 不加功能不引依赖 /
+  **先出视觉方案给用户过, 过了再写码**。
+  **定案 (2026-09-13)**: 暗色「一片灰泥」根因 = **双重 gamma 编码** —— 渲染目标强制
+  sRGB (`render/mod.rs:160-165`) + `rect`/`text` 管线原样输出作者态 sRGB 值
+  (`rect.wgsl:102`/`text.wgsl:68`), 硬件再编码一次。`Color` 在框架里有**两句互相矛盾的
+  契约** (`layout.rs:10` 说线性 / `theme.rs:61` 说 sRGB 编码), GPU 通路与 WCAG 护栏
+  **各信一句** → 护栏按 token 算出 14:1 全绿, 屏幕真实是 6.4:1。推算: 暗色背景
+  `#191920` 显示成 (88,88,99), 正文 `0.12` 显示成 ≈97 —— **文字与背景差 9/255**。
+  **用户裁定方案 B** (保留 sRGB 目标 + 在 GPU 边界补转换; A 会弄坏本来正确的
+  image/background 管线)。产品侧另有半成品: 暗色 token 没接完 (12 条清单余 4 条),
+  clear_color 仍写死浅色。
+  **上轮失败教训** (`docs/SPEC-dark-theme.md` 产出当前暗色): 对比度数值全达标仍难看 ——
+  **对比度合格 ≠ 好看**, 本轮判据是整屏观感
 - 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
 - 测试基线: **98 绿** (51 lib + 39 main + 8 genlog), 2026-09-13 实测 (含设置卡溢出守卫
   与 `VERSION_ROW_H` 同源两条; lib = expand/levels/open/search, main = view/main/settings;
@@ -111,6 +136,7 @@
 ## 必读
 
 - 意图 (为什么做/竞品裂缝/MVP 边界/开枪前提/定价锚): `../danqing/docs/intent/log-viewer-poc.md`
+- 意图 (UI 视觉重构的约束与裁决): `docs/intent/ui-redesign.md`
 - 框架规则: `../danqing/CLAUDE.md`
 - 农场跨仓约定: `../CLAUDE.md`
 

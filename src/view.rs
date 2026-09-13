@@ -98,7 +98,9 @@ pub(crate) fn trace_fg() -> Color {
 }
 
 /// 日志级别着色: 行前 200 字节内找级别关键字 (日志行级别几乎都在行首)。
-fn level_color(line: &[u8]) -> Color {
+///
+/// `th` **只用于未命中级别时的正文色** —— 级别色板本身是固定语义色, 不随主题走。
+fn level_color<T: Theme>(line: &[u8], th: &T) -> Color {
     let head = &line[..line.len().min(200)];
     // 长词优先: FATAL 含 "AT" 之类子串碰撞无所谓 (都是错误级), 但 WARN 要先于 INFO 判
     let has = |pat: &[u8]| memchr::memmem::find(head, pat).is_some();
@@ -109,13 +111,15 @@ fn level_color(line: &[u8]) -> Color {
     } else if has(b"DEBUG") || has(b"TRACE") {
         Color::rgb(0.55, 0.55, 0.58)
     } else {
-        Color::rgb(0.12, 0.12, 0.12) // text_default
+        // 必须走 token: 这里原先写死近黑 `0.12` (= 浅色主题的正文色),
+        // 修好双重 gamma 之后它在暗色背景上就是**真的近黑** —— 整列消失。
+        th.text_primary()
     }
 }
 
 /// level 列单元格着色 (表格模式): INFO 也给蓝 —— 窄列色带是语义扫描线;
 /// 原始模式整行着色的降噪策略 (INFO 走默认色) 不同, 两函数有意不共用。
-fn level_cell_color(v: &str) -> Color {
+fn level_cell_color<T: Theme>(v: &str, th: &T) -> Color {
     let b = v.as_bytes();
     let has = |pat: &[u8]| memchr::memmem::find(b, pat).is_some();
     if has(b"FATAL") || has(b"ERROR") {
@@ -127,18 +131,18 @@ fn level_cell_color(v: &str) -> Color {
     } else if has(b"DEBUG") || has(b"TRACE") {
         trace_fg()
     } else {
-        Color::rgb(0.12, 0.12, 0.12) // text_default
+        th.text_primary() // 同 level_color: 写死近黑会在暗色下消失
     }
 }
 
 /// status 列按首数字分段: 2xx 绿 / 3xx 蓝 / 4xx 琥珀 / 5xx 红。
-fn status_color(v: &str) -> Color {
+fn status_color<T: Theme>(v: &str, th: &T) -> Color {
     match v.as_bytes().first() {
         Some(b'2') => ok_fg(),
         Some(b'3') => info_fg(),
         Some(b'4') => warn_fg(),
         Some(b'5') => err_fg(),
-        _ => Color::rgb(0.12, 0.12, 0.12), // text_default
+        _ => th.text_primary(), // 同 level_color: 写死近黑会在暗色下消失
     }
 }
 
@@ -154,16 +158,17 @@ fn is_numeric(v: &str) -> bool {
 /// 表格单元格语义配色: level/status 按值分段, 其余一律正文色。
 /// (曾有时间戳列/hex 标识符降灰设计, 用户验收判死: 白底小字看不清;
 /// klogg/LogViewPlus/Daucloud 三家竞品对 ts/req_id 均一视同仁用正文色。)
-fn cell_color(name: &str, v: &str) -> Color {
+fn cell_color<T: Theme>(name: &str, v: &str, th: &T) -> Color {
     if name == "level" || name == "severity" {
-        return level_cell_color(v);
+        return level_cell_color(v, th);
     }
     if (name.contains("status") || name == "code")
         && v.as_bytes().first().is_some_and(u8::is_ascii_digit)
     {
-        return status_color(v);
+        return status_color(v, th);
     }
-    Color::rgb(0.12, 0.12, 0.12) // text_default
+    // 正文色走 token —— 写死近黑在暗色主题下与背景同值, 整列消失 (2026-09-13)。
+    th.text_primary()
 }
 
 /// 一行可见窗口的命中几何 (选区 T3): `base_byte` = 左截断起点的解码字节偏移,
@@ -741,7 +746,7 @@ impl Widget for LogView {
                     else {
                         continue;
                     };
-                    let color = cell_color(&col.name, &v);
+                    let color = cell_color(&col.name, &v, &th);
                     let cell_x = cx + 8.0;
                     let left_cut = (text_x - cell_x).max(0.0);
                     let right_edge = (cx + cw - 8.0).min(text_right);
@@ -783,7 +788,7 @@ impl Widget for LogView {
                 // 原始模式: 整行级别着色 + 水平左截断 (scroll_trim) + 右截断省略;
                 // 行内容宽度边测边长 (max_seen, 水平滚动范围估计)
                 let raw = file.line_lossy(line_no);
-                let color = level_color(raw.as_bytes());
+                let color = level_color(raw.as_bytes(), &th);
                 let full_w = texts.measure(&raw, FONT_SIZE);
                 if full_w > self.max_seen.get() {
                     self.max_seen.set(full_w);
@@ -1525,6 +1530,7 @@ impl Bar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use danqing::theme::DarkTheme;
 
     /// 回归: Esc 清除过滤后占位须复原空态文案, 不能留上次的 "已应用: ..."。
     #[test]
@@ -1548,18 +1554,50 @@ mod tests {
     fn level_color_prefers_error_over_info() {
         // 行首含 ERROR 与 "informational" 之类干扰时仍判 ERROR
         assert_eq!(
-            level_color(b"2026-09-05 INFO ok"),
-            Color::rgb(0.12, 0.12, 0.12), // text_default
+            level_color(b"2026-09-05 INFO ok", &LightTheme),
+            LightTheme.text_primary(),
             "INFO 走默认色"
         );
-        let err = level_color(b"2026-09-05 ERROR disk full");
+        let err = level_color(b"2026-09-05 ERROR disk full", &LightTheme);
         assert!(err.r > 0.7, "ERROR 判红: {err:?}");
-        let fatal = level_color(b"FATAL boom");
+        let fatal = level_color(b"FATAL boom", &LightTheme);
         assert!(fatal.r > 0.7, "FATAL 判红");
-        let warn = level_color(b"WARN slow query");
+        let warn = level_color(b"WARN slow query", &LightTheme);
         assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
-        let dbg = level_color(b"DEBUG cache miss");
+        let dbg = level_color(b"DEBUG cache miss", &LightTheme);
         assert!(dbg.r < 0.6, "DEBUG 判灰");
+    }
+
+    #[test]
+    fn body_color_follows_theme_instead_of_hardcoded_near_black() {
+        // 回归锁 (2026-09-13): 正文色曾写死 `0.12,0.12,0.12` —— 那是浅色主题的近黑。
+        // 双重 gamma 修好后, 它在暗色背景上就**真的是近黑**, 整列消失 (用户实机报的
+        // 「暗色只剩 level 列」)。正文色必须跟主题走。
+        assert_eq!(
+            cell_color("msg", "request completed", &LightTheme),
+            LightTheme.text_primary(),
+            "浅色: 正文色 = text_primary"
+        );
+        assert_eq!(
+            cell_color("msg", "request completed", &DarkTheme),
+            DarkTheme.text_primary(),
+            "暗色: 正文色 = text_primary"
+        );
+        assert_eq!(
+            level_color(b"2026-09-05 INFO ok", &DarkTheme),
+            DarkTheme.text_primary(),
+            "暗色: 未命中级别时同样走 token"
+        );
+        assert_eq!(
+            cell_color("status", "N/A", &DarkTheme),
+            DarkTheme.text_primary(),
+            "暗色: 非数字 status 同样走 token"
+        );
+        // 实质保证: 暗色正文色必须**够亮**, 否则「跟了 token」也只是换个名字看不见。
+        assert!(
+            danqing::relative_luminance(DarkTheme.text_primary()) > 0.5,
+            "暗色正文色须足够亮"
+        );
     }
 
     #[test]
@@ -1573,52 +1611,72 @@ mod tests {
     #[test]
     fn cell_color_semantics() {
         // level 列: 全级别色带 (INFO 蓝, 与原始模式整行降噪策略不同)
-        assert_eq!(cell_color("level", "INFO"), info_fg(), "INFO 蓝");
-        assert_eq!(cell_color("level", "ERROR"), err_fg(), "ERROR 红");
         assert_eq!(
-            cell_color("severity", "WARN"),
+            cell_color("level", "INFO", &LightTheme),
+            info_fg(),
+            "INFO 蓝"
+        );
+        assert_eq!(
+            cell_color("level", "ERROR", &LightTheme),
+            err_fg(),
+            "ERROR 红"
+        );
+        assert_eq!(
+            cell_color("severity", "WARN", &LightTheme),
             warn_fg(),
             "severity 同 level"
         );
         // status 列: 按首数字分段, 非数字值不着色
-        assert_eq!(cell_color("status", "200"), ok_fg(), "2xx 绿");
-        assert_eq!(cell_color("status", "301"), info_fg(), "3xx 蓝");
-        assert_eq!(cell_color("http_status", "404"), warn_fg(), "4xx 琥珀");
-        assert_eq!(cell_color("status", "503"), err_fg(), "5xx 红");
+        assert_eq!(cell_color("status", "200", &LightTheme), ok_fg(), "2xx 绿");
         assert_eq!(
-            cell_color("status", "N/A"),
-            Color::rgb(0.12, 0.12, 0.12), // text_default
+            cell_color("status", "301", &LightTheme),
+            info_fg(),
+            "3xx 蓝"
+        );
+        assert_eq!(
+            cell_color("http_status", "404", &LightTheme),
+            warn_fg(),
+            "4xx 琥珀"
+        );
+        assert_eq!(cell_color("status", "503", &LightTheme), err_fg(), "5xx 红");
+        assert_eq!(
+            cell_color("status", "N/A", &LightTheme),
+            LightTheme.text_primary(),
             "非数字 status 默认色"
         );
         // 其余列一律正文色 (降灰设计已被用户验收判死: 白底小字看不清,
         // klogg/LogViewPlus/Daucloud 对 ts/req_id 均用正文色)
         assert_eq!(
-            cell_color("ts", "2026-09-05"),
-            Color::rgb(0.12, 0.12, 0.12),
+            cell_color("ts", "2026-09-05", &LightTheme),
+            LightTheme.text_primary(),
             "ts 正文色"
         );
         assert_eq!(
-            cell_color("msg", "request completed"),
-            Color::rgb(0.12, 0.12, 0.12)
+            cell_color("msg", "request completed", &LightTheme),
+            LightTheme.text_primary()
         );
         assert_eq!(
-            cell_color("logger", "auth-service"),
-            Color::rgb(0.12, 0.12, 0.12),
+            cell_color("logger", "auth-service", &LightTheme),
+            LightTheme.text_primary(),
             "logger 正文色"
         );
         assert_eq!(
-            cell_color("path", "/api/v1/orders/84701"),
-            Color::rgb(0.12, 0.12, 0.12),
+            cell_color("path", "/api/v1/orders/84701", &LightTheme),
+            LightTheme.text_primary(),
             "path 正文色"
         );
         assert_eq!(
-            cell_color("req_id", "1b26690fb26795f6"),
-            Color::rgb(0.12, 0.12, 0.12),
+            cell_color("req_id", "1b26690fb26795f6", &LightTheme),
+            LightTheme.text_primary(),
             "长 hex 正文色"
         );
         assert_eq!(
-            cell_color("trace_id", "550e8400-e29b-41d4-a716-446655440000"),
-            Color::rgb(0.12, 0.12, 0.12),
+            cell_color(
+                "trace_id",
+                "550e8400-e29b-41d4-a716-446655440000",
+                &LightTheme,
+            ),
+            LightTheme.text_primary(),
             "UUID 正文色"
         );
     }
