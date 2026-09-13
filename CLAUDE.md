@@ -99,19 +99,29 @@
 - **同日 push**: danqing `dev` (1 笔, 纯文档) / danqing-logfile `master` (3 笔, 含
   9312→34ms 那个修复) / 本仓 `dev` (32 笔) —— 三仓全部推上远端。
   **仍未做**: 农场根 CLAUDE.md 与其余三仓仍是旧模型 ([patch] 提交在 Cargo.toml), 待裁决是否全线铺开
-- 当前: **两条线并行** ——
-  ① **v1.0 收尾**: ~~等级直方图~~ 已交付验收; 余 **(a)** MSIX 打包 + Store 上架物料
+- 当前: **UI 改造五模块已闭环; v1.0 收尾是唯一主线** ——
+  ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
+     `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
+     `color-pipeline` / `theme-recalibrate` / `component-polish` / `token-completion` /
+     `layout-rhythm` 五格全 ✅, 每格机器 + 用户真机双闭环。
+     含: 双重 gamma 修复、全框架控件补 per-frame `bind_theme`、暗色 token 重校、
+     展开块底色 / 斑马与 hover 拆通道、**暗色语义色板 (2026-09-13 用户实机报
+     「ERROR 选中行看得眼花」→ 两成因各修: 语义色板两套 + 选区带 30%→20%)**。
+     **遗留四条待裁** —— 正文在 `tasks/todo-open-decisions.md` (D1–D4), 别处不抄数字。
+     四条都是**查出来但没动**的: 浅色三支「面」token 近乎不存在 (下拉 hover 现役
+     不可见) / 浅色语义色 sub-AA / 浅色两条着色路径分叉 / 框架 `composite_over`
+     混在 sRGB 空间 (文档还在推荐用它, 是量错对象的入口)。
+  ② **v1.0 收尾** (原为并行线, 现为唯一主线): 余 **(a)** MSIX 打包 + Store 上架物料
      (待打包方案调研) **(b)** 版本号 `0.1.0`→`1.0.0` + 重打包 + git tag
      **(c)** 对外文案/截图素材
-  ② **UI 视觉重构** (2026-09-13 立项, 意图 `docs/intent/ui-redesign.md`;
-     spec `docs/specs/SPEC-ui-redesign.md`, **模块地图待批**): 卡在
-     「**先出视觉方案给用户过, 过了再写码**」—— 方案未过**不得进 build**。
-     暗色缺陷**已定案**: 根因是**双重 gamma 编码**, 非透明层/清屏色 (那两条是误判)
-  **交叉点**: UI 方案决定商店首图与截图素材 → **② 必须先于 ①(c)**;
-  而 ①(a) 的 MSIX 打包方案调研与之**互不阻塞**, 可并行
-- push 状态: 2026-09-13 三仓已推 (danqing `dev` 1 笔 / danqing-logfile `master` 3 笔 /
-  本仓 `dev` 32 笔), 三仓 working tree 干净、`ahead=0`。**此后仍守「未获用户指示不 push」**
-  —— 上面那批是用户逐项点头后才推的, 不构成默许
+  **交叉点 (已解)**: UI 方案决定商店首图与截图素材 → ① 已不再是 ②(c) 的前置。
+  **但 ① 的暗色配色用户尚未真机过目** —— 模块闭环 ≠ 观感验收, 那批色号整个换了。
+- push 状态 (2026-09-13 当日末): danqing `dev` 已推 **3 笔** (`d2de15b` 控件主题绑定 /
+  `767701b` 半透明表面守卫 / `486d180` 选区带 30%→20%), ahead=0;
+  danqing-logfile `master` 同步, ahead=0;
+  **本仓 `dev` `ahead=1`** —— `3c19b54` (暗色语义色板 + 重钉 `486d180d`) **只提交未推**
+  (用户当时的指令是「提交」, 未含推本仓)。三仓 working tree 全干净。
+  **仍守「未获用户指示不 push」** —— 上面每批都是用户逐项点头后才推的, 不构成默许
 - 2026-09-13: **UI 视觉重构立项** (interview-me 收敛, 用户显式 yes) —— 意图
   `docs/intent/ui-redesign.md`。要点: 好看到「一眼像个正经工具」/ **含布局** / 浅色暗色都做 /
   **密度不许降**(用户原话「不允许」) / **框架哪儿挡路动哪儿**(已授权) / 不加功能不引依赖 /
@@ -128,9 +138,11 @@
   **上轮失败教训** (`docs/SPEC-dark-theme.md` 产出当前暗色): 对比度数值全达标仍难看 ——
   **对比度合格 ≠ 好看**, 本轮判据是整屏观感
 - 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
-- 测试基线: **98 绿** (51 lib + 39 main + 8 genlog), 2026-09-13 实测 (含设置卡溢出守卫
-  与 `VERSION_ROW_H` 同源两条; lib = expand/levels/open/search, main = view/main/settings;
-  引擎 51 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)
+- 测试基线: **112 绿** (51 lib + 53 main + 8 genlog), 2026-09-13 实测
+  (含设置卡溢出守卫与 `VERSION_ROW_H` 同源两条, 以及暗色语义色板的两条 AA 守卫;
+  lib = expand/levels/open/search, main = view/main/settings;
+  引擎 51 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)。
+  框架侧 **582 lib + 全部集成测试绿**
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读
