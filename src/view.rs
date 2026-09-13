@@ -184,6 +184,60 @@ fn expand_block_bg(theme: crate::config::AppTheme) -> Color {
     }
 }
 
+/// 展开块底色的**矩形** + 这一段连续子行到哪结束 (开区间末位)。
+///
+/// **一段连续子行只出 `一个` 矩形** —— 这是本条的存在理由, 不是顺手优化。
+///
+/// 原先按子行逐行铺: 相邻两行在**逻辑坐标**上严丝合缝 (间距就是 [`ROW_HEIGHT`]),
+/// 但每个矩形都会做**边缘抗锯齿**, 而它们是**各自**与下面的底色混合的 —— 两次
+/// 半透明叠不出一次全不透明。于是行交界处留下一道 1–2px 的浅色横线
+/// (2026-09-13 用户实机报「浅色主题, 行展开区域出现行间隔」; 截图实测那条缝
+/// 渲染成 `(207,216,212)`, 而块色 `(200,209,205)`、页面底 `(240,248,246)`)。
+///
+/// **不是新缺陷, 是深色块把它照出来的**: 浅色块色原为 `#E4EEEA` (对底 Δ`L*` 3.68),
+/// 缝与块色只差 ~2/255 —— 看不见; 换成 `#C8D1CD` (Δ`L*` 13.88) 后一眼就是「行间隔」。
+/// 与 D1、面阶梯属同一类: **换个取值, 早先就错的东西才现形**。
+///
+/// `limit` 是**可见行上界**, 由调用方给: 一段可能长达十几万行 (一个巨大 JSON 全展开),
+/// 而只有可见的几十行会被画出来 —— 扫到底纯属白费, 这是每帧都跑的热路径。
+/// 返回值里的矩形底边因此可能落在视口下方, 交给 clip 裁掉。
+///
+/// 段首若在视口上方 (`is_sub_row(start - 1)` 为真, 滚动到底时会遇到),
+/// **往上多铺一行**: 那条边界整个被 clip 挡掉, 不会画到别的行上, 却能免得
+/// 一道缝正好落在视口第一行。
+///
+/// 回归锁 `expand_block_rects_put_a_contiguous_run_in_one_rect`。
+fn expand_block_rects(
+    start: u64,
+    limit: u64,
+    y_of: impl Fn(u64) -> f32,
+    is_sub_row: impl Fn(u64) -> bool,
+    x: f32,
+    width: f32,
+) -> Vec<Rect> {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < limit {
+        if !is_sub_row(i) {
+            i += 1;
+            continue;
+        }
+        // 段首可能在视口上方 —— 上面还有同名子行就往上多铺一行, 交给 clip 裁。
+        let top = if i > 0 && is_sub_row(i - 1) {
+            y_of(i) - ROW_HEIGHT
+        } else {
+            y_of(i)
+        };
+        // 一段连续子行 = **一个**矩形
+        while i < limit && is_sub_row(i) {
+            i += 1;
+        }
+        let bottom = y_of(i);
+        out.push(Rect::from_xywh(x, top, width, bottom - top));
+    }
+    out
+}
+
 /// 书签行号色 —— 两主题各一支金。
 ///
 /// **有意不套 `Theme::accent`**: accent 已经用于选中行 / 焦点边框 / 指示线,
@@ -837,6 +891,21 @@ impl Widget for LogView {
         texts.push_clip(clip);
         let first = self.top_row.floor() as u64;
         let frac = (self.top_row - first as f64) as f32;
+        // 展开块只画到「可见的最后一行 + 2」—— 段可能远超视口, 见 `expand_block_rects`。
+        let scan_limit = (first + (frac + list_h / ROW_HEIGHT).ceil() as u64 + 2).min(count);
+        // 展开块底色是**最底层**: 整层先铺完, 下面行循环里的斑马/选中/hover 才压得住它。
+        // 一段连续子行只出一个矩形 —— 逐行铺会在行交界留下抗锯齿的浅色缝。
+        let row_y = |j: u64| rows_top + (j - first) as f32 * ROW_HEIGHT - frac * ROW_HEIGHT;
+        for block in expand_block_rects(
+            first,
+            scan_limit,
+            row_y,
+            |j| self.line_at(j).1 > 0,
+            area.origin.x,
+            area.size.width - SCROLLBAR_W,
+        ) {
+            rects.push_rect(block, expand_block_bg(self.theme), 0.0);
+        }
         let mut i = first;
         loop {
             let y = rows_top + (i - first) as f32 * ROW_HEIGHT - frac * ROW_HEIGHT;
@@ -857,12 +926,9 @@ impl Widget for LogView {
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
             let (line_no, sub_off) = self.line_at(i);
             let is_sub_row = sub_off > 0;
-            // 展开块底色**先铺** (2026-09-13): 子行原先与真实行长得一模一样 (只差
-            // 没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
+            // 展开块底色已在上面整层铺完 (2026-09-13): 子行原先与真实行长得一模一样
+            // (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
             // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
-            if is_sub_row {
-                rects.push_rect(row_rect, expand_block_bg(self.theme), 0.0);
-            }
             if table && i % 2 == 1 && !is_sub_row {
                 // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
                 // 交替条纹会把它切碎、语义又糊回去。
@@ -2192,6 +2258,50 @@ mod tests {
             danqing::relative_luminance(DarkTheme.text_primary()) > 0.5,
             "暗色正文色须足够亮"
         );
+    }
+
+    /// **一段连续子行只许出一个底面矩形** —— 回归锁 (2026-09-13, 用户实机报)。
+    ///
+    /// 触发: 用户报「浅色主题, 行展开区域出现行间隔」。截图实测那条缝**横贯整行**,
+    /// 渲染成 `(207,216,212)`, 而块色是 `(200,209,205)`、页面底 `(240,248,246)` ——
+    /// 既不是块色也不是底色, 是**两个矩形各自的边缘抗锯齿叠出来的**: 相邻两行的
+    /// 矩形在逻辑坐标上严丝合缝, 但每个都自己跟底色做一次半透明混合, 谁也盖不满。
+    ///
+    /// **不是新缺陷**: 浅色块色原为 `#E4EEEA` (对底 Δ`L*` 3.68), 缝与块色只差约
+    /// 2/255 —— 看不见; 换成 `#C8D1CD` (Δ`L*` 13.88) 后一眼就是「行间隔」。
+    /// 与 D1、面阶梯同属一类: 换个取值, 早先就错的东西才现形。
+    ///
+    /// 有牙齿: 改回逐行铺 → 六子行的一段出**六个**矩形, 第一条断言直接红。
+    #[test]
+    fn expand_block_rects_put_a_contiguous_run_in_one_rect() {
+        let y_of = |j: u64| j as f32 * ROW_HEIGHT;
+        // 3..9 是一段 (六个子行), 12 单独一段
+        let is_sub = |j: u64| (3..9).contains(&j) || j == 12;
+        let rects = expand_block_rects(0, 20, y_of, is_sub, 10.0, 100.0);
+        assert_eq!(rects.len(), 2, "两段连续子行 = 两个矩形, 实得 {rects:?}");
+        assert_eq!(rects[0].origin.y, 3.0 * ROW_HEIGHT, "首段上沿");
+        assert_eq!(
+            rects[0].size.height,
+            6.0 * ROW_HEIGHT,
+            "首段要**一整块**盖住六个子行, 中间不许断开"
+        );
+        assert_eq!(rects[1].origin.y, 12.0 * ROW_HEIGHT, "次段上沿");
+        assert_eq!(rects[1].size.height, ROW_HEIGHT);
+        assert_eq!(rects[0].origin.x, 10.0, "横向上沿内容区左沿");
+        assert_eq!(rects[0].size.width, 100.0);
+
+        // 段首在视口上方 (滚动到底时会遇到): 往上多铺一行, 那道边界才不会
+        // 正好落在视口第一行
+        let rects = expand_block_rects(5, 20, y_of, is_sub, 0.0, 100.0);
+        assert_eq!(rects[0].origin.y, 4.0 * ROW_HEIGHT, "上沿补一行");
+
+        // 段被可见区截断: 底边必须够到 `limit`, 否则视口底部会缺一块
+        let rects = expand_block_rects(3, 6, y_of, is_sub, 0.0, 100.0);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].size.height, 3.0 * ROW_HEIGHT, "截到 limit 为止");
+
+        // 没有子行 → 一个矩形都不出 (普通表格每帧都走这条)
+        assert!(expand_block_rects(0, 20, y_of, |_| false, 0.0, 100.0).is_empty());
     }
 
     #[test]
