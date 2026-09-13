@@ -74,12 +74,21 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
     };
     let content_w = content_width();
     // 卡片底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
-    // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是 `rgba(…,0.10)`
+    // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是半透明
     // —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
-    // 必然是实色)。用户要求面板背景不透明, 故用它, 靠 border 与底层区分。
+    // 必然是实色)。用户要求面板背景不透明, 故用它。
+    //
+    // **不描边** (用户 2026-09-13 定)。与底层的区分交给 scrim 就够: 卡外被压暗
+    // (实测 (18,18,24)), 卡内是不透明的 `background()` ((25,25,32))。
+    // 原先那圈 `border()` 在暗色下会渲染成 (131,131,135) 的亮框, 是**重复**的一道
+    // (scrim 已经在做区分) 且过重。注: `UiBox` 不调 `.border_color()` 就完全不画边,
+    // 所以这里是删掉而不是把 width 置 0。
+    // 底色走**绑定**而非构造值: `view()` 只在启动时求值一次, 构造态的颜色
+    // 不会跟着主题切换走 (与标题栏同款的坑)。浅色启动、切到暗色 → 暗色 scrim 上
+    // 浮着一张浅色卡。回归锁: `settings_card_background_follows_theme_switch`。
     UiBox::new(t.background())
+        .bind_color(|app: &LogApp| app.theme.theme().background())
         .radius(12.0)
-        .border_color(t.border())
         .child(Padding::new(
             pad,
             Column::new()
@@ -512,6 +521,7 @@ pub(crate) fn handle_settings_key(key: &Key) -> Option<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use danqing::srgb_to_linear;
 
     /// 布局一个组件, 返回它**自报的自然高度**(不受固定高盒子影响)。
     fn natural_height(w: &mut impl Widget, c: Constraints, texts: &mut TextBatch) -> f32 {
@@ -561,5 +571,76 @@ mod tests {
             .layout(Constraints::loose(Size::new(300.0, 100.0)), &mut texts)
             .height;
         assert_eq!(h, VERSION_ROW_H);
+    }
+
+    /// 设置卡底色必须**每帧**从应用状态重取 —— 与标题栏同款的坑。
+    ///
+    /// `view()` 只在启动时求值一次, 所以 `settings_card(theme)` 里
+    /// `UiBox::new(t.background())` 烘进去的是**启动那一刻**的底色: 浅色启动、
+    /// 切到暗色 → 暗色 scrim 上浮着一张浅色卡。
+    /// **构造用一个主题、sync 用另一个**才测得到绑定本身 (两边同主题的话,
+    /// 就算没绑定也照样绿)。
+    #[test]
+    fn settings_card_background_follows_theme_switch() {
+        use danqing::theme::LightTheme;
+
+        let mut card = settings_card(AppTheme::Dark); // 构造用暗色
+        let mut light_app = crate::LogApp::new_empty();
+        light_app.theme = AppTheme::Light; // 每帧状态是浅色
+        card.sync(&light_app);
+
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 600.0)), &mut texts);
+        card.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        let b = LightTheme.background();
+        let want = [
+            srgb_to_linear(b.r),
+            srgb_to_linear(b.g),
+            srgb_to_linear(b.b),
+            b.a,
+        ];
+        assert!(
+            rects
+                .instance_colors()
+                .iter()
+                .any(|c| c.iter().zip(want.iter()).all(|(x, y)| (x - y).abs() < 1e-3)),
+            "切到浅色后卡面底色应变成浅色主题的 background()"
+        );
+    }
+
+    /// 设置卡**不描边** —— 用户 2026-09-13 的裁定。
+    ///
+    /// 与底层的区分交给 scrim 就够 (卡外被压暗、卡内是不透明的 `background()`),
+    /// 再描一圈边是重复的一道。守的是「别为了定义感又把边加回来」:
+    /// `UiBox` 的 `border_width` 默认就是 `1.0`, 加回来只要一行 `.border_color(...)`。
+    #[test]
+    fn settings_card_paints_no_border() {
+        let theme = AppTheme::Dark;
+        let mut card = settings_card(theme);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::default();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 600.0)), &mut texts);
+        card.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        // 实例里存的是 **linear** 值, 比较前同样解码 —— 否则比的是两个色彩空间
+        // (这正是修好双重 gamma 之前那批断言的形态)。
+        let b = theme.theme().border();
+        let want = [
+            srgb_to_linear(b.r),
+            srgb_to_linear(b.g),
+            srgb_to_linear(b.b),
+            b.a,
+        ];
+        let painted_border = rects.instance_colors().iter().any(|c| {
+            c.iter()
+                .zip(want.iter())
+                .all(|(x, y)| (x - y).abs() < 0.001)
+        });
+        assert!(
+            !painted_border,
+            "设置卡不应画边框 —— 区分交给 scrim (见 settings_card 的注释)"
+        );
     }
 }

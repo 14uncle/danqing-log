@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use danqing::theme::{ScenePalette, SceneTheme, Theme};
-use danqing::widget::{Column, LogoKind, Node, Row, Stack, TitleBar, node};
+use danqing::widget::{Column, LogoKind, Node, Row, Stack, TitleBar, Widget, node};
 use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
@@ -118,6 +118,37 @@ fn title_theme(theme: config::AppTheme) -> SceneTheme {
 /// 症状恰好是「暗色下标题栏一条白板」。
 fn window_clear_color(theme: config::AppTheme) -> Color {
     theme.theme().background()
+}
+
+/// 标题栏 (含嵌入的过滤栏)。
+///
+/// 抽成函数不只为了整洁 —— **测试必须复用同一份构建代码**才守得住下面这个坑:
+/// `view()` 只在启动时求值一次 (`danqing/src/window/mod.rs:207` 的
+/// `let tree = app.view();`, 之后整棵交给 Handler, 不再重建), 所以
+/// `TitleBar::themed(&title_theme(..))` 烘进去的是**启动那一刻**的主题色。
+/// 卡面上其它控件走 `bind_color` 闭包、每帧重读, 于是切主题时**只有标题栏停在旧色**
+/// —— 底色换了、文字没换: 切到浅色是浅字压浅底, 切到暗色是暗字压暗底
+/// (用户实机报的「标题看不清」, 两个方向都成立)。
+///
+/// `bind_theme` 是框架**专为这件事**准备的 API (见 `TitleBar` 文档,
+/// 「每帧从应用状态重取主题」)。**不许删**。
+/// 参数取**值**而非 `&LogApp`: edition 2024 里 `impl Trait` 会捕获全部输入生命周期,
+/// 借 `&LogApp` 返回的话这个类型就不是 `'static`, `Column::child` 直接编译不过
+/// (E0521 「borrowed data escapes」)。
+fn title_bar(theme: config::AppTheme, title: String) -> impl Widget {
+    TitleBar::themed(&title_theme(theme), title)
+        .bind_theme(|app: &LogApp| title_theme(app.theme))
+        .logo_kind(LogoKind::Log)
+        .on_close(|| WindowAction::Close)
+        .on_minimize(|| WindowAction::Minimize)
+        .on_maximize(|| WindowAction::MaximizeOrRestore)
+        .on_drag(|| WindowAction::Drag)
+        .bind_maximized(|app: &LogApp| app.maximized)
+        .embed(
+            view::Bar::default()
+                .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
+                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+        )
 }
 
 /// 应用状态本体 (danqing App)。
@@ -1155,20 +1186,7 @@ impl App for LogApp {
             Stack::new()
                 .child(
                     Column::new()
-                        .child(
-                            TitleBar::themed(&title_theme(self.theme), self.make_title())
-                                .logo_kind(LogoKind::Log)
-                                .on_close(|| WindowAction::Close)
-                                .on_minimize(|| WindowAction::Minimize)
-                                .on_maximize(|| WindowAction::MaximizeOrRestore)
-                                .on_drag(|| WindowAction::Drag)
-                                .bind_maximized(|app: &LogApp| app.maximized)
-                                .embed(
-                                    view::Bar::default()
-                                        .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                                        .bind_clear_search(|app: &LogApp| app.search_clear_rev),
-                                ),
-                        )
+                        .child(title_bar(self.theme, self.make_title()))
                         .fill(
                             Row::new()
                                 .fill(histogram::LevelHistogram::new(), 0)
@@ -1479,6 +1497,47 @@ mod tests {
         assert_eq!(clamp_top(500.0, 100), 99.0, "越界钳到末行");
         assert_eq!(clamp_top(42.5, 100), 42.5, "区间内不变 (保小数偏移)");
         assert_eq!(clamp_top(3.0, 0), 0.0, "空文件归零");
+    }
+
+    /// 切主题后**标题栏文字色必须跟着变** —— 它靠 `bind_theme` 每帧重取,
+    /// 不能靠构造。
+    ///
+    /// 复现的是这个缺陷: `view()` 只在启动时求值一次
+    /// (`danqing/src/window/mod.rs:207` 的 `let tree = app.view();`),
+    /// 所以构造时烘进 `TitleBar` 的主题色**不随切换而变**, 而底色 (清屏色) 变了
+    /// → 切到浅色是浅字压浅底、切到暗色是暗字压暗底。用户实机报的两个方向都成立。
+    ///
+    /// **关键在「构造用一个主题、sync 用另一个」**: 两边都用同一主题的话,
+    /// 就算 `bind_theme` 掉了也照样绿 —— 那样测的是构造, 不是绑定。
+    #[test]
+    fn title_bar_colors_follow_theme_switch() {
+        use danqing::{Constraints, Point, Rect, RectBatch, TextBatch};
+
+        // 构造用暗色 —— 字号/间距两主题相同, 变的只有颜色。
+        let mut dark_app = LogApp::new_empty();
+        dark_app.theme = config::AppTheme::Dark;
+        let mut bar = title_bar(dark_app.theme, dark_app.make_title());
+
+        // 每帧状态换成浅色 (模拟运行中切主题)。
+        let mut light_app = LogApp::new_empty();
+        light_app.theme = config::AppTheme::Light;
+        bar.sync(&light_app);
+
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let size = bar.layout(Constraints::tight(Size::new(1100.0, 40.0)), &mut texts);
+        bar.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        // 浅色标题栏的文字色 = ScenePalette::text_primary = 0.12, 进 GPU 前解码。
+        let want = danqing::srgb_to_linear(0.12);
+        let hit = texts
+            .instance_colors()
+            .iter()
+            .any(|c| (c.r - want).abs() < 1e-3);
+        assert!(
+            hit,
+            "切到浅色后标题文字应变成浅色主题的正文色 (0.12) —— 没命中即 `bind_theme` 缺失"
+        );
     }
 
     #[test]
