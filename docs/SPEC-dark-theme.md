@@ -118,20 +118,33 @@ Dropdown::new(vec!["浅色".into(), "深色".into()])
 
 ### 已知遗漏清单
 
-| # | 位置 | 问题 | 修复方案 |
-|---|------|------|---------|
-| 1 | `level_color()` | ERROR/WARN/DEBUG 颜色 hardcode `text_default=0.12` | 正文色从 Theme.text_primary 读取 |
-| 2 | `level_cell_color()` | 同上 | 同上 |
-| 3 | `status_color()` | HTTP 状态色 hardcode `text_default=0.12` | 同上 |
-| 4 | `cell_color()` | 单元格正文色 hardcode `0.12` | 同上 |
-| 5 | `Bar::base_input()` | 输入色 `0.20`、光标色 `0.10` | 改用 Theme.text_primary / caret |
-| 6 | `Bar` 占位色 | `0.45, 0.45, 0.48` hardcode | 改用 Theme.text_secondary |
-| 7 | 书签行号色 | `0.75, 0.60, 0.10` 深色背景下偏暗 | 从 Theme.accent 派生 |
-| 8 | 展开 `[+]/[-]` | 图标色 hardcode `text_default` | 改用 Theme.text_secondary |
-| 9 | `title_theme()` | 标题栏固定浅色 ScenePalette | 根据 ThemeMode 切换浅色/深色 ScenePalette |
-| 10 | `settings.rs` | 卡片背景/边框/文字 hardcode 浅色 | 改用 Theme token |
-| 11 | 主题切换 UI | 文字按钮 | 改用 Dropdown widget |
-| 12 | 删除 `src/theme.rs` | 自建颜色系统 | 全部改为框架 Theme token |
+> **⚠ 本清单已于 2026-09-13 逐条核对并结清。此后暗色相关工作以
+> `docs/specs/SPEC-ui-redesign.md` 为准, 不要再照本表施工。**
+> 核对时发现它**谎报进度**: 12 条里 8 条其实早已完成 —— 清单停在上一轮结束时,
+> 之后又清掉一批。而它**从未列过**真正最大的那一条 (`clear_color`, 见下 #13)。
+
+| # | 位置 | 状态 |
+|---|------|------|
+| 1 | `level_color()` | ✅ 已完成 (`th.text_primary()`) |
+| 2 | `level_cell_color()` | ✅ 已完成 |
+| 3 | `status_color()` | ✅ 已完成 |
+| 4 | `cell_color()` | ✅ 已完成 |
+| 5 | `Bar::base_input()` | ✅ 2026-09-13: 挂 `bind_theme`, 删掉三个写死色 |
+| 6 | `Bar` 占位色 | ⚠️ **有意保留**: 中性灰在两个主题上都读得动 (暗色 3.20 / 浅色 3.9)。`TextInput::themed()` 本来就把它定成与主题无关的 `(160,160,160)`, 把它并进主题绑定会**顺带改掉所有其它产品的占位色** |
+| 7 | 书签行号色 | ✅ 2026-09-13: 两主题各一支金。**未采纳**原方案「从 `Theme.accent` 派生」—— 那会把书签与选中/强调混成一个通道 |
+| 8 | 展开 `[+]/[-]` | ✅ 已完成 (已是 `th.text_primary()`) |
+| 9 | `title_theme()` | ✅ 2026-09-13: 六项改取 `LogTheme`; `backdrop_light/dark` 框架无 token, 保留手写 |
+| 10 | `settings.rs` | ✅ 已完成 (走 `sync()`) |
+| 11 | 主题切换 UI | ✅ 已完成 (Dropdown) |
+| 12 | 删除 `src/theme.rs` | ✅ 已完成 |
+| **13** | **`clear_color`** | ✅ 2026-09-13。**原清单里根本没有这一条**: `WindowConfig.clear_color` 写死浅色且全仓**零处** `set_clear_color` 调用 —— 存暗色配置启动会开在白底上, 运行中切主题也不通知窗口 |
+
+**另有一整类问题原清单没覆盖**: 「切主题后不跟随」。视图树只在启动时构建一次
+(`window/mod.rs` 的 `let tree = app.view();`), 所以任何在 `view()` 里
+`themed(&theme)` 构造的控件都把主题色烘死在启动那一刻。框架原先**只有
+`TitleBar` 有 per-frame 主题绑定** —— 已为 `Tabs` / `Dropdown` / `TextInput`
+补上 (`bind_theme`, 形状统一)。详见
+`tasks/todo-theme-recalibrate.md` 的「附二」。
 
 ### 主题切换架构
 

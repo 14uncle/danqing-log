@@ -52,7 +52,7 @@
 
 ## Phase 2: 框架开口 + 输入栏
 
-- [ ] **T0: 前置 —— 开本地 patch 联动**
+- [x] **T0: 前置 —— 开本地 patch 联动** ✅ 2026-09-13
   - 说明: 在本仓根 `cp tools/local-patch.toml .cargo/config.toml`。
     **不开则 `../danqing` 的本地改动静默不生效**（patch 默认关）。
     收尾 (`T6`) 时 `rm` 回默认态; 该文件已 gitignore, 不进提交。
@@ -62,7 +62,7 @@
   - Files: `.cargo/config.toml`（本地新建, 不提交）
   - Scope: XS
 
-- [ ] **T2: `TextInput::set_theme` + 过滤/搜索栏接入 (R2)**
+- [x] **T2: `TextInput::bind_theme` + 过滤/搜索栏接入 (R2)** ✅ 2026-09-13
   - 说明: 框架 `TextInput` 在 `themed()` 里把主题**摊平成已解析的 `Color` 字段**
     (`danqing/src/widget/form/text_input.rs:21-73`), **无 setter** ——
     跨帧持有编辑状态的控件没有换主题的路径。`Dropdown` 同款但不受影响
@@ -87,7 +87,7 @@
 
 ## Phase 3: 收尾三小项
 
-- [ ] **T3: `header_line()` 随主题 (R3)**
+- [x] **T3: `header_line()` 随主题 (R3)** ✅ 2026-09-13
   - 说明: `view.rs:76-78` 恒用 `LightTheme.divider()`。调用点两处 (`:563`、`:890`)。
   - Acceptance: 改 `fn header_line<T: Theme>(th: &T) -> Color { th.divider() }`,
     两处调用点传 `th`
@@ -96,7 +96,7 @@
   - Scope: XS
   - 备注: 动前先确认两处 `th` 在作用域内; 若 `:563` 没有则从 `self.theme.theme()` 取
 
-- [ ] **T4: 书签行号金按主题取色 (R4)** —— **待 Open Q1 定**
+- [x] **T4: 书签行号金按主题取色 (R4)** ✅ 2026-09-13 (用户裁定: 两支金放产品侧, 不套 accent)
   - 说明: `view.rs:678-679` 写死 `0.75,0.60,0.10`。旧清单建议套 `Theme.accent`,
     但那会把「书签」与「选中/强调」混成一个通道 —— **建议不套**
     （亮色金 + 暗色更亮的金, 两支都放产品侧, 不为此扩框架 trait）
@@ -106,7 +106,7 @@
   - Files: `src/view.rs`
   - Scope: XS
 
-- [ ] **T5: `title_theme()` 去手抄 (R5)** —— **待 Open Q2 定**
+- [x] **T5: `title_theme()` 去手抄 (R5)** ✅ 2026-09-13 (用户裁定: 六项取 `LogTheme`, 独立成批)
   - 说明: `main.rs:84-107` 已按主题分支, 但调色板是手抄的, 且与
     `docs/SPEC-dark-theme.md:168-195` 定稿不符（浅色 accent 是**蓝** `0.18,0.35,0.60`,
     框架玉色是 `15,118,110` —— 两套色）。
@@ -130,7 +130,7 @@
     `Compiling danqing v0.1.0 (https://github.com/14uncle/danqing#<新 sha>)`
     —— **从 GitHub 拉的**, 证明改动真进了远端且不再依赖本地 patch
 
-- [ ] **T7: 更新 `docs/SPEC-dark-theme.md` 的过时清单**
+- [x] **T7: 更新 `docs/SPEC-dark-theme.md` 的过时清单** ✅ 2026-09-13
   - 说明: 那份「已知遗漏清单」现在**谎报进度**（称 4 条残, 实际 3 条残 + 1 条半）。
     本仓复发性教训: 「加新决定、不回头清旧文字」。不可信的清单会让下一个人
     重做已完成的活。
@@ -145,8 +145,22 @@
 - [ ] 模块 3 `danqing:component-polish` —— T2 已吃掉其中 `TextInput` 那一小块
 - [ ] 模块 5 `log:layout-rhythm` —— **须先过设计提案门**
 
-## 偏离记录
+## 偏离记录 (2026-09-13)
 
-> 执行中追加。若发现 plan §0 的表与实际不符, 记这里并同步改 plan。
-
-（暂无）
+1. **T2 的方法名改了**: plan 写 `TextInput::set_theme(&mut self, theme)`,
+   **实际实现为 `bind_theme`** —— 与 `TitleBar` / `Tabs` / `Dropdown` 统一形状
+   (`bind_theme<S, T: Theme>(f: Fn(&S) -> T)`)。改名的理由: 本批一共给四个组件
+   补了同一件事, **形式必须一致**; 而 `set_theme` 那种「传一个主题值进来」的签名
+   与另外三个对不上, 会立刻分叉出第二种写法。
+   附带好处: 绑定在**构造时**挂上、每帧自动重放, 不像 `set_theme` 那样要求调用方
+   每帧手动喂 —— 少一个「忘了调」的坑。
+2. **T2 的验收项 ⑤「grep `TextInput::themed(&LightTheme)` 零命中」判据过严**:
+   构造总得给一个主题, 它只是首帧兜底值, 真正决定观感的是绑定。保留该调用并注释说明。
+3. **T2 的占位色不改** (原 Acceptance 要求改 `th.text_secondary()`)。
+   原因: 框架 `TextInput::themed()` 把它定成**与主题无关**的中性灰 `(160,160,160)`,
+   并进主题绑定会**顺带改掉所有其它产品的占位色**; 且现有值两个主题都读得动
+   (暗色 3.20 / 浅色 3.9)。已同步改 `SPEC-dark-theme.md` 清单第 6 条的结论。
+4. **T3 + T4 合成一笔提交**: 两者都只动 `view.rs`, 无法按文件拆成两笔干净的提交。
+5. **T5 触发一条既有守卫转红** (`title_bar_colors_follow_theme_switch` —— 它内部钉着
+   旧手抄值 `0.12`)。**那条红是真的**, 已改为从 `LightTheme.text_primary()` 取。
+   留档理由: 这是「守卫确实在盯颜色」的一次实证, 不是修测试糊过去。
