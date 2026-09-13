@@ -375,12 +375,12 @@
   (PFX = `release-archives/log/msix/sideload-signing.pfx`, 20:28) —— 与被删的那个不是同一个。
   `CurrentUser\TrustedPeople` 已删; **`LocalMachine\TrustedPeople` 需提权, 待用户跑**
   (那条才是 MSIX 部署服务真正读的 —— 见 pomodoro 同文件「只认 LocalMachine」那条)。
-  另 (**2026-09-13 实测计数, 别凭印象**): `LocalMachine\TrustedPeople` 共 5 张 ——
-  在用两张 (`CFC2703D` 本仓 / `19FA8DF1` pomodoro)、本仓孤儿一张 (`61D8E83B`, 待提权删)、
-  pomodoro 的 09-01 遗留两张 (`9645DC09` / `038B9331`);
-  `CurrentUser\TrustedPeople` 剩 7 张 = 上述在用两张 + 同两张 09-01 遗留 +
-  另三张只有它有的旧指纹 (`D9848012` / `B696E9A9` / `2CD02DCD`)。
-  **都未动** —— 属别仓遗留, 待用户裁。
+  另 (**六张孤儿已清, 2026-09-14**): 两个 store 现在**各只剩在用的两张**
+  (`CFC2703D` 本仓 / `19FA8DF1` pomodoro)。清掉的是本仓 `61D8E83B` + pomodoro 的
+  `9645DC09` / `038B9331` / `D9848012` / `B696E9A9` / `2CD02DCD`。
+  清前实测计数 `LocalMachine` 5 张 / `CurrentUser` 7 张 —— **别凭印象, 我当时就写错过一次**。
+  **删前先把「无对应私钥」证掉**: 全农场 `find -iname "*.pfx"` 只有两份, 指纹恰是在用的那两张
+  → 其余六张不可恢复也无影响。`LocalMachine` 那侧走脚本 + `Start-Process -Verb RunAs` (UAC)。
   **查证时差点踩雷**: 09-01 那批里**有一张正是 pomodoro 的在用证书**
   (`19FA8DF1` —— 拿 `release-archives/pomodoro/msix/sideload-signing.pfx` 开出来对上的),
   **不能整批删**, 删了 pomodoro 再侧载就是 `0x800B0109`。
@@ -388,11 +388,11 @@
   各仓 `release-archives/<产品>/msix/sideload-signing.pfx` 开出来的指纹 = 该仓在用的那张
   **本机 `Cert:` PSDrive 不可用** (Security 模块加载失败), 查/删证书一律走 `certutil`
   (`certutil -user -store My` / `-delstore TrustedPeople <sha1>`), 输出经 `iconv -f GBK` 才是中文
-- push 状态 (2026-09-13 收尾批后): 本仓 `dev` **已推** (`2589d47` 截图同源核实 + 本笔收尾批),
-  `ahead=0`; danqing `dev` 无变动。
-  **pomodoro `dev` 一笔订正 (`7395d8f`) 已提交未推** —— 走的是它自己的 dev→master 流程,
-  (现 checkout 仍在其 `master`, 故本机 `master` 上那份文件仍是旧措辞, 待它下次合并)。
-  另: **本机 MSIX 侧载证书那批遗留未清** (见上条 (3), 需提权 + 先分清哪张在用)
+- push 状态 (2026-09-13~14 收尾批后): 本仓 `dev` **已推**, `ahead=0`; danqing `dev` 无变动;
+  **pomodoro `dev` 一笔订正 `7395d8f` 已推** (`0db0bcd..7395d8f`)。
+  走的是它自己的 dev→master 流程 —— **其 `master` 尚未合并, 那份文件在 `master` 上仍是旧措辞**,
+  下次合并才跟上; 它的本机 checkout 已还原回 `master`, 工作分支未动。
+  **本机 MSIX 侧载证书遗留已清干净** (见上条 (3))
   danqing `dev` 当日推 7 笔 —— 控件主题绑定 / 半透明表面守卫 / 选区带 30%→20% /
   **浅色 `surface_variant` (D1)** / **表头面与斑马撞车 (甲)** / **选区带那句补实测** /
   **日志目录加用户数据兜底 (MSIX 商店版)** / **`is_packaged()` (MSIX 包标识)**;
