@@ -211,6 +211,19 @@ fn bookmark_color(theme: crate::config::AppTheme) -> Color {
 /// 暗色那一套按实测挑: 换完后 ERROR 6.32 / WARN 10.47 / OK 10.03 / INFO 6.88 /
 /// DEBUG 6.89, 全部过 AA。
 ///
+/// **浅色的欠账同样成立, 且根子更深** —— 那套值只对**白底**成立, 换成页面底
+/// `#F0F8F6` 就掉下来: 实测 WARN 3.25 / OK 3.78 / DEBUG 3.09 (INFO 4.38 也只差一点,
+/// 只有 ERROR 5.34 是够的)。2026-09-13 一并修掉。
+///
+/// **判据 (两个主题同一把尺)**: 语义色是**文字**, 但按它实际压着的**面**分两档 ——
+/// **常驻面** (页面底 / 斑马行) 过 WCAG AA 4.5; **瞬时面** (hover / 选中行) 不低于 3.0。
+/// 瞬时态放宽到 3.0, 与框架侧 `selection_band_does_not_step_too_far_from_the_background`
+/// 从两边一夹, 是暗色那次就定下的口径; 浅色这次照搬 —— 两个主题第一次用同一把尺。
+///
+/// **斑马行必须进常驻档**, 别只量页面底: 表里一半的行就是斑马底, 只量页面底
+/// 等于漏掉一半的行 —— 这与「面阶梯」那次翻车是**同一个错**
+/// (那里是判据对页面底、屏幕上挨着的是斑马, 见 [`row_band_bg`])。
+///
 /// **为什么不扩 `Theme` trait**: 级别/状态是**日志语义**, 不是通用设计 token
 /// (与 [`bookmark_color`] 同一条判据)。放产品侧。
 ///
@@ -220,10 +233,13 @@ fn bookmark_color(theme: crate::config::AppTheme) -> Color {
 /// 阈值 0.5 落在两个内置主题的巨大空档里 (浅色底 `L` ≈ 0.93, 暗色底 ≈ 0.010)。
 ///
 /// **浅色有两条口径, 且它们不一样 —— 这是查出来的, 不是设计出来的。**
-/// 「整行着色」与「单元格着色」原先各写了一套字面量, 差得不小 (实测 `ΔE76`:
+/// 「整行着色」与「单元格着色」原先各写了一套字面量 (实测 `ΔE76`:
 /// ERROR 3.43 / WARN 4.15 / DEBUG 1.65, JND ≈ 2.3 —— 前两支**可感知**)。
-/// 本轮**原样保留**, 因为用户对浅色的指示是「现值一行不动」, 而这是既有观感、
-/// 用户验收过。合并与否是独立决策, 别顺手做掉。
+/// 两条路径**仍然分开**, 各自按上面那把尺独立压暗 (合并与否是独立决策 D3,
+/// 见 `tasks/todo-open-decisions.md`)。这次压暗**几乎没有动到分叉本身** ——
+/// 实测 `ΔE76`: ERROR 3.43 → **3.70** / WARN 4.15 → **3.42** / DEBUG 1.65 → 1.20,
+/// 前两支仍**在 JND 之上**可感知。**注意这与「分值」无关**: 两条口径都过 AA 了,
+/// 但它们仍然不是同一个颜色。要么并成一支, 要么认下这个分叉, 别指望它自己消失。
 /// 暗色是全新的, 没有历史包袱, 故两条路径共用一套。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct LevelPalette {
@@ -240,25 +256,39 @@ pub(crate) struct LevelPalette {
 }
 
 impl LevelPalette {
-    /// 浅色 · **整行着色**口径 (原 `level_color` 里的字面量) —— 原值原样。
+    /// 浅色 · **整行着色**口径 (原 `level_color` 里的字面量)。
+    ///
+    /// 2026-09-13 按上面那把尺压暗: **保持 HSL 色相与饱和度, 只降亮度**
+    /// (二分求最低亮度, 再留一点余量让护栏不贴在阈值上)。所以是**同一批颜色变深**,
+    /// 不是换了一套色板 —— 用户熟悉的 `WARN` 仍是那个琥珀、`INFO` 仍是那个蓝。
+    /// ERROR 本来就过线, **一个字节没动**。
+    ///
+    /// 修前 → 修后 (对页面底 `#F0F8F6` / 斑马 `#E6EEEC`):
+    /// ERROR 5.34/4.88 不动 · WARN 3.25/2.97 → 5.05/4.62 ·
+    /// OK 3.78/3.46 → 5.06/4.63 · INFO 4.38/4.00 → 5.05/4.62 ·
+    /// DEBUG 3.09/2.83 → 5.04/4.61。回归锁
+    /// [`tests::light_semantic_colors_clear_wcag_aa_on_light_surfaces`]。
     pub(crate) fn light_line() -> Self {
         Self {
-            error: Color::rgb(0.75, 0.18, 0.18),
-            warn: Color::rgb(0.70, 0.50, 0.08),
-            ok: Color::rgb(0.16, 0.56, 0.32),
-            info: Color::rgb(0.22, 0.46, 0.74),
-            trace: Color::rgb(0.55, 0.55, 0.58),
+            error: Color::from_srgb8(0xBF, 0x2E, 0x2E),
+            warn: Color::from_srgb8(0x89, 0x63, 0x0F),
+            ok: Color::from_srgb8(0x23, 0x78, 0x45),
+            info: Color::from_srgb8(0x33, 0x6B, 0xAE),
+            trace: Color::from_srgb8(0x69, 0x69, 0x71),
         }
     }
 
-    /// 浅色 · **单元格/状态**口径 (原 `*_fg()` 函数) —— 原值原样。
+    /// 浅色 · **单元格/状态**口径 (原 `*_fg()` 函数)。
+    ///
+    /// 同上一把尺、同一套色相, 但**独立压暗** (两条口径的分叉见类型级文档)。
+    /// 落到的值与 [`Self::light_line`] 很接近但**不相等** —— 这不是笔误。
     pub(crate) fn light_cell() -> Self {
         Self {
-            error: Color::rgb(0.76, 0.21, 0.21),
-            warn: Color::rgb(0.72, 0.50, 0.02),
-            ok: Color::rgb(0.16, 0.56, 0.32),
-            info: Color::rgb(0.22, 0.46, 0.74),
-            trace: Color::rgb(0.56, 0.56, 0.60),
+            error: Color::from_srgb8(0xC1, 0x36, 0x36),
+            warn: Color::from_srgb8(0x8C, 0x62, 0x04),
+            ok: Color::from_srgb8(0x23, 0x78, 0x45),
+            info: Color::from_srgb8(0x33, 0x6B, 0xAE),
+            trace: Color::from_srgb8(0x69, 0x69, 0x73),
         }
     }
 
@@ -1783,14 +1813,22 @@ mod tests {
             LightTheme.text_primary(),
             "INFO 走默认色"
         );
-        let err = level_color(b"2026-09-05 ERROR disk full", &LightTheme);
-        assert!(err.r > 0.7, "ERROR 判红: {err:?}");
-        let fatal = level_color(b"FATAL boom", &LightTheme);
-        assert!(fatal.r > 0.7, "FATAL 判红");
-        let warn = level_color(b"WARN slow query", &LightTheme);
-        assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
-        let dbg = level_color(b"DEBUG cache miss", &LightTheme);
-        assert!(dbg.r < 0.6, "DEBUG 判灰");
+        // 断言「判到了哪一支」, 而**不是**「那一支长什么样」。
+        //
+        // 原先这里写的是通道阈值 (`err.r > 0.7` / `warn.g > 0.4` 一类) —— 那是拿
+        // 色值当分类的代理, 两个东西一起测。2026-09-13 D2 按 AA 把浅色压暗一遍,
+        // WARN 的 `r` 从 0.70 落到 0.54, 这条**假红**了: 分类明明是对的。
+        // 分类与取值分开测 —— 取值有 `light_semantic_colors_clear_wcag_aa_*` 管。
+        let pal = LevelPalette::light_line();
+        for (line, want, what) in [
+            (&b"2026-09-05 ERROR disk full"[..], pal.error, "ERROR"),
+            (&b"FATAL boom"[..], pal.error, "FATAL"),
+            (&b"WARN slow query"[..], pal.warn, "WARN"),
+            (&b"DEBUG cache miss"[..], pal.trace, "DEBUG"),
+            (&b"TRACE tick"[..], pal.trace, "TRACE"),
+        ] {
+            assert_eq!(level_color(line, &LightTheme), want, "{what} 没判到对应色");
+        }
     }
 
     /// 线性空间合成后的亮度 (与 GPU 一致)。
@@ -1825,9 +1863,9 @@ mod tests {
     /// (已在框架侧锁), 另一半是**这五支从来只有浅色一套值** —— 深饱和色压在近黑底上,
     /// 实测 ERROR 3.03 / INFO 3.70 / OK 4.28, **全部低于 WCAG AA (4.5)**。
     ///
-    /// **只卡暗色**: 浅色那套的 WARN 3.18 / DEBUG 2.97 / OK 3.78 同样不过 AA,
-    /// 但那是用户已验收的既有观感, 用户对浅色的指示是「现值一行不动」——
-    /// 拿这条锁去卡浅色等于借护栏之名改浅色主题。**浅色的欠账另立**, 不夹带。
+    /// **只卡暗色**: 浅色那套的 WARN 3.18 / DEBUG 2.97 / OK 3.78 同样不过 AA ——
+    /// 那条欠账当时**另立**了 (D2), 已于 2026-09-13 收口, 见下一条
+    /// [`Self::light_semantic_colors_clear_wcag_aa_on_light_surfaces`]。
     ///
     /// 有牙齿: 修之前 ERROR 3.03, 直接红。
     #[test]
@@ -1847,6 +1885,62 @@ mod tests {
                 ratio >= AA,
                 "暗色的 {name} 对底色只有 {ratio:.2} < {AA}: {c:?}"
             );
+        }
+    }
+
+    /// **浅色的语义色同样要过 AA** —— 与暗色那条**同一把尺** (2026-09-13, D2 收口)。
+    ///
+    /// 触发: 审查浅色截图时发现选中的那一行 `status=400` 读不出来, 一度当成**独立缺陷**
+    /// (「选中行上的语义色碰撞」); 算完才清楚**它不是一个新问题, 就是这条欠账显形** ——
+    /// 那套值只对**白底**成立, 换成页面底 `#F0F8F6` 就掉下来。
+    ///
+    /// **判据分两档** (与暗色侧完全一致): **常驻面** (页面底 / 斑马行) 要 4.5,
+    /// **瞬时面** (hover / 选中行) 只要 3.0 —— 瞬时态那条与框架侧的
+    /// `selection_band_does_not_step_too_far_from_the_background` 从两边一夹。
+    ///
+    /// **斑马行必须进常驻档**: 表里一半的行就是斑马底。只量页面底 = 漏掉一半的行,
+    /// 这与「面阶梯」那次翻车是**同一个错** (判据对页面底, 而屏幕上挨着的是别的面)。
+    ///
+    /// 两条口径**各测一遍**: 分叉是真实存在的 (D3), 漏测一条等于放走一半的着色路径。
+    ///
+    /// 有牙齿: 修之前 WARN 3.25 / OK 3.78 / DEBUG 3.09, 三条一起红。
+    #[test]
+    fn light_semantic_colors_clear_wcag_aa_on_light_surfaces() {
+        const AA: f32 = 4.5;
+        const FLOOR: f32 = 3.0;
+        let th = LightTheme;
+        // 底色一律取**渲染后**的亮度 (与屏幕上一致): 斑马/hover 是实色,
+        // 选中行要先经**线性**合成 —— 别用 `danqing::composite_over`, 它在 sRGB 空间混。
+        let page = danqing::relative_luminance(th.background());
+        let zebra = danqing::relative_luminance(row_band_bg(crate::config::AppTheme::Light));
+        let hover = danqing::relative_luminance(row_hover_bg(crate::config::AppTheme::Light));
+        let selected = composited_luminance(th.selection(), th.background());
+        let surfaces = [
+            ("页面底", page, AA),
+            ("斑马行", zebra, AA),
+            ("hover", hover, FLOOR),
+            ("选中行", selected, FLOOR),
+        ];
+        let palettes = [
+            ("整行着色", LevelPalette::for_line(&th)),
+            ("单元格/状态", LevelPalette::for_cell(&th)),
+        ];
+        for (path, pal) in palettes {
+            for (name, c) in [
+                ("error", pal.error),
+                ("warn", pal.warn),
+                ("ok", pal.ok),
+                ("info", pal.info),
+                ("trace", pal.trace),
+            ] {
+                for (surface, bg, bar) in surfaces {
+                    let ratio = ratio_on(c, bg);
+                    assert!(
+                        ratio >= bar,
+                        "{path} 口径 {name} 压 {surface} 只有 {ratio:.2} 低于 {bar}: {c:?}"
+                    );
+                }
+            }
         }
     }
 
