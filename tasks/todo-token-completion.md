@@ -121,7 +121,7 @@
 
 ## Phase 4: 收口
 
-- [ ] **T6: 三件套 + 真机验收 + 落地链**
+- [x] **T6: 三件套 + 真机验收 + 落地链** ✅ 2026-09-13 —— **真机验收通过 (用户)**
   - `cargo fmt` + `clippy --all-targets -- -D warnings` + 测试全绿（**两仓各跑**）
   - 真机验收: 浅/暗各一轮, 逐条对 R1–R5 的 Verify
   - 落地链: `rm .cargo/config.toml` 关 patch → **push 框架** →
