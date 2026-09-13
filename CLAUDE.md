@@ -355,10 +355,40 @@
   1.x 付费层是**新增的**批量/留存/交付能力。
 
 - 2026-09-13 (**发布前状态盘点 — 主渠道产物补齐**):
-  **踩坑 (留给发布当天)**: `release-archives/log/` 里现在**同时躺着 v0.1.0 与 v1.0.0 两个 zip**
-  —— v0.1.0 从未发布 (无 Release、无 tag), 是死重量, 且是现成的「拿错包」陷阱
-  (pomodoro 就栽过「MSIX 上传成旧版」)。**发布前先清掉或挪走**, 别靠肉眼认版本号
-- push 状态 (2026-09-13 当日末): **三仓 working tree 干净、`ahead=0`**。
+  **「拿错包」陷阱已清 (见下条收尾批)**: 原记「`release-archives/log/` 里同时躺着 v0.1.0 与
+  v1.0.0 两个 zip」—— v0.1.0 从未发布 (无 Release、无 tag) 却是现成的「拿错包」陷阱
+  (pomodoro 栽过「MSIX 上传成旧版」)。**发布前先清掉或挪走**, 别靠肉眼认版本号
+
+- 2026-09-13 (**三件早先挂起的收尾** —— 都不是代码):
+  **(1) `_stale/`**: v0.1.0 三件 (zip + `.sha256` + 解压目录) 挪进
+  `release-archives/log/_stale/`, 顶层**只剩 v1.0.0 一个 zip**。**挪走不是删除** (可逆),
+  `_stale/` 随时可清空
+  **(2) pomodoro 的过期待办已结**: 其 `memory/msix-sideload-workflow.md` 原记「MSIX 下商店版
+  无日志 —— danqing 侧待办: 日志目录回退 `%APPDATA%`」。该待办**早已在框架侧落地**
+  (`danqing` `src/log.rs` 三级回退, 第②级 `%LOCALAPPDATA%\<exe 名>\logs`, 2026-09-13 实测
+  商店版日志正常落包私有目录), 且实际落点是 `%LOCALAPPDATA%` **不是 `%APPDATA%`** ——
+  已改写该条并留验证手法 (第①级常写成功、走不到②, 用同名文件占住 `logs` 位置逼出降级路径)。
+  **改动在 pomodoro 仓, 未提交**
+  **(3) 孤立自签证书已删**: `CN=DanqingLog-LocalTest` (`61d8e83b`, 09-13 19:23) 是
+  `sign_msix_local.ps1` 早期用占位主题时建的, 其 PFX 在 20:28 被真主题证书覆盖 → 私钥已失,
+  纯遗留。**先证明再删**: `signtool verify /pa /v` 读出在用的包签自 `CFC2703D`
+  (PFX = `release-archives/log/msix/sideload-signing.pfx`, 20:28) —— 与被删的那个不是同一个。
+  `CurrentUser\TrustedPeople` 已删; **`LocalMachine\TrustedPeople` 需提权, 待用户跑**
+  (那条才是 MSIX 部署服务真正读的 —— 见 pomodoro 同文件「只认 LocalMachine」那条)。
+  另: 本机 `LocalMachine\TrustedPeople` 还躺着 **5 个 09-01 的 `CN=5F2A7EA5-…`**
+  (pomodoro 侧载期遗留, 同主题不同密钥), **未动** —— 属别仓遗留, 待用户裁。
+  **查证时差点踩雷**: 这 5 个里**有一个是 pomodoro 的在用证书**
+  (`19FA8DF1…` —— 拿 `release-archives/pomodoro/msix/sideload-signing.pfx` 开出来对上的),
+  **不能整批删**, 删了 pomodoro 再侧载就是 `0x800B0109`。
+  **同主题多张证书时, 只能靠 PFX 对指纹认亲, 不能靠主题认**。
+  通用做法: 各仓 `release-archives/<产品>/msix/sideload-signing.pfx` 开出来的指纹 = 该仓在用的那张
+  **本机 `Cert:` PSDrive 不可用** (Security 模块加载失败), 查/删证书一律走 `certutil`
+  (`certutil -user -store My` / `-delstore TrustedPeople <sha1>`), 输出经 `iconv -f GBK` 才是中文
+- push 状态 (2026-09-13 收尾批后): 本仓 `dev` **已推** (`2589d47` 截图同源核实 + 本笔收尾批),
+  `ahead=0`; danqing `dev` 无变动。
+  **pomodoro `dev` 一笔订正 (`7395d8f`) 已提交未推** —— 走的是它自己的 dev→master 流程,
+  (现 checkout 仍在其 `master`, 故本机 `master` 上那份文件仍是旧措辞, 待它下次合并)。
+  另: **本机 MSIX 侧载证书那批遗留未清** (见上条 (3), 需提权 + 先分清哪张在用)
   danqing `dev` 当日推 7 笔 —— 控件主题绑定 / 半透明表面守卫 / 选区带 30%→20% /
   **浅色 `surface_variant` (D1)** / **表头面与斑马撞车 (甲)** / **选区带那句补实测** /
   **日志目录加用户数据兜底 (MSIX 商店版)** / **`is_packaged()` (MSIX 包标识)**;
