@@ -72,10 +72,28 @@ const DOUBLE_CLICK_MS: u128 = 300;
 /// 双击位移容差; 同值兼任「按下→框选」升级阈值 (抖动不产选区)。
 const CLICK_DIST: f32 = 4.0;
 
-/// header_line 使用框架 LightTheme divider。
-fn header_line() -> Color {
-    LightTheme.divider()
+/// 表头下划线 / 状态栏顶线的颜色 —— 取**当前主题**的分割线色。
+///
+/// 原先恒用 `LightTheme.divider()`（不看当前主题）: 暗色下这两条线用的是浅色主题
+/// 那条 (黑 10%), 压在近黑底上等于没画。回归锁 `header_line_follows_theme`。
+fn header_line<T: Theme>(th: &T) -> Color {
+    th.divider()
 }
+/// 书签行号色 —— 两主题各一支金。
+///
+/// **有意不套 `Theme::accent`**: accent 已经用于选中行 / 焦点边框 / 指示线,
+/// 书签套上去会把**第三类语义**混进「选中/强调」那一个通道 —— 扫一眼分不出
+/// 哪行是书签、哪行是选中。框架没有书签 token, **也不为它扩 trait**:
+/// 这是产品语义, 放产品侧。回归锁 `bookmark_color_is_its_own_channel_per_theme`。
+fn bookmark_color(theme: crate::config::AppTheme) -> Color {
+    match theme {
+        // 原值原样保留: 深金配白底, 用户验收过。
+        crate::config::AppTheme::Light => Color::rgb(0.75, 0.60, 0.10),
+        // 近黑底上要提亮 —— 同一支深金在暗色下会糊进背景。
+        crate::config::AppTheme::Dark => Color::rgb(0.95, 0.78, 0.28),
+    }
+}
+
 /// INFO / 3xx 蓝。
 pub(crate) fn info_fg() -> Color {
     Color::rgb(0.22, 0.46, 0.74)
@@ -560,7 +578,7 @@ impl Widget for LogView {
             }
             rects.push_rect(
                 Rect::from_xywh(area.origin.x, hy + HEADER_H - 1.0, area.size.width, 1.0),
-                header_line(),
+                header_line(&th),
                 0.0,
             );
         }
@@ -676,7 +694,7 @@ impl Widget for LogView {
             let no = format!("{}", line_no + 1);
             let no_w = texts.measure(&no, AUX_FONT_SIZE);
             let no_color = if self.bookmarks.contains(&line_no) {
-                Color::rgb(0.75, 0.60, 0.10)
+                bookmark_color(self.theme)
             } else {
                 th.text_secondary()
             };
@@ -887,7 +905,7 @@ impl Widget for LogView {
         // 底栏状态行 (打开耗时/过滤统计 = 截图弹药本体); 顶部 1px 线与列表区分层
         rects.push_rect(
             Rect::from_xywh(area.origin.x, status_y, area.size.width, 1.0),
-            header_line(),
+            header_line(&th),
             0.0,
         );
         let sy =
@@ -1575,6 +1593,46 @@ mod tests {
         assert!(warn.r > 0.6 && warn.g > 0.4, "WARN 判黄: {warn:?}");
         let dbg = level_color(b"DEBUG cache miss", &LightTheme);
         assert!(dbg.r < 0.6, "DEBUG 判灰");
+    }
+
+    /// 书签行号色: 两主题各一支金, 且**不能**等于次级正文色。
+    ///
+    /// 回归锁 (2026-09-13): 书签色原先是写死的 `0.75,0.60,0.10` —— 那是配白底的,
+    /// 近黑底上偏暗。旧清单建议「从 `Theme.accent` 派生」, **没有采纳**:
+    /// accent 已经用于选中行 / 焦点边框 / 指示线, 书签套上去会把**第三类语义**
+    /// 混进「选中/强调」那一个通道, 扫一眼分不出哪行是书签、哪行是选中。
+    #[test]
+    fn bookmark_color_is_its_own_channel_per_theme() {
+        let light = bookmark_color(crate::config::AppTheme::Light);
+        let dark = bookmark_color(crate::config::AppTheme::Dark);
+        assert_ne!(light, dark, "两主题各一支金");
+        assert_ne!(
+            light,
+            LightTheme.text_secondary(),
+            "书签是独立通道, 不能退化成次级正文色"
+        );
+        assert_ne!(dark, DarkTheme.text_secondary(), "同上");
+        assert_ne!(
+            light,
+            LightTheme.accent(),
+            "不能混进 accent —— 那是选中/强调的通道"
+        );
+    }
+
+    /// `header_line` 必须取**当前主题**的分割线色。
+    ///
+    /// 回归锁 (2026-09-13): 它原先恒用 `LightTheme.divider()`, 完全不看当前主题 ——
+    /// 表头下划线与状态栏顶线在暗色下用的是浅色主题那条 (黑 10%), 压在近黑底上
+    /// 等于没有。两处调用点 (`:563` / `:890`) 都白描了一道看不见的线。
+    #[test]
+    fn header_line_follows_theme() {
+        assert_eq!(header_line(&LightTheme), LightTheme.divider(), "浅色");
+        assert_eq!(header_line(&DarkTheme), DarkTheme.divider(), "暗色");
+        assert_ne!(
+            header_line(&LightTheme),
+            header_line(&DarkTheme),
+            "两主题的分割线色必须不同 —— 相同即等于没跟随"
+        );
     }
 
     /// 过滤/搜索栏的输入色必须跟着主题走。
