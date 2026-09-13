@@ -297,6 +297,23 @@
   **渲染在商店页内**、用户不必离开; 代价 (第二副本会漂) 也写明, 并留了「改 URL 不必重打包」
   的后路 (隐私策略是纯元数据)。**没翻案, 只换了理由** —— 原推荐不变, 因为仓库可见性与
   「贴文本还是贴 URL」本来就是两件事
+- 2026-09-13 (**「外人克隆能构建」用真克隆验证过了** —— 本仓有过一次**假**的承诺
+  (9-13 修 `[patch]` 那次前), 所以这次不推理, 真跑): SSH 克隆到临时目录 → **87 文件、
+  无 `[patch]`、lock 钉 `677aac3c`** → `cargo build --locked` → **3m30s 成功**,
+  产物 `target/debug/danqing-log.exe` (350MB, 带调试信息)。验完即删 (临时克隆 2.1GB)。
+  **中途踩了一个必踩的坑, 记下来免得重复**: 第一次构建**失败**在
+  `linking with link.exe failed` / `x86_64-pc-windows-msvc` —— **用错工具链**。
+  原因正是农场约定第 6 条那个坑 (本机 msvc 不可用), 但**只在克隆目录炸**:
+  `rustup override` 是**按目录记的本地设置**(`~/.rustup/settings.toml`), 工作仓库有、
+  新克隆没有。**这不是仓库缺陷, 是测试环境缺设置** —— 补
+  `rustup override set stable-x86_64-pc-windows-gnu` 后即成功。
+  **注意别被假退出码骗**: 管道里 `cargo build ... | tail` 的退出码是 `tail` 的,
+  恒为 0 —— 第一次「成功」就是这么骗过去的, 是读输出才看见 error。
+  故本次改成 `cargo build > log 2>&1; echo "cargo exit code: $?"` 分开取。
+  **裁决: 不加 `rust-toolchain.toml`**。msvc 不可用是**这台机器**的环境问题 (多半只装了
+  rustup 的 gnu 工具链、没装 VS Build Tools), 不是仓库属性; 写死
+  `x86_64-pc-windows-gnu` 等于为绕开一台机器的毛病**把 Windows 专用三元组强加给所有平台**
+  (Linux/macOS 拿到直接失败), 而普通 Windows 开发者有 MSVC、默认就能构建
 - push 状态 (2026-09-13 当日末): **三仓 working tree 干净、`ahead=0`**。
   danqing `dev` 当日推 7 笔 —— 控件主题绑定 / 半透明表面守卫 / 选区带 30%→20% /
   **浅色 `surface_variant` (D1)** / **表头面与斑马撞车 (甲)** / **选区带那句补实测** /
