@@ -79,31 +79,32 @@ pub(crate) struct SearchOutcome {
     query: String,
 }
 
-/// 标题栏主题：浅色 (匹配白底日志视图), 深色文字。
-/// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用深色。
+/// 标题栏主题 —— 用 `LogTheme` 的 token 组装一个 `SceneTheme`。
+///
+/// 六项 (`base` / `accent` / `text_primary` / `text_secondary` / `surface` /
+/// `surface_input`) **全部取自 `LogTheme`**, 不再手抄。手抄的后果是同一个界面里
+/// 出现**两套强调色**: 原先浅色分支的 accent 是蓝 `0.18,0.35,0.60`, 而框架玉色是
+/// `#0F766E`; `base` 也手抄成 `0.96` 灰, 与主题真实的 `#F0F8F6` 差一截。
+///
+/// `backdrop_light` / `backdrop_dark` **保留手写**: 框架没有对应 token ——
+/// 它们是场景层的前后景渐变端点, 只服务标题栏这一层场景。
+/// 回归锁 `title_theme_derives_tokens_from_log_theme`。
 fn title_theme(theme: config::AppTheme) -> SceneTheme {
-    match theme {
-        config::AppTheme::Light => SceneTheme::new(ScenePalette {
-            base: Color::rgb(0.96, 0.96, 0.96),
-            accent: Color::rgb(0.18, 0.35, 0.60),
-            text_primary: Color::rgb(0.12, 0.12, 0.12),
-            text_secondary: Color::rgb(0.40, 0.40, 0.42),
-            surface: Color::rgba(0.0, 0.0, 0.0, 0.04),
-            surface_input: Color::rgba(0.0, 0.0, 0.0, 0.06),
-            backdrop_light: Color::rgb(0.85, 0.85, 0.88),
-            backdrop_dark: Color::rgb(0.70, 0.70, 0.74),
-        }),
-        config::AppTheme::Dark => SceneTheme::new(ScenePalette {
-            base: Color::rgb(0.10, 0.10, 0.13),
-            accent: Color::from_srgb8(26, 158, 138),
-            text_primary: Color::rgb(0.90, 0.90, 0.92),
-            text_secondary: Color::rgb(0.56, 0.56, 0.58),
-            surface: Color::rgba(1.0, 1.0, 1.0, 0.06),
-            surface_input: Color::rgba(1.0, 1.0, 1.0, 0.10),
-            backdrop_light: Color::rgb(0.16, 0.16, 0.20),
-            backdrop_dark: Color::rgb(0.06, 0.06, 0.08),
-        }),
-    }
+    let t = theme.theme();
+    let (backdrop_light, backdrop_dark) = match theme {
+        config::AppTheme::Light => (Color::rgb(0.85, 0.85, 0.88), Color::rgb(0.70, 0.70, 0.74)),
+        config::AppTheme::Dark => (Color::rgb(0.16, 0.16, 0.20), Color::rgb(0.06, 0.06, 0.08)),
+    };
+    SceneTheme::new(ScenePalette {
+        base: t.background(),
+        accent: t.accent(),
+        text_primary: t.text_primary(),
+        text_secondary: t.text_secondary(),
+        surface: t.surface(),
+        surface_input: t.surface_input(),
+        backdrop_light,
+        backdrop_dark,
+    })
 }
 
 /// 窗口清屏色 —— **单点定义, 启动与切主题都取它**。
@@ -1499,6 +1500,38 @@ mod tests {
         assert_eq!(clamp_top(3.0, 0), 0.0, "空文件归零");
     }
 
+    /// `title_theme` 的六项必须**取自 `LogTheme`**, 不再手抄。
+    ///
+    /// 手抄的后果是同一个界面里出现**两套强调色**: 浅色分支的 accent 曾经是蓝
+    /// `0.18,0.35,0.60`, 而框架玉色是 `#0F766E`。六个值全部改成从 `LogTheme` 取,
+    /// 只剩 `backdrop_light/dark` 手写 (框架没有对应 token, 它们只服务标题栏
+    /// 这一层场景)。
+    #[test]
+    fn title_theme_derives_tokens_from_log_theme() {
+        for app in [config::AppTheme::Light, config::AppTheme::Dark] {
+            let scene = title_theme(app);
+            let t = app.theme();
+            assert_eq!(scene.background(), t.background(), "{app:?} base");
+            assert_eq!(scene.accent(), t.accent(), "{app:?} accent");
+            assert_eq!(
+                scene.text_primary(),
+                t.text_primary(),
+                "{app:?} text_primary"
+            );
+            assert_eq!(
+                scene.text_secondary(),
+                t.text_secondary(),
+                "{app:?} text_secondary"
+            );
+            assert_eq!(scene.surface(), t.surface(), "{app:?} surface");
+            assert_eq!(
+                scene.surface_input(),
+                t.surface_input(),
+                "{app:?} surface_input"
+            );
+        }
+    }
+
     /// 切主题后**标题栏文字色必须跟着变** —— 它靠 `bind_theme` 每帧重取,
     /// 不能靠构造。
     ///
@@ -1528,15 +1561,18 @@ mod tests {
         let size = bar.layout(Constraints::tight(Size::new(1100.0, 40.0)), &mut texts);
         bar.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
 
-        // 浅色标题栏的文字色 = ScenePalette::text_primary = 0.12, 进 GPU 前解码。
-        let want = danqing::srgb_to_linear(0.12);
+        // 期望值**从主题取**, 不写字面量: 原先这里钉的是手抄时代的 `0.12`,
+        // R5 把 `title_theme` 改成取自 `LogTheme` 后它就过期了 (token 是 #0F172A),
+        // 断言随即变红 —— 那条红是真的, 说明它确实盯着颜色。
+        let t = danqing::theme::LightTheme.text_primary();
+        let want = danqing::srgb_to_linear(t.r);
         let hit = texts
             .instance_colors()
             .iter()
             .any(|c| (c.r - want).abs() < 1e-3);
         assert!(
             hit,
-            "切到浅色后标题文字应变成浅色主题的正文色 (0.12) —— 没命中即 `bind_theme` 缺失"
+            "切到浅色后标题文字应变成浅色主题的正文色 {t:?} —— 没命中即 `bind_theme` 缺失"
         );
     }
 
