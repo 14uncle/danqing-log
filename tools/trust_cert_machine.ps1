@@ -9,7 +9,9 @@
 # 用法 (触发 UAC 提权, 把下面整行粘进普通 PowerShell 或 cmd):
 #   powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-File','F:/github/farm01/danqing-log/tools/trust_cert_machine.ps1'"
 #
-# 清理: certlm.msc -> 受信任的发布者 / 受信任人, 删 CN=DanqingLog-LocalTest。
+# 清理: certlm.msc -> 受信任的发布者 / 受信任人, 删本脚本打印的那个 Subject
+#       (证书主题**就是** Partner Center 的 Publisher CN, 不是另造的测试名 —— 见
+#        sign_msix_local.ps1 里那段「为什么用真实标识」。所以别照着一个名字找, 看输出)。
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path "$PSScriptRoot\.."

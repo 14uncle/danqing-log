@@ -1,7 +1,7 @@
 ﻿# sign_msix_local.ps1 - MSIX 侧载实测: 自签证书 + 信任 + 签名 + 安装
 #
 # **仅用于本地测试。** 提交商店的包**不签名** —— 商店收录后用它自己的证书重签,
-# 而且本地签过的包反而会被拒 (你的证书主题不可能等于 Partner Center 给的 CN=<GUID>)。
+# 而我们的自签证书链它不认, 签过的包反而可能被拒。本脚本签出来的包只用于本机侧载。
 #
 # 用法 (仓库根目录):
 #   powershell -NoProfile -File tools/sign_msix_local.ps1
@@ -15,7 +15,7 @@
 # 若第 4 步报 0x800B0109 (证书链不受信任): AppX 部署服务以 SYSTEM 身份验签,
 # **只认 LocalMachine\TrustedPeople** —— 跑 tools/trust_cert_machine.ps1 (要 UAC)。
 #
-# 清理: certmgr.msc -> 当前用户 -> 受信任的发布者 / 受信任人, 删 CN=DanqingLog-LocalTest;
+# 清理: certmgr.msc -> 当前用户 -> 受信任的发布者 / 受信任人, 删本脚本打印的那个 Subject;
 #       卸载: 设置 -> 应用 -> 丹青日志 LogLens。
 # 本机坑 (承自 pomodoro memory/msix-sideload-workflow.md): 本机 `Cert:` PSDrive 不可用
 # (Security 模块加载失败), 故全程走 .NET, 不用 New-SelfSignedCertificate。
