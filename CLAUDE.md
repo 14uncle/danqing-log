@@ -181,7 +181,30 @@
   计数: danqing **592** lib + 集成; 本仓 51 lib + **74** main + 8 genlog; clippy 0; 3 连跑绿。
   **未覆盖 (如实记)**: 本模块所有测试都塞合成几何, 无一条验证真实 paint 把子行几何
   插在正确显示行、把列区间写进缓存 —— 「三源一体」只锁了「给定正确几何, 命中/复制
-  一致」。余 code-simplify 一段。
+  一致」。
+- 2026-09-14 (**T2 联动落地 + code-simplify 收口 → 五段全闭**, 已 commit push):
+  **裁定 ③ 行多选挂 v1.x** (理由: 框选已覆盖连续区间 / Ctrl 指定多选偏 niche /
+  前置是先改框架 (`Event::MouseInput` 不带修饰键) + 一个 M5 级模块 / v1.0 已为此
+  阻塞一轮; 且「批量」正是付费层话术素材 → 叙事更顺)。落档 `docs/ROADMAP-v1x.md`
+  §一欠账表 + §四待裁项, spec §8.4。
+  **T2**: danqing push → 本仓**关 patch** `cargo update -p danqing` 复钉 →
+  两仓分别提交。**踩到并解掉 lock 陷阱的一个新形态**: 关 patch 后 `cargo update -p
+  danqing` 直接报 **`package ID specification danqing did not match any packages`**
+  —— 因为 lock 还是 path 态 (无 `source` 行), cargo 的当前解析里根本没有「有来源的
+  danqing」可供匹配。**解法 = 先跑一次 `cargo check`** 让它按 manifest 重解 (实测
+  一步就钉到了刚 push 的 rev), 之后再 `cargo update` 才认得。
+  **code-simplify**: 框架 —— 连接符段的手搓双向扫描 (15 行) 与已有 `run_over` 是
+  同一个原语 → 一次调用 (`run_over` 起点含 `pos` 本身, 语义逐字等价); 两处闭包 →
+  命名谓词 `is_punct`。本仓 —— `text_x` / `row_at` / `is_double_click` 各抽成方法:
+  前两个原先在 **paint / 命中测试 / 按下分流三处**各推一遍同一个**载荷几何式子**
+  (注释里写着「同源」却靠手抄维持), 后者在文本与单元格双击两处各抄一份判定。
+  **明确不动**按下处理那个三分支链 —— 条件全写明了才好读, 改成依赖 else 链的
+  隐含不变式 = 用可读性换行数 (简化的失败模式)。
+  全绿: danqing **592 lib** + 集成 (测试**零改动**); 本仓 51 lib + 74 main + 8 genlog;
+  clippy 0; `--locked` 无 patch 构建通过。
+  **最终 rev**: danqing `b4b43e1` / 本仓 lock 钉 `danqing#b4b43e1b`。
+  **模块五阶段 (spec→plan→build→review→code-simplify) 全闭 + 人工验收通过。**
+  余下全是 v1.0 发布链 (重拍截图 → 打 tag → GitHub Release → 商店提交), 待逐项点头。
 - 当前: **UI 改造五模块已闭环; v1.0 收尾是唯一主线** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):

@@ -680,16 +680,39 @@ impl LogView {
     }
 
     /// 行文本区左键按下的选区处理 (T3)。双击 (300ms/4px, title_bar 先例) =
+    /// 文本区左缘 (绝对窗口 x) = 展开标识区 + 行号槽 + 间距。
+    /// **与 paint 同源** —— 原先 paint / 命中测试 / 按下分流各推一遍同一个式子,
+    /// 三处任一漂了都会让「点得到的地方」与「画出来的地方」错开。
+    fn text_x(&self, area: Rect) -> f32 {
+        area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP
+    }
+
+    /// 列表区内的相对 y → 显示行。**与 paint 的行锚定同源** (paint 逐行递增,
+    /// event 侧只能由 y 反算, 两套算法必须给出同一个行号)。
+    /// **不钳上界**: 列表区下方空白会算出越界行, 由各调用方自己挡 ——
+    /// `hit_text` 靠几何缓存 (只含真实行), 单元格路径靠 [`Self::cell_value`]
+    /// 的 `display_count` 守卫。
+    fn row_at(&self, rel_y: f32) -> u64 {
+        (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64
+    }
+
+    /// 双击判定 (300ms / 4px, 沿用 `title_bar` 先例): 与上次按下在时间与位移
+    /// 阈值内。文本双击与单元格双击**共用同一套规则** —— 原先两处各抄一份,
+    /// 「同规则同常量」只靠注释维持。
+    fn is_double_click(&self, now: Instant, position: Point) -> bool {
+        self.last_click.is_some_and(|(t, p)| {
+            now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
+                && (position.x - p.x).abs() < CLICK_DIST
+                && (position.y - p.y).abs() < CLICK_DIST
+        })
+    }
+
     /// 框架混合连接器分词整选 (M1); 单击 = 潜伏锚点 (拖超阈值才升级框选) 且清除旧选区。
     /// 调用方已判定: 左键 + 已打开文件 + px 在文本区 + (原始模式全行区 | 表格模式
     /// 仅展开子行, M3)。
     fn handle_text_press(&mut self, area: Rect, position: Point) {
         let now = Instant::now();
-        let dbl = self.last_click.is_some_and(|(t, p)| {
-            now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
-                && (position.x - p.x).abs() < CLICK_DIST
-                && (position.y - p.y).abs() < CLICK_DIST
-        });
+        let dbl = self.is_double_click(now, position);
         if dbl {
             if let Some((r, b)) = self.hit_text(area, position) {
                 // M3: 文本来源 = 该行复制内容 (子行 = `label = value` 串) ——
@@ -728,8 +751,8 @@ impl LogView {
         if !(0.0..list_h).contains(&rel_y) {
             return None;
         }
-        let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
-        let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
+        let row = self.row_at(rel_y);
+        let text_x = self.text_x(area);
         let (_, sub_off) = self.line_at(row);
         let content_x = if sub_off > 0 {
             pos.x - text_x
@@ -789,11 +812,7 @@ impl LogView {
     fn handle_cell_press(&mut self, row: u64, position: Point) {
         self.selection = None;
         let now = Instant::now();
-        let dbl = self.last_click.is_some_and(|(t, p)| {
-            now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
-                && (position.x - p.x).abs() < CLICK_DIST
-                && (position.y - p.y).abs() < CLICK_DIST
-        });
+        let dbl = self.is_double_click(now, position);
         if dbl {
             self.selected_cell = self
                 .col_idx_at(position)
@@ -903,8 +922,8 @@ impl Widget for LogView {
         let sample = "8".repeat(digits.max(4));
         let gutter_w = (texts.measure(&sample, AUX_FONT_SIZE) + 20.0).max(GUTTER_MIN);
         self.gutter_w.set(gutter_w); // 选区命中 (event 无 TextBatch) 同源
-        // 展开标识区 + 行号槽 + 间距
-        let text_x = area.origin.x + EXPAND_W + gutter_w + GUTTER_GAP;
+        // 展开标识区 + 行号槽 + 间距 (与命中测试/按下分流同一个式子)
+        let text_x = self.text_x(area);
         let text_right = area.origin.x + area.size.width - SCROLLBAR_W - 6.0;
         let text_w = (text_right - text_x).max(1.0);
         // 水平偏移 (T7): paint 防御性回钳 (窗口变宽/内容变窄后 offset 可能越界)
@@ -1441,8 +1460,7 @@ impl Widget for LogView {
                     .set(self.settings_btn_rect.get().contains(*position));
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
-                    self.hover_row
-                        .set((self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64);
+                    self.hover_row.set(self.row_at(rel_y));
                 } else {
                     self.hover_row.set(u64::MAX);
                 }
@@ -1508,14 +1526,14 @@ impl Widget for LogView {
                 }
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
-                    let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
+                    let row = self.row_at(rel_y);
                     // 行首 ▶/▼ 展开开关区 (左 20px, 表格模式); 其余点击选中
                     let in_glyph = self.table_mode() && position.x - area.origin.x < EXPAND_W;
                     if in_glyph {
                         msgs.push(Box::new(Msg::ToggleExpand(row)));
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
-                        let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
+                        let text_x = self.text_x(area);
                         let sub_row = self.line_at(row).1 > 0;
                         // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
                         // | 表格模式仅展开子行); 右键不清选区/不污染双击判定

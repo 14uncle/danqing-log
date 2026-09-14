@@ -360,4 +360,16 @@ push。回本仓: `cargo update -p danqing` → 全测试绿 → 提交 lock (me
   **③ 行多选裁定挂 v1.x** (理由与前置见 §8.4 与 `ROADMAP-v1x.md` §四);
   **T2 联动落地** —— danqing 改动 push → 本仓关 patch `cargo update -p danqing`
   复钉 `Cargo.lock` → 两仓分别提交。**模块至此 spec→plan→build→review 四段全闭,
-  机器 + 验收双闭环。** 余 code-simplify 一段。
+  机器 + 验收双闭环。**
+- 2026-09-14 (**code-simplification 收口 —— 五段全闭**): 行为不变的前提下砍重复。
+  ① **框架**: 连接符段的手搓双向扫描 (15 行) 与已有 `run_over` 是同一个原语 →
+  改为一次调用 (语义逐字等价 —— `run_over` 的起点含 `pos` 本身); 两处
+  `matches!(cls_of(c), Cls::Conn | Cls::Other)` 闭包 → 命名谓词 `is_punct`。
+  ② **本仓**: `text_x` / 显示行反算 (`row_at`) / 双击判定 (`is_double_click`)
+  各抽成方法 —— 前两个原先在三处各推一遍同一个**载荷几何式子** (paint / 命中测试 /
+  按下分流), 注释里写着「同源」却靠手抄维持; 双击判定原先在文本与单元格两处各抄
+  一份, 「同规则同常量」只靠注释。抽后各只剩一个定义。
+  **明确不动的**: 按下处理那个三分支链 —— 它把条件全写明了, 改成依赖 else 链的
+  **隐含不变式**反而更难读 (简化的失败模式: 用可读性换行数)。
+  行为不变: danqing 592 lib + 集成 (测试零改动); 本仓 133 全绿; clippy 0;
+  `--locked` 无 patch 构建通过; lock 复钉 `danqing#b4b43e1b`。

@@ -140,6 +140,23 @@
     单元格描边是否真能一眼看出选中的是哪一格。
   - 余: code-simplify 阶段 (五阶段最后一段)。
 
+- [x] **T10: code-simplification (五阶段最后一段)**
+  - 说明: 行为不变前提下砍重复 —— 框架: 连接符段扫描改用 `run_over` (手搓 15 行
+    与它是同一原语) + `is_punct` 命名谓词; 本仓: `text_x` / `row_at` /
+    `is_double_click` 各抽成方法 (前两个原先在**三处**各推一遍同一个载荷几何式子,
+    后者两处各抄一份双击判定)。
+  - Acceptance: 测试**零改动**全绿; `--locked` 无 patch 构建通过; lock 复钉新 rev。
+  - Verify: 两仓三件套; `cargo build --locked`
+  - Files: `../danqing/src/text/selection.rs`, `src/view.rs`
+  - Scope: S
+  - **明确不做**: 按下处理的三分支链 —— 条件写明了才好读, 改成隐含不变式是
+    用可读性换行数。
+
+## Phase 收口
+
+- [x] **两仓 push 完成** (2026-09-14): danqing `ce60236`→`b4b43e1`; 本仓 `4f36f95` + 重构笔;
+      lock 钉 `danqing#b4b43e1b`; 工作区干净。
+
 ## Checkpoint: 人工验收 (用户实机)
 
 - [ ] **spec §7 五条全过** (① .log 双击整选/选半/单字; ② 行复制 + 旧五种姿势回归;
