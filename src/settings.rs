@@ -175,7 +175,11 @@ fn close_row() -> impl Widget {
             CloseButton::new()
                 .on_click(|| Msg::CloseSettings)
                 .bind_color(|app: &LogApp| app.theme.theme().text_primary())
-                .bind_hover_color(|app: &LogApp| app.theme.theme().surface_variant()),
+                .bind_hover_color(|app: &LogApp| app.theme.theme().surface_variant())
+                // 焦点环走 accent: 框架默认是 `Color::WHITE`, 在**浅色卡片**上
+                // 等于没有 (卡片底是 `background()`) —— P8 的验收是「Tab 停上去
+                // 看得见」, 不绑色就只是把白圈画在白底上。
+                .bind_focus_color(|app: &LogApp| app.theme.theme().accent()),
         )
 }
 
