@@ -1,2 +1,0 @@
-# [build] target-dir 已于 2026-09-10 去掉共享: RustRover 多仓并发编译触发 race condition。
-# 各仓恢复独立 target/，多占 ~40GB 但彻底消除编译冲突。

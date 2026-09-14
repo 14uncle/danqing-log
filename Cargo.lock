@@ -854,6 +854,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "danqing"
 version = "0.1.0"
+source = "git+https://github.com/14uncle/danqing#b4b43e1b73e258311785ab7d7a6af684f6240181"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -889,11 +890,12 @@ source = "git+https://github.com/14uncle/danqing-encoding#d86741caee0ab102cb8d6d
 
 [[package]]
 name = "danqing-log"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "danqing",
  "danqing-logfile",
+ "dirs 6.0.0",
  "log",
  "memchr",
  "memmap2",
@@ -907,6 +909,7 @@ dependencies = [
 [[package]]
 name = "danqing-logfile"
 version = "0.1.0"
+source = "git+https://github.com/14uncle/danqing-logfile#baee0a8b2265845585884f8e86d52288633d0f95"
 dependencies = [
  "anyhow",
  "danqing-encoding",

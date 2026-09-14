@@ -17,6 +17,8 @@
 #![windows_subsystem = "windows"]
 
 mod app_update;
+mod config;
+mod histogram;
 mod settings;
 mod tray;
 mod view;
@@ -26,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use danqing::theme::{ScenePalette, SceneTheme};
-use danqing::widget::{Column, LogoKind, Node, Stack, TitleBar, node};
+use danqing::theme::{ScenePalette, SceneTheme, Theme};
+use danqing::widget::{Column, LogoKind, Node, Row, Stack, TitleBar, Widget, node};
 use danqing::{
     AnimationCtx, App, Color, Event, Key, NamedKey, Size, WindowAction, WindowConfig, run_app,
 };
@@ -35,6 +37,7 @@ use danqing::{
 use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
+use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
 use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
 use danqing_log::search::{AsyncJob, SearchNav};
@@ -76,19 +79,77 @@ pub(crate) struct SearchOutcome {
     query: String,
 }
 
-/// 标题栏主题：浅色 (匹配白底日志视图), 深色文字。
-/// SceneTheme 提供跨明暗 Theme 实现; 背景透明，标题文字/按钮符号用深色。
-fn title_theme() -> SceneTheme {
+/// 标题栏主题 —— 用 `LogTheme` 的 token 组装一个 `SceneTheme`。
+///
+/// 六项 (`base` / `accent` / `text_primary` / `text_secondary` / `surface` /
+/// `surface_input`) **全部取自 `LogTheme`**, 不再手抄。手抄的后果是同一个界面里
+/// 出现**两套强调色**: 原先浅色分支的 accent 是蓝 `0.18,0.35,0.60`, 而框架玉色是
+/// `#0F766E`; `base` 也手抄成 `0.96` 灰, 与主题真实的 `#F0F8F6` 差一截。
+///
+/// `backdrop_light` / `backdrop_dark` **保留手写**: 框架没有对应 token ——
+/// 它们是场景层的前后景渐变端点, 只服务标题栏这一层场景。
+/// 回归锁 `title_theme_derives_tokens_from_log_theme`。
+fn title_theme(theme: config::AppTheme) -> SceneTheme {
+    let t = theme.theme();
+    let (backdrop_light, backdrop_dark) = match theme {
+        config::AppTheme::Light => (Color::rgb(0.85, 0.85, 0.88), Color::rgb(0.70, 0.70, 0.74)),
+        config::AppTheme::Dark => (Color::rgb(0.16, 0.16, 0.20), Color::rgb(0.06, 0.06, 0.08)),
+    };
     SceneTheme::new(ScenePalette {
-        base: Color::rgb(0.96, 0.96, 0.96),
-        accent: Color::rgb(0.18, 0.35, 0.60),
-        text_primary: Color::rgb(0.12, 0.12, 0.12),
-        text_secondary: Color::rgb(0.40, 0.40, 0.42),
-        surface: Color::rgba(0.0, 0.0, 0.0, 0.04),
-        surface_input: Color::rgba(0.0, 0.0, 0.0, 0.06),
-        backdrop_light: Color::rgb(0.85, 0.85, 0.88),
-        backdrop_dark: Color::rgb(0.70, 0.70, 0.74),
+        base: t.background(),
+        accent: t.accent(),
+        text_primary: t.text_primary(),
+        text_secondary: t.text_secondary(),
+        surface: t.surface(),
+        surface_input: t.surface_input(),
+        backdrop_light,
+        backdrop_dark,
     })
+}
+
+/// 窗口清屏色 —— **单点定义, 启动与切主题都取它**。
+///
+/// 为什么必须是单点: 清屏色有两条来路 (启动的 `WindowConfig`、运行时的
+/// `set_clear_color`), 各算一份就会漂 —— 本仓已有先例 (设置卡页签序号曾在两个文件
+/// 各抄一份、双双漂掉)。
+///
+/// 为什么它值得存在: 标题栏那条亮带**就是**清屏色。框架 `TitleBar` 的背景是有意的
+/// `TRANSPARENT` (`danqing/src/widget/title_bar.rs`, 且有测试锁死), 让窗口底色透出;
+/// 内容区反而看不见它 (被不透明的 `th.background()` 盖住)。所以清屏色不跟随主题时,
+/// 症状恰好是「暗色下标题栏一条白板」。
+fn window_clear_color(theme: config::AppTheme) -> Color {
+    theme.theme().background()
+}
+
+/// 标题栏 (含嵌入的过滤栏)。
+///
+/// 抽成函数不只为了整洁 —— **测试必须复用同一份构建代码**才守得住下面这个坑:
+/// `view()` 只在启动时求值一次 (`danqing/src/window/mod.rs:207` 的
+/// `let tree = app.view();`, 之后整棵交给 Handler, 不再重建), 所以
+/// `TitleBar::themed(&title_theme(..))` 烘进去的是**启动那一刻**的主题色。
+/// 卡面上其它控件走 `bind_color` 闭包、每帧重读, 于是切主题时**只有标题栏停在旧色**
+/// —— 底色换了、文字没换: 切到浅色是浅字压浅底, 切到暗色是暗字压暗底
+/// (用户实机报的「标题看不清」, 两个方向都成立)。
+///
+/// `bind_theme` 是框架**专为这件事**准备的 API (见 `TitleBar` 文档,
+/// 「每帧从应用状态重取主题」)。**不许删**。
+/// 参数取**值**而非 `&LogApp`: edition 2024 里 `impl Trait` 会捕获全部输入生命周期,
+/// 借 `&LogApp` 返回的话这个类型就不是 `'static`, `Column::child` 直接编译不过
+/// (E0521 「borrowed data escapes」)。
+fn title_bar(theme: config::AppTheme, title: String) -> impl Widget {
+    TitleBar::themed(&title_theme(theme), title)
+        .bind_theme(|app: &LogApp| title_theme(app.theme))
+        .logo_kind(LogoKind::Log)
+        .on_close(|| WindowAction::Close)
+        .on_minimize(|| WindowAction::Minimize)
+        .on_maximize(|| WindowAction::MaximizeOrRestore)
+        .on_drag(|| WindowAction::Drag)
+        .bind_maximized(|app: &LogApp| app.maximized)
+        .embed(
+            view::Bar::default()
+                .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
+                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+        )
 }
 
 /// 应用状态本体 (danqing App)。
@@ -110,6 +171,24 @@ pub(crate) struct LogApp {
     mode: ViewMode,
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
+    /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
+    /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
+    level_counts: Arc<LevelCounts>,
+    /// 计数所用的级别类列名 (None = 行口径)。追加时据此选同一条口径 ——
+    /// 口径混用会让同一个侧栏里出现两种数法。
+    level_column: Option<String>,
+    /// 侧栏每桶的点选子句 (None = 该行不可点)。明文/无级别类列时全 None。
+    /// 子句只依赖列名 (前缀口径无 per-file 观察值), 故追加换入时无需重算。
+    level_queries: LevelQueries,
+    /// 后台级别计数作业。
+    ///
+    /// **计数不在打开管道里** (2026-09-12 用户实机反馈后改): 字段口径的
+    /// `extract_field` 要在整行里找 `"level":`, 成本随行内容走; 对某些文件它是
+    /// 打开路径上最重的一段, 挡在内容显示之前就是「索引 92ms 却等十几秒」。
+    /// 现在打开只交出口径列名, 计数由这里的作业后台完成, 侧栏随后补入。
+    levels_job: AsyncJob<levels::LevelsOutcome>,
+    /// 计数是否仍在算 —— 侧栏据此显示「计算中」而非把 0 当数读。
+    levels_pending: bool,
     /// 过滤命中的文件行号 (升序); None = 全量。
     filtered: Option<Arc<Vec<u64>>>,
     /// 已应用的过滤查询。
@@ -135,6 +214,10 @@ pub(crate) struct LogApp {
     expanded: ExpandMap,
     /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭，惰性 parse)。
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
+    /// 展开态修订号 (M3): `toggle_expand` 每次实际改动 +1; LogView 据它
+    /// 作废旧选区/单元格选中 —— 展开/折叠改变显示行映射, 旧 (显示行, 偏移)
+    /// 会指向错误的行。
+    expand_rev: u64,
     // ---- live-tail (T2) ----
     /// 文件路径 (增长检测轮询用)。
     path: PathBuf,
@@ -153,6 +236,15 @@ pub(crate) struct LogApp {
     loading_label: Option<(String, String)>,
     /// 设置卡是否打开 (S2)。
     settings_open: bool,
+    /// 主题模式 (浅色/深色)。
+    theme: config::AppTheme,
+    /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
+    histogram_visible: bool,
+    /// 设置卡当前页签**下标** —— 序号含义见 `settings.rs` 里 `.tab()` 处 (**唯一真身**,
+    /// 别在这里另列一份, 加页签时会漂)。越界值无需在此防御: 框架 `Tabs` 自行钳制
+    /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
+    /// 留在应用状态里: 重开卡片停在上次那页。
+    settings_tab: usize,
 }
 
 /// 应用消息。
@@ -180,8 +272,15 @@ pub(crate) enum Msg {
     FocusSearch,
     /// Esc 清除过滤。
     ClearFilter,
+    /// 设置卡切页签 (下标含义见 `settings.rs` 的 `.tab()` 处)。
+    SelectSettingsTab(usize),
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
+    // ---- level-histogram 侧栏 ----
+    /// 点侧栏柱条: 套用该桶的过滤子句; 已是当前生效项则清除 (切换语义)。
+    ApplyLevelFilter(Level),
+    /// `Ctrl+L`: 侧栏显隐 (落 config.toml)。
+    ToggleHistogram,
     // ---- S2–S4 设置卡 ----
     /// 打开设置卡。
     OpenSettings,
@@ -193,6 +292,10 @@ pub(crate) enum Msg {
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     Notice(String),
+    // ---- 主题下拉 ----
+    /// 通过下拉选择器选择主题 (索引)。
+    /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管, 不再经应用消息。
+    SelectTheme(usize),
     /// 退出应用 (托盘菜单)。
     Quit,
     /// 无操作 (事件吞噬用，不触发任何状态变更)。
@@ -202,6 +305,7 @@ pub(crate) enum Msg {
 impl LogApp {
     /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
     fn new_empty() -> Self {
+        let cfg = config::Config::load();
         Self {
             window_sender: None,
             file: Arc::new(LogFile::empty()),
@@ -212,6 +316,11 @@ impl LogApp {
             status: String::new(),
             mode: ViewMode::Raw,
             schema: None,
+            level_counts: Arc::new(LevelCounts::default()),
+            level_column: None,
+            level_queries: levels::no_level_queries(),
+            levels_job: AsyncJob::new(),
+            levels_pending: false,
             filtered: None,
             filter_applied: String::new(),
             filter_clear_rev: 0,
@@ -226,6 +335,7 @@ impl LogApp {
             bookmarks: std::collections::BTreeSet::new(),
             expanded: ExpandMap::new(),
             sub_rows: std::collections::BTreeMap::new(),
+            expand_rev: 0,
             focus_bar: false,
             path: PathBuf::new(),
             follow: false,
@@ -235,7 +345,78 @@ impl LogApp {
             open_job: None,
             loading_label: None,
             settings_open: false,
+            theme: cfg.theme,
+            histogram_visible: cfg.histogram,
+            settings_tab: 0,
         }
+    }
+
+    /// 采纳一份产物带来的计数口径: 列名与据此生成的点选子句表。
+    ///
+    /// 抽成一处而非在 `apply_fresh` / `apply_rebuild` 各写一遍 —— 两处的写法
+    /// 必须永远一致 (口径与子句表不同步 = 点某行筛到另一行), 重复即隐患。
+    fn adopt_level_column(&mut self, column: Option<String>) {
+        self.level_queries = column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = column;
+    }
+
+    /// 起一个后台计数作业 (换文件 / 重建后调用; 口径列名须已由
+    /// [`Self::adopt_level_column`] 定好)。
+    ///
+    /// 计数未就绪期间侧栏**只读且不显示数字** —— 把 0 显示出来会被读成
+    /// 「这个文件真的没有 ERROR」, 那是假信息。
+    fn launch_levels_job(&mut self) {
+        self.levels_job.invalidate();
+        self.levels_pending = true;
+        self.level_counts = Arc::new(LevelCounts::default());
+        self.level_queries = levels::no_level_queries();
+        let file = Arc::clone(&self.file);
+        let column = self.level_column.clone();
+        self.levels_job
+            .launch(move || levels::counts_for(file, column.as_deref()));
+    }
+
+    /// 计数作业交付: 与快照对账后换入计数与子句表。
+    ///
+    /// 作业在算的时候文件可能又增长了 —— 此时**不能重起作业** (持续增长的 tail
+    /// 会永远算不完), 而是用 `update_for_append` 把快照之后的那几行按「重叠一行」
+    /// 补上。只数增量, 很便宜。
+    fn pickup_levels_job(&mut self) {
+        let Some(out) = self.levels_job.poll() else {
+            return;
+        };
+        let counts = if out.file.line_count() < self.file.line_count() {
+            levels::update_for_append(
+                &out.file,
+                &self.file,
+                out.counts,
+                self.level_column.as_deref(),
+            )
+        } else {
+            out.counts
+        };
+        self.level_counts = Arc::new(counts);
+        self.level_queries = out
+            .column
+            .as_deref()
+            .map_or_else(levels::no_level_queries, levels::level_queries_for);
+        self.level_column = out.column;
+        self.levels_pending = false;
+    }
+
+    /// 把当前设置写回 `config.toml`。
+    ///
+    /// 必须走整文件写入 —— [`config::Config`] 的两个键同源, 分头写会让
+    /// 「改主题」顺手抹掉侧栏开关 (config.rs 的 `round_trip_preserves_both_keys`
+    /// 钉着这条)。
+    fn save_config(&self) {
+        config::Config {
+            theme: self.theme,
+            histogram: self.histogram_visible,
+        }
+        .save();
     }
 
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
@@ -288,6 +469,7 @@ impl LogApp {
         if self.expanded.is_expanded(file_line) {
             self.expanded.collapse(file_line);
             self.sub_rows.remove(&file_line);
+            self.expand_rev += 1; // 显示行映射已变 → LogView 选区守卫
             return;
         }
         let raw = self.file.line(file_line);
@@ -300,6 +482,7 @@ impl LogApp {
         }
         self.expanded.expand(file_line, rows.len());
         self.sub_rows.insert(file_line, rows);
+        self.expand_rev += 1;
     }
 
     /// F 键：跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
@@ -343,7 +526,13 @@ impl LogApp {
                 } else {
                     None
                 };
-                self.open_job = Some(OpenJob::launch_append(&self.path, old, delta, filter));
+                self.open_job = Some(OpenJob::launch_append(
+                    &self.path,
+                    old,
+                    delta,
+                    filter,
+                    self.level_column.clone(),
+                ));
                 self.refresh_status();
                 return;
             }
@@ -373,10 +562,18 @@ impl LogApp {
         // review C1: 旧内容上的在途 filter/search 结果不得贴到新内容
         self.filter_job.invalidate();
         self.search_job.invalidate();
-        let OpenOutcome { file, schema, .. } = out;
+        let OpenOutcome {
+            file,
+            schema,
+            level_column,
+            ..
+        } = out;
         let base_status = status_text(path, &file);
         let new_count = file.line_count();
         self.file = Arc::new(file);
+        // 格式可能整体换了 → 列名与子句表跟着换 (不沿用旧的); 计数重新后台算
+        self.adopt_level_column(level_column);
+        self.launch_levels_job();
         // review R4: 轮转后格式可能变了 (JSONL↔明文), schema/mode 用 worker 新发现
         self.schema = schema.map(Arc::new);
         self.mode = if self.schema.is_some() {
@@ -416,6 +613,7 @@ impl LogApp {
         let OpenOutcome {
             file: new_file,
             schema,
+            level_column,
             ..
         } = out;
         let base_status = status_text(&new_path, &new_file);
@@ -444,6 +642,8 @@ impl LogApp {
         self.base_status = base_status;
         self.mode = mode;
         self.schema = schema;
+        self.adopt_level_column(level_column);
+        self.launch_levels_job();
         self.top_row = 0.0;
         self.selected = 0;
         self.filtered = None;
@@ -468,10 +668,39 @@ impl LogApp {
     /// None = 本地扫 (同步小追加, 毫秒级)。
     fn apply_appended(&mut self, new: LogFile, worker_hits: Option<Vec<u64>>) {
         let old_line_count = self.file.line_count();
+        // 重算起点**退一行**: 旧快照末行可能以无换行结尾、被本次追加补全改判
+        // (review R1)。计数与过滤必须同起点同区间, 否则柱条数字与筛选结果
+        // 当场分岔 —— 即 D2 红线破裂, 而这正是 review 前两侧同步漂移掩盖掉的那个形态。
+        //
+        // 这里与 worker 各自独立算出同一个 `from` (worker 用发起时的旧行数, 这里用
+        // 落地时的) —— 二者能相等，靠的是 `poll_growth` 开头的 `open_job.is_some()`
+        // 门禁: 在途期间不叠加任何 tail 动作, 故 `self.file` 不会在 launch 与落地
+        // 之间被别的追加换掉。**若将来允许并发追加, 这个摘/补对称会静默失效**
+        // (摘多了漏行、摘少了重计), 届时须把 `from` 随产物一起交回来。
+        let from = old_line_count.saturating_sub(1);
+        // 计数: 已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量, 便宜),
+        // **先算再换入** (update_for_append 需要旧快照)。
+        //
+        // 未就绪 → **什么都不做**: 计数作业交付时会拿它自己的快照与当时的文件
+        // 对账 (见 `pickup_levels_job`)。这里若重起作业, 一个持续增长的 tail
+        // 会把计数一遍遍从头来过 —— 永远算不完, 侧栏永远挂在「…」。
+        let recomputed = (!self.levels_pending).then(|| {
+            levels::update_for_append(
+                &self.file,
+                &new,
+                *self.level_counts,
+                self.level_column.as_deref(),
+            )
+        });
         self.file = Arc::new(new);
+        if let Some(c) = recomputed {
+            self.level_counts = Arc::new(c);
+        }
+        // 过滤: 先摘掉将被重算区间的旧命中, 再合并新命中 (否则重叠行出现两次)
+        self.drop_filter_hits_from(from);
         match worker_hits {
             Some(hits) => self.merge_filter_hits(hits),
-            None => self.append_filter_hits(old_line_count),
+            None => self.append_filter_hits(from),
         }
         if self.follow {
             self.top_row = self.max_top();
@@ -488,23 +717,33 @@ impl LogApp {
         };
         let job = self.open_job.take().expect("在途 job");
         match res {
-            Ok(out) => match job.kind() {
-                OpenKind::Fresh => self.apply_fresh(job.path().to_path_buf(), out),
-                OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
-                OpenKind::Append => {
-                    if out.rebuilt {
-                        // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
-                        self.apply_rebuild(job.path(), out);
-                    } else {
-                        let OpenOutcome {
-                            file,
-                            incremental_hits,
-                            ..
-                        } = out;
-                        self.apply_appended(file, incremental_hits);
+            Ok(out) => {
+                // 落地耗时 (自发起): 与 worker 的 `perf open_phases` 对照 ——
+                // 两者相减即「交付 + 拾取」的延迟; 若落地很快而用户仍等很久,
+                // 瓶颈就在落地之后的渲染, 不在这条管道。
+                log::info!(
+                    "perf open_landed: {:?} 自发起 (kind={:?})",
+                    job.elapsed_since_launch(),
+                    job.kind()
+                );
+                match job.kind() {
+                    OpenKind::Fresh => self.apply_fresh(job.path().to_path_buf(), out),
+                    OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
+                    OpenKind::Append => {
+                        if out.rebuilt {
+                            // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
+                            self.apply_rebuild(job.path(), out);
+                        } else {
+                            let OpenOutcome {
+                                file,
+                                incremental_hits,
+                                ..
+                            } = out;
+                            self.apply_appended(file, incremental_hits);
+                        }
                     }
                 }
-            },
+            }
             Err(e) => {
                 // 「索引已取消」= 主动取消, 静默; 失败语义按 kind 分流 (保旧行为):
                 // Fresh 失败 notice + 留空态/旧视图; Rebuild/Append 静默,
@@ -530,8 +769,26 @@ impl LogApp {
         }
     }
 
-    /// 实时过滤：增量行追加命中表 (只跑新行，不全量重跑)。
-    fn append_filter_hits(&mut self, old_line_count: u64) {
+    /// 点侧栏柱条: 套用该桶的过滤子句 (复用既有过滤通路, 零新语法);
+    /// 点的已是当前生效项 → 清除 (切换语义)。
+    ///
+    /// 子句来自 `level_queries` —— 它是**按当前文件的级别类列**生成的,
+    /// 不是写死的 `level=X`: 列名可能是 severity/lvl, 值可能是 WARNING。
+    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE / 明文模式) 在侧栏侧已挡,
+    /// 此处再兜一层 —— 消息源不止一处时不会漏。
+    fn apply_level_filter(&mut self, level: Level) {
+        let Some(q) = self.level_queries[level as usize].clone() else {
+            return;
+        };
+        if self.filter_applied == q {
+            self.update(Msg::ApplyFilter(String::new()));
+        } else {
+            self.update(Msg::ApplyFilter(q));
+        }
+    }
+
+    /// 实时过滤：增量行追加命中表 (只跑 `[from, …)`，不全量重跑)。
+    fn append_filter_hits(&mut self, from: u64) {
         if self.filter_applied.is_empty() {
             return;
         }
@@ -539,8 +796,27 @@ impl LogApp {
             return;
         }
         let clauses = jsonl::parse_query(&self.filter_applied);
-        let new_hits = jsonl::run_filter_from(&self.file, &clauses, old_line_count);
+        let new_hits = jsonl::run_filter_from(&self.file, &clauses, from);
         self.merge_filter_hits(new_hits);
+    }
+
+    /// 摘掉过滤表中 `>= from` 的旧命中 —— 它们落在本次重算区间内, 会被重新跑出来。
+    ///
+    /// 必须与 [`Self::append_filter_hits`] 的起点**同一个 `from`**: 重叠行若只摘不补
+    /// 就漏, 只补不摘就重, 两种都让底栏行数与侧栏柱条一起偏 (且一起偏就意味着
+    /// D2 的对照检查看不出来)。
+    fn drop_filter_hits_from(&mut self, from: u64) {
+        let Some(existing) = &self.filtered else {
+            return;
+        };
+        // 表按行号升序 (过滤产出即有序), 故二分找到第一个 >= from 的位置
+        let keep = existing.partition_point(|&l| l < from);
+        if keep == existing.len() {
+            return; // 无命中落在重算区间, 无需摘
+        }
+        let mut kept = existing.as_ref()[..keep].to_vec();
+        kept.shrink_to_fit();
+        self.filtered = Some(Arc::new(kept));
     }
 
     /// 合并增量命中进过滤表 (本地扫描与 worker 下沉共用合并半段, review R2)。
@@ -567,6 +843,12 @@ impl LogApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // 索引之后的阶段 (列发现 / 级别计数) 没有细粒度字节进度 —— 继续显示百分比
+        // 就会卡在 99% 不动, 用户看到的等待于是和状态栏那个「索引 N ms」对不上
+        // (2026-09-12 用户反馈)。如实报阶段名, 把这段等待显性化。
+        if let Some(phase) = job.phase_name() {
+            return Some((phase, name, "…".to_string()));
+        }
         let verb = match job.kind() {
             OpenKind::Fresh => "正在索引",
             OpenKind::Rebuild => "重建中",
@@ -764,19 +1046,31 @@ impl LogApp {
     }
 
     /// `b` / Ctrl+B: 切换选中行书签 (按文件行号，过滤模式下语义不漂移)。
+    /// 状态栏补动作反馈 —— 此前只有行号变金一个信号，用户按完不知道成没成;
+    /// 计数由 `refresh_status` 的常驻「书签 N」段承担，这里只缀动作。
     fn toggle_bookmark(&mut self) {
         let line = self.file_line_of(self.selected);
-        if !self.bookmarks.insert(line) {
+        let added = self.bookmarks.insert(line);
+        if !added {
             self.bookmarks.remove(&line);
         }
         self.refresh_status();
+        self.status.push_str(if added {
+            " · 已添加书签"
+        } else {
+            " · 已去掉书签"
+        });
     }
 
-    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。
+    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。状态栏报位次 `书签 i/N`。
     fn goto_next_bookmark(&mut self) {
         if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.selected)) {
             self.jump_to_file_line(line);
             self.refresh_status();
+            // line 必在集合内: 位次 = 比它小的书签数 + 1
+            let i = self.bookmarks.range(..line).count() + 1;
+            let n = self.bookmarks.len();
+            self.status.push_str(&format!(" · 书签 {i}/{n}"));
         }
     }
 }
@@ -855,12 +1149,21 @@ impl App for LogApp {
             Msg::FocusSearch => self.open_search(),
             Msg::ClearFilter => self.clear_filter(),
             Msg::ToggleMode => self.toggle_mode(),
+            // ---- level-histogram 侧栏 ----
+            Msg::ApplyLevelFilter(l) => self.apply_level_filter(l),
+            Msg::ToggleHistogram => {
+                self.histogram_visible = !self.histogram_visible;
+                self.save_config();
+            }
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
                 self.settings_open = true;
             }
             Msg::CloseSettings => {
                 self.settings_open = false;
+            }
+            Msg::SelectSettingsTab(i) => {
+                self.settings_tab = i;
             }
             Msg::OpenUrl(url) => {
                 if let Err(err) = open::that(&url) {
@@ -874,6 +1177,15 @@ impl App for LogApp {
                 self.notice = Some(text);
                 self.refresh_status();
             }
+            Msg::SelectTheme(idx) => {
+                self.theme = config::AppTheme::from_index(idx);
+                // 通知窗口换底色。**这一步此前从缺** —— 于是切主题后标题栏那条
+                // (透出的清屏色) 纹丝不动, 只有内容区变了色。
+                if let Some(sender) = &self.window_sender {
+                    sender.set_clear_color(window_clear_color(self.theme));
+                }
+                self.save_config();
+            }
             Msg::Quit => {
                 if let Some(sender) = &self.window_sender {
                     sender.quit();
@@ -884,29 +1196,25 @@ impl App for LogApp {
     }
 
     fn view(&self) -> Node {
-        // 顶层：Stack[Column[TitleBar.embed(Bar), LogView.fill], Overlay(设置卡)]。
-        // 设置卡浮层在最上层，关闭时零高不拦截事件。
+        // 顶层：Stack[Column[TitleBar.embed(Bar), Row[Histogram(Fit), LogView.fill]],
+        // Overlay(设置卡)]。设置卡浮层在最上层，关闭时零高不拦截事件。
+        //
+        // 侧栏做成 LogView 的 **sibling** (weight 0 = 取自身 layout 的固定宽),
+        // 而非塞进 LogView 内部 —— 后者要改它的 gutter/x 偏移/命中测试/横滚范围
+        // 一整套坐标数学, sibling 方案下 LogView 只是拿到一个更窄的 area。
         node(
             Stack::new()
                 .child(
                     Column::new()
-                        .child(
-                            TitleBar::themed(&title_theme(), self.make_title())
-                                .logo_kind(LogoKind::Log)
-                                .on_close(|| WindowAction::Close)
-                                .on_minimize(|| WindowAction::Minimize)
-                                .on_maximize(|| WindowAction::MaximizeOrRestore)
-                                .on_drag(|| WindowAction::Drag)
-                                .bind_maximized(|app: &LogApp| app.maximized)
-                                .embed(
-                                    view::Bar::default()
-                                        .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                                        .bind_clear_search(|app: &LogApp| app.search_clear_rev),
-                                ),
-                        )
-                        .fill(view::LogView::new(), 1),
+                        .child(title_bar(self.theme, self.make_title()))
+                        .fill(
+                            Row::new()
+                                .fill(histogram::LevelHistogram::new(), 0)
+                                .fill(view::LogView::new(), 1),
+                            1,
+                        ),
                 )
-                .child(settings::settings_overlay()),
+                .child(settings::settings_overlay(self.theme)),
         )
     }
 
@@ -921,12 +1229,15 @@ impl App for LogApp {
         else {
             return;
         };
-        // 设置卡打开时 Esc 关闭 (S3)
+        // 设置卡打开 = 模态: Esc 关卡 (S3), 其余键一律吞掉 —— 卡底下的日志区
+        // 不该响应键盘 (2026-09-14 用户实机: 卡内主题下拉未持焦时 ↑↓ 滚动了
+        // 底层日志)。卡内控件经焦点路由自行消费、到不了这里; 能到这里的都是
+        // 无人认领的键。(Ctrl+O/Ctrl+L 走 app_key_filter 前置, 不在此门禁内。)
         if self.settings_open {
             if let Some(msg) = settings::handle_settings_key(key) {
                 self.update(msg);
-                return;
             }
+            return;
         }
         // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
         if !self.has_file {
@@ -1006,15 +1317,17 @@ impl App for LogApp {
     /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
     /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
     fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
-        // 设置卡打开时 Esc 前置关闭 (评审 R2): LogView 持焦后, 框架对未消费
-        // 的 Escape 只清焦不回退应用层, 不经此前置关卡需按两次 —— S3 回归。
-        if self.settings_open {
-            if let Event::Key {
-                key: Key::Named(NamedKey::Escape),
-                pressed: true,
-                ..
-            } = event
-            {
+        // Esc 前置：设置卡 > (后续留给搜索/过滤栏)
+        if let Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            ..
+        } = event
+        {
+            if self.settings_open {
+                // 本函数在焦点分发前运行 (无论有无焦点)，所以卡内主题下拉展开
+                // 时按 Esc 也走这条路径：整卡通关，而非先收下拉。与「设置卡
+                // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
         }
@@ -1036,6 +1349,10 @@ impl App for LogApp {
         if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
             return Some(Msg::ToggleMode);
         }
+        // Ctrl+L 侧栏显隐: 走前置过滤而非 event(), 故栏聚焦时也生效 (与 Ctrl+T 同级)
+        if s.eq_ignore_ascii_case("l") {
+            return Some(Msg::ToggleHistogram);
+        }
         if s.eq_ignore_ascii_case("o") {
             // Ctrl+O 全局：弹文件选择器，选中返回 OpenFile msg
             if let Some(p) = rfd::FileDialog::new().set_title("选择日志文件").pick_file() {
@@ -1056,6 +1373,7 @@ impl App for LogApp {
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
     fn tick(&mut self, _ctx: &AnimationCtx) {
         self.pickup_open_job();
+        self.pickup_levels_job();
         if let Some(out) = self.filter_job.poll() {
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
@@ -1136,8 +1454,17 @@ fn status_text(path: &Path, file: &LogFile) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // 报**打开总墙钟**在先, 行索引在后。
+    //
+    // 原来只报「索引 N ms」, 而它不含 UTF-16 的读整文件 + 转码 —— 实测 100 MiB
+    // UTF-16LE: 报「索引 7 ms」而实际 open 200 ms (**13 倍**), GB 级按比例是秒级。
+    // 「数字和视觉不符」的这类反馈, 根子就是报了个不等于等待时间的数字。
+    let mut load = format!("打开 {} ms", s.open.as_millis());
+    if s.preprocess > Duration::ZERO {
+        load.push_str(&format!(" (转码 {} ms)", s.preprocess.as_millis()));
+    }
     format!(
-        "{name} · {} · {:.1} MiB · {} 行 · mmap {} µs · 索引 {} ms ({:.0} MiB/s)",
+        "{name} · {} · {:.1} MiB · {} 行 · {load} · mmap {} us · 索引 {} ms ({:.0} MiB/s)",
         s.encoding.label(),
         s.file_bytes as f64 / (1024.0 * 1024.0),
         s.line_count,
@@ -1171,7 +1498,9 @@ fn run(path: Option<&Path>) -> Result<()> {
     let config = WindowConfig {
         title: "丹青日志 LogLens".to_string(),
         size: Size::new(1100.0, 760.0),
-        clear_color: Color::rgb(0.98, 0.98, 0.98),
+        // 清屏色随配置里的主题 —— 此前写死浅色, 存暗色配置启动也开在白底上
+        // (app 在上一行已从配置读出主题, 只是当时没人问它)。
+        clear_color: window_clear_color(app.theme),
         logo_name: "log".into(),
         maximized: true, // 日志查看器主战场是全屏阅读: 初始最大化
         hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
@@ -1183,6 +1512,25 @@ fn run(path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// expand_rev (M3/T6): 实际展开/折叠才 +1; parse 失败/无嵌套不涨 ——
+    /// 守卫的触发源必须精确, 虚涨会误杀活着的选区 (LogView 侧见
+    /// `sync_clears_selection_when_expand_rev_changes`)。
+    #[test]
+    fn toggle_expand_bumps_expand_rev_only_on_real_change() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("{\"a\":{\"b\":1}}\nplain\n".as_bytes());
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        let rev0 = app.expand_rev;
+        app.toggle_expand(0); // 展开含嵌套行
+        assert_eq!(app.expand_rev, rev0 + 1);
+        app.toggle_expand(1); // 明文行 parse 失败 → 不涨
+        assert_eq!(app.expand_rev, rev0 + 1);
+        app.toggle_expand(0); // 折叠
+        assert_eq!(app.expand_rev, rev0 + 2);
+        std::fs::remove_file(&p).ok();
+    }
 
     #[test]
     fn clamp_top_bounds() {
@@ -1190,6 +1538,106 @@ mod tests {
         assert_eq!(clamp_top(500.0, 100), 99.0, "越界钳到末行");
         assert_eq!(clamp_top(42.5, 100), 42.5, "区间内不变 (保小数偏移)");
         assert_eq!(clamp_top(3.0, 0), 0.0, "空文件归零");
+    }
+
+    /// `title_theme` 的六项必须**取自 `LogTheme`**, 不再手抄。
+    ///
+    /// 手抄的后果是同一个界面里出现**两套强调色**: 浅色分支的 accent 曾经是蓝
+    /// `0.18,0.35,0.60`, 而框架玉色是 `#0F766E`。六个值全部改成从 `LogTheme` 取,
+    /// 只剩 `backdrop_light/dark` 手写 (框架没有对应 token, 它们只服务标题栏
+    /// 这一层场景)。
+    #[test]
+    fn title_theme_derives_tokens_from_log_theme() {
+        for app in [config::AppTheme::Light, config::AppTheme::Dark] {
+            let scene = title_theme(app);
+            let t = app.theme();
+            assert_eq!(scene.background(), t.background(), "{app:?} base");
+            assert_eq!(scene.accent(), t.accent(), "{app:?} accent");
+            assert_eq!(
+                scene.text_primary(),
+                t.text_primary(),
+                "{app:?} text_primary"
+            );
+            assert_eq!(
+                scene.text_secondary(),
+                t.text_secondary(),
+                "{app:?} text_secondary"
+            );
+            assert_eq!(scene.surface(), t.surface(), "{app:?} surface");
+            assert_eq!(
+                scene.surface_input(),
+                t.surface_input(),
+                "{app:?} surface_input"
+            );
+        }
+    }
+
+    /// 切主题后**标题栏文字色必须跟着变** —— 它靠 `bind_theme` 每帧重取,
+    /// 不能靠构造。
+    ///
+    /// 复现的是这个缺陷: `view()` 只在启动时求值一次
+    /// (`danqing/src/window/mod.rs:207` 的 `let tree = app.view();`),
+    /// 所以构造时烘进 `TitleBar` 的主题色**不随切换而变**, 而底色 (清屏色) 变了
+    /// → 切到浅色是浅字压浅底、切到暗色是暗字压暗底。用户实机报的两个方向都成立。
+    ///
+    /// **关键在「构造用一个主题、sync 用另一个」**: 两边都用同一主题的话,
+    /// 就算 `bind_theme` 掉了也照样绿 —— 那样测的是构造, 不是绑定。
+    #[test]
+    fn title_bar_colors_follow_theme_switch() {
+        use danqing::{Constraints, Point, Rect, RectBatch, TextBatch};
+
+        // 构造用暗色 —— 字号/间距两主题相同, 变的只有颜色。
+        let mut dark_app = LogApp::new_empty();
+        dark_app.theme = config::AppTheme::Dark;
+        let mut bar = title_bar(dark_app.theme, dark_app.make_title());
+
+        // 每帧状态换成浅色 (模拟运行中切主题)。
+        let mut light_app = LogApp::new_empty();
+        light_app.theme = config::AppTheme::Light;
+        bar.sync(&light_app);
+
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let size = bar.layout(Constraints::tight(Size::new(1100.0, 40.0)), &mut texts);
+        bar.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        // 期望值**从主题取**, 不写字面量: 原先这里钉的是手抄时代的 `0.12`,
+        // R5 把 `title_theme` 改成取自 `LogTheme` 后它就过期了 (token 是 #0F172A),
+        // 断言随即变红 —— 那条红是真的, 说明它确实盯着颜色。
+        let t = danqing::theme::LightTheme.text_primary();
+        let want = danqing::srgb_to_linear(t.r);
+        let hit = texts
+            .instance_colors()
+            .iter()
+            .any(|c| (c.r - want).abs() < 1e-3);
+        assert!(
+            hit,
+            "切到浅色后标题文字应变成浅色主题的正文色 {t:?} —— 没命中即 `bind_theme` 缺失"
+        );
+    }
+
+    #[test]
+    fn window_clear_color_follows_theme() {
+        // 清屏色的**单点定义** (AD1): 启动与切主题都取它, 不许两处各算一份。
+        // 回归的是这个缺陷: 清屏色原本写死浅色, 且全仓**零处** set_clear_color 调用 ——
+        // 于是存暗色配置启动、或运行中切到暗色, 窗口底色纹丝不动。
+        // 标题栏那条亮带**就是**清屏色 (框架 TitleBar 背景是有意的 TRANSPARENT)。
+        use danqing::theme::{DarkTheme, LightTheme, Theme};
+        assert_eq!(
+            window_clear_color(config::AppTheme::Light),
+            LightTheme.background(),
+            "浅色: 清屏色 = 主题背景"
+        );
+        assert_eq!(
+            window_clear_color(config::AppTheme::Dark),
+            DarkTheme.background(),
+            "暗色: 清屏色 = 主题背景"
+        );
+        assert_ne!(
+            window_clear_color(config::AppTheme::Light),
+            window_clear_color(config::AppTheme::Dark),
+            "两主题的清屏色必须不同 —— 相同即等于没跟随 (本缺陷的原始形态)"
+        );
     }
 
     #[test]
@@ -1220,6 +1668,38 @@ mod tests {
         );
     }
 
+    /// 模态键盘门禁 (2026-09-14 用户实机): 设置卡开着、卡内下拉未持焦时
+    /// 按 ↑↓, 卡底下的日志区滚动了。卡内控件经焦点路由消费、不经 `app.event`;
+    /// 能到这里的都是无人认领的键, 除 Esc (关卡) 外一律吞掉。
+    #[test]
+    fn settings_modal_swallows_unhandled_keys() {
+        let mut app = LogApp::new_empty();
+        let lines: String = (0..100)
+            .map(|i| format!("2026-09-14 12:00:{i:02} INFO line {i}\n"))
+            .collect();
+        let p = temp_log(lines.as_bytes());
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.settings_open = true;
+
+        let key = |key: NamedKey| Event::Key {
+            key: Key::Named(key),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        app.event(&key(NamedKey::ArrowDown));
+        assert_eq!(app.top_row, 0.0, "设置卡开着: ↓ 不得滚动底层日志");
+        app.event(&key(NamedKey::PageDown));
+        assert_eq!(app.top_row, 0.0, "设置卡开着: PageDown 不得滚动底层日志");
+
+        // Esc 不在吞键范围: 必须仍能关卡。
+        app.event(&key(NamedKey::Escape));
+        assert!(!app.settings_open, "Esc 必须仍能关闭设置卡");
+        std::fs::remove_file(&p).ok();
+    }
+
     /// 空态 LogApp 测试夹具 (与 run() 的空态骨架同构)。
     fn temp_log(content: &[u8]) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1232,6 +1712,307 @@ mod tests {
         path
     }
 
+    /// 追加换入: 计数由落点按「重叠一行」增量更新, 终值必须等于对新文件的全量重算。
+    #[test]
+    fn apply_appended_updates_counts_incrementally() {
+        let mut app = LogApp::new_empty();
+        let p1 =
+            temp_log("2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n".as_bytes());
+        let f1 = LogFile::open(&p1).unwrap();
+        app.level_counts = Arc::new(levels::count_levels(&f1));
+        app.file = Arc::new(f1);
+        app.levels_pending = false;
+        assert_eq!(app.level_counts.get(Level::Error), 1, "起点 1 条 ERROR");
+
+        let p2 = temp_log(
+            "2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n2026-09-05 12:00:03 ERROR three\n"
+                .as_bytes(),
+        );
+        let f2 = LogFile::open(&p2).unwrap();
+        app.apply_appended(f2, None);
+
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::count_levels(&app.file),
+            "增量更新 == 对新文件全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 2, "旧 1 + 新 1");
+        assert_eq!(app.level_counts.total(), 3);
+        std::fs::remove_file(&p1).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    /// **计数未就绪时追加**: 不得重起作业 —— 一个持续增长的 tail 会把计数
+    /// 一遍遍从头来过 (永远算不完, 侧栏永远挂在「…」); 也不得把旧快照的增量
+    /// 贴到新文件上。正确做法是等作业交付时与快照对账 (`pickup_levels_job`)。
+    #[test]
+    fn apply_appended_while_pending_keeps_counts_pending() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log(
+            "2026-09-05 12:00:01 ERROR one
+"
+            .as_bytes(),
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.levels_pending = true; // 模拟后台作业仍在算旧快照
+        app.level_counts = Arc::new(LevelCounts::default());
+
+        let f2 = LogFile::open(&p).unwrap();
+        app.apply_appended(f2, None);
+        assert!(app.levels_pending, "仍等原作业交付, 不得重起");
+        assert_eq!(
+            app.level_counts.total(),
+            0,
+            "不得把旧快照的增量贴到新文件上"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 作业快照之后文件又长过 → 交付时按「重叠一行」与快照对账, 得到与**当前**
+    /// 文件一致的计数 (既不重起作业, 也不交付一份过期的数)。
+    #[test]
+    fn pickup_levels_job_reconciles_lines_added_after_snapshot() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log(
+            "2026-09-05 12:00:01 ERROR one
+"
+            .as_bytes(),
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.level_column = None;
+        app.launch_levels_job(); // 快照 = 此刻的 1 行
+
+        // 作业在算的同时文件又长了两行
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(
+                b"2026-09-05 12:00:02 INFO two
+2026-09-05 12:00:03 ERROR three
+",
+            )
+            .unwrap();
+        }
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        assert_eq!(app.file.line_count(), 3, "快照之后又长了两行");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(Arc::clone(&app.file), None).counts,
+            "对账后 == 当前文件全量重算 (不是过期的那份)"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 2, "两条 ERROR 都在");
+        assert_eq!(app.level_counts.total(), 3);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// **R1 回归 (应用层)**: 旧快照末行无换行、被追加补全改判时, 计数与过滤必须
+    /// **同时**覆盖那一行 —— 只改一侧就会让柱条数字与筛选结果分岔 (D2 红线)。
+    #[test]
+    fn apply_appended_covers_completed_half_line_on_both_sides() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("X\n2026-09-05 12:00:01 ".as_bytes());
+        let f1 = LogFile::open(&p).unwrap();
+        app.level_counts = Arc::new(levels::count_levels(&f1));
+        app.file = Arc::new(f1);
+        app.levels_pending = false;
+        assert_eq!(app.level_counts.get(Level::Error), 0, "半行未成词");
+
+        // 已应用的过滤 + 已建立(空)的过滤表, 模拟 tail 中途
+        app.filter_applied = "ERROR".into();
+        app.filtered = Some(Arc::new(Vec::new()));
+
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"ERROR disk\n").unwrap();
+        }
+        let f2 = LogFile::open(&p).unwrap();
+        assert_eq!(f2.line_count(), 2, "补全半行不增行数");
+        app.apply_appended(f2, None);
+
+        assert_eq!(
+            app.level_counts.get(Level::Error),
+            1,
+            "被补全的半行必须改判"
+        );
+        assert_eq!(app.level_counts.get(Level::Other), 1, "只剩开头那行 X");
+        let shown = app.filtered.as_ref().expect("过滤表仍在");
+        assert_eq!(
+            shown.len() as u64,
+            app.level_counts.get(Level::Error),
+            "D2 红线: 筛出行数必须 == 柱条数字"
+        );
+        assert_eq!(
+            shown.as_slice(),
+            [1],
+            "第 1 行 (0-based) 是那条补全的 ERROR"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+    /// **T5 端到端一致性 (D2 红线的应用层落点)**: 点柱条 → 真实过滤管道 →
+    /// 筛出行数 == 柱条数字。
+    ///
+    /// 引擎层的逐桶相等已由 `levels.rs` 的 `field_counts_equal_filter_hits_...`
+    /// 钉住; 这条补的是「应用层真的把对的那个子句发出去了」——
+    /// 子句生成、toggle 语义、AsyncJob 管道都不脱节。
+    #[test]
+    fn clicking_a_bar_filters_to_exactly_the_bar_count() {
+        let mut app = LogApp::new_empty();
+        // 300 行: ERROR / INFO / WARNING 各 100。WARNING 是关键样本 ——
+        // 它验证别名靠前缀通配被吃到 (字节全等的 level=WARN 会筛出 0 行)。
+        let mut content = Vec::new();
+        for i in 0..300 {
+            let lv = match i % 3 {
+                0 => "ERROR",
+                1 => "INFO",
+                _ => "WARNING",
+            };
+            content.extend_from_slice(format!("{{\"level\":\"{lv}\",\"i\":{i}}}\n").as_bytes());
+        }
+        let p = temp_log(&content);
+        let f = LogFile::open(&p).unwrap();
+        app.level_counts = Arc::new(levels::count_levels_field(&f, "level"));
+        app.level_queries = levels::level_queries_for("level");
+        app.file = Arc::new(f);
+        app.has_file = true;
+
+        for level in [Level::Error, Level::Info, Level::Warn] {
+            app.filter_applied.clear(); // 避开 toggle 分支, 单纯验「套用后筛多少」
+            app.apply_level_filter(level);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let lines = loop {
+                if let Some(out) = app.filter_job.poll() {
+                    break out.lines;
+                }
+                assert!(Instant::now() < deadline, "过滤 job 5s 未交卷 (悬挂?)");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                lines.len() as u64,
+                app.level_counts.get(level),
+                "{level:?}: 筛出行数 != 柱条数字 —— D2 红线在应用层破裂"
+            );
+            assert_eq!(lines.len(), 100, "{level:?}: 300 行三轮 → 各 100");
+        }
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// **本次事故的回归 (2026-09-12)**: 打开**不得**等计数。
+    ///
+    /// 事由: 计数原先与文件同批交付, 而字段口径的 `extract_field` 要在整行里找
+    /// `"level":`, 成本随行内容走 —— 用户实机打开 1GB JSONL 时, 状态栏写
+    /// 「索引 92ms」却等了十几秒 (那十几秒全在 worker 里数级别)。
+    /// 修法: 打开只交出口径列名, 计数交独立后台作业, 侧栏随后补入。
+    ///
+    /// 这条钉住三件事: ① 落地后侧栏处于「未就绪」而非拿 0 冒充; ② 此时只读
+    /// (不得拿空子句表去点); ③ 作业交付后计数等于全量重算。
+    #[test]
+    fn apply_fresh_does_not_block_on_level_counting() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log(
+            "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
+        );
+        let f = LogFile::open(&p).unwrap();
+        let out = OpenOutcome {
+            file: f,
+            schema: jsonl::discover_schema(&LogFile::open(&p).unwrap()),
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: Some("level".into()),
+        };
+        app.apply_fresh(p.clone(), out);
+
+        // ① 落地即返回: 计数未就绪
+        assert!(app.levels_pending, "打开不得等计数 —— 落地时计数必未就绪");
+        assert_eq!(app.level_counts.total(), 0, "不得拿 0 冒充真实计数");
+        // ② 未就绪期间侧栏只读 (空子句表), 点不到任何一行
+        assert!(
+            app.level_queries.iter().all(Option::is_none),
+            "计数未就绪 → 侧栏只读"
+        );
+
+        // ③ 等后台作业交付
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷 (悬挂?)");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(Arc::clone(&app.file), Some("level")).counts,
+            "交付的计数 == 全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Info), 1);
+        assert_eq!(
+            app.level_queries[Level::Error as usize].as_deref(),
+            Some("level=ERROR*"),
+            "就绪后子句表随口径一起到位"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 轮转/重建: 计数重新后台算, 且列名与子句表跟着换 —— JSONL 变明文后必须
+    /// 降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
+    #[test]
+    fn apply_rebuild_switches_column_and_recounts() {
+        let mut app = LogApp::new_empty();
+        let p1 = temp_log(
+            "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
+        );
+        let f1 = LogFile::open(&p1).unwrap();
+        app.level_counts = Arc::new(levels::count_levels_field(&f1, "level"));
+        app.level_queries = levels::level_queries_for("level");
+        app.level_column = Some("level".into());
+        app.file = Arc::new(f1);
+        app.has_file = true;
+        assert!(
+            app.level_queries[Level::Error as usize].is_some(),
+            "起点: JSONL 可点"
+        );
+
+        // 轮转后内容变明文 → 口径列随之作废
+        let p2 = temp_log("2026-09-05 ERROR plain one\n2026-09-05 WARN plain two\n".as_bytes());
+        let out = OpenOutcome {
+            file: LogFile::open(&p2).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: true,
+            level_column: None,
+        };
+        app.apply_rebuild(&p2, out);
+
+        assert!(app.levels_pending, "重建后计数重新后台算");
+        assert!(app.level_column.is_none(), "列名换掉, 不沿用旧的");
+        assert!(
+            app.level_queries.iter().all(Option::is_none),
+            "明文 → 子句表清空 (降级只读)"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.levels_pending {
+            app.pickup_levels_job();
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *app.level_counts.as_ref(),
+            levels::counts_for(Arc::clone(&app.file), None).counts,
+            "重建后计数 == 新文件全量重算"
+        );
+        assert_eq!(app.level_counts.get(Level::Error), 1);
+        assert_eq!(app.level_counts.get(Level::Warn), 1);
+        assert_eq!(app.level_counts.total(), 2);
+        std::fs::remove_file(&p1).ok();
+        std::fs::remove_file(&p2).ok();
+    }
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
@@ -1258,11 +2039,13 @@ mod tests {
         });
         // 两个 worker 阻塞中 (结果必未到达) → 换入新文件 (invalidate 发生)
         let p = temp_log(b"new\nfile\n");
+        let f = LogFile::open(&p).unwrap();
         let out = OpenOutcome {
-            file: LogFile::open(&p).unwrap(),
+            file: f,
             schema: None,
             incremental_hits: None,
             rebuilt: false,
+            level_column: None,
         };
         app.apply_fresh(p.clone(), out);
         // 放行 worker 交付, 长窗轮询: 结果必须永不到达

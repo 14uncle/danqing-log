@@ -7,7 +7,7 @@
 #
 # Usage (from repo root):
 #   powershell -NoProfile -File tools/package_portable.ps1
-#   powershell -NoProfile -File tools/package_portable.ps1 -Version 0.1.0
+#   powershell -NoProfile -File tools/package_portable.ps1 -Version 1.0.0
 #
 # Always runs cargo build --release before packaging.
 
@@ -42,7 +42,7 @@ if (-not $PSBoundParameters.ContainsKey('Version')) {
     }
 }
 
-$ReleaseDir = Join-Path $RepoRoot "..\.cargo-target\release"  # shared farm target (see .cargo/config.toml)
+$ReleaseDir = Join-Path $RepoRoot "target\release"  # 本仓独立 target (shared target 已废除 2026-09-10)
 $Stage = Join-Path $OutDir "stage"
 $ArchiveBase = "${BinaryName}-v${Version}-win-x64"
 $ZipPath = Join-Path $OutDir "${ArchiveBase}.zip"

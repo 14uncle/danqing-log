@@ -1,6 +1,6 @@
 [package]
 name = "danqing-log"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "丹青日志 LogLens —— 大文件日志/JSONL 查看分析器 (第四件产品)"
@@ -21,6 +21,7 @@ regex = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 open = "5"
 rfd = "0.15"
+dirs = "6"
 
 [profile.dev]
 opt-level = 1
@@ -38,9 +39,7 @@ strip = "debuginfo"
 [build-dependencies]
 winresource = "0.1"
 
-# 本地联动开发：git 依赖透明替换为本地副本。
-# 发布时去掉本段，Cargo.lock 钉 git rev 保可复现。
-[patch."https://github.com/14uncle/danqing"]
-danqing = { path = "../danqing" }
-[patch."https://github.com/14uncle/danqing-logfile"]
-danqing-logfile = { path = "../danqing-logfile" }
+# 本地联动开发的 [patch] 段**已移出本文件** —— 提交进仓库的 Cargo.toml 必须
+# 保持「纯 git 依赖」，否则外部克隆会因 patch 指向仓库外的 ../danqing 而构建不了。
+# 本机联动改由 .cargo/config.toml (已 gitignore) 提供同款 [patch]，RustRover/cargo
+# 自动读取，日常开发无感。详见 CLAUDE.md「依赖关系」。

@@ -15,6 +15,15 @@ desktop.ini
 
 # Logs
 *.log
+/test-data
 
 # Local Claude Code settings
 /.claude/settings.local*.json*
+
+# 本机联动依赖替换 (含本地 ../ 路径, 不进仓库)
+/.cargo/config.toml
+
+# Windows SDK 打包工具 (makeappx / makepri / signtool, ~19MB) —— 不进仓库。
+# 缺失时按 tools/build_msix.ps1 头部注释补 (nuget 取 Microsoft.Windows.SDK.BuildTools)。
+tools/sdk-tools/
+__pycache__/
