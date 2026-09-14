@@ -154,6 +154,19 @@ fn row_hover_bg(theme: crate::config::AppTheme) -> Color {
     }
 }
 
+/// 单元格高亮的两笔颜色 (底色, 描边)。
+///
+/// **底笔与行选中同 token 是有意的** —— 单元格是行内**更具体**的选中, 底色沿用
+/// 选中带, 读起来是「这一行里, 这一格」。
+/// **但只画底色等于没有反馈** (2026-09-14 实机/审查 #2): 双击单元格必然同时选中
+/// 该行 (调用方先推 `Msg::Select`), 行底色已经铺了 `selection()`, 同色再叠一层
+/// 完全看不出选中的是哪一列 —— 而 Ctrl+C 只复制这一格, 视觉 (整行) 与结果
+/// (单格) 自相矛盾。故**必须**另起一笔描边把格子圈出来。
+/// 回归锁 `cell_highlight_border_is_a_second_stroke`。
+fn cell_highlight_colors(th: &impl Theme) -> (Color, Color) {
+    (th.selection(), th.accent())
+}
+
 /// 展开块底色 —— 比内容区底**略深**一档, 把子行与真实行分开。
 ///
 /// 展开的子行原先与真实行**长得一模一样** (只差没有行号), 用户分不清
@@ -538,6 +551,16 @@ pub(crate) struct LogView {
     // ---- 文本选区 (T3, 仅原始模式) ----
     /// 文本选区 (锚点/光标点 = 显示行 + 解码字节偏移); None 或空 = 无选区。
     selection: Option<TextSelection>,
+    /// 上次 sync 所见的展开态修订号 (M3): `app.expand_rev` 变化 = 显示行映射已变,
+    /// 旧选区/(M4)单元格选中的 (显示行, 偏移) 指向错误的行 → 作废。
+    last_expand_rev: u64,
+    /// 单元格选中 (M4): (显示行, 列下标) —— 表格模式普通行双击产生,
+    /// 矩形高亮 + Ctrl+C 复制完整值。存视图层 (与文本选区同层, 不进 LogApp)。
+    selected_cell: Option<(u64, usize)>,
+    /// 列区间缓存 (M4, paint 写 event 读): 可见列的 (x0, x1, 列下标),
+    /// 绝对窗口 x —— 列宽靠 TextBatch 实测, event 侧重算不可能 (D2)。
+    /// 非表格模式 = 空 (paint 每帧重置, 顺带清陈旧)。
+    col_spans: std::cell::RefCell<Vec<(f32, f32, usize)>>,
     /// 按下待升级 (行, 字节, 屏幕位置): 拖超 CLICK_DIST 升级框选,
     /// 未超即抬起 = 单击 (不产空选区)。
     press: Option<(u64, usize, Point)>,
@@ -583,6 +606,9 @@ impl LogView {
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
             selection: None,
+            last_expand_rev: 0,
+            selected_cell: None,
+            col_spans: std::cell::RefCell::new(Vec::new()),
             press: None,
             dragging: false,
             last_click: None,
@@ -624,6 +650,25 @@ impl LogView {
         expand::file_line_at(row, self.lines(), &self.expanded).unwrap_or((0, 0))
     }
 
+    /// 显示行的复制/分词文本 (M3): 普通行 = 解码原文; 展开子行 = 该子行
+    /// `label = value` 串 (构造点 = [`sub_row_text`], paint 与行兜底同用)。
+    /// 无文件/子行缺失 → 空串 (复制拼装对零宽切片本就跳过)。
+    fn row_content(&self, row: u64) -> String {
+        let Some(file) = self.file.as_ref() else {
+            return String::new();
+        };
+        let (line_no, sub_off) = self.line_at(row);
+        if sub_off > 0 {
+            return self
+                .sub_rows
+                .get(&line_no)
+                .and_then(|v| v.get(sub_off - 1))
+                .map(sub_row_text)
+                .unwrap_or_default();
+        }
+        file.line_lossy(line_no).into_owned()
+    }
+
     /// 选区是否超复制上限 (R3, 2026-09-08 评审): 滚轮甩底可造出全文件选区,
     /// 无上限复制 = 逐行解码 + 逐行分配, UI 冻结分钟级 —— 对「1GB 不卡」
     /// 立身之本的产品是口碑级事故。超限 Ctrl+C 不动作 + 底栏提示。
@@ -635,8 +680,9 @@ impl LogView {
     }
 
     /// 行文本区左键按下的选区处理 (T3)。双击 (300ms/4px, title_bar 先例) =
-    /// 空白分隔 token 整选; 单击 = 潜伏锚点 (拖超阈值才升级框选) 且清除旧选区。
-    /// 调用方已判定: 原始模式 + 左键 + 已打开文件 + px 在文本区。
+    /// 框架混合连接器分词整选 (M1); 单击 = 潜伏锚点 (拖超阈值才升级框选) 且清除旧选区。
+    /// 调用方已判定: 左键 + 已打开文件 + px 在文本区 + (原始模式全行区 | 表格模式
+    /// 仅展开子行, M3)。
     fn handle_text_press(&mut self, area: Rect, position: Point) {
         let now = Instant::now();
         let dbl = self.last_click.is_some_and(|(t, p)| {
@@ -646,12 +692,9 @@ impl LogView {
         });
         if dbl {
             if let Some((r, b)) = self.hit_text(area, position) {
-                let (line_no, _) = self.line_at(r);
-                let text = self
-                    .file
-                    .as_ref()
-                    .map(|f| f.line_lossy(line_no))
-                    .unwrap_or_default();
+                // M3: 文本来源 = 该行复制内容 (子行 = `label = value` 串) ——
+                // 与命中几何/渲染同串 (三源一体), token 边界才不偏
+                let text = self.row_content(r);
                 let (s, e) = selection::token_at(&text, b);
                 self.selection = Some(TextSelection::new((r, s), (r, e)));
             }
@@ -670,11 +713,14 @@ impl LogView {
     ///
     /// event 无 TextBatch, 字符级命中走 paint 缓存的逐字符几何 ([`Self::row_geom`],
     /// TextInput char_offsets 同法); 与渲染同一解码路径, 宽度天然一致。
-    /// 返回 None = 该坐标不可选 (列表区外 / 表格模式 / 展开子行 / 未缓存行)。
+    /// 返回 None = 该坐标不可选 (列表区外 / 未缓存行 —— 表格模式普通行不缓存,
+    /// 展开子行 M3 起缓存可命中)。
     /// 按下路径由调用方挡 gutter 区 (px < text_x 不进选区); 拖动路径的
     /// gutter 内坐标 (content_x 为负) 归 base_byte = 可见窗口首字符 ——
     /// 水平滚动后 != 行首, 语义为「选到最左可见处」。缓存未覆盖的字符区间
     /// (视口右缘外) 归最后可见字符 —— 用户只能选中看得到的文本。
+    /// **x_offset 分叉 (M3, D3)**: 子行不参与水平滚动 (paint 无 x_off),
+    /// 其 content_x 不加 `x_offset`; 普通行加。
     fn hit_text(&self, area: Rect, pos: Point) -> Option<(u64, usize)> {
         let chrome_top = self.chrome_top();
         let list_h = (area.size.height - chrome_top - STATUS_HEIGHT).max(0.0);
@@ -684,7 +730,12 @@ impl LogView {
         }
         let row = (self.top_row + f64::from(rel_y / ROW_HEIGHT)) as u64;
         let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
-        let content_x = pos.x - text_x + self.x_offset.get();
+        let (_, sub_off) = self.line_at(row);
+        let content_x = if sub_off > 0 {
+            pos.x - text_x
+        } else {
+            pos.x - text_x + self.x_offset.get()
+        };
         let geom = self.row_geom.borrow();
         let g = geom.get(&row)?;
         // 首个 x_end > content_x 的字符即 caret 归属 (TextInput hit_to_index 同语义);
@@ -692,6 +743,66 @@ impl LogView {
         let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
         let byte = if n == 0 { g.base_byte } else { g.offs[n - 1].1 };
         Some((row, byte))
+    }
+
+    /// 列区间命中 (M4): 屏幕 x → 列下标。读 paint 缓存的绝对窗口坐标
+    /// (D2 —— event 无 TextBatch, 列宽重算不可能)。滚出视口的列不在缓存
+    /// = 点不到, 天然一致。
+    fn col_idx_at(&self, pos: Point) -> Option<usize> {
+        self.col_spans
+            .borrow()
+            .iter()
+            .find(|(x0, x1, _)| (*x0..*x1).contains(&pos.x))
+            .map(|(_, _, idx)| *idx)
+    }
+
+    /// 单元格完整值 (M4): 该行 parse 后取列字段经 `cell_display` —— 与显示
+    /// 同源 (字符串裸值/其余紧凑), **不受列宽截断省略影响**。
+    /// 行 parse 失败 / 无该字段 / 子行 / **显示行越界** → None
+    /// (不产生选中, 也不复制)。
+    fn cell_value(&self, row: u64, col_idx: usize) -> Option<String> {
+        // 越界行守卫 (2026-09-14 审查 #1): 列表区下方空白处按下时 row 由 y 反算,
+        // 可以是任意值, 而 `line_at` 对越界行走 `unwrap_or((0, 0))` 会**塌缩成
+        // 文件第 0 行** —— 放行会造出「画面上无高亮 (srow 不等于任何可见 i)、
+        // Ctrl+C 却复制第 0 行该列」的隐形选中。hit_text 走 row_geom 缓存
+        // (paint 只缓存 < count 的行) 天然挡得住, 单元格路径读的是 col_spans
+        // (纯 x 命中, 无行维度), 必须自己挡。
+        if row >= self.display_count() {
+            return None;
+        }
+        let (line_no, sub_off) = self.line_at(row);
+        if sub_off > 0 {
+            return None; // 子行无单元格 (走文本选区通道)
+        }
+        let col = self.schema.as_deref()?.columns.get(col_idx)?;
+        let raw = self.file.as_ref()?.line(line_no);
+        jsonl::parse_line(raw)?
+            .get(col.name.as_str())
+            .map(jsonl::cell_display)
+    }
+
+    /// 表格模式普通行的左键按下 (M4): 双击 (300ms/4px, 与文本双击同规则同常量)
+    /// 且命中有值单元格 → 选中该格; 单击或双击落空 → 清单元格选中
+    /// (行选中走调用方的 Msg::Select, 与此独立)。
+    /// **任何单元格按下都作废文本选区** —— 新手势独占 (2026-09-14 实机:
+    /// 展开块框选后双击单元格, 旧选区残留, Ctrl+C 复制的是旧选区)。
+    fn handle_cell_press(&mut self, row: u64, position: Point) {
+        self.selection = None;
+        let now = Instant::now();
+        let dbl = self.last_click.is_some_and(|(t, p)| {
+            now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS
+                && (position.x - p.x).abs() < CLICK_DIST
+                && (position.y - p.y).abs() < CLICK_DIST
+        });
+        if dbl {
+            self.selected_cell = self
+                .col_idx_at(position)
+                .and_then(|ci| self.cell_value(row, ci).map(|_| (row, ci)));
+            self.last_click = None; // 三连击不链式, 重新开始计数 (与文本双击同)
+        } else {
+            self.selected_cell = None;
+            self.last_click = Some((now, position));
+        }
     }
 }
 
@@ -711,14 +822,23 @@ fn clamp_x(x: f32, content_w: f32, viewport_w: f32) -> f32 {
     x.clamp(0.0, (content_w - viewport_w).max(0.0))
 }
 
+/// 展开子行的文本串 (`label = value`) —— **唯一构造点** (M3 三源一体)。
+/// paint 子行分支 / [`LogView::row_content`] / 行兜底复制三处共用: 命中几何是按
+/// 这个串测宽的, 复制也按它的字节偏移切片, 改格式只此一处 —— 否则任一处分叉
+/// 都会让「双击选中的字符」与「复制出的内容」错位。
+fn sub_row_text(r: &SubRow) -> String {
+    format!("{} = {}", r.label, r.value)
+}
+
 impl Widget for LogView {
     fn sync(&mut self, state: &dyn Any) {
         let app = state
             .downcast_ref::<LogApp>()
             .expect("LogView 绑定状态类型不匹配");
-        // 选区失效守卫: 显示行→内容映射变化 (换文件/过滤变化/切模式) 时
+        // 选区失效守卫: 显示行→内容映射变化 (换文件/过滤变化/切模式/展开折叠) 时
         // 旧选区的 (显示行, 偏移) 不再对应原文, 必须作废 (含潜伏按下);
         // 追加 tail 换入新 Arc 同样触发 —— 保守清除胜过复制出错行。
+        // 展开折叠走修订号 (M3, expand_rev): ExpandMap 无可比性, 逐帧 diff 不值。
         let file_changed = self
             .file
             .as_ref()
@@ -728,10 +848,13 @@ impl Widget for LogView {
             (None, None) => false,
             _ => true,
         };
-        if file_changed || filtered_changed || self.mode != app.mode {
+        let expand_changed = app.expand_rev != self.last_expand_rev;
+        self.last_expand_rev = app.expand_rev;
+        if file_changed || filtered_changed || self.mode != app.mode || expand_changed {
             self.selection = None;
             self.press = None;
             self.dragging = false;
+            self.selected_cell = None; // M4: 同守卫块, 同一作废理由
         }
         self.file = Some(Arc::clone(&app.file));
         self.has_file = app.has_file;
@@ -800,11 +923,13 @@ impl Widget for LogView {
         // 表格模式: 列布局 (列宽 = 采样字符宽实测 + 内边距, ≤16 列常量成本;
         // 水平滚动: 列区整体左移, 滚出左右缘的列整列不画)
         let mut cols: Vec<(f32, f32, &Column)> = Vec::new();
+        // 列区间缓存 (M4): 可见列的 (x0, x1, 列下标) 绝对窗口 x, paint 写 event 读
+        let mut spans: Vec<(f32, f32, usize)> = Vec::new();
         if table {
             let schema = self.schema.as_deref().expect("表格模式必有 schema");
             let mut x = text_x - x_off;
             let mut total_w = 0.0f32;
-            for col in &schema.columns {
+            for (col_idx, col) in schema.columns.iter().enumerate() {
                 let w = texts.measure(&"8".repeat(col.width_chars), FONT_SIZE) + COL_PAD;
                 total_w += w;
                 if x + w <= text_x {
@@ -816,6 +941,7 @@ impl Widget for LogView {
                     continue; // 整列滚出右缘 (继续累计 total_w)
                 }
                 cols.push((x, w, col));
+                spans.push((x, x + w, col_idx));
                 x += w;
             }
             if total_w > self.max_seen.get() {
@@ -853,6 +979,8 @@ impl Widget for LogView {
                 0.0,
             );
         }
+        // M4: 列区间入缓存 (非表格模式 = 空, 顺带清掉切模式前的陈旧缓存)
+        self.col_spans.replace(spans);
 
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
@@ -946,13 +1074,55 @@ impl Widget for LogView {
                 // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
                 rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
             }
+            // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
+            // 与行选中可同存 —— 单元格是更具体的选中, 画在上层)
+            if let Some((srow, scol)) = self.selected_cell {
+                if srow == i && !is_sub_row {
+                    let spans = self.col_spans.borrow();
+                    if let Some((x0, x1, _)) = spans.iter().find(|(_, _, ci)| *ci == scol) {
+                        let hx0 = x0.max(text_x);
+                        let hx1 = x1.min(text_right);
+                        if hx1 > hx0 {
+                            let cell_rect =
+                                Rect::from_xywh(hx0, y + 2.0, hx1 - hx0, ROW_HEIGHT - 4.0);
+                            // 两笔: 底色 (与行选中同 token, 见 cell_highlight_colors)
+                            // + 描边 (唯一指出「具体哪一格」的一笔, 按钮焦点环同款原语)
+                            let (fill, border) = cell_highlight_colors(&th);
+                            rects.push_rect(cell_rect, fill, 2.0);
+                            rects.push_rounded_border(cell_rect, border, 2.0, 1.5);
+                        }
+                    }
+                }
+            }
             // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
             if is_sub_row {
                 if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1)) {
                     let indent = (row.depth as f32 - 1.0) * 16.0;
-                    let s = format!("{} = {}", row.label, row.value);
+                    let s = sub_row_text(row);
                     let draw_x = text_x + indent;
                     if draw_x < text_right {
+                        // 选区命中几何 (M3): 串由 `sub_row_text` 单点构造, 命中/渲染/
+                        // 复制三源一体; 子行不参与水平滚动 (无 x_off) → 内容域起点
+                        // = indent, hit_text 对子行相应不加 x_offset (D3 分叉)
+                        let geom =
+                            measure_row_geom(texts, &s, 0, indent, text_right - text_x + 64.0);
+                        self.row_geom.borrow_mut().insert(i, geom);
+                        // 文本选区区间 (M3): 与 raw 行同法 (measure 前缀→矩形),
+                        // 唯二差异 = 串是子行串、无 x_off (子行不水平滚动)
+                        if let Some(sel) = self.selection.as_ref().filter(|s| !s.is_empty()) {
+                            if let Some((b0, b1)) = selection::row_slice(sel, i, &s) {
+                                let x0 = (draw_x + texts.measure(&s[..b0], FONT_SIZE)).max(text_x);
+                                let x1 =
+                                    (draw_x + texts.measure(&s[..b1], FONT_SIZE)).min(text_right);
+                                if x1 > x0 {
+                                    rects.push_rect(
+                                        Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                        th.selection(),
+                                        2.0,
+                                    );
+                                }
+                            }
+                        }
                         fit_push(
                             texts,
                             &s,
@@ -1345,15 +1515,33 @@ impl Widget for LogView {
                         msgs.push(Box::new(Msg::ToggleExpand(row)));
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
-                        // 文本选区 (T3): 仅左键 + 原始模式 (右键不清选区/不污染
-                        // 双击判定 —— 评审 O1); 左键落 gutter = 仅行选中并清选区
                         let text_x = area.origin.x + EXPAND_W + self.gutter_w.get() + GUTTER_GAP;
-                        if *button == MouseButton::Left && !self.table_mode() && self.has_file {
+                        let sub_row = self.line_at(row).1 > 0;
+                        // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
+                        // | 表格模式仅展开子行); 右键不清选区/不污染双击判定
+                        // (评审 O1); 左键落 gutter = 仅行选中并清选区
+                        if *button == MouseButton::Left
+                            && (!self.table_mode() || sub_row)
+                            && self.has_file
+                        {
                             if position.x >= text_x {
                                 self.handle_text_press(area, *position);
                             } else {
                                 self.selection = None;
                             }
+                            self.selected_cell = None; // M4: 文本选区动作清单元格选中
+                        } else if *button == MouseButton::Left
+                            && self.table_mode()
+                            && self.has_file
+                            && !sub_row
+                            && position.x >= text_x
+                        {
+                            // 单元格双击 (M4): 表格模式普通行的文本区左键
+                            self.handle_cell_press(row, *position);
+                        } else if *button == MouseButton::Left && self.table_mode() {
+                            // 表格普通行的 gutter/行号区单击: 也清单元格选中
+                            // (单击他处 = 放弃, 与文本选区的 gutter 惯例一致)
+                            self.selected_cell = None;
                         }
                     }
                     EventResult::Consumed
@@ -1397,12 +1585,21 @@ impl Widget for LogView {
                 pressed: true,
                 ..
             } => {
-                // 有选区时 Esc 清选区; 无选区 Ignored (框架清焦, 现状)
-                if self.selection.as_ref().is_some_and(|s| !s.is_empty()) {
-                    self.selection = None;
-                    EventResult::Consumed
-                } else {
+                // Esc = 放弃当前手势: 清文本选区 / 单元格选中 / **潜伏按下**
+                // (潜伏按下也算 —— 否则按住左键中途 Esc 再继续拖仍会升级成框选);
+                // 全无 → Ignored (框架清焦, 现状)
+                if self.selection.as_ref().is_none_or(|s| s.is_empty())
+                    && self.selected_cell.is_none()
+                    && self.press.is_none()
+                    && !self.dragging
+                {
                     EventResult::Ignored
+                } else {
+                    self.selection = None;
+                    self.selected_cell = None;
+                    self.press = None;
+                    self.dragging = false;
+                    EventResult::Consumed
                 }
             }
             _ => EventResult::Ignored,
@@ -1427,29 +1624,42 @@ impl Widget for LogView {
         Some(self.area.get())
     }
 
-    /// 当前可复制文本: 原始模式 = 非空且不超限的文本选区 (跨行 `\n` 拼接);
-    /// 表格模式 = 选中行完整原文 (不受单元格截断省略影响; 选中展开子行时
-    /// 归父行原文 —— 子行是父行 JSON 的投影, 复制原文不丢信息);
-    /// 其余 (原始模式仅行选中) = None —— Ctrl+C 只认文本选区 (spec 决策)。
+    /// 当前可复制文本, 三级优先 (2026-09-14 翻案旧 spec「Ctrl+C 只认文本选区」):
+    /// ① 非空且不超限的文本选区 (跨行 `\n` 拼接, 逐行走 [`Self::row_content`] —
+    ///   普通行原文、展开子行供子行串, raw 模式跨界框选混排自然成立);
+    /// ② 单元格选中 (M4) → 该字段完整值 (不受列宽截断省略影响; 选中后行数据
+    ///   失效则防御性落到 ③);
+    /// ③ 行选中 (**两模式统一**) → [`Self::row_content`]: 普通行 = 解码原文
+    ///   (表格模式同样拿完整原文, 不受单元格截断省略影响),
+    ///   子行 = 该子行 `label = value` 串 (**#5 展开块 Ctrl+C 的落点**);
+    ///   子行数据缺失 → None (不复制空串冒充)。
+    /// 全无 → None (Ctrl+C 不动作, 剪贴板不动)。
     fn selected_text(&self) -> Option<String> {
         if let Some(sel) = &self.selection {
             if !sel.is_empty() {
                 if self.selection_over_limit() {
                     return None;
                 }
-                let file = self.file.as_ref()?;
-                return Some(selection::copy_text(sel, &|row| {
-                    let (line_no, sub_off) = self.line_at(row);
-                    if sub_off > 0 {
-                        return String::new(); // 展开子行不进选区文本 (防御)
-                    }
-                    file.line_lossy(line_no).into_owned()
-                }));
+                return Some(selection::copy_text(sel, &|row| self.row_content(row)));
             }
         }
-        if self.table_mode() && self.has_file && self.selected < self.display_count() {
+        if let Some((row, col_idx)) = self.selected_cell {
+            // 该列水平滚出视口时不高亮但仍复制 —— 与行选中「滚出屏幕仍能复制」
+            // 同一语义 (选中不因视口移动而失效; col_spans 只含可见列, 见 col_idx_at)
+            if let Some(v) = self.cell_value(row, col_idx) {
+                return Some(v);
+            }
+        }
+        if self.has_file && self.selected < self.display_count() {
+            let (line_no, sub_off) = self.line_at(self.selected);
+            if sub_off > 0 {
+                return self
+                    .sub_rows
+                    .get(&line_no)
+                    .and_then(|v| v.get(sub_off - 1))
+                    .map(sub_row_text);
+            }
             let file = self.file.as_ref()?;
-            let (line_no, _) = self.line_at(self.selected);
             return Some(file.line_lossy(line_no).into_owned());
         }
         None
@@ -2194,6 +2404,24 @@ mod tests {
         );
     }
 
+    /// 单元格高亮的**描边**必须与底笔可分辨。
+    ///
+    /// 回归锁 (2026-09-14 审查 #2): 本模块原先把单元格画成**只有一笔**
+    /// `th.selection()` —— 与行选中底色同一个 token, 而双击单元格必然同时选中
+    /// 该行 (行底色已在下面铺过), 于是整行一片同色, 看不出选中的是哪一列。
+    /// 而 Ctrl+C 只复制这一格, 视觉 (整行) 与结果 (单格) 自相矛盾。
+    /// 底笔与行选中同色是有意的, 所以这条锁只钉**描边那一笔必不相同**。
+    #[test]
+    fn cell_highlight_border_is_a_second_stroke() {
+        let (light_fill, light_border) = cell_highlight_colors(&LightTheme);
+        assert_ne!(
+            light_fill, light_border,
+            "浅色: 描边与底色同色 = 看不出选中的是哪一格"
+        );
+        let (dark_fill, dark_border) = cell_highlight_colors(&DarkTheme);
+        assert_ne!(dark_fill, dark_border, "暗色同上");
+    }
+
     /// `header_line` 必须取**当前主题**的分割线色。
     ///
     /// 回归锁 (2026-09-13): 它原先恒用 `LightTheme.divider()`, 完全不看当前主题 ——
@@ -2453,7 +2681,8 @@ mod tests {
         // 水平滚动后: content_x = px - text_x + x_off = 15 + 100 = 115 → 超末字符 → byte 3
         v.x_offset.set(100.0);
         assert_eq!(v.hit_text(area, Point::new(84.0 + 15.0, 5.0)), Some((0, 3)));
-        // 未缓存行 (表格/展开子行/空白行区) → None (不可选)
+        // 未缓存行 (表格模式普通行/空白行区) → None (不可选);
+        // 展开子行 M3 起有缓存可命中, 见 hit_text_sub_row_ignores_x_offset
         assert_eq!(
             v.hit_text(area, Point::new(84.0 + 15.0, 5.0 + ROW_HEIGHT)),
             None
@@ -2487,8 +2716,8 @@ mod tests {
         );
     }
 
-    /// 复制接线 (T4): 原始模式 = 文本选区拼文本; 表格模式 = 选中行完整原文;
-    /// 空选区/原始仅行选中 = None (Ctrl+C 不动作, 剪贴板不动)。
+    /// 复制接线: 三级优先 = 文本选区 > (单元格选中, M4) > 行选中 (两模式统一,
+    /// 2026-09-14 翻案「只认文本选区」); 越界/无文件 = None (Ctrl+C 不动作)。
     #[test]
     fn selected_text_raw_selection_and_table_row() {
         let path = std::env::temp_dir().join(format!("danqing-log-sel-{}.log", std::process::id()));
@@ -2497,20 +2726,24 @@ mod tests {
         let mut v = LogView::new();
         v.file = Some(Arc::new(file));
         v.has_file = true;
-        // 原始模式: 跨行选区 → 首行后缀 + 末行前缀
+        // 第①级: 跨行选区 → 首行后缀 + 末行前缀
         v.selection = Some(TextSelection::new((0, 4), (1, 2)));
         assert_eq!(v.selected_text().as_deref(), Some("bbb\ncc"));
         // 反向选区同内容
         v.selection = Some(TextSelection::new((1, 2), (0, 4)));
         assert_eq!(v.selected_text().as_deref(), Some("bbb\ncc"));
-        // 空选区 → None
-        v.selection = Some(TextSelection::new((0, 1), (0, 1)));
-        assert_eq!(v.selected_text(), None);
-        // 原始模式仅行选中 → None (spec: Ctrl+C 只认文本选区)
+        // 第③级 (翻案): 原始模式仅行选中 → 整行原文
         v.selection = None;
         v.selected = 2;
-        assert_eq!(v.selected_text(), None);
+        assert_eq!(v.selected_text().as_deref(), Some("ddd eee"));
+        // 空选区视同无选区 → 落行兜底 (不是 None)
+        v.selection = Some(TextSelection::new((0, 1), (0, 1)));
+        assert_eq!(v.selected_text().as_deref(), Some("ddd eee"));
+        // ① 优先于 ③: 有文本选区时行选中不抢
+        v.selection = Some(TextSelection::new((0, 0), (0, 3)));
+        assert_eq!(v.selected_text().as_deref(), Some("aaa"));
         // 表格模式: 选中行完整原文 (行内容不经单元格截断)
+        v.selection = None;
         v.mode = ViewMode::Table;
         v.schema = Some(Arc::new(Schema {
             columns: vec![Column {
@@ -2519,6 +2752,419 @@ mod tests {
             }],
         }));
         assert_eq!(v.selected_text().as_deref(), Some("ddd eee"));
+        // 选中越界 → None (Ctrl+C 不动作, 剪贴板不动)
+        v.selected = 99;
+        assert_eq!(v.selected_text(), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// M3 夹具: 2 行 JSONL, 行 0 展开两条子行 →
+    /// 显示行 0 = 文件行 0, 1..=2 = 子行, 3 = 文件行 1。
+    /// 子行串: row1 = "msg = 订单创建成功" (订 起 byte 6), row2 = "id = 42"。
+    /// `tag`: 每测试唯一 —— 并行测试共享同一路径会读到他测试的截断/删除中间态。
+    fn sub_row_fixture(tag: &str) -> (LogView, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "danqing-log-sub-{tag}-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        let mut em = ExpandMap::new();
+        em.expand(0, 2);
+        v.expanded = em;
+        v.sub_rows.insert(
+            0,
+            vec![
+                SubRow {
+                    depth: 1,
+                    label: "msg".into(),
+                    value: "订单创建成功".into(),
+                },
+                SubRow {
+                    depth: 1,
+                    label: "id".into(),
+                    value: "42".into(),
+                },
+            ],
+        );
+        (v, path)
+    }
+
+    /// row1 ("msg = 订单创建成功", 24 字节) 的合成几何: 10px/字符,
+    /// 中文字符字节端 +3 (与真实 char_indices 对齐)。
+    fn sub_row1_geom() -> RowGeom {
+        RowGeom {
+            base_byte: 0,
+            offs: vec![
+                (10.0, 1),
+                (20.0, 2),
+                (30.0, 3),
+                (40.0, 4),
+                (50.0, 5),
+                (60.0, 6),
+                (70.0, 9),
+                (80.0, 12),
+                (90.0, 15),
+                (100.0, 18),
+                (110.0, 21),
+                (120.0, 24),
+            ],
+        }
+    }
+
+    /// 子行命中 (M3/T4): 子行缓存几何后可命中, 且 content_x **不加** x_offset
+    /// (子行不参与水平滚动, D3); 同帧普通行仍加 —— 分叉两肢一起锁。
+    #[test]
+    fn hit_text_sub_row_ignores_x_offset() {
+        let (v, path) = sub_row_fixture("hit");
+        v.gutter_w.set(56.0);
+        let geom = || RowGeom {
+            base_byte: 0,
+            offs: vec![(10.0, 1), (20.0, 2), (30.0, 3)],
+        };
+        v.row_geom.borrow_mut().insert(0, geom());
+        v.row_geom.borrow_mut().insert(1, geom()); // 子行
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let text_x = EXPAND_W + 56.0 + GUTTER_GAP;
+        // 无滚动: 普通行与子行同点同结果 (content_x = 15 → byte 1)
+        assert_eq!(
+            v.hit_text(area, Point::new(text_x + 15.0, 5.0)),
+            Some((0, 1))
+        );
+        assert_eq!(
+            v.hit_text(area, Point::new(text_x + 15.0, 5.0 + ROW_HEIGHT)),
+            Some((1, 1))
+        );
+        // 水平滚动 100px: 普通行 content_x = 115 → 末字符后 byte 3; 子行不动
+        v.x_offset.set(100.0);
+        assert_eq!(
+            v.hit_text(area, Point::new(text_x + 15.0, 5.0)),
+            Some((0, 3))
+        );
+        assert_eq!(
+            v.hit_text(area, Point::new(text_x + 15.0, 5.0 + ROW_HEIGHT)),
+            Some((1, 1)),
+            "子行命中不得随 x_offset 偏移"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 子行双击分词 (M3/T5): 表格模式子行上双击 = 框架新分词作用于**子行串**
+    /// (三源一体) —— 中文逐字 / 英文复合词; Ctrl+C 复制选中 token。
+    #[test]
+    fn sub_row_double_click_selects_token_in_sub_row_text() {
+        let (mut v, path) = sub_row_fixture("dbl");
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "a".into(),
+                width_chars: 4,
+            }],
+        }));
+        v.row_geom.borrow_mut().insert(1, sub_row1_geom());
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let text_x = EXPAND_W + 56.0 + GUTTER_GAP;
+        let press = |x: f32| Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(x, HEADER_H + ROW_HEIGHT + 5.0),
+        };
+        // 双击「订」(content_x 65 → caret byte 6 → CJK 逐字)
+        v.event(&press(text_x + 65.0), area, &mut msgs);
+        v.event(&press(text_x + 65.0), area, &mut msgs);
+        assert_eq!(v.selection, Some(TextSelection::new((1, 6), (1, 9))));
+        assert_eq!(v.selected_text().as_deref(), Some("订"));
+        // 双击「msg」(content_x 5 → base_byte 0 → 复合词)
+        v.event(&press(text_x + 5.0), area, &mut msgs);
+        v.event(&press(text_x + 5.0), area, &mut msgs);
+        assert_eq!(v.selection, Some(TextSelection::new((1, 0), (1, 3))));
+        assert_eq!(v.selected_text().as_deref(), Some("msg"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 子行框选与行复制 (M3/T5): 块内跨子行拖选 → 各子行串 `\n` 拼接;
+    /// 无文本选区时选中子行 Ctrl+C = 该子行串 (**#5 回归锁**); 普通行回归原文。
+    #[test]
+    fn sub_row_drag_selection_and_row_copy() {
+        let (mut v, path) = sub_row_fixture("drag");
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "a".into(),
+                width_chars: 4,
+            }],
+        }));
+        v.row_geom.borrow_mut().insert(1, sub_row1_geom());
+        v.row_geom.borrow_mut().insert(
+            2,
+            RowGeom {
+                base_byte: 0,
+                offs: vec![
+                    (10.0, 1),
+                    (20.0, 2),
+                    (30.0, 3),
+                    (40.0, 4),
+                    (50.0, 5),
+                    (60.0, 6),
+                    (70.0, 7),
+                ],
+            },
+        );
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let text_x = EXPAND_W + 56.0 + GUTTER_GAP;
+        // 按下子行 1 起点 (byte 0)
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(text_x + 5.0, HEADER_H + ROW_HEIGHT + 5.0),
+            },
+            area,
+            &mut msgs,
+        );
+        // 拖到子行 2 (content_x 65 → byte 6)
+        v.event(
+            &Event::CursorMoved(Point::new(text_x + 65.0, HEADER_H + 2.0 * ROW_HEIGHT + 5.0)),
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.selection, Some(TextSelection::new((1, 0), (2, 6))));
+        // 复制 = 子行 1 整串 + 子行 2 [..6] —— `\n` 拼接
+        assert_eq!(
+            v.selected_text().as_deref(),
+            Some("msg = 订单创建成功\nid = 4")
+        );
+        // 抬起落定 (回归既有状态机)
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(text_x + 65.0, HEADER_H + 2.0 * ROW_HEIGHT + 5.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.press.is_none() && !v.dragging);
+        // #5 回归锁: 选中子行 (无文本选区) Ctrl+C = 该子行串, 不是父行原文
+        v.selection = None;
+        v.selected = 1;
+        assert_eq!(v.selected_text().as_deref(), Some("msg = 订单创建成功"));
+        // 回归: 普通行仍复制解码原文
+        v.selected = 3;
+        assert_eq!(v.selected_text().as_deref(), Some("{\"b\":2}"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// raw 模式跨界框选 (M3): 普通行原文 + 子行串混排
+    /// (spec Open Q3 —— 语义自洽, 不特殊处理)。
+    #[test]
+    fn raw_mode_cross_boundary_selection_mixes_line_and_sub_row_text() {
+        let (mut v, path) = sub_row_fixture("cross"); // 默认 Raw 模式
+        v.selection = Some(TextSelection::new((0, 0), (1, 9)));
+        // 行 0 全行 "{\"a\":1}" + 子行 1 [..9] = "msg = 订"
+        assert_eq!(v.selected_text().as_deref(), Some("{\"a\":1}\nmsg = 订"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 回归 (M3): 表格模式**普通行**仍不产生文本选区 (文本选区是子行专属通道;
+    /// M4 的双击单元格走另一条状态, 不在此钉)。
+    #[test]
+    fn table_mode_normal_row_press_makes_no_text_selection() {
+        let (mut v, path) = sub_row_fixture("norm");
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "a".into(),
+                width_chars: 4,
+            }],
+        }));
+        // 即使有缓存几何也不接 (防御性 —— 正常 paint 不会给普通行缓存)
+        v.row_geom.borrow_mut().insert(0, sub_row1_geom());
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let text_x = EXPAND_W + 56.0 + GUTTER_GAP;
+        let press = |x: f32| Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(x, HEADER_H + 5.0),
+        };
+        v.event(&press(text_x + 5.0), area, &mut msgs);
+        assert_eq!(v.selection, None);
+        assert!(v.press.is_none());
+        // 双击亦然 (不进 handle_text_press → 无 token 选区)
+        v.event(&press(text_x + 5.0), area, &mut msgs);
+        assert_eq!(v.selection, None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// expand_rev 守卫 (M3/T6): 展开/折叠改变显示行映射 → sync 作废旧选区
+    /// (含潜伏按下); rev 不变 → 保留 (不误杀活着的选区)。
+    #[test]
+    fn sync_clears_selection_when_expand_rev_changes() {
+        let path = std::env::temp_dir().join(format!("danqing-log-rev-{}.log", std::process::id()));
+        std::fs::write(&path, "l0\nl1\n").unwrap();
+        let mut app = crate::LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&path).unwrap());
+        app.has_file = true;
+        let mut v = LogView::new();
+        v.file = Some(Arc::clone(&app.file));
+        v.has_file = true;
+        v.last_expand_rev = app.expand_rev;
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+        v.selected_cell = Some((0, 1));
+        // rev 不变 → 都保留
+        v.sync(&app);
+        assert!(v.selection.is_some() && v.selected_cell.is_some());
+        // rev 变化 → 都作废
+        app.expand_rev += 1;
+        v.sync(&app);
+        assert_eq!(v.selection, None);
+        assert_eq!(v.selected_cell, None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// M4 夹具: 2 行 JSONL (行 0: level + 长 msg; 行 1: 仅 level 无 msg),
+    /// 表格模式双列; 列区间合成缓存 = [(text_x, 200) level, (200, 400) msg]
+    /// (绝对窗口 x; paint 缓存的替身 —— event 只读它)。
+    /// `tag`: 每测试唯一 —— 并行共享同一路径会读/写到他测试的中间态。
+    fn cell_fixture(tag: &str) -> (LogView, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "danqing-log-cell-{tag}-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "{\"level\":\"ERROR\",\"msg\":\"订单创建成功,支付网关超时\"}\n{\"level\":\"INFO\"}\n",
+        )
+        .unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![
+                Column {
+                    name: "level".into(),
+                    width_chars: 5,
+                },
+                Column {
+                    name: "msg".into(),
+                    width_chars: 6,
+                },
+            ],
+        }));
+        let text_x = EXPAND_W + 56.0 + GUTTER_GAP;
+        v.col_spans
+            .replace(vec![(text_x, 200.0, 0), (200.0, 400.0, 1)]);
+        (v, path)
+    }
+
+    /// 单元格双击 (M4): 命中有值列 → 选中; Ctrl+C 拿**完整值** (列宽 6 字符
+    /// 装不下 msg, 复制不受截断影响); 单击他格清除; 双击落空 (列区间外 /
+    /// 该行无该字段) 不产选中。
+    #[test]
+    fn cell_double_click_selects_and_copies_full_value() {
+        let (mut v, path) = cell_fixture("dbl");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let press = |x: f32, row: f32| Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(x, HEADER_H + row * ROW_HEIGHT + 5.0),
+        };
+        // 残留回归 (2026-09-14 实机): 先有文本选区 (展开块框选),
+        // 再双击单元格 → 旧选区必须作废 (否则 Ctrl+C 复制的是旧选区)
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+        // 双击 level 列 (x=150)
+        v.event(&press(150.0, 0.0), area, &mut msgs);
+        v.event(&press(150.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, Some((0, 0)));
+        assert_eq!(v.selection, None, "单元格按下作废旧文本选区");
+        assert_eq!(v.selected_text().as_deref(), Some("ERROR"));
+        // 单击 msg 列 → 先清; 再击成双击 → 选中, 复制完整值
+        v.event(&press(300.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, None, "单击他格清除选中");
+        v.event(&press(300.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, Some((0, 1)));
+        assert_eq!(
+            v.selected_text().as_deref(),
+            Some("订单创建成功,支付网关超时"),
+            "复制完整值, 不受列宽截断影响"
+        );
+        // 双击列区间外 → 不产选中
+        v.event(&press(500.0, 0.0), area, &mut msgs);
+        v.event(&press(500.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, None);
+        // 双击无该字段的格 (行 1 无 msg) → 不产选中
+        v.event(&press(300.0, 1.0), area, &mut msgs);
+        v.event(&press(300.0, 1.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, None, "无该字段的单元格不产选中");
+        // 末行下方空白双击 (2026-09-14 审查 #1): row 由 y 反算得越界值, line_at
+        // 会把它塌缩成文件第 0 行 —— 必须不产选中, 否则画面上看不到高亮 (srow
+        // 等于不了任何可见行), Ctrl+C 却复制第 0 行该列的值
+        v.event(&press(150.0, 9.0), area, &mut msgs);
+        v.event(&press(150.0, 9.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, None, "末行下方空白双击不产选中");
+        // gutter/行号区单击 → 清单元格选中 (单击他处 = 放弃)
+        v.event(&press(150.0, 0.0), area, &mut msgs);
+        v.event(&press(150.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, Some((0, 0)));
+        v.event(&press(EXPAND_W + 5.0, 0.0), area, &mut msgs);
+        assert_eq!(v.selected_cell, None, "gutter 单击清单元格选中");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 复制上限守卫 (R3): 超 10 万行的文本选区 Ctrl+C 不动作, 且**不落**第②③级
+    /// —— 否则「超限不复制」会被单元格/行兜底悄悄绕过, 白设一道闸。
+    #[test]
+    fn over_limit_selection_blocks_copy_without_falling_through() {
+        let (mut v, path) = cell_fixture("limit");
+        v.selected = 0;
+        v.selected_cell = Some((0, 0)); // ② 有内容, 同样必须被挡住
+        v.selection = Some(TextSelection::new((0, 0), (COPY_MAX_LINES, 0)));
+        assert!(v.selection_over_limit());
+        assert_eq!(v.selected_text(), None, "超限不复制, 也不落单元格/行兜底");
+        // 恰在上限 → 不超限 (边界; 不实跑复制 —— 10 万行拼接无测试价值)
+        v.selection = Some(TextSelection::new((0, 0), (COPY_MAX_LINES - 1, 0)));
+        assert!(!v.selection_over_limit());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 复制三级优先链 (M2 搭链 / M4 填级): 文本选区 > 单元格选中 > 行选中;
+    /// 单元格失效 (列下标越界) → 防御落行兜底。
+    #[test]
+    fn selected_text_priority_selection_over_cell_over_row() {
+        let (mut v, path) = cell_fixture("prio");
+        // ③ 行兜底: 完整原文
+        v.selected = 0;
+        assert_eq!(
+            v.selected_text().as_deref(),
+            Some("{\"level\":\"ERROR\",\"msg\":\"订单创建成功,支付网关超时\"}")
+        );
+        // ② 单元格压过行
+        v.selected_cell = Some((0, 0));
+        assert_eq!(v.selected_text().as_deref(), Some("ERROR"));
+        // ① 文本选区压过单元格
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+        assert_eq!(v.selected_text().as_deref(), Some("{\""));
+        // 单元格失效 → 落 ③ 行兜底 (不复制空串冒充)
+        v.selection = None;
+        v.selected_cell = Some((0, 99));
+        assert_eq!(
+            v.selected_text().as_deref(),
+            Some("{\"level\":\"ERROR\",\"msg\":\"订单创建成功,支付网关超时\"}"),
+            "失效单元格防御落行兜底"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -2544,6 +3190,10 @@ mod tests {
         v.selection = Some(TextSelection::new((0, 0), (1, 2)));
         assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
         assert_eq!(v.selection, None);
+        // 单元格选中 (M4): Esc 同样清除并消费
+        v.selected_cell = Some((0, 1));
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert_eq!(v.selected_cell, None);
     }
 
     /// 框选状态机 (R1 回归): 单击 (未超阈值抬起) 不产选区;

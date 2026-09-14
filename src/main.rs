@@ -214,6 +214,10 @@ pub(crate) struct LogApp {
     expanded: ExpandMap,
     /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭，惰性 parse)。
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
+    /// 展开态修订号 (M3): `toggle_expand` 每次实际改动 +1; LogView 据它
+    /// 作废旧选区/单元格选中 —— 展开/折叠改变显示行映射, 旧 (显示行, 偏移)
+    /// 会指向错误的行。
+    expand_rev: u64,
     // ---- live-tail (T2) ----
     /// 文件路径 (增长检测轮询用)。
     path: PathBuf,
@@ -331,6 +335,7 @@ impl LogApp {
             bookmarks: std::collections::BTreeSet::new(),
             expanded: ExpandMap::new(),
             sub_rows: std::collections::BTreeMap::new(),
+            expand_rev: 0,
             focus_bar: false,
             path: PathBuf::new(),
             follow: false,
@@ -464,6 +469,7 @@ impl LogApp {
         if self.expanded.is_expanded(file_line) {
             self.expanded.collapse(file_line);
             self.sub_rows.remove(&file_line);
+            self.expand_rev += 1; // 显示行映射已变 → LogView 选区守卫
             return;
         }
         let raw = self.file.line(file_line);
@@ -476,6 +482,7 @@ impl LogApp {
         }
         self.expanded.expand(file_line, rows.len());
         self.sub_rows.insert(file_line, rows);
+        self.expand_rev += 1;
     }
 
     /// F 键：跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
@@ -1506,6 +1513,24 @@ fn run(path: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// expand_rev (M3/T6): 实际展开/折叠才 +1; parse 失败/无嵌套不涨 ——
+    /// 守卫的触发源必须精确, 虚涨会误杀活着的选区 (LogView 侧见
+    /// `sync_clears_selection_when_expand_rev_changes`)。
+    #[test]
+    fn toggle_expand_bumps_expand_rev_only_on_real_change() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("{\"a\":{\"b\":1}}\nplain\n".as_bytes());
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        let rev0 = app.expand_rev;
+        app.toggle_expand(0); // 展开含嵌套行
+        assert_eq!(app.expand_rev, rev0 + 1);
+        app.toggle_expand(1); // 明文行 parse 失败 → 不涨
+        assert_eq!(app.expand_rev, rev0 + 1);
+        app.toggle_expand(0); // 折叠
+        assert_eq!(app.expand_rev, rev0 + 2);
+        std::fs::remove_file(&p).ok();
+    }
 
     #[test]
     fn clamp_top_bounds() {

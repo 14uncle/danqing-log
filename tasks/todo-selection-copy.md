@@ -2,11 +2,16 @@
 
 > spec: `docs/specs/SPEC-selection-copy.md` | plan: `tasks/plan-selection-copy.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
+> 2026-09-14 build auto: **T1/T3–T8 机器闭环全绿** (danqing 590 lib; 本仓 51 lib + 72 main + 8 genlog; clippy 0)。
+> 2026-09-14 **review 收口**: 两路独立审查 (框架分词 APPROVE / 产品接线 REQUEST CHANGES
+> → 两条必修 + 三条建议全落); 现计数 danqing **592** lib; 本仓 51 lib + **74** main + 8 genlog。
+> T2 留用户闸门 (push + 重钉 lock); Checkpoint 人工验收待用户实机。
+> 实现与 spec 的三处分叉 (引导段规则 / URL 查询串 / 多字节断言值) 已回本 spec §9。
 > 构建序: M1 (框架) → M2 → M3 → M4; commit/push 点标 ⏸ 待用户点头。
 
 ## Phase M1: 框架分词 (danqing)
 
-- [ ] **T1: `token_at` 重写 + 测试全套**
+- [x] **T1: `token_at` 重写 + 测试全套**
   - 说明: 五类字符分类 (Space/Cjk/Word/Conn/Other) + 复合词规则
     (Conn 连续段两侧皆 Word → 内部化, D1); Cjk = `4E00–9FFF ∪ 3400–4DBF ∪
     F900–FAFF`; Conn = ``- : . / \ = @ _ + %``; Word = `is_alphanumeric` 且非 Cjk;
@@ -18,7 +23,8 @@
     `hello,world` 三分; `"ERROR"` 引号分离; `订单创建成功` 逐字;
     混合行 `订单(order_service) 创建成功` 各类各归; 空白段惯例; 空行/全空白;
     off 超界归最后字符; 任意 off 不劈 UTF-8 字符;
-    旧断言 `token_multibyte_never_splits_char` 反向 ((0,6)→(0,3)), 其余旧测试不动仍绿
+    旧断言 `token_multibyte_never_splits_char` 反向 ((0,6)→(3,6), 腹中 off 归下一字符),
+    其余旧测试不动仍绿
   - Verify: `cd ../danqing && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
     (基线 583 lib + 集成不破)
   - Files: `../danqing/src/text/selection.rs`
@@ -38,7 +44,7 @@
 
 ## Phase M2: 原始模式行复制 (本仓)
 
-- [ ] **T3: `selected_text` 三级链 + 原始模式行兜底**
+- [x] **T3: `selected_text` 三级链 + 原始模式行兜底**
   - 说明: 取文案链统一为 ① 非空文本选区 (含超限) > ② 单元格选中 (留位, M4 填) >
     ③ 行选中两模式统一 (普通行 = 原文; 子行 = 父行原文沿用, M3 再改子行串);
     删 `view.rs:1438` 的 `table_mode()` 条件; 改写 `view.rs:1421` 旧注释
@@ -53,7 +59,7 @@
 
 ## Phase M3: 展开块选区 (本仓, 依赖 M1)
 
-- [ ] **T4: 子行命中几何 + `hit_text` x_offset 分叉**
+- [x] **T4: 子行命中几何 + `hit_text` x_offset 分叉**
   - 说明: 子行 paint 分支 (`view.rs:950-968`) 构建 `RowGeom` 入缓存
     (文本 = paint 同串 `format!("{} = {}", label, value)`, base 0, start_x = indent,
     右界同 raw 行); `hit_text` (`view.rs:687`) 按 `line_at(row).1 > 0` 分叉 —
@@ -64,7 +70,7 @@
   - Files: `src/view.rs`
   - Scope: M
 
-- [ ] **T5: 子行事件接线 + 复制供给**
+- [x] **T5: 子行事件接线 + 复制供给**
   - 说明: 表格模式左键按压条件 (`view.rs:1339`) 放宽为 `!table_mode() || 子是行`
     → 子行走 `handle_text_press` 全套 (潜伏锚点/双击 M1 新语义/框选);
     子行 gutter 区 (x < text_x) = 清选区; 选区 `line` 回调 (`view.rs:1429-1435`)
@@ -77,7 +83,7 @@
   - Files: `src/view.rs`
   - Scope: M
 
-- [ ] **T6: `expand_rev` 失效守卫**
+- [x] **T6: `expand_rev` 失效守卫**
   - 说明: `LogApp` 加 `expand_rev: u64`, `toggle_expand` (`main.rs:1119`) +1;
     `LogView` 记所见 rev, `sync` 不一致 → 清选区 + 潜伏按下 (复用
     `view.rs:731-735` 失效块); M4 的 `selected_cell` 预留同清钩子
@@ -89,7 +95,7 @@
 
 ## Phase M4: 表格单元格复制 (本仓)
 
-- [ ] **T7: 列区间缓存 + `selected_cell` 状态 + 双击接线 + 高亮**
+- [x] **T7: 列区间缓存 + `selected_cell` 状态 + 双击接线 + 高亮**
   - 说明: paint 把可见列区间缓存进 `RefCell<Vec<(f32, f32, usize)>>`
     (绝对窗口 x, D2); 新状态 `selected_cell: Option<(u64, usize)>` 存 LogView (D6);
     表格普通行左键接入 `last_click` 双击检测 (300ms/4px 复用常量),
@@ -101,7 +107,7 @@
   - Files: `src/view.rs`
   - Scope: M
 
-- [ ] **T8: 复制第 2 级 + 失效同清 + 优先级链测试**
+- [x] **T8: 复制第 2 级 + 失效同清 + 优先级链测试**
   - 说明: `selected_text` 第②级 = 该行 parse 后 `col.name` 字段经
     `jsonl::cell_display` 的完整串; parse 失败/无字段 → 不产 `selected_cell`
     (T7 接线处保证); `sync` 失效块 (文件/过滤/模式 + expand_rev) 同清
@@ -112,6 +118,27 @@
   - Verify: `cargo test`
   - Files: `src/view.rs`
   - Scope: S
+
+## Phase M5: review 收口 (2026-09-14)
+
+- [x] **T9: 两路独立审查 + 必修/建议全落**
+  - 说明: 框架侧 (`danqing/src/text/selection.rs`) 与产品侧 (`src/view.rs` +
+    `src/main.rs`) 各一路; 详见 spec §9 的 review 条目。
+  - Acceptance: **必修两条** —— ① 越界行造隐形选中 (`cell_value` 加
+    `row >= display_count()` 守卫; 回归锁经 **A/B 对照**验证: 摘掉守卫即红在
+    `Some((9, 0))`); ② 单元格高亮与行底色同 token 不可见 (改两笔: 底色 +
+    `accent()` 描边, 抽 `cell_highlight_colors` + 回归锁)。
+    **建议三条** —— ③ 子行串抽 `sub_row_text` 唯一构造点 (原两处各 `format!`);
+    ④ Esc 连同潜伏按下作废; ⑤ 框架侧三条 (枚举注释订正 / `?`&`#` 断言补齐 /
+    边界用例组) + 边界落档两条 (滚出视口仍复制 / 行兜底无字节闸)。
+  - Verify: `cd ../danqing && cargo clippy --all-targets -- -D warnings && cargo test`;
+    本仓同款 —— **全绿 3 连跑**, clippy 0
+  - Files: `../danqing/src/text/selection.rs`, `src/view.rs`
+  - Scope: M
+  - **未覆盖 (如实记)**: 全部新测试都塞合成几何, 没有一条走真实 paint →
+    「三源一体」只锁了「给定正确几何, 命中/复制一致」。人工验收需重点看
+    单元格描边是否真能一眼看出选中的是哪一格。
+  - 余: code-simplify 阶段 (五阶段最后一段)。
 
 ## Checkpoint: 人工验收 (用户实机)
 
