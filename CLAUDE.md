@@ -112,12 +112,41 @@
   SPEC-level-histogram 的既定行为 (行口径计数在跑 ~94ms/1GB; hover 只给可点行是 9-13
   验收改判; 点选限 JSONL 是 D3 划线) —— 但**产品所有者本人都读成坏了** = .log 只读态
   在界面上不可辨认 (两种模式侧栏同貌, 只是一个能点一个不能)。裁定: **提示进 v1.0** ——
-  侧栏底部在「有文件 + 非 pending + 子句表全 None」时加一行「仅统计·不可点选」
-  (`histogram.rs` `READONLY_HINT`, 宽度有测量守卫 `readonly_hint_fits_sidebar_width`);
+  侧栏**顶部** (首版放底部角落, 同日实机被否「谁看得到啊」) 在「有文件 +
+  非 pending + 子句表全 None」时加一行「仅统计·不可点选」(`histogram.rs`
+  `READONLY_HINT`; 桶行几何随 `top_inset()` 整体下移, paint 与命中测试同源,
+  宽度有测量守卫 `readonly_hint_fits_sidebar_width`); 同轮实机还报
+  「清除筛选」文本未居中, 三轮收口: ① 左对齐 → 居中; ② 探针直读字形图集发现
+  前缀 `✕` (U+2715) **不在内嵌 Sarasa 子集** (0×0 空字形, 从未渲染, 占位宽度把
+  文本顶偏右 6px; 框架 CloseButton 是纯矢量不走字体, 空缺一直没暴露) → 换 `×`;
+  ③ `×` 被判「画蛇添足」→ **纯文字「清除筛选」**; 居中参照物从行矩形改为
+  **悬停底色块** (块 [ry-2,ry+24] 与行 [ry,ry+28] 中心差 2.5px, 按行居中在按钮内
+  读作偏下) —— `centered_text_origin(按钮块)` + 守卫
+  `clear_row_text_is_centered_in_its_button`。提示行颜色同日改 `text_secondary`
+  (实机: 正文色太亮)。
   **.log 按级别筛选挂 v1.x** (ROADMAP §一欠账表; 需新造行首子串过滤通路, 直接接全行
   子串会让柱条数字与筛选结果打架 = spec D2 红线)。顺手清掉 `histogram.rs` 模块头
   「不做 hover」的过期注释 (9-13 已改判而注释没跟上 —— 「加新决定不清旧文字」又一例)。
-  spec 验收反馈 section 已补第 4 条落档。
+  spec 验收反馈 section 已补第 4/5 条落档。
+  **同日发现 patch/lock 陷阱的新形态**: 前一个会话为选区框架改动开了
+  `.cargo/config.toml` patch 没关 (danqing `src/text/selection.rs` 有未提交改动),
+  我当天的 cargo 命令把 `Cargo.lock` 的 pinned rev 剥成了 path 态 ——
+  **patch 开着时 lock 必然是 path 态, 别在这个状态下提交 lock**;
+  联动改动 push 后 `cargo update -p danqing` 才会复钉。
+- 2026-09-14 (**选区/复制一致性 T1/T3–T8 机器闭环**, 未 commit push; T2 留用户闸门):
+  spec→plan→build auto 走完 (零 commit 惯例)。**M1 框架分词重写** (`token_at` 混合连接器
+  规则: 五类字符 + Conn **段级**内部化 + **引导段不对称** (绝对路径 `/`/负号/CLI 旗标
+  并入右侧复合词, 尾随不粘连) —— 引导段是 build 中被 `/var/log/...` 实测逼出来的,
+  spec 初版「首尾皆词」过紧); danqing **590 lib** + 集成全绿。
+  本仓: 三级复制链 (文本选区 > 单元格 > 行, 两模式统一行兜底 = **翻案「只认文本选区」**) /
+  展开块子行双击·框选·复制 (渲染/命中/复制**三源一体** = 同一 `row_content` 串) /
+  `hit_text` **x_offset 分叉** (子行不参与水平滚动) / `expand_rev` 选区守卫 (折叠后
+  旧选区不指错行) / 表格**双击单元格复制完整值** (列区间 paint 缓存, D2)。
+  本仓 **51 lib + 72 main + 8 genlog** 全绿, clippy 0。
+  **实现与 spec 三处分叉已回本 spec §9** (引导段规则 / URL 查询串 `?` 断开 /
+  多字节断言 (0,6)→(3,6))。
+  **待用户**: ① T2 —— push danqing → 本仓 `cargo update -p danqing` 复钉 → 提交 lock
+  (**patch 开着, lock 现为 path 态, 此态别提交**); ② 人工验收 (spec §7 五条, 含 GBK 中文)。
 - 当前: **UI 改造五模块已闭环; v1.0 收尾是唯一主线** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
