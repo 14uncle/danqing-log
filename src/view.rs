@@ -987,7 +987,19 @@ impl Widget for LogView {
             // 行号 (文件真实行号; 书签行金色)
             let no = format!("{}", line_no + 1);
             let no_w = texts.measure(&no, AUX_FONT_SIZE);
-            let no_color = if self.bookmarks.contains(&line_no) {
+            let bookmarked = self.bookmarks.contains(&line_no);
+            if bookmarked {
+                // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
+                // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
+                // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
+                // 两条都可见; 表格模式的 ▶/▼ 在 [0,EXPAND_W) 内, 不撞。
+                rects.push_rect(
+                    Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
+                    bookmark_color(self.theme),
+                    0.0,
+                );
+            }
+            let no_color = if bookmarked {
                 bookmark_color(self.theme)
             } else {
                 th.text_secondary()

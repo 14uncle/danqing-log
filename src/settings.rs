@@ -209,26 +209,28 @@ fn version_row() -> impl Widget {
 /// 快捷键固定键列宽 (成列才好扫; 与作用之间留出对齐感)。
 const SHORTCUT_KEY_W: f32 = 120.0;
 
-/// 快捷键一览 —— 「用户怎么知道有这个键」在界面上的唯一归处
+/// 快捷键一览的「键 → 作用」表 —— 「用户怎么知道有这个键」在界面上的唯一归处
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
+/// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
+/// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
+const SHORTCUT_KEYS: [(&str, &str); 6] = [
+    ("Ctrl+O", "打开文件"),
+    ("Ctrl+F", "搜索"),
+    ("Ctrl+T", "表格 / 原始模式互切"),
+    ("Ctrl+L", "级别侧栏 显示 / 收起"),
+    ("Ctrl+B", "添加书签 / 去掉书签"),
+    ("Ctrl+G", "跳下一书签"),
+];
+
+/// 快捷键一览 —— 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 是「设置卡」的
+/// 唯一入口, 用户找说明会来这儿。
 ///
-/// 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 是「设置卡」的唯一入口,
-/// 用户找说明会来这儿。只列**猜不出来**的那几个组合键 (方向键/翻页键不必教);
-/// 完整清单在 README。
+/// **不再有「完整清单见 README」引导行** (2026-09-14 用户去掉): 商店版用户
+/// 没有仓库语境, 不知道 README 在哪 —— 那行字对他们是指向虚无。故本表即全部
+/// 说教, README 的完整清单只服务 GitHub 读者。
 fn shortcuts_section(content_w: f32) -> impl Widget {
-    const KEYS: [(&str, &str); 5] = [
-        ("Ctrl+O", "打开文件"),
-        ("Ctrl+F  ·  /", "搜索"),
-        ("Ctrl+T", "表格 / 原始模式互切"),
-        ("Ctrl+L", "级别侧栏 显示 / 收起"),
-        ("Ctrl+B  ·  Ctrl+G", "切换书签 / 下一书签"),
-    ];
-    let mut col = Column::new().gap(4.0).cross_stretch().child(Center::new(
-        Text::new("完整清单见 README".to_string())
-            .font_size(BODY_SIZE)
-            .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
-    ));
-    for (k, a) in KEYS {
+    let mut col = Column::new().gap(4.0).cross_stretch();
+    for (k, a) in SHORTCUT_KEYS {
         col = col.child(shortcut_row(k, a));
     }
     content_row(col, content_w)
@@ -579,6 +581,29 @@ mod tests {
             .layout(Constraints::loose(Size::new(300.0, 100.0)), &mut texts)
             .height;
         assert_eq!(h, VERSION_ROW_H);
+    }
+
+    /// 回归锁 (2026-09-14): 合并行 `("Ctrl+B · Ctrl+G", "切换书签 / 下一书签")` 拆成两行时,
+    /// Ctrl+G 的作用被抄成「切换书签」—— 那是 Ctrl+B (`toggle_bookmark`) 的动词;
+    /// Ctrl+G 实为 `goto_next_bookmark` 跳下一书签 (main.rs 键分发与 README 完整清单均为此义)。
+    /// 卡上这两行的动词不可互换; 断言钉语义关键词而不是整串, 给措辞微调留余地。
+    #[test]
+    fn shortcut_card_bookmark_rows_match_dispatch() {
+        let action_of = |key: &str| {
+            SHORTCUT_KEYS
+                .iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("快捷键卡缺 {key} 行"))
+                .1
+        };
+        assert!(
+            action_of("Ctrl+B").contains("添加"),
+            "Ctrl+B = 切换书签 (添加/去掉)"
+        );
+        assert!(
+            action_of("Ctrl+G").contains("下一"),
+            "Ctrl+G = 跳下一书签, 不是切换"
+        );
     }
 
     /// 切主题后**设置卡里的页签栏文字色也要跟着变**。

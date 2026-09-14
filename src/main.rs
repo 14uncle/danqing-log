@@ -1039,19 +1039,31 @@ impl LogApp {
     }
 
     /// `b` / Ctrl+B: 切换选中行书签 (按文件行号，过滤模式下语义不漂移)。
+    /// 状态栏补动作反馈 —— 此前只有行号变金一个信号，用户按完不知道成没成;
+    /// 计数由 `refresh_status` 的常驻「书签 N」段承担，这里只缀动作。
     fn toggle_bookmark(&mut self) {
         let line = self.file_line_of(self.selected);
-        if !self.bookmarks.insert(line) {
+        let added = self.bookmarks.insert(line);
+        if !added {
             self.bookmarks.remove(&line);
         }
         self.refresh_status();
+        self.status.push_str(if added {
+            " · 已添加书签"
+        } else {
+            " · 已去掉书签"
+        });
     }
 
-    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。
+    /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。状态栏报位次 `书签 i/N`。
     fn goto_next_bookmark(&mut self) {
         if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.selected)) {
             self.jump_to_file_line(line);
             self.refresh_status();
+            // line 必在集合内: 位次 = 比它小的书签数 + 1
+            let i = self.bookmarks.range(..line).count() + 1;
+            let n = self.bookmarks.len();
+            self.status.push_str(&format!(" · 书签 {i}/{n}"));
         }
     }
 }
