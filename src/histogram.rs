@@ -7,8 +7,13 @@
 //! 为什么是**对数刻度**横条: 线性刻度下 Info 4544133 会把 Fatal 4760 压成亚像素,
 //! 而后者恰恰是唯一要看的那一根。计数数字始终以文本完整显示, 横条只表相对量级。
 //!
-//! 为什么**不做 hover**: spec 的 Open Question 倾向不做 (简单到不需要解释);
-//! 可点行的可发现性改由「当前生效行高亮」承担 —— 点过之后有反馈。
+//! hover 只给**可点行** (2026-09-13 验收改判: 原「不做 hover」被实机证伪) ——
+//! 反馈本身即「哪几行能点」的说明书, 故只读行不得有反馈; 点过之后另有
+//! 「当前生效行高亮」与「✕ 清除筛选」行。
+//!
+//! .log / 无级别列的 JSONL 下侧栏**只读** (D3: 点选限 JSONL 字段过滤通路)。
+//! 只读态底部给一行「仅统计·不可点选」说明 (2026-09-14: 两种模式侧栏长得一样,
+//! 用户实机把「活着但不能点」读成了「坏了」)。
 //!
 //! 布局: 本组件是 LogView 的 **sibling** (顶层 `Row[Histogram, LogView.fill]`),
 //! 不侵入 LogView 内部的坐标数学 —— 后者只是拿到一个更窄的 `area`。
@@ -45,6 +50,10 @@ const MIN_BAR_W: f32 = 2.0;
 const MIN_CONTENT_WIDTH: f32 = 640.0;
 /// 「清除筛选」行与 6 个桶之间的间距 (行序号 = 6, 见 [`row_rect`])。
 const CLEAR_ROW_GAP: f32 = 10.0;
+/// 只读态底部说明文案。直接回答用户实机的两条困惑:「有没有在统计」(仅统计) +
+/// 「为什么点不动」(不可点选)。守卫 `readonly_hint_fits_sidebar_width` 钉住它
+/// 一行放得下侧栏 —— 放不下就是截断, 还不如不写。
+const READONLY_HINT: &str = "仅统计·不可点选";
 
 /// 侧栏的有效宽度: 关掉 (`Ctrl+L`), 或窗口窄到容不下 → 0。
 ///
@@ -123,6 +132,8 @@ pub(crate) struct LevelHistogram {
     /// 那是假信息。计数改为后台作业后, 这个窗口是常态 (见 main.rs 的
     /// `launch_levels_job`)。
     pending: bool,
+    /// 是否有文件打开 (空态 false) —— 只读说明行的显示条件之一, 空态不贴。
+    file_open: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
     /// 鼠标悬停的行 (仅**可点**的行会进这里)。
@@ -151,6 +162,7 @@ impl LevelHistogram {
             queries: levels::no_level_queries(),
             visible: true,
             pending: false,
+            file_open: false,
             active: None,
             hover: std::cell::Cell::new(None),
             bg: Color::rgb(1.0, 1.0, 1.0),
@@ -182,6 +194,16 @@ impl LevelHistogram {
             .max()
             .unwrap_or(0)
     }
+
+    /// 只读说明行是否可见: 有文件打开 + 计数已交付 + 子句表全 None
+    /// (明文 .log, 或无级别类列的 JSONL —— 两者都是永久只读)。
+    ///
+    /// **pending 期间不显示**: 那时只读是暂时的 (JSONL 交付后即变得可点),
+    /// 提前贴「不可点选」是假话。**空态不显示**: 没文件时六个 0 行之上
+    /// 再贴一行说明是噪音。
+    fn readonly_hint_visible(&self) -> bool {
+        self.file_open && !self.pending && self.queries.iter().all(Option::is_none)
+    }
 }
 
 impl Default for LevelHistogram {
@@ -206,6 +228,7 @@ impl Widget for LevelHistogram {
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
         self.pending = app.levels_pending;
+        self.file_open = app.has_file;
         // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
         self.active = Level::ALL.iter().copied().find(|l| {
@@ -340,6 +363,18 @@ impl Widget for LevelHistogram {
 
         // 底部提示: 收起侧栏只有 `Ctrl+L` 一个入口, 而界面上没有任何可见控件 ——
         // 人工验收反馈「用户怎么知道按 Ctrl+L」。放导轨底部, 不挤占计数区。
+        // 只读态 (.log / 无级别列 JSONL) 在它上面再加一行说明 —— 两种模式的侧栏
+        // 长得一样, 只是一个能点一个不能, 用户实机把「活着但不能点」读成了「坏了」
+        // (2026-09-14)。一句话摆明「在统计、点不了」。
+        if self.readonly_hint_visible() {
+            texts.push_text(
+                READONLY_HINT,
+                bar_x,
+                area.origin.y + area.size.height - 8.0 - line_h - 4.0,
+                LABEL_SIZE,
+                self.text_secondary,
+            );
+        }
         let hint = "Ctrl+L 收起";
         texts.push_text(
             hint,
@@ -636,5 +671,36 @@ mod tests {
                 i - 1
             );
         }
+    }
+
+    /// 只读说明的显示条件矩阵: 有文件 + 计数已交付 + 子句表全 None, 三者缺一不可。
+    /// pending 期间贴了是假话 (JSONL 交付后即可点), 空态贴了是噪音。
+    #[test]
+    fn readonly_hint_visibility_matrix() {
+        let mut w = LevelHistogram::new();
+        assert!(!w.readonly_hint_visible(), "新建 (空态无文件) 不贴");
+
+        w.file_open = true;
+        assert!(
+            w.readonly_hint_visible(),
+            ".log (有文件 + 全 None + 已交付) 应贴"
+        );
+
+        w.pending = true;
+        assert!(!w.readonly_hint_visible(), "计数在算时不贴 (只是暂时只读)");
+
+        w.pending = false;
+        w.queries = levels::level_queries_for("level");
+        assert!(!w.readonly_hint_visible(), "JSONL 有子句表不贴");
+    }
+
+    /// 只读说明必须一行放得下侧栏 —— 放不下就是截断, 还不如不写。
+    /// 字号 / 栏宽 / 文案任一改动超宽, 这里立刻红 (布局数值量了再写, 不估算)。
+    #[test]
+    fn readonly_hint_fits_sidebar_width() {
+        let mut texts = TextBatch::default();
+        let w = texts.measure(READONLY_HINT, LABEL_SIZE);
+        let avail = HIST_WIDTH - 2.0 * PAD_X;
+        assert!(w <= avail, "「{READONLY_HINT}」宽 {w} 超出可用 {avail}");
     }
 }
