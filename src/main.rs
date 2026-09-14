@@ -1222,12 +1222,15 @@ impl App for LogApp {
         else {
             return;
         };
-        // 设置卡打开时 Esc 关闭 (S3)
+        // 设置卡打开 = 模态: Esc 关卡 (S3), 其余键一律吞掉 —— 卡底下的日志区
+        // 不该响应键盘 (2026-09-14 用户实机: 卡内主题下拉未持焦时 ↑↓ 滚动了
+        // 底层日志)。卡内控件经焦点路由自行消费、到不了这里; 能到这里的都是
+        // 无人认领的键。(Ctrl+O/Ctrl+L 走 app_key_filter 前置, 不在此门禁内。)
         if self.settings_open {
             if let Some(msg) = settings::handle_settings_key(key) {
                 self.update(msg);
-                return;
             }
+            return;
         }
         // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
         if !self.has_file {
@@ -1638,6 +1641,38 @@ mod tests {
             build_search_pattern(Encoding::Gbk, "中文"),
             "(?-u)\\xD6\\xD0\\xCE\\xC4"
         );
+    }
+
+    /// 模态键盘门禁 (2026-09-14 用户实机): 设置卡开着、卡内下拉未持焦时
+    /// 按 ↑↓, 卡底下的日志区滚动了。卡内控件经焦点路由消费、不经 `app.event`;
+    /// 能到这里的都是无人认领的键, 除 Esc (关卡) 外一律吞掉。
+    #[test]
+    fn settings_modal_swallows_unhandled_keys() {
+        let mut app = LogApp::new_empty();
+        let lines: String = (0..100)
+            .map(|i| format!("2026-09-14 12:00:{i:02} INFO line {i}\n"))
+            .collect();
+        let p = temp_log(lines.as_bytes());
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.settings_open = true;
+
+        let key = |key: NamedKey| Event::Key {
+            key: Key::Named(key),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        app.event(&key(NamedKey::ArrowDown));
+        assert_eq!(app.top_row, 0.0, "设置卡开着: ↓ 不得滚动底层日志");
+        app.event(&key(NamedKey::PageDown));
+        assert_eq!(app.top_row, 0.0, "设置卡开着: PageDown 不得滚动底层日志");
+
+        // Esc 不在吞键范围: 必须仍能关卡。
+        app.event(&key(NamedKey::Escape));
+        assert!(!app.settings_open, "Esc 必须仍能关闭设置卡");
+        std::fs::remove_file(&p).ok();
     }
 
     /// 空态 LogApp 测试夹具 (与 run() 的空态骨架同构)。
