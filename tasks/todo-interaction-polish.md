@@ -138,7 +138,22 @@
   - **教训 (写在这里免得重犯)**: 「框架先出现、产品后赋值」读起来顺, 但与**本仓
     实际分层相反**。分层的判据在**代码注释**里, 不在架构直觉里 —— 动框架前先读那一段。
 
-- [ ] **T5: 联动落地** ⏸
+- [x] **T5: 联动落地** ✅ (2026-09-14, 用户点头后执行)
+  - **框架侧**: 两笔提交 → push `dev` (`b4b43e1..ec8ae09`)。
+    `e439725` 光标形状 API + 命中遍历两查询共用一趟; `ec8ae09` CloseButton 补焦点态。
+  - **本仓**: 关 patch (`rm .cargo/config.toml`) → `cargo check` 按 manifest 重解,
+    **一步就钉到了刚 push 的 `ec8ae09b`** (这一步本就够, 无需再 `cargo update -p`) →
+    `Cargo.lock` 为带 `source` 的 pinned 态 (不是 path 态)。
+  - **验证**: 无 patch 状态下 `cargo check --all-targets --locked` 通过 (= 外人克隆
+    可复现), 本仓 133 绿 + 两仓 clippy 0。
+  - **提交**: 框架 `e439725` + `ec8ae09`; 本仓 `1566c0e` (五份文档) +
+    `7c39236` (settings + lock)。本仓两笔均在 **`dev`**, master 未动。
+  - **踩坑并已修 (记下来)**: 第一笔本仓文档提交**落到了 `master`** —— 工作区在
+    发版合并后停在 master 上, 而本仓 CLAUDE.md 只写了分支模型、没写「工作区可能
+    停在哪儿」。**修法** (无损失): 先 `git diff --stat dev b2d8351` 确认两分支树
+    **完全相同** → `git checkout dev` + `git cherry-pick` → `git branch -f master
+    b2d8351` (**不切分支、不碰工作区**, 比 `reset --hard` 安全)。
+    已写进用户级 memory; **提交前先看 `git status -sb` 首行是不是 `## dev...`**。
   - 说明: danqing 三件套 → **push (待用户点头)** → 本仓**关 patch**
     (`rm .cargo/config.toml`) → `cargo update -p danqing` → 三件套绿 →
     提交 lock (待用户点头, message 注明关联)
