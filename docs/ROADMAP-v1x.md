@@ -45,6 +45,7 @@ JSONL 自动检测+列发现+字段过滤迷你语法+嵌套展开 / 编码检�
 | 免语法字段查询 UI（列发现采样结果做成下拉点选） | 缺口，**提议待裁** | — |
 | 原始文本模式按级别筛选（.log 侧栏柱条可点） | 缺口，**2026-09-14 用户裁定挂 v1.x** —— 需新造「行首子串」过滤通路（计数口径 = 行首 200B，普通过滤 = 全行子串，直接接会「柱条数字与筛选结果当场打架」，违反 D2 口径一致原则） | `specs/SPEC-level-histogram.md` §5/D3 |
 | 行多选（Shift 连续 / Ctrl 指定） | 缺口，**2026-09-14 用户裁定挂 v1.x** —— **前置 = 框架先给 `Event::MouseInput` 加修饰键**（该事件现在只有 `button/pressed/position`，`MouseWheel` 的 shift 是上次打磨寄生加的），属第三次联动；产品侧还要一整套新状态（多选集合/锚点、复制按显示行序拼接、子行怎么算、与三级复制链的优先级、`COPY_MAX_LINES` 超限检查、过滤/折叠失效守卫） | `specs/SPEC-selection-copy.md` §8 |
+| 输入框 hover 反馈（P4） | 缺口，**2026-09-15 用户裁定本批不补 → 挂 v1.x** —— 框架 `TextInput` **连 hover 状态都没有**（`danqing/src/widget/form/text_input.rs` 里 `CursorMoved` 零命中），属框架改动 = 一次跨仓联动；产品侧无从下手 | `tasks/matrix-interaction-polish.md` §6.3 |
 
 **等级直方图为什么必须免费**：它是 LogViewPlus 最能卖钱的一个功能（截图：Info 4,544,133 /
 Error 43,464 / **Fatal 4,760**，一眼知道该看哪行），也是排障的第一动作。免费层缺它，

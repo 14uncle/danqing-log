@@ -169,6 +169,10 @@ pub(crate) struct LogApp {
     base_status: String,
     /// 底栏合成文本 (base + 模式 + 过滤 + 搜索)。
     status: String,
+    /// 这一行 `status` 是不是**错误** (P27)。只由 [`Self::set_status_error`] 置位,
+    /// 由 [`Self::set_status`] / [`Self::refresh_status`] 清除 —— **单一写入点**,
+    /// 别处直接 `self.status = …` 会让标志与实际内容脱钩。
+    status_error: bool,
     mode: ViewMode,
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
@@ -369,6 +373,7 @@ impl LogApp {
             selected: 0,
             base_status: EMPTY_STATUS.to_string(),
             status: String::new(),
+            status_error: false,
             mode: ViewMode::Raw,
             schema: None,
             level_counts: Arc::new(LevelCounts::default()),
@@ -972,7 +977,7 @@ impl LogApp {
 
     fn refresh_status(&mut self) {
         if let Some((verb, name, detail)) = self.loading_parts() {
-            self.status = format!("{verb} {name} · {detail}");
+            self.set_status(format!("{verb} {name} · {detail}"));
             // 无旧文件才上占位文案 (有旧文件: 列表照画, 进度只上底栏)
             self.loading_label = if self.has_file {
                 None
@@ -1030,7 +1035,24 @@ impl LogApp {
         // notice **不进这个串** —— 它是第二条通道, 由 `LogView::paint` 单独取色单独
         // 落笔 (T11)。此前把它拼进来, 结果是同一句话被画两遍 (串尾一遍、notice 段
         // 又一遍), 而且「警示色」和「常态色」压在同一个字符串上根本没处分。
+        self.set_status(s);
+    }
+
+    /// 写底栏**常态**信息 —— 顺手清掉错误态 (错误是**这一句**的属性, 换句就没了)。
+    fn set_status(&mut self, s: String) {
         self.status = s;
+        self.status_error = false;
+    }
+
+    /// 写底栏**错误** —— **常驻红, 不消退**。
+    ///
+    /// P27 的收口 (2026-09-15 用户裁定「后者」): 「正则无效」这类错误**不走
+    /// notice 通道** —— notice 有 4 秒消退期, 而它是「你刚按的那下没生效」,
+    /// 不该自己消失。判据是 P27 原文那句「**错误在视觉上不存在**」: 修之前它与
+    /// 打开耗时/过滤统计同色同字号, 只有读文字才知道出错了。
+    fn set_status_error(&mut self, s: String) {
+        self.status = s;
+        self.status_error = true;
     }
 
     /// 解析过滤查询 —— **全应用唯一的过滤解析入口** (parse + 键名规范化)。
@@ -1063,7 +1085,7 @@ impl LogApp {
         }
         let clauses = self.parse_filter(&query);
         let file = Arc::clone(&self.file);
-        self.status = format!("{} · 过滤 \"{query}\" 中…", self.base_status);
+        self.set_status(format!("{} · 过滤 \"{query}\" 中…", self.base_status));
         self.filter_job.launch(move || {
             let t = Instant::now();
             let lines = jsonl::run_filter(&file, &clauses);
@@ -1128,13 +1150,13 @@ impl LogApp {
         }
         let pattern = build_search_pattern(self.file.encoding(), &q);
         let Ok(re) = regex::bytes::Regex::new(&pattern) else {
-            self.status = format!("{} · 搜索 \"{q}\" 正则无效", self.base_status);
+            self.set_status_error(format!("{} · 搜索 \"{q}\" 正则无效", self.base_status));
             return;
         };
         self.search_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         self.search_query = q.clone();
         let file = Arc::clone(&self.file);
-        self.status = format!("{} · 搜索 \"{q}\" 中…", self.base_status);
+        self.set_status(format!("{} · 搜索 \"{q}\" 中…", self.base_status));
         self.search_job.launch(move || {
             let t = Instant::now();
             let (hits, total, _) = file.search(&re, SEARCH_HIT_CAP);
@@ -2733,6 +2755,35 @@ mod tests {
         );
         // 反向对照: 常态信息该在的仍在 (别把整条底栏一起删了)
         assert!(!app.status.is_empty(), "常态信息不得一起被删掉");
+    }
+
+    /// P27 收口 (2026-09-15 用户裁定「**后者**」): 无效正则这类错误**走 status 的
+    /// 错误态 (常驻红)**, **不进 notice 通道** —— notice 有 4 秒消退期, 而它是
+    /// 「你刚按的那下没生效」, 不该自己消失。
+    ///
+    /// 这条钉的是**标志与内容同真同假**: 置了错误态就得真有错误, 换了常态就得清掉
+    /// —— 脱钩了就是「绿水配红字」那类假信息。
+    #[test]
+    fn invalid_regex_marks_the_status_as_an_error_and_normal_status_clears_it() {
+        let mut app = LogApp::new_empty();
+        app.refresh_status();
+        assert!(!app.status_error, "起点不该是错误态");
+
+        // 未闭合分组 → 正则必然编译失败
+        app.apply_search("(".to_string());
+        assert!(app.status.contains("正则无效"), "须说清为什么搜不了");
+        assert!(
+            app.status_error,
+            "无效正则须把底栏标成错误 (paint 才会用 danger)"
+        );
+        assert!(
+            app.notice.is_none(),
+            "错误**不得**走 notice 通道 —— 那条 4 秒就消退, 用户裁定要常驻"
+        );
+        // **反向对照**: 常态刷新必须清掉标志 —— 否则红字会跟着后续所有信息一起红
+        app.refresh_status();
+        assert!(!app.status_error, "常态刷新须清掉错误态");
+        assert!(!app.status.contains("正则无效"), "常态刷新也该换掉那句话");
     }
 
     /// T13 —— 「被吞掉的输入必有原因」: **本表就是规则的挂载点**。

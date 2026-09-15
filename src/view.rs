@@ -703,6 +703,12 @@ pub(crate) struct LogView {
     /// 指针停在哪一根条上; `None` = 都没停。见 [`BarAxis`]。
     hover_bar: std::cell::Cell<Option<BarAxis>>,
     status: String,
+    /// 底栏那行 `status` 是不是**错误** (P27)。2026-09-15 用户裁定「**常驻红**」——
+    /// 不给它走 notice 通道: notice 有 4 秒消退期, 而「正则无效」是「你刚按的那下
+    /// 没生效」, 不该自己消失 (用户原话)。与 notice 的 `Warn` 档共用 `danger()`,
+    /// 但活在另一条通道上。真身是 `app.status_error`, 唯一写入点是
+    /// `LogApp::set_status_error`。
+    status_error: bool,
     /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的 —— 常态信息
     /// `text_secondary()` / 提示 `text_primary()` / 警示 `danger()`, 见 paint。
     /// sync 时从 `app.notice` 读; **不得**再拼进 `status` (那会画两遍)。
@@ -788,6 +794,7 @@ impl LogView {
             h_drag: std::cell::Cell::new(None),
             hover_bar: std::cell::Cell::new(None),
             status: String::new(),
+            status_error: false,
             notice: None,
             mode: ViewMode::Raw,
             schema: None,
@@ -1193,6 +1200,7 @@ impl Widget for LogView {
         self.top_row = app.top_row;
         self.selected = app.selected;
         self.status = app.status.clone();
+        self.status_error = app.status_error;
         self.notice = app.notice.clone();
         self.mode = app.mode;
         self.schema = app.schema.clone();
@@ -1765,7 +1773,13 @@ impl Widget for LogView {
             area.origin.x + 10.0,
             sy,
             AUX_FONT_SIZE,
-            th.text_secondary(),
+            // P27: 错误态用 `danger()` —— 与打开耗时/过滤统计**不再同色**。
+            // 这正是 P27 原文点名的毛病: 「错误在视觉上不存在」。
+            if self.status_error {
+                th.danger()
+            } else {
+                th.text_secondary()
+            },
         );
         if let Some((notice_text, _)) = &self.notice {
             let status_w = texts.measure(&self.status, AUX_FONT_SIZE);
@@ -1989,7 +2003,16 @@ impl Widget for LogView {
                     return EventResult::Consumed;
                 }
                 let rel_y = position.y - area.origin.y - chrome_top;
-                if (0.0..list_h).contains(&rel_y) {
+                // **「列表矩形之内、真实行数之外」= 末行下方空白** (P20)。
+                // 2026-09-15 用户实机报「还是没看到出声」: 原判据只问 `rel_y` 落没
+                // 落在矩形里, 于是点空白被当成「点中了一个越界行」——
+                // `Msg::Select(越界行)` 在 app 侧被 `row < display_count` 挡掉
+                // (`main.rs:1288`), 于是**既不发生什么也不出声**, 而这里照旧返回
+                // `Consumed`。正是 P20 要消灭的那类沉默。
+                // **行数判据必须带上, 且只能排在 `rel_y` 之后**: `rel_y` 为负时
+                // `row_at` 里的 f64→u64 强转会**饱和到 0**, 单看行数会把列表上方的
+                // 点击误判成第 0 行。
+                if (0.0..list_h).contains(&rel_y) && self.row_at(rel_y) < self.display_count() {
                     let row = self.row_at(rel_y);
                     // 行首 +/- 展开开关区 (左 20px, 表格模式); 其余点击选中
                     // S2: 命中判定与绘制位置同源 (`expand_glyph_x` / `in_expand_glyph`)
@@ -2049,6 +2072,9 @@ impl Widget for LogView {
                     // M3 (2026-09-14 实机 M0 P20): 点列表区**末行下方空白**被吞
                     // 时说清为什么 —— 原先 `Ignored` 静默, 用户不知道是没点中
                     // 还是程序没响应。
+                    // 现在两个来源共用这一支: ① 落在列表矩形**之外** (状态栏那一带);
+                    // ② 落在矩形**之内但超出真实行数** (「末行下方空白」的本体 ——
+                    // 2026-09-15 用户实机报它没出声, 因为原先只判了 ①)。
                     msgs.push(Box::new(Msg::Notice(
                         "此处无行".into(),
                         crate::NoticeKind::Info,
@@ -3009,23 +3035,54 @@ mod tests {
     ///
     /// 归因**刻意不动**: 仍返回 `Ignored`, 点击照旧穿透去清焦点 (归因是 M4 的活)。
     /// 所以这里同时锁住「出了声」与「没改归因」两件事。
+    ///
+    /// **2026-09-15 用户实机报「还是没看到出声」—— 这条测试当时是假绿**:
+    /// 它把点击点放在 `HEADER_H + list_h + 8.0`, 而那已经**越出列表矩形**、落进
+    /// 状态栏那一带了 (它还漏算了表格模式的过滤栏: `chrome_top` = `HEADER_H` +
+    /// `FILTER_BAR_H`, 比 `HEADER_H` 大), 于是走的是「矩形之外」那一支 ——
+    /// **从没覆盖过「矩形之内、末行之下」这个本体**。现在两个位置各测一次,
+    /// **都按真实布局 (`chrome_top()`) 算**, 且先断言「点在矩形里」。
     #[test]
     fn click_below_the_last_row_says_there_is_no_row() {
         let (mut v, path) = cell_fixture("m3-p20");
         let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
-        let list_h = area.size.height - HEADER_H - STATUS_HEIGHT;
-        let ev = Event::MouseInput {
+        let chrome_top = v.chrome_top();
+        let list_h = area.size.height - chrome_top - STATUS_HEIGHT;
+        let rows_bottom = area.origin.y + chrome_top + v.display_count() as f32 * ROW_HEIGHT;
+
+        let click = |button_y: f32| Event::MouseInput {
             button: MouseButton::Left,
             pressed: true,
-            position: Point::new(300.0, area.origin.y + HEADER_H + list_h + 8.0),
+            position: Point::new(300.0, button_y),
         };
+
+        // ① **本体**: 列表矩形之内、末行之下 (夹具只有 2 行, 下面是好大一片空白)
+        let inside = rows_bottom + 20.0;
+        assert!(
+            inside < area.origin.y + chrome_top + list_h,
+            "前提: 这个点必须真落在列表矩形**之内** —— 否则又退化成测「矩形之外」了"
+        );
         let mut msgs = danqing::widget::MsgQueue::new();
         assert_eq!(
-            v.event(&ev, area, &mut msgs),
+            v.event(&click(inside), area, &mut msgs),
             EventResult::Ignored,
             "空白处点击的归因不变 (仍穿透)"
         );
-        assert!(said(&msgs, "此处无行"), "须说清为什么没反应");
+        assert!(
+            said(&msgs, "此处无行"),
+            "末行下方空白须说清为什么没反应 (原先静默: 越界行被 app 的 \
+             `row < display_count` 挡掉, 于是什么都不发生)"
+        );
+
+        // ② 矩形**之外** (状态栏那一带): 同一句, 两条来源共用一支
+        let mut msgs = danqing::widget::MsgQueue::new();
+        v.event(
+            &click(area.origin.y + chrome_top + list_h + 8.0),
+            area,
+            &mut msgs,
+        );
+        assert!(said(&msgs, "此处无行"), "矩形外那一支不得改坏");
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -3190,6 +3247,45 @@ mod tests {
         // 另一条假反馈 (标识可点、行文本不可点, 两者不能共用一个 hover 信号)
         v.hover_expand.set(false);
         assert_eq!(accent_glyphs(&mut v), cold, "不在展开列上就不得点亮标识");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// P27 的**视觉判据** (原文那句「错误在视觉上不存在」): 错误态那一行底栏
+    /// 必须换色, 与打开耗时/过滤统计**同屏可辨**。
+    ///
+    /// 按**重数差**验, 不按下标取 —— 底栏后面还压着设置入口与位置计数。
+    #[test]
+    fn status_error_is_a_color_of_its_own() {
+        let (mut v, path) = cell_fixture("p27");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let secondary = lin(v.theme.theme().text_secondary());
+        // 夹具直接 `LogView::new()`, 没同步过 app —— 手动给一行常态底栏
+        v.status = "索引 92ms · 2 行".into();
+        // **空白不算字形实例** (排字时被跳过) —— 差点把这条断言写成「13 个全走」,
+        // 实测差 4 个正好是那 4 个空格。数它要先把空白滤掉。
+        let n = v.status.chars().filter(|c| !c.is_whitespace()).count();
+
+        let count_secondary = |v: &mut LogView| {
+            let mut texts = TextBatch::new();
+            let mut rects = RectBatch::new();
+            v.paint(area, &mut rects, &mut texts);
+            texts
+                .instance_colors()
+                .iter()
+                .filter(|c| [c.r, c.g, c.b, c.a] == secondary)
+                .count()
+        };
+
+        v.status_error = false;
+        let cold = count_secondary(&mut v);
+        v.status_error = true;
+        let hot = count_secondary(&mut v);
+        assert_eq!(
+            cold - hot,
+            n,
+            "置错误态后, status 那 {n} 个字形须**全部**离开 `text_secondary` \
+             (A/B: 去掉 paint 里的分支, 这条必红)"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -5292,6 +5388,15 @@ mod tests {
     #[test]
     fn drag_state_machine_forms_and_settles_selection() {
         let mut v = LogView::new();
+        // **夹具必须挂真文件** (2026-09-15, P20 修复暴露): 下面按下的是第 0 行,
+        // 而 P20 起「列表矩形**之内**、真实行数**之外**」也算空白 —— `file = None`
+        // 时 `display_count()` 是 0, 那一按会被归成「此处无行」。
+        // 原夹具只塞了 `row_geom` 却不给 file, 是「手抄几何 + 空文件」的合成体,
+        // 只能活在旧判据下 —— 那正是本仓自记的「所有条目都是合成几何」那笔欠账。
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-drag-{}.log", std::process::id()));
+        std::fs::write(&path, "2026-09-05 12:00:01 ERROR one\n").unwrap();
+        v.file = Some(Arc::new(LogFile::open(&path).unwrap()));
         v.has_file = true;
         v.gutter_w.set(56.0);
         v.row_geom.borrow_mut().insert(
@@ -5338,5 +5443,6 @@ mod tests {
         assert_eq!(v.selection, Some(TextSelection::new((0, 0), (0, 1))));
         assert!(v.press.is_none(), "右键不产潜伏锚点");
         assert_eq!(v.last_click, lc, "右键不污染双击判定");
+        std::fs::remove_file(&path).ok();
     }
 }
