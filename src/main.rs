@@ -248,6 +248,13 @@ pub(crate) struct LogApp {
     theme: config::AppTheme,
     /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
     histogram_visible: bool,
+    /// 配置读写路径。`None` = 用户真实配置 (`%APPDATA%\danqing-log\config.toml`)。
+    ///
+    /// **测试必须给临时路径** —— 见 [`Self::save_config`] 里那条 `#[cfg(test)]` 的
+    /// 硬拦。这不是洁癖: `save_to` 是**整文件覆盖写**, 而 `load_from` 对认不出的
+    /// `mode` 会取值域默认 (light) —— 一次 `cargo test` 就能把用户的主题**改掉**,
+    /// 并抹掉手写注释。
+    cfg_path: Option<std::path::PathBuf>,
     /// 设置卡当前页签**下标** —— 序号含义见 `settings.rs` 里 `.tab()` 处 (**唯一真身**,
     /// 别在这里另列一份, 加页签时会漂)。越界值无需在此防御: 框架 `Tabs` 自行钳制
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
@@ -271,7 +278,15 @@ pub(crate) enum Msg {
     /// **绝对**滚到某显示行 (T17 滚动条拖拽)。与 `ScrollRows` 的两点不同都是
     /// 有意的: ① 它是绝对定位, 拖拽是「拇指在哪内容就在哪」而不是增量;
     /// ② 它**不动 `selected`** —— 抓滚动条是「看」不是「选」, 见 todo T17 不变量 ③。
-    ScrollTo(f64),
+    ///
+    /// `at_bottom` = 目标就在**条能被拖到的最底**。它存在只为一个理由: 跟随态下
+    /// app 的 `top_row` 用 `count-1` 口径, 而条能表达的最大值是 `count-可见行数`
+    /// —— 两者不等, 直接比 `top < top_row` 会把「在底部碰一下条」误判成「向上看」
+    /// 而**静默脱掉 FOLLOW** (T17 review 抓出来的)。带上这一位, 判断才有据可依。
+    ScrollTo {
+        top: f64,
+        at_bottom: bool,
+    },
     /// 点击选中显示行。
     Select(u64),
     /// 展开/折叠某显示行的嵌套 (表格模式)。
@@ -330,8 +345,17 @@ pub(crate) enum Msg {
 impl LogApp {
     /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
     fn new_empty() -> Self {
-        let cfg = config::Config::load();
+        Self::new_empty_at(None)
+    }
+
+    /// 同上, 但可指定配置路径 (仅测试用; 见 `cfg_path` 字段)。
+    fn new_empty_at(cfg_path: Option<std::path::PathBuf>) -> Self {
+        let cfg = match &cfg_path {
+            Some(p) => config::Config::load_from(p),
+            None => config::Config::load(),
+        };
         Self {
+            cfg_path,
             window_sender: None,
             file: Arc::new(LogFile::empty()),
             has_file: false,
@@ -439,11 +463,24 @@ impl LogApp {
     /// 「改主题」顺手抹掉侧栏开关 (config.rs 的 `round_trip_preserves_both_keys`
     /// 钉着这条)。
     fn save_config(&self) {
-        config::Config {
+        let cfg = config::Config {
             theme: self.theme,
             histogram: self.histogram_visible,
+        };
+        match &self.cfg_path {
+            Some(p) => cfg.save_to(p),
+            // **测试里不许落到真实配置**: 这条不是洁癖, 是实测过的坑 ——
+            // 本批的 T20 单测走 `update(Msg::ToggleHistogram)` → 这里 → 真实路径,
+            // 而 `save_to` 是**整文件覆盖写**、`load_from` 对认不出的 `mode` 取默认
+            // (light): 一次 `cargo test` 就能把用户的主题改掉、手写注释抹掉。
+            // 与其靠「下一个写测试的人记得」, 不如让它**写不出去**。
+            None => {
+                #[cfg(test)]
+                panic!("测试不得写真实配置 —— 请用 LogApp::new_empty_at(临时路径)");
+                #[cfg(not(test))]
+                cfg.save();
+            }
         }
-        .save();
     }
 
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
@@ -1200,9 +1237,11 @@ impl App for LogApp {
                 // 方向键滚动时选中跟随首行，底栏读数即当前位置
                 self.selected = self.top_row as u64;
             }
-            Msg::ScrollTo(top) => {
-                // 向上拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)
-                if top < self.top_row && self.follow {
+            Msg::ScrollTo { top, at_bottom } => {
+                // 往回(上)拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)。
+                // **拖到条底不算往回** —— 见枚举上的注释: 跟随态的 `top_row` 比条能
+                // 表达的底还大, 不排除这一格就会「在底部碰一下条 → FOLLOW 没了」。
+                if !at_bottom && top < self.top_row && self.follow {
                     self.follow = false;
                     self.refresh_status();
                 }
@@ -1457,15 +1496,6 @@ impl App for LogApp {
                 return Some(Msg::CloseSettings);
             }
         }
-        // 模态守卫 (T16/P32): 设置卡开着时, 全局键**不得穿透到卡后**。
-        // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
-        // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
-        // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
-        // (`handler.rs:434-441`), 所以这个守卫只能加在产品侧。
-        // **吞掉, 不是放行**: 返回 `None` 的含义是「我没拦」, 事件会继续往下走。
-        if self.settings_open {
-            return Some(Msg::Noop);
-        }
         let Event::Key {
             key,
             pressed: true,
@@ -1478,6 +1508,20 @@ impl App for LogApp {
         let Key::Character(s) = key else {
             return None;
         };
+        // 模态守卫 (T16/P32): 设置卡开着时, 全局键**不得穿透到卡后**。
+        // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
+        // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
+        // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
+        // (`handler.rs:434-441`), 所以这个守卫只能加在产品侧。
+        //
+        // **位置很要紧: 必须在「ctrl + 字符」筛选之后**。框架在这一函数返回
+        // `Some` 时**直接 return, 不再走焦点分发** (`handler.rs:436-441`), 而卡内
+        // 控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠焦点分发收键 —— 守卫若放在函数
+        // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
+        // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
+        if self.settings_open {
+            return Some(Msg::Noop);
+        }
         if s.eq_ignore_ascii_case("f") {
             return Some(Msg::FocusSearch);
         }
@@ -2277,12 +2321,52 @@ mod tests {
         };
         app.selected = 7;
 
-        app.update(Msg::ScrollTo(120.0));
+        app.update(Msg::ScrollTo {
+            top: 120.0,
+            at_bottom: false,
+        });
         assert_eq!(app.top_row, 120.0, "绝对定位须原样落到 top_row");
         assert_eq!(app.selected, 7, "抓滚动条不得动选中行");
 
         app.update(Msg::ScrollRows(1.0));
         assert_eq!(app.selected, 121, "对照: 滚轮/方向键那条路仍让选中跟随首行");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T17 回归锁: 在底部**碰一下滚动条**不得静默脱掉 FOLLOW。
+    ///
+    /// 跟随态下 app 的 `top_row` 是 `count-1`, 而滚动条能表达的最大值是
+    /// `count-可见行数` —— 两个口径差着 `可见行数-1` 行。原先直接比
+    /// `top < top_row`, 于是「在底部往下拖」也被判成「向上看」, ` · FOLLOW`
+    /// 悄悄从底栏消失。修法: 落到条底 (`at_bottom`) 时不参与这个判断、
+    /// 往回拖仍照旧。**A/B 实证**: 去掉 `!at_bottom` 那一项, 本测试第一段必红。
+    #[test]
+    fn touching_the_scroll_bar_at_the_bottom_keeps_follow() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let p = temp_log(body.as_bytes());
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+
+        // 条能表达的最底位比 app 的 `max_top()` 小 —— 正是当年误判的那一格
+        let bar_bottom = app.max_top() - 10.0;
+        app.follow = true;
+        app.top_row = app.max_top();
+        app.update(Msg::ScrollTo {
+            top: bar_bottom,
+            at_bottom: true,
+        });
+        assert!(app.follow, "拖到条底不该脱跟随 (用户没在往回看)");
+
+        // 对照: 真往回拖 (没到条底) 仍然脱跟随。**必须把 top_row 放回跟随位**
+        // —— 上一条已经把 top_row 拉到了 bar_bottom, 不放回去这条就不是「往回拖」。
+        app.follow = true;
+        app.top_row = app.max_top();
+        app.update(Msg::ScrollTo {
+            top: bar_bottom,
+            at_bottom: false,
+        });
+        assert!(!app.follow, "往回拖须停止跟随");
         std::fs::remove_file(&p).ok();
     }
 
@@ -2325,8 +2409,10 @@ mod tests {
     fn wheel_rows_is_clamped_and_sign_flipped() {
         assert!(wheel_rows(-1.0) > 0.0, "与 danqing Scrollable 同向");
         assert_eq!(wheel_rows(0.0), 0.0);
-        assert!(wheel_rows(-100.0) <= WHEEL_MAX_ROWS, "像素档不得跳几百行");
-        assert!(wheel_rows(100.0) >= -WHEEL_MAX_ROWS);
+        // 钉**值**而不是钉「有夹子」: 写 `<= WHEEL_MAX_ROWS` 的话, 把常量从 12
+        // 改成 50 它照样绿 —— 那就不叫守卫了。
+        assert_eq!(wheel_rows(-100.0), WHEEL_MAX_ROWS, "像素档夹到上界");
+        assert_eq!(wheel_rows(100.0), -WHEEL_MAX_ROWS);
     }
 
     /// T18 (P17): notice 自带消退期限 —— 到点清掉, 不留常驻噪声。
@@ -2350,14 +2436,26 @@ mod tests {
     ///
     /// 「双向同步」不是两处赋值互相对, 而是只有一份真相: 开关读
     /// `app.histogram_visible`、Ctrl+L 与开关都发 `Msg::ToggleHistogram`。
+    ///
+    /// **配置路径必须显式给临时文件**: 这条消息会 `save_config()`, 而默认路径是
+    /// 用户真实的 `config.toml` (整文件覆盖写)。本测试第一版就是这么写的, 被
+    /// review 抓出来 —— 现在 `save_config` 在测试里拿不到路径会直接 panic。
     #[test]
     fn histogram_toggle_is_one_state_for_both_entries() {
-        let mut app = LogApp::new_empty();
+        let p = temp_log(b"");
+        let mut app = LogApp::new_empty_at(Some(p.clone()));
         let before = app.histogram_visible;
         app.update(Msg::ToggleHistogram);
         assert_eq!(app.histogram_visible, !before, "两条入口共用的那一支须翻转");
         app.update(Msg::ToggleHistogram);
         assert_eq!(app.histogram_visible, before, "再切一次回到原状");
+        // 落盘也走的是**同一个**路径 (整文件同源, 不碰用户真配置)
+        assert_eq!(
+            config::Config::load_from(&p).histogram,
+            before,
+            "切换须落盘到注入的路径"
+        );
+        std::fs::remove_file(&p).ok();
     }
 
     /// T21 (P39): Ctrl+F **不清草稿** —— 它是「回到搜索框」的反射键,
@@ -2404,6 +2502,32 @@ mod tests {
                 _ => "",
             };
             assert!(leaked.is_empty(), "{name} 穿透了设置卡: {leaked}");
+        }
+        // **反向对照 —— 本测试第一版缺的就是这半边, 于是漏掉了一个 Critical**:
+        // 卡内控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠**焦点分发**收键, 而框架在
+        // `app_key_filter` 返回 `Some` 时直接 return、不再分发 (`handler.rs:436-441`)。
+        // 所以非全局键**必须**放行 (`None`), 否则卡内键盘全死 —— 而上一段
+        // 「不该发生的副作用没发生」是**看不出**这一点的 (吞得越多它越绿)。
+        let plain = |k: Key| Event::Key {
+            key: k,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        for (name, ev) in [
+            ("↓ (下拉导航)", plain(Key::Named(NamedKey::ArrowDown))),
+            (
+                "Enter (下拉选中 / 关闭钮)",
+                plain(Key::Named(NamedKey::Enter)),
+            ),
+            ("Space (侧栏开关)", plain(Key::Named(NamedKey::Space))),
+            ("普通字符 (打字)", plain(Key::Character("x".into()))),
+        ] {
+            assert!(
+                app.app_key_filter(&ev).is_none(),
+                "{name} 必须放行给卡内控件 —— 守卫吞了它, 卡内键盘就死了"
+            );
         }
         // 这三条由 `LogApp::event` 那条路认领, 那里有同款门禁 —— 一并锁住
         app.event(&ctrl_key("b"));

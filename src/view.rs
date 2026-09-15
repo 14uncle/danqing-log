@@ -136,6 +136,14 @@ impl VScroll {
         let t = ((thumb_top - self.track_top) / self.span).clamp(0.0, 1.0);
         f64::from(t) * self.max_top
     }
+
+    /// 该拇指位置是否已在条能被拖到的**最底**。
+    ///
+    /// 判据取**拇指位置**而不是 `top_row_at(...) >= max_top`: 后者要走一趟浮点
+    /// 换算再比, 这里本来就有确切的坐标可看。
+    fn at_bottom(&self, thumb_top: f32) -> bool {
+        self.span <= 0.0 || thumb_top >= self.track_top + self.span - 0.5
+    }
 }
 
 /// 水平滚动条几何 (T17)。与 [`VScroll`] 同一条纪律: paint 与拖拽共用一份,
@@ -164,12 +172,10 @@ fn h_scroll(text_x: f32, text_w: f32, track_y: f32, max_seen: f32, x_off: f32) -
     let span = (text_w - thumb_w).max(0.0);
     let max_x = (max_seen - text_w).max(1.0);
     Some(HScroll {
-        hit: Rect::from_xywh(
-            text_x,
-            track_y - (SCROLLBAR_HIT_W - SCROLLBAR_H),
-            text_w,
-            SCROLLBAR_HIT_W,
-        ),
+        // 命中带**向下**延伸 (轨道在列表区最底, 下面是状态栏): 向上会让 6px
+        // 压在列表末行上, 那一带就从此选不中行了。竖条没有这个问题 —— 它的带子
+        // 在右缘之外, 本来就是内容区以外。
+        hit: Rect::from_xywh(text_x, track_y, text_w, SCROLLBAR_HIT_W),
         track_left: text_x,
         thumb_x: text_x + (x_off / max_x) * span,
         thumb_w,
@@ -856,6 +862,16 @@ impl LogView {
         })
     }
 
+    /// 指针是否落在滚动条**可能出现**的窄带里 —— 只比坐标, 不算几何、不碰
+    /// `display_count`。给 `CursorMoved` 做短路用 (见那里的注释)。
+    ///
+    /// 判据取「条能出现的位置」而非「条此刻存在」: 宁可多算一次, 不可漏掉 ——
+    /// 条不存在时 `bars()` 会返回 `None`, 后面的逻辑本来就出不来结果。
+    fn near_bar(area: Rect, list_bottom: f32, p: Point) -> bool {
+        let right = area.origin.x + area.size.width - SCROLLBAR_HIT_W;
+        p.x >= right || p.y >= list_bottom - SCROLLBAR_HIT_W
+    }
+
     /// 两条滚动条的几何 (T17) —— 命中与拖拽**共用这一处**, 免得 event 里再推一遍
     /// `text_x`/`text_w`/`max_seen` 那串式子。
     ///
@@ -865,7 +881,7 @@ impl LogView {
         let rows_top = area.origin.y + self.chrome_top();
         let v = v_scroll(area, rows_top, list_h, self.display_count(), self.top_row);
         let text_x = self.text_x(area);
-        let text_w = (Self::text_right(area) - text_x).max(0.0);
+        let text_w = (Self::text_right(area) - text_x).max(1.0);
         let h = h_scroll(
             text_x,
             text_w,
@@ -1170,7 +1186,10 @@ impl Widget for LogView {
         self.expanded = app.expanded.clone();
         self.sub_rows = app.sub_rows.clone();
         self.theme = app.theme;
-        // 模式变化才重编译 (正则编译 ms 级, 不能进 paint)
+        // 模式变化才重编译 (正则编译 ms 级, 不能进 paint)。
+        // **只认 app.search_pattern 这一串** —— 它就是搜索执行用的那串
+        // (`build_search_pattern` 的产物), 故大小写敏感之类的 flag 自动同源,
+        // 高亮不可能与命中集不一致。**勿在此另拼 pattern** (spec D8)。
         if self.search_pattern_src != app.search_pattern {
             self.search_pattern_src = app.search_pattern.clone();
             self.search_re = app
@@ -1779,26 +1798,42 @@ impl Widget for LogView {
                     .set(self.settings_btn_rect.get().contains(*position));
                 // T17: 拖拽跟手 —— 拇指顶 = 指针 − 抓握偏移, 再走逆运算得 top_row。
                 // 夹取在 `top_row_at` / `x_offset_at` 里 (验收 ②), 故拖出轨道也不越界。
-                let (vbar, hbar) = self.bars(area, list_h);
-                self.hover_bar.set(
-                    vbar.filter(|s| s.hit.contains(*position))
-                        .map(|_| BarAxis::Vertical)
-                        .or_else(|| {
-                            hbar.filter(|s| s.hit.contains(*position))
-                                .map(|_| BarAxis::Horizontal)
-                        }),
-                );
-                if let (Some(grab), Some(sb)) = (self.v_drag.get(), vbar) {
-                    msgs.push(Box::new(Msg::ScrollTo(sb.top_row_at(position.y - grab))));
-                    self.hover_row.set(u64::MAX); // 拖条时不该同时高亮行 (两套反馈别打架)
-                    return EventResult::Consumed;
-                }
-                if let (Some(grab), Some(hb)) = (self.h_drag.get(), hbar) {
-                    // 横滚量是**视图局部状态** (`x_offset`), 不经应用层 —— 与竖条
-                    // 走 `Msg::ScrollTo` 不同, 因为横向偏移本来就不进 LogApp。
-                    self.x_offset.set(hb.x_offset_at(position.x - grab));
-                    self.hover_row.set(u64::MAX);
-                    return EventResult::Consumed;
+                //
+                // **先按位置短路, 再算几何**: `bars()` 要 `display_count()`, 而它在
+                // 过滤态是 O(命中行数) 的 —— 鼠标一动就付一次, 对「1GB 不卡」是实打实
+                // 的倒退 (宽过滤下命中数百万行)。指针不在条可能出现的窄带里就整个跳过。
+                // 拖拽中不能跳 (指针会离开窄带), 故先看拖拽态。
+                let dragging = self.v_drag.get().is_some() || self.h_drag.get().is_some();
+                if !dragging
+                    && !Self::near_bar(area, area.origin.y + chrome_top + list_h, *position)
+                {
+                    self.hover_bar.set(None);
+                } else {
+                    let (vbar, hbar) = self.bars(area, list_h);
+                    self.hover_bar.set(
+                        vbar.filter(|s| s.hit.contains(*position))
+                            .map(|_| BarAxis::Vertical)
+                            .or_else(|| {
+                                hbar.filter(|s| s.hit.contains(*position))
+                                    .map(|_| BarAxis::Horizontal)
+                            }),
+                    );
+                    if let (Some(grab), Some(sb)) = (self.v_drag.get(), vbar) {
+                        let ty = position.y - grab;
+                        msgs.push(Box::new(Msg::ScrollTo {
+                            top: sb.top_row_at(ty),
+                            at_bottom: sb.at_bottom(ty),
+                        }));
+                        self.hover_row.set(u64::MAX); // 拖条时不该同时高亮行 (两套反馈别打架)
+                        return EventResult::Consumed;
+                    }
+                    if let (Some(grab), Some(hb)) = (self.h_drag.get(), hbar) {
+                        // 横滚量是**视图局部状态** (`x_offset`), 不经应用层 —— 与横条
+                        // 走 `Msg::ScrollTo` 的竖条不同 (横向偏移本来就不进 LogApp)。
+                        self.x_offset.set(hb.x_offset_at(position.x - grab));
+                        self.hover_row.set(u64::MAX);
+                        return EventResult::Consumed;
+                    }
                 }
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
@@ -1823,6 +1858,9 @@ impl Widget for LogView {
             Event::CursorLeft => {
                 self.settings_hover.set(false);
                 self.hover_row.set(u64::MAX);
+                // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
+                // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
+                self.hover_bar.set(None);
                 // 按下未拖动就离窗 = 放弃潜伏选区; 框选中离窗保留
                 // (窗口最大化下边缘拖出是常态, 回窗继续跟手)
                 if !self.dragging {
@@ -1884,7 +1922,9 @@ impl Widget for LogView {
                 }
                 // 滚动条按下 (T17)。在行命中**之前**: 条压在列表右缘/底缘之上,
                 // 先判条才不会被行抢走 (条只有 6px 宽, 抢走就再也抓不到)。
-                // 竖条在前: 右下角两权重叠, 竖条更常用, 让它赢。
+                // 竖条先判只是**习惯性**的次序 —— 两者的命中带在 x 上只在
+                // `width - SCROLLBAR_HIT_W` 这一条零宽边界相接, 并不真的重叠
+                // (横条向下延伸后才如此; 别以为这里有一场优先级竞争)。
                 let (vbar, hbar) = self.bars(area, list_h);
                 if let Some(sb) = vbar.filter(|s| s.hit.contains(*position)) {
                     // 抓在拇指上保持抓握点; 抓在轨道空白处则让拇指心对齐指针
@@ -1896,7 +1936,11 @@ impl Widget for LogView {
                         sb.thumb_h / 2.0
                     };
                     self.v_drag.set(Some(grab));
-                    msgs.push(Box::new(Msg::ScrollTo(sb.top_row_at(position.y - grab))));
+                    let ty = position.y - grab;
+                    msgs.push(Box::new(Msg::ScrollTo {
+                        top: sb.top_row_at(ty),
+                        at_bottom: sb.at_bottom(ty),
+                    }));
                     return EventResult::Consumed;
                 }
                 if let Some(hb) = hbar.filter(|s| s.hit.contains(*position)) {
@@ -2079,8 +2123,14 @@ impl Widget for LogView {
         Some(self.area.get())
     }
 
-    /// 与 FocusOut 同语义 (T14/P19): 面板隐藏时收不到 FocusOut, 须主动清 ——
-    /// 否则高亮会留在屏上, 而它此时既不可复制也点不到 (正是 P19 那个假象)。
+    /// 与 FocusOut 同语义 (T14/P19)。
+    ///
+    /// **当前组件树里没有调用点** —— 框架只在 `overlay` / `multi_panel` / `tabs`
+    /// 三处调 `reset_focus`, 而 `LogView` 既不在设置卡的 `Overlay` 内容里、也不在
+    /// 任何面板里, 收不到这一发。留着它是**接口完整性**: `focused` 一旦与真实焦点
+    /// 脱钩, 屏上就会留下「看着选中、按 Ctrl+C 却没反应」的假象 (正是 P19),
+    /// 而本组件哪天被放进面板, 没有它就会踩这个坑。
+    /// (本批第一版把注释写成「面板隐藏时收不到 FocusOut」, 那是把设想当成了事实。)
     fn reset_focus(&mut self) {
         self.focused = false;
     }
@@ -3053,34 +3103,83 @@ mod tests {
             .count()
     }
 
+    /// 画出来的**文本选区带/单元格底**条数 —— 两者同尺寸 (`ROW_HEIGHT - 4`),
+    /// 而**行选中底是整行高** (`ROW_HEIGHT`), 故这个数能把它们分开。
+    ///
+    /// 为什么需要它: 行选中是 `selected` 决定的, 夹具里默认恒有 —— 只数
+    /// 「选中色矩形总数」的话, 行选中会**替**另外两类把断言满足掉。
+    fn band_shaped_rects(v: &LogView) -> usize {
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(
+            Rect::from_xywh(0.0, 0.0, 800.0, 600.0),
+            &mut rects,
+            &mut texts,
+        );
+        let want = lin(v.theme.theme().selection());
+        let got = rects.instance_rects();
+        let colors = rects.instance_colors();
+        got.iter()
+            .zip(colors.iter())
+            .filter(|(r, c)| **c == want && (r.size.height - (ROW_HEIGHT - 4.0)).abs() < 0.01)
+            .count()
+    }
+
     /// T14 验收 ②: 「看得见 ⇔ 复制得到」这条不变量对**三类选中各测一次** ——
     /// 它不是「行选中」那一处的局部约定。
     ///
     /// 由构造保证的机制见 `LogView::focused`: 框架只在持焦链路上派发 `Event::Copy`,
     /// 所以三处高亮全部 AND 上焦点, 两边就是同一个因。
+    ///
+    /// **本测试第一版是假绿的, 记在这里**: 三类共用表格夹具、且都数「选中色矩形
+    /// 总数」, 而文本选区带**只在原始模式与子行上画** —— 表格夹具根本走不到那儿,
+    /// 于是第三例实际是被**行选中底**满足的, 对选区带零覆盖。
+    /// **A/B 实证**: 摘掉选区带的焦点守卫, 那一版照样全绿。
+    /// 现在每类用它**自己那台夹具**, 并改用 `band_shaped_rects` 把行选中排除掉。
     #[test]
     fn the_three_highlights_all_follow_focus() {
-        type Set = fn(&mut LogView);
-        let cases: [(&str, Set); 3] = [
-            ("行选中", |v| v.selected = 0),
-            ("单元格选中", |v| v.selected_cell = Some((0, 1))),
-            ("文本选区", |v| {
-                v.selection = Some(TextSelection::new((0, 0), (0, 2)));
-            }),
-        ];
-        for (i, (name, set)) in cases.iter().enumerate() {
-            let (mut v, path) = cell_fixture(&format!("t14-{i}"));
-            v.hover_row.set(u64::MAX);
-            v.focused = false;
-            set(&mut v);
-            assert_eq!(selection_token_rects(&v), 0, "{name}: 失焦时不得画出来");
-            v.focused = true;
-            assert!(
-                selection_token_rects(&v) > 0,
-                "{name}: 持焦时必须画出来 (否则是「复制得到却看不见」)"
-            );
-            std::fs::remove_file(&path).ok();
-        }
+        // ① 行选中 (表格夹具)
+        let (mut v, path) = cell_fixture("t14-row");
+        v.hover_row.set(u64::MAX);
+        v.selected = 0;
+        v.focused = false;
+        assert_eq!(selection_token_rects(&v), 0, "行选中: 失焦时不得画出来");
+        v.focused = true;
+        assert!(
+            selection_token_rects(&v) > 0,
+            "行选中: 持焦时必须画出来 (否则是「复制得到却看不见」)"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // ② 单元格选中 (表格夹具; 行选中置到别的行, 不替它满足)
+        let (mut v, path) = cell_fixture("t14-cell");
+        v.hover_row.set(u64::MAX);
+        v.selected = 1;
+        v.selected_cell = Some((0, 1));
+        v.focused = false;
+        assert_eq!(band_shaped_rects(&v), 0, "单元格: 失焦时不得画出来");
+        v.focused = true;
+        assert!(band_shaped_rects(&v) > 0, "单元格: 持焦时必须画出来");
+        std::fs::remove_file(&path).ok();
+
+        // ③ 文本选区带 —— **必须用原始模式夹具**: 选区带的两处绘制点分别在
+        // 「子行」与「非表格」分支里, 表格夹具走不到 (第一版就栽在这儿)。
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-t14-band-{}.log", std::process::id()));
+        std::fs::write(&path, "ERROR line one\nINFO line two\n").unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(LogFile::open(&path).unwrap()));
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Raw;
+        v.selected = 1; // 行选中挪到**别的行**, 不许它冒充选区带
+        v.hover_row.set(u64::MAX);
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+        v.focused = false;
+        assert_eq!(band_shaped_rects(&v), 0, "文本选区: 失焦时不得画出来");
+        v.focused = true;
+        assert!(band_shaped_rects(&v) > 0, "文本选区: 持焦时必须画出来");
+        std::fs::remove_file(&path).ok();
     }
 
     /// T14 验收 ①: 「点行 → Esc → Ctrl+C」这条链 —— 高亮必须跟着焦点一起走。
@@ -3278,7 +3377,7 @@ mod tests {
         let top = msgs
             .iter()
             .find_map(|m| match m.downcast_ref::<Msg>() {
-                Some(Msg::ScrollTo(t)) => Some(*t),
+                Some(Msg::ScrollTo { top, .. }) => Some(*top),
                 _ => None,
             })
             .expect("拖动须发出 ScrollTo");
@@ -3304,11 +3403,12 @@ mod tests {
     ///
     /// 只做竖条会留下「两根同貌的拇指, 一根能拖一根不能」—— 那正是本模块要消灭的
     /// 形态。横条的成本不比竖条低 (状态机一样), 所以没有理由只做一半。
-    #[test]
-    fn horizontal_scroll_bar_drags_and_round_trips() {
-        let path =
-            std::env::temp_dir().join(format!("danqing-log-hscroll-{}.log", std::process::id()));
-        // 长行: 只有内容宽于视口时横条才出现
+    /// T17 夹具: 200 行长行 (内容宽于视口 → 横条出现)。
+    fn hscroll_fixture(tag: &str) -> (LogView, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "danqing-log-hscroll-{tag}-{}.log",
+            std::process::id()
+        ));
         let body: String = (0..200)
             .map(|i| format!("line {i} {}\n", "x".repeat(400)))
             .collect();
@@ -3319,7 +3419,39 @@ mod tests {
         v.focused = true;
         v.gutter_w.set(56.0);
         v.mode = ViewMode::Raw;
+        (v, path)
+    }
 
+    /// T17 回归锁: 横条的命中带**向下**延伸, 不吃列表末行的下半截。
+    ///
+    /// 本批第一版让它向上延伸 (`track_y - 6`, 凑满 12px 可拖带), 于是内容横向
+    /// 溢出时, 列表末行最下面那一带点下去只会**开始拖横条** —— 那一带的行选中
+    /// 从此没了。竖条没有这个问题: 它的带子在文本右缘之外, 本来就是内容区以外。
+    #[test]
+    fn horizontal_bar_hit_band_does_not_steal_row_clicks() {
+        let (mut v, path) = hscroll_fixture("hitband");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts); // 让 max_seen 落地
+        let (rows_top, list_h) = list_geom(&v, area);
+
+        // 轨道**上方 2px** —— 仍在列表区内, 但已不在可拖带上
+        let y = rows_top + list_h - SCROLLBAR_H - 2.0;
+        let x = LogView::text_x(&v, area) + 40.0;
+        let msgs = press_at(&mut v, area, MouseButton::Left, Point::new(x, y));
+        assert!(v.h_drag.get().is_none(), "轨道上方的点不该开始拖横条");
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::Select(_)))),
+            "该点应落到行上 (行选中), 而不是被横条吞掉"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn horizontal_scroll_bar_drags_and_round_trips() {
+        let (mut v, path) = hscroll_fixture("drag");
         let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
         let mut texts = TextBatch::new();
         let mut rects = RectBatch::new();

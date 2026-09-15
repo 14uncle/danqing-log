@@ -42,6 +42,11 @@ impl Config {
     }
 
     /// 存到真实配置路径。
+    ///
+    /// **只在非 test 构建里有调用点**: 产品的 `LogApp::save_config` 在测试构建下
+    /// 拿不到注入路径会直接 panic (防测试覆盖写用户真配置), 于是这里在 test 下
+    /// 成了死代码 —— 那条 `allow` 说的就是这件事, 不是漏网。
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn save(self) {
         self.save_to(&config_path());
     }

@@ -53,13 +53,12 @@
 |------|------|------|
 | M1 (框架) | ✅ 已 push | P8 P9 P31 |
 | M2 | ✅ 已 push | P10 P11 P14 P15 P16 P28 + S1–S3 |
-| M3 | ✅ 已 commit (未 push) | P20–P27 P33 P34 (+ P6 同批) |
-| M4 | ✅ 已落地 (未 commit) | P19 P29 P30 P32 |
-| M5 | ✅ 已落地 (未 commit) | P17 P36 P37 P39; **P38 改判不做** (见 todo T19) |
+| M3 | ✅ 已 push | P20–P27 P33 P34 (+ P6 同批) |
+| M4 | ✅ 已 push | P19 P29 P30 P32 |
+| M5 | ✅ 已 push | P17 P36 P37 P39; **P38 改判不做** (见 todo T19) |
 
-**M5 的一处框架改动待 push**: T21 把 `TextInput::select_all` 转 pub (`../danqing`
-本地已改已绿)。故本仓 `.cargo/config.toml` patch **保持开着**, `Cargo.lock` 现为
-**path 态 —— 该状态不可提交**。落地顺序见 `todo-interaction-polish.md` T21 条。
+**落地**: 本仓 `bfa8c21` (含 M3 `f25cb0d`) + 框架 `24bd9a4`; lock 钉 `danqing#24bd9a4f`。
+patch 已关, `--locked` 无 patch 可复现。
 
 **§6 核对单新增一条**: `NOTICE_TTL` (notice 自动消退时长) 是**估值** ——
 实机那轮要两个方向都试 (太短没看见 / 太长碍事), 见 spec §6 裁决补记 (2)。

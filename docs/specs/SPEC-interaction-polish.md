@@ -3,9 +3,11 @@
 > @author 十四叔 · @date 2026/09/14
 > 状态: **能力地图已批** (2026-09-14 用户裁定 5/6/7 + 「go」); **spec 已批** (2026-09-14 用户「yes」);
 > plan 落盘 `tasks/plan-interaction-polish.md` + `tasks/todo-interaction-polish.md`; **M0 实机走查待用户**
-> 进度 (2026-09-15): **M1 已 push** / **M2 已 push** / **M3 机器闭环 (未 commit)** /
-> M4 M5 未开工。逐条记录见 `todo-interaction-polish.md`; §4 末尾有 build 期三处裁决补记
-> (P33 改判不走 notice 通道 / T11 暴露「分通道」的两处字面反转 / T13 落成一张表)
+> 进度 (2026-09-15): **M1–M5 全部落地并 push** —— 本仓 `bfa8c21` (含 M3 `f25cb0d`)
+> + 框架 `24bd9a4` (T21 的 `TextInput::select_all`), lock 钉 `24bd9a4f`。
+> 逐条记录见 `todo-interaction-polish.md`; build 期裁决补记见 §4 末尾 (P33 改判 /
+> T11 的分通道反转 / T13 落成一张表) 与 §6 末尾 (P38 改判不做 / T18 时长待实机 /
+> T21 的框架改动)。**余下只有 §7 实机走查** —— 那是本 spec 的最后一关。
 > 前置意图: `docs/intent/interaction-polish.md` (interview-me 四轮裁定 + 显式 yes)
 > 需求输入: `tasks/matrix-interaction-polish.md` (**39 条粗糙点**, 全部带 `file:line`;
 > 同时是 §7 实机走查的核对单)
@@ -25,9 +27,10 @@
 1. 矩阵 39 条**逐条转成改后行为**, 每条配**一条守卫或回归锁** (沿用本仓习惯);
 2. **用户实机按核对单走完**, 确认无新缺口 —— 完成标志是**矩阵走完**, 不是「修完报出来的那几条」;
 3. `cargo fmt` + `cargo clippy --all-targets -- -D warnings` + 测试全绿
-   (本仓基线 **133 绿** = 51 lib + **74** main + 8 genlog; 框架基线 **600 lib** + 集成 59
-   —— 2026-09-14 M1 完成后实测。**原记 115 / 583 都是旧数字**: 115 是 selection-copy
-   模块之前的 (那之后 main 从 56 涨到 74), 583 是更早的框架基线)。
+   (本仓 **169 绿** = 51 lib + **110** main + 8 genlog; 框架 **600 lib** + 集成 59
+   —— **2026-09-15 五模块全部落地后实测**。
+   **这行数字一直在动, 别抄**: 本文件先后写过 115 → 133 → 169, 每一次都是当时的真数,
+   过一阵就过期; 按仓库约定**记账前先量** (`todo-interaction-polish.md` 头部有最新基线)。
 
 **三问的可判定化** (反面教材全部来自已发生的实机回归, 用来校准尺子):
 
@@ -384,9 +387,9 @@ notice 曾被拼进 `status` 而 paint 又单独画一遍 (`画两遍`); `Info` 
 「具体时长 build 时**实测定**, 不估算」, 而本机跑不了真机走查 —— 故取 `NOTICE_TTL = 4s`
 并在代码与 todo 里都标成**待实机核对**, 挂进 §6 核对单。这是本模块唯一没做到的验收。
 
-**(3) T21 需要一处框架改动** (`TextInput::select_all` 转 pub), 已在 `../danqing`
-本地改完且三件套绿, **未 push** (用户未授权)。故本仓 patch 保持开着、`Cargo.lock`
-停在 path 态 —— **该状态不可提交**, 落地顺序见 todo T21 条。
+**(3) T21 需要一处框架改动** (`TextInput::select_all` 转 pub) —— 已落地:
+danqing `24bd9a4` 已 push, 本仓 lock 复钉 `ec8ae09b` → `24bd9a4f`, patch 已关,
+`--locked` 无 patch 可复现。**这是本 spec 唯一的框架改动** (M3/M4 均零框架改动)。
 
 | 条 | 现状 (查证) | 改法 |
 |----|------------|------|

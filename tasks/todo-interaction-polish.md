@@ -6,7 +6,7 @@
 > 构建序: **M1 (框架) → M2 → M3 → M4 → M5**; commit/push 点标 ⏸ 待用户点头。
 > 基线: 本仓 **169 绿** (51 lib + 110 main + 8 genlog, 2026-09-15 M5 完成后实测);
 > 框架 **600 lib** + 集成 59 绿 (**M5 的 T21 动了一处框架**: `TextInput::select_all`
-> 转 pub —— 本地已改已绿, **未 push**, 见 T21 条)。
+> 转 pub —— 已 push `24bd9a4`, 见 T21 条)。
 > 记账前先量, 别抄旧数 —— main 从 74 → 82 (M2) → 92 (M3) → 105 (M4) → 110 (M5)。
 > **M0 (用户实机走查 5 条) 在 build 前**: P10 / P11 / P19 / P30 / P31。
 
@@ -511,15 +511,45 @@ notice。
     `Bar` 新增 `bind_refocus_search`, 在 rev 变化**且 `search_ti.is_focused()`** 时
     全选。「已持焦」由栏自己判 (sync 跑在焦点落地之前, 首次聚焦那一刻框里没有光标,
     也没有该全选的东西 —— 时序天然正确)。清空仍归 Esc, 那条路径没动 (测试里带对照)。
-  - **⚠ 一处框架改动 (本批唯一)**: `TextInput::select_all` 原是私有
-    (`fn select_all`), 现改 `pub` + doc。**已在 ../danqing 本地改完并三件套绿
-    (600 lib + 集成), 但未 push** —— 用户未授权 push。故本仓 `.cargo/config.toml`
-    **patch 必须保持开着**, `Cargo.lock` 现为 **path 态, 此态绝不能提交**
-    (这正是 2026-09-14 踩过两次的坑)。
-  - 落地顺序 (待用户点头): danqing 提交 push → 本仓关 patch → `cargo update -p danqing`
-    (先跑一次 `cargo check` 让它按 manifest 重解) → 提交 lock → 两仓分别提交。
+  - **✅ 一处框架改动 (本批唯一), 已落地**: `TextInput::select_all` 原是私有
+    (`fn select_all`), 改为 `pub` + doc, **danqing `24bd9a4` 已 push**。
+    本仓关 patch → `cargo check` (让它按 manifest 重解) → `cargo update -p danqing`
+    → lock 复钉 `ec8ae09b` → **`24bd9a4f`** → `--locked` 无 patch 构建通过。
+    两仓分别提交, message 互相注明关联。
   - 守卫: `reopen_search_keeps_the_draft` (应用侧: 不再清空 + Esc 仍清, 带对照) /
     `refocus_selects_the_existing_draft` (栏侧: 已持焦才全选, 且不清空)。**已 A/B**。
+
+## Review 轮 (2026-09-15, `/agent-skills:code-review-and-quality`)
+
+三路独立审查 (view.rs / main.rs / M5) 后逐条复核。**结论: 发现 1 个 Critical + 3 个
+Required, 全部已修并加锁**。本模块五阶段的 review 一栏至此才算走完 —— build 期
+自查漏掉的东西, 独立审查逐条抓了出来。
+
+| # | 严重度 | 问题 | 处置 |
+|---|--------|------|------|
+| R1 | **Critical** | **T16 模态守卫吞掉了卡内所有按键**。守卫放在 `app_key_filter` 入口, 而框架在该回调返回 `Some` 时**直接 return、不再走焦点分发** → 设置卡里的主题下拉导航不动、侧栏开关切不了、Enter 关不掉卡。**键盘用户能聚焦到控件却按不动**。基线本来是好的 (只拦 Esc/f/t/l/o), 是本批改坏的 | 守卫下移到「ctrl + 字符」筛选**之后**; 测试补**反向对照**(非全局键必须 `None`)。A/B: 搬回入口即精确红 |
+| R2 | **Required** | **T20 单测写用户的真实配置文件**。`new_empty()` 读真路径、`Msg::ToggleHistogram` → `save_config()` → `save_to(真路径)`, 而 `save_to` 是**整文件覆盖写**、`load_from` 对认不出的 `mode` 取默认 (light) —— 一次 `cargo test` 就能改掉用户的主题、抹掉手写注释。全仓唯一一条这样的测试 | `LogApp` 加 `cfg_path` + `new_empty_at(临时路径)`; 并且**测试里拿不到路径直接 panic** —— 与其靠下一个人记得, 不如让它写不出去 |
+| R3 | **Required** | **T14 的第三例是假绿**。「三类各测一次」里那例文本选区**根本没画**: 夹具是表格模式, 而选区带只在子行/非表格分支绘制 —— 断言实际被**行选中底**满足, 对不变量零覆盖 | 三类各用**自己那台夹具** + 新增 `band_shaped_rects` (按高度把行选中排除掉)。A/B: 摘掉选区带的焦点守卫, 改前全绿、改后精确红 |
+| R4 | **Required** | **todo 里宣称的守卫不存在**: 写着「守卫 `shortcut_card_lists_single_keys_but_not_arrow_keys` (防改回)」, 仓里根本没有这条测试。**宣称有守卫比没守卫更坏** —— 它会让人以为已经挡住了 | 补写该守卫 + 补一条**横向**溢出守卫 (`shortcut_rows_fit_the_card_width`: 框架 `Text` 不换行, 高度守卫看不见横向顶穿) |
+| R5 | Optional | 横条命中带**向上**延伸 6px, 吃掉列表末行最下面一带 —— 那一带的**行选中**从此没了 (竖条无此问题, 它的带子在内容区之外) | 改为**向下**延伸 (入状态栏, 那儿除了 ⚙ 没有可点物)。新增守卫 + A/B |
+| R6 | Optional | `Msg::ScrollTo` 与 FOLLOW 的**口径不一致**: 跟随态 `top_row` 是 `count-1`, 条能表达的上界是 `count-可见` —— 直接比 `top < top_row` 会把「在底部碰一下条」判成「向上看」而**静默脱掉 FOLLOW** | `ScrollTo` 带 `at_bottom` 位 (拖到条底不参与该判断)。新增守卫 + A/B |
+| R7 | Optional | `bars()` 进了 `CursorMoved` 主路径 → 每次鼠标移动付一次 O(过滤命中数) 的 `display_count()`。对「1GB 不卡」是实打实的倒退 | 先按坐标短路 (`near_bar`), 不在条附近就整个跳过; 拖拽中不跳 |
+| R8 | Nit ×4 | `CursorLeft` 漏清 `hover_bar` (拇指 hover 态与手型留在屏上) / `reset_focus` 注释把「面板隐藏」当成真实场景 (LogView 不在任何面板里, 全仓无调用点) / 「右下角两权重叠」与几何不符 (只在一处零界相接) / `wheel_rows` 上界只钉「有夹子」不钉值 | 逐条修正 |
+| R9 | Nit | 快捷键表的判据自相矛盾: 原始模式的 `b`/`'` 与已列的 Ctrl+B/G 是**同一动作的两套按键**, 按「猜不出来就列」该列、按「不重复」不该列 | 明写补一条判据「同一动作只列一条」, 并在注释里点破原判据的缺口 |
+
+**未改、只记** (两处, 都不是本批引入):
+- **空态下滚轮被静默吞掉**, 而同一提交刚给按键加了「尚未打开文件」—— 不对称。
+  不补的理由: 滚轮是高频事件, 而 `set_notice` 每次都重置消退期限, 直接照抄会让提示
+  变常驻 (从静默变成噪声)。要补得先做「同文案不续期」的去重。
+- **`!self.settings_open` 那道滚轮门禁在真机上不可达** (卡开着时框架已把带坐标的鼠标
+  事件全吞了) —— 无害的冗余防御, 测试直调 `app.event` 才验证得到它。
+
+**另**: 本批改动了 **8 处既有测试的前置条件** (夹具补 `focused = true`)。它们由
+「断言恒画」变成「断言持焦时画」, 补偿覆盖是 R3 那条重写后的三例测试。
+**本批只删改了一条既有测试** (`readonly_sidebar_swallows_clicks_without_message` →
+`..._but_says_why`, P21 的刻意改判, 已落档), 其余全是新增。
+
+---
 
 ## Phase 收尾
 
