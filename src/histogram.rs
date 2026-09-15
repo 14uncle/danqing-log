@@ -457,7 +457,18 @@ impl Widget for LevelHistogram {
         };
         // 不可点 (明文模式 / 无子句的桶 / 没有生效筛选时的清除行) —— 吞掉点击,
         // 不让它穿透到底下的列表 (点在有东西的地方不该毫无回应地选中底下的行)。
+        // M3 (2026-09-14 实机 M0 P21): 吞掉时**说清为什么** —— 原先静默,
+        // 用户不知道是没点中还是程序没响应。
         if !self.is_row_clickable(i) {
+            let reason = if i == CLEAR_ROW {
+                "无生效筛选可清除"
+            } else {
+                "本级别不可点选 (仅统计)"
+            };
+            msgs.push(Box::new(Msg::Notice(
+                reason.into(),
+                crate::NoticeKind::Info,
+            )));
             return EventResult::Consumed;
         }
         if i == CLEAR_ROW {
@@ -612,10 +623,15 @@ mod tests {
         assert!(!q.is_empty(), "清除行点击必须发出消息");
     }
 
-    /// 只读侧栏 (全 None 子句表) 下点击必须被吞掉, 且不发出任何消息 ——
-    /// 否则点空侧栏会穿透去选中底下的日志行。
+    /// 只读侧栏 (全 None 子句表) 下点击仍必须被**吞掉** (不穿透去选中底下的日志行),
+    /// 但不再静默 —— M3 (P21) 起每次吞掉都附一条说明。
+    ///
+    /// 本测试原名 `readonly_sidebar_swallows_clicks_without_message`, 断言「不发
+    /// 任何消息」。P21 把「静默吞掉」判成了缺陷 (用户分不清「没点中」与「程序没
+    /// 响应」), 故**跟着改判**: 「不穿透」这条不变式原样保留, 「不发声」那条反转
+    /// 成「必须恰好说一条, 且是带原因的 Notice」。
     #[test]
-    fn readonly_sidebar_swallows_clicks_without_message() {
+    fn readonly_sidebar_swallows_clicks_but_says_why() {
         let mut w = LevelHistogram::new();
         assert!(w.queries.iter().all(Option::is_none), "新建即只读");
         let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
@@ -633,9 +649,14 @@ mod tests {
             assert_eq!(
                 w.event(&ev, area, &mut q),
                 EventResult::Consumed,
-                "第 {i} 行点击应被吞"
+                "第 {i} 行点击应被吞 (不穿透)"
             );
-            assert!(q.is_empty(), "只读侧栏不得发消息");
+            assert_eq!(q.len(), 1, "第 {i} 行吞掉时须**恰好**说一条原因");
+            let msg = q[0].downcast_ref::<Msg>().expect("消息应是 Msg");
+            assert!(
+                matches!(msg, Msg::Notice(text, _) if !text.is_empty()),
+                "第 {i} 行的拒绝须带上原因 (非空 Notice)"
+            );
         }
     }
 

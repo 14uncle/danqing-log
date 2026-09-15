@@ -226,7 +226,7 @@ pub(crate) struct LogApp {
     /// 上次 stat 轮询时刻 (250ms 节流)。
     last_stat_poll: Instant,
     /// 底栏提示 (截断/轮转等一次性事件)。
-    notice: Option<String>,
+    notice: Option<(String, NoticeKind)>,
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
     /// 在途打开作业 (async-open): Some = 打开/重建/追平进行中, UI 全程可响应;
@@ -245,6 +245,15 @@ pub(crate) struct LogApp {
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
     /// 留在应用状态里: 重开卡片停在上次那页。
     settings_tab: usize,
+}
+
+/// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    /// 警示 (打开失败/轮转/选区超限) —— 用 `danger()` 画。
+    Warn,
+    /// 提示 (复制回执等) —— 用 `text_secondary()` 画。
+    Info,
 }
 
 /// 应用消息。
@@ -291,7 +300,11 @@ pub(crate) enum Msg {
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
-    Notice(String),
+    ///
+    /// **级别语义** (2026-09-14 实机 M0 P27): `NoticeKind::Warn` = 警示
+    /// (打开失败/轮转/选区超限), 用 `danger()` 画; `NoticeKind::Info` = 提示
+    /// (复制回执等), 用 `text_secondary()` 画 —— 两者同屏时**可辨**。
+    Notice(String, NoticeKind),
     // ---- 主题下拉 ----
     /// 通过下拉选择器选择主题 (索引)。
     /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管, 不再经应用消息。
@@ -594,7 +607,7 @@ impl LogApp {
         self.sub_rows.clear();
         self.top_row = 0.0;
         self.selected = 0;
-        self.notice = Some("文件已截断/轮转".into());
+        self.notice = Some(("文件已截断/轮转".into(), NoticeKind::Warn));
         self.refresh_status();
     }
 
@@ -752,12 +765,15 @@ impl LogApp {
                     match job.kind() {
                         OpenKind::Fresh => {
                             log::warn!("打开失败：{e:#}");
-                            self.notice = Some(format!(
-                                "无法打开：{}",
-                                job.path()
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy())
-                                    .unwrap_or_default()
+                            self.notice = Some((
+                                format!(
+                                    "无法打开：{}",
+                                    job.path()
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy())
+                                        .unwrap_or_default()
+                                ),
+                                NoticeKind::Warn,
                             ));
                         }
                         OpenKind::Rebuild => log::warn!("轮转重建失败：{e:#}"),
@@ -924,9 +940,9 @@ impl LogApp {
         if self.follow {
             s.push_str(" · FOLLOW");
         }
-        if let Some(n) = &self.notice {
-            s.push_str(&format!(" · {n}"));
-        }
+        // notice **不进这个串** —— 它是第二条通道, 由 `LogView::paint` 单独取色单独
+        // 落笔 (T11)。此前把它拼进来, 结果是同一句话被画两遍 (串尾一遍、notice 段
+        // 又一遍), 而且「警示色」和「常态色」压在同一个字符串上根本没处分。
         self.status = s;
     }
 
@@ -1071,6 +1087,10 @@ impl LogApp {
             let i = self.bookmarks.range(..line).count() + 1;
             let n = self.bookmarks.len();
             self.status.push_str(&format!(" · 书签 {i}/{n}"));
+        } else {
+            // M3 (P25): 无书签时 Ctrl+G 按了没反应 —— 说清为什么。
+            self.notice = Some(("尚无书签 (b 添加)".into(), NoticeKind::Info));
+            self.refresh_status();
         }
     }
 }
@@ -1173,8 +1193,8 @@ impl App for LogApp {
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
-            Msg::Notice(text) => {
-                self.notice = Some(text);
+            Msg::Notice(text, kind) => {
+                self.notice = Some((text, kind));
                 self.refresh_status();
             }
             Msg::SelectTheme(idx) => {
@@ -1241,6 +1261,10 @@ impl App for LogApp {
         }
         // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
         if !self.has_file {
+            // M3 (2026-09-14 实机 M0 P26): 空态按键被吞时**说清为什么** ——
+            // 原先 `return` 静默, 用户按 Ctrl+F/方向键毫无反应。
+            self.notice = Some(("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info));
+            self.refresh_status();
             return;
         }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
@@ -1255,8 +1279,22 @@ impl App for LogApp {
                     self.goto_next_bookmark();
                     return;
                 }
-                if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
-                    self.update(Msg::ToggleMode);
+                if s.eq_ignore_ascii_case("t") {
+                    if self.schema.is_some() {
+                        self.update(Msg::ToggleMode);
+                    } else {
+                        // M3 (P23): Ctrl+T 无 JSONL 时**说清为什么** —— 原先静默。
+                        self.notice = Some(("本文件非 JSONL, 无表格模式".into(), NoticeKind::Info));
+                        self.refresh_status();
+                    }
+                    return;
+                }
+                if s.eq_ignore_ascii_case("a") {
+                    // M3 (P34): Ctrl+A 被吞 —— 说清为什么 (行多选已裁挂 v1.x,
+                    // 见 docs/ROADMAP-v1x.md §四)。
+                    self.notice = Some(("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info));
+                    self.refresh_status();
+                    return;
                 }
             }
             return;
@@ -1293,12 +1331,20 @@ impl App for LogApp {
                 let file_line = self.file_line_of(self.selected);
                 if !self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
+                } else {
+                    // M3 (P24): → 在已展开行上按了没反应 —— 说清为什么。
+                    self.notice = Some(("本行已展开".into(), NoticeKind::Info));
+                    self.refresh_status();
                 }
             }
             Key::Named(NamedKey::ArrowLeft) if self.mode == ViewMode::Table => {
                 let file_line = self.file_line_of(self.selected);
                 if self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
+                } else {
+                    // M3 (P24): ← 在未展开行上按了没反应 —— 说清为什么。
+                    self.notice = Some(("本行未展开".into(), NoticeKind::Info));
+                    self.refresh_status();
                 }
             }
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
@@ -2063,5 +2109,168 @@ mod tests {
         assert!(app.filtered.is_none());
         assert!(app.search.is_none());
         std::fs::remove_file(&p).ok();
+    }
+
+    // ---- M3 (T12): 九条沉默接入的回归锁 ----
+    //
+    // 公共判据是「触发后**出声**且**说得对**」: 只测「有提示」会放过提示写错原因
+    // 的形态, 只测「返回 Consumed/Ignored」则完全测不出这一批改动 (M3 一律不动
+    // 归因, 只加原因)。
+
+    /// 敲一个无修饰键。
+    fn press(app: &mut LogApp, key: Key) {
+        app.event(&Event::Key {
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+    }
+
+    /// 敲一个 Ctrl+字母。
+    fn press_ctrl(app: &mut LogApp, ch: &str) {
+        app.event(&Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        });
+    }
+
+    /// 造一个开了真文件 (内容自定) 的 app, 交给 `f` 跑, 收尾删文件。
+    /// 走 `has_file` 门禁**之后**的键处理路径 —— 空态会先被 P26 那条拦下。
+    fn with_file<T>(content: &[u8], f: impl FnOnce(&mut LogApp) -> T) -> T {
+        let p = temp_log(content);
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        let out = f(&mut app);
+        std::fs::remove_file(&p).ok();
+        out
+    }
+
+    /// 取当前 notice 文本; 没有则连底栏一起报出来 (方便定位是「没出声」还是
+    /// 「声出到了别处」)。
+    fn notice_of(app: &LogApp) -> String {
+        app.notice
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_else(|| panic!("须有一条 notice; 当前底栏: {}", app.status))
+    }
+
+    /// T11 回归锁: notice 是**第二条通道**, 不得拼进 `status` 串。
+    ///
+    /// 曾把它拼进去, 而 `LogView::paint` 又单独画一遍 `notice` —— 同一句话在底栏
+    /// 出现**两次**。而两遍还是同色的, 第一眼只像「重复」不像「出错」, 所以这条
+    /// 必须由守卫而不是靠眼睛。
+    #[test]
+    fn notice_is_not_folded_into_the_status_line() {
+        let mut app = LogApp::new_empty();
+        app.refresh_status();
+        app.notice = Some(("此处无行".into(), NoticeKind::Info));
+        app.refresh_status();
+        assert!(app.notice.is_some(), "前提: notice 还在");
+        assert!(
+            !app.status.contains("此处无行"),
+            "notice 不得拼进 status (会被画两遍): {}",
+            app.status
+        );
+        // 反向对照: 常态信息该在的仍在 (别把整条底栏一起删了)
+        assert!(!app.status.is_empty(), "常态信息不得一起被删掉");
+    }
+
+    /// T13 —— 「被吞掉的输入必有原因」: **本表就是规则的挂载点**。
+    ///
+    /// M3 之前本仓只有一处出声 (正则无效进底栏), 其余静默。这条把那个孤例**升格
+    /// 为规则**: 再遇到「按了没反应」, 要做的不是「记得去加提示」, 而是**往这张表
+    /// 加一行** —— 行在, 判据在, 原因就漏不掉。
+    ///
+    /// 每行给的是**期望的原因片段**, 不是「有提示就算」: 后者会放过原因写错的形态。
+    /// 本表只收**键盘路径**上的吞键; 鼠标路径各有同构的守卫
+    /// (`view.rs::click_below_the_last_row_says_there_is_no_row` /
+    /// `expand_glyph_on_a_leaf_row_says_why_instead_of_toggling` /
+    /// `histogram.rs::readonly_sidebar_swallows_clicks_but_says_why`)。
+    #[test]
+    fn every_swallowed_key_says_why() {
+        type Run = Box<dyn Fn() -> String>;
+        let rows: Vec<(&str, &str, Run)> = vec![
+            (
+                "P26 空态按键",
+                "尚未打开文件",
+                Box::new(|| {
+                    let mut app = LogApp::new_empty();
+                    assert!(!app.has_file);
+                    press(&mut app, Key::Named(NamedKey::ArrowDown));
+                    notice_of(&app)
+                }),
+            ),
+            (
+                "P23 Ctrl+T 无 JSONL",
+                "非 JSONL",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        assert!(app.schema.is_none(), "前提: 无 JSONL schema");
+                        press_ctrl(app, "t");
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P24 ← 落在未展开行",
+                "未展开",
+                Box::new(|| {
+                    with_file(b"{\"a\":{\"b\":1}}\nplain\n", |app| {
+                        app.mode = ViewMode::Table;
+                        press(app, Key::Named(NamedKey::ArrowLeft));
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P24 → 落在已展开行",
+                "已展开",
+                Box::new(|| {
+                    with_file(b"{\"a\":{\"b\":1}}\nplain\n", |app| {
+                        app.mode = ViewMode::Table;
+                        app.toggle_expand(0); // 真展开 (行 0 含嵌套)
+                        assert!(app.expanded.is_expanded(0), "前提: 行 0 已展开");
+                        press(app, Key::Named(NamedKey::ArrowRight));
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P25 Ctrl+G 无书签",
+                "尚无书签",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        assert!(app.bookmarks.is_empty(), "前提: 无书签");
+                        press_ctrl(app, "g");
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                // 口径须与 `ROADMAP-v1x.md` §四 同源 —— 写成「暂不支持」之类
+                // 就又是一处各说各话, 故断言片段锁在 "v1.x" 上。
+                "P34 Ctrl+A 被吞",
+                "v1.x",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        press_ctrl(app, "a");
+                        notice_of(app)
+                    })
+                }),
+            ),
+        ];
+        for (name, expect, run) in &rows {
+            let text = run();
+            assert!(
+                text.contains(expect),
+                "{name}: 被吞掉的输入须说出「{expect}」, 实得「{text}」"
+            );
+        }
     }
 }

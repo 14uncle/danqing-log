@@ -539,6 +539,10 @@ pub(crate) struct LogView {
     /// 选中的显示行。
     selected: u64,
     status: String,
+    /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的 —— 常态信息
+    /// `text_secondary()` / 提示 `text_primary()` / 警示 `danger()`, 见 paint。
+    /// sync 时从 `app.notice` 读; **不得**再拼进 `status` (那会画两遍)。
+    notice: Option<(String, crate::NoticeKind)>,
     mode: ViewMode,
     schema: Option<Arc<Schema>>,
     /// 过滤命中的文件行号 (升序); None = 全量。
@@ -611,6 +615,7 @@ impl LogView {
             top_row: 0.0,
             selected: 0,
             status: String::new(),
+            notice: None,
             mode: ViewMode::Raw,
             schema: None,
             filtered: None,
@@ -914,6 +919,7 @@ impl Widget for LogView {
         self.top_row = app.top_row;
         self.selected = app.selected;
         self.status = app.status.clone();
+        self.notice = app.notice.clone();
         self.mode = app.mode;
         self.schema = app.schema.clone();
         self.filtered = app.filtered.clone();
@@ -1465,6 +1471,17 @@ impl Widget for LogView {
         );
         let sy =
             status_y + (STATUS_HEIGHT - aux_line_h) / 2.0 + texts.ascent(f32::from(AUX_FONT_SIZE));
+        // M3 (2026-09-14 实机 M0 P27): notice 与常态信息**分通道** —— 原先整个
+        // status 字符串一个颜色, 错误在视觉上不存在。
+        //
+        // 三档取色: 警示 `danger()` / 提示 `text_primary()` / 常态 `text_secondary()`。
+        // 提示**不能**也用 `text_secondary()` —— 那就与常态同色, 等于没分通道
+        // (T11 的验收判据正是「同屏可辨」)。常态那一档不再随有无 notice 变化:
+        // 「降噪」既没有更暗的 token 可用, 又会让整行文字在提示出现时集体变一下。
+        let notice_color = self.notice.as_ref().map(|(_, kind)| match kind {
+            crate::NoticeKind::Warn => th.danger(),
+            crate::NoticeKind::Info => th.text_primary(),
+        });
         texts.push_text(
             &self.status,
             area.origin.x + 10.0,
@@ -1472,6 +1489,16 @@ impl Widget for LogView {
             AUX_FONT_SIZE,
             th.text_secondary(),
         );
+        if let Some((notice_text, _)) = &self.notice {
+            let status_w = texts.measure(&self.status, AUX_FONT_SIZE);
+            texts.push_text(
+                notice_text,
+                area.origin.x + 10.0 + status_w + 16.0,
+                sy,
+                AUX_FONT_SIZE,
+                notice_color.unwrap_or_else(|| th.text_primary()),
+            );
+        }
         // 设置入口 (S2): ⚙ 设置 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 设置";
         let settings_w = texts.measure(settings_label, AUX_FONT_SIZE);
@@ -1591,7 +1618,24 @@ impl Widget for LogView {
                     // S2: 命中判定与绘制位置同源 (`expand_glyph_x` / `in_expand_glyph`)
                     let in_glyph = self.in_expand_glyph(area, *position);
                     if in_glyph {
-                        msgs.push(Box::new(Msg::ToggleExpand(row)));
+                        // M3 (2026-09-14 实机 M0 P22): 表格**无 glyph 的行**点行首
+                        // 展开区照样发 `ToggleExpand` → 零反应。现在校验可展开性,
+                        // 不可展开则说清为什么。
+                        let file_line = self.line_at(row).0;
+                        let raw = self.file.as_ref().map(|f| f.line(file_line));
+                        let expandable = raw.as_ref().is_some_and(|r| {
+                            jsonl::parse_line(r)
+                                .as_ref()
+                                .is_some_and(jsonl::is_expandable)
+                        });
+                        if expandable {
+                            msgs.push(Box::new(Msg::ToggleExpand(row)));
+                        } else {
+                            msgs.push(Box::new(Msg::Notice(
+                                "本行无嵌套可展".into(),
+                                crate::NoticeKind::Info,
+                            )));
+                        }
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
                         let text_x = self.text_x(area);
@@ -1625,6 +1669,13 @@ impl Widget for LogView {
                     }
                     EventResult::Consumed
                 } else {
+                    // M3 (2026-09-14 实机 M0 P20): 点列表区**末行下方空白**被吞
+                    // 时说清为什么 —— 原先 `Ignored` 静默, 用户不知道是没点中
+                    // 还是程序没响应。
+                    msgs.push(Box::new(Msg::Notice(
+                        "此处无行".into(),
+                        crate::NoticeKind::Info,
+                    )));
                     EventResult::Ignored
                 }
             }
@@ -1650,10 +1701,10 @@ impl Widget for LogView {
                 if self.selected_text().is_some() {
                     EventResult::Consumed
                 } else if self.selection_over_limit() {
-                    msgs.push(Box::new(Msg::Notice(format!(
-                        "选区超 {} 万行未复制 (防冻结)",
-                        COPY_MAX_LINES / 10000
-                    ))));
+                    msgs.push(Box::new(Msg::Notice(
+                        format!("选区超 {} 万行未复制 (防冻结)", COPY_MAX_LINES / 10000),
+                        crate::NoticeKind::Warn,
+                    )));
                     EventResult::Ignored
                 } else {
                     EventResult::Ignored
@@ -1751,6 +1802,20 @@ const BAR_PAD_X: f32 = 10.0;
 const BAR_LABEL_GAP: f32 = 8.0;
 /// 栏顶部内偏移 (视觉下沉, 避紧贴标题栏底边)。
 const BAR_TOP_OFFSET: f32 = 3.0;
+/// 栏持焦时的**键义提示** (P33)。
+///
+/// 栏持焦后 `Space`=输入空格、`Home/End`=移光标 —— 与失焦时 (翻页 / 跳首末)
+/// 语义相反, 而 `↑↓`/`PgUp`/`PgDn` 仍滚列表。三种键三种去向, 不说就没人知道。
+/// 这几个键**不是被拒绝**, 是被输入框收下了 —— 所以这里写「归谁」而不是
+/// 「为什么不行」, 也就不能走 M3 的 notice 通道: 那会每次打空格都在底栏刷一条。
+const BAR_KEY_HINT: &str = "↑↓ 滚列表 · Space/Home/End 归输入框";
+/// 键义提示与输入区之间的间隙。
+const BAR_HINT_GAP: f32 = 16.0;
+/// 栏持焦时底边**焦点线**的高 (P6; 颜色取 `Theme::accent()`, 见 `Bar::paint`)。
+/// 输入框是 `chromeless` 的, 不自绘焦点描边, 持焦的唯一证据原先只有**半周期闪烁**
+/// 的 caret (熄灭那半周期里零指示)。定死 2px 且画在栏自己的 32px 之内 —— 不挤动
+/// 任何已有几何。
+const BAR_FOCUS_LINE: f32 = 2.0;
 /// 过滤栏空态占位 (未应用过滤时; 应用后换成 "已应用: ..." 提示, 故须可复原)。
 const FILTER_PLACEHOLDER: &str =
     "输入如 level=ERROR status=50* (AND · 尾缀 * 前缀通配) · Enter 应用 · Esc 清除 · Ctrl+T 切回";
@@ -1812,6 +1877,10 @@ pub(crate) struct Bar {
     /// 前缀标签宽度 (paint 测量缓存, event 转发与 paint 的 input_area 须一致,
     /// 否则点击定位光标会偏一个 label 宽)。
     label_width: std::cell::Cell<f32>,
+    /// 键义提示的**占位宽** (含间隙; paint 测量缓存, 与 `label_width` 同理 ——
+    /// `input_area` 靠它让位, 而 `input_area` 同时供 paint 与 event 转发使用,
+    /// 于是「提示画在哪」与「点到哪」不可能分岔)。**0 = 不显示**。
+    hint_reserved: std::cell::Cell<f32>,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
 }
@@ -1829,6 +1898,7 @@ impl Bar {
             applied_search_rev: 0,
             active: ActiveBar::Hidden,
             label_width: std::cell::Cell::new(0.0),
+            hint_reserved: std::cell::Cell::new(0.0),
             theme: crate::config::AppTheme::Light,
         }
     }
@@ -1895,8 +1965,28 @@ impl Bar {
     /// 输入矩形 (label 之后到右缘)。
     fn input_area(&self, area: Rect, label_w: f32) -> Rect {
         let text_x = area.origin.x + BAR_PAD_X + label_w + BAR_LABEL_GAP;
-        let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X).max(1.0);
+        // 持焦时右侧让出键义提示的位置 (hint_reserved 由 paint 测量后写入;
+        // 未持焦 / 放不下时为 0)。**单点收口**: paint 与 event 转发都走这里。
+        let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X - self.hint_reserved.get())
+            .max(1.0);
         Rect::from_xywh(text_x, area.origin.y, w, area.size.height)
+    }
+
+    /// 当前生效输入是否持焦。`chromeless` 下框架不画描边, 焦点态全由本容器呈现
+    /// (P6 底边线 + P33 键义提示), 故这个查询是那两处共同的判据。
+    fn input_focused(&self) -> bool {
+        self.active_input().map(|t| t.is_focused()).unwrap_or(false)
+    }
+
+    /// 当前生效角色的空态占位文案。**只给 P33 的宽度判据用** ——
+    /// 空框持焦时输入框画的就是它, 提示要避开的也正是它。
+    /// 文案本身仍由 `filter_placeholder_text` / `search_placeholder_text` 单点构造。
+    fn active_placeholder(&self) -> String {
+        match self.active {
+            ActiveBar::Filter => filter_placeholder_text(&self.filter_applied),
+            ActiveBar::Search => search_placeholder_text(&self.search_query),
+            ActiveBar::Hidden => String::new(),
+        }
     }
 
     /// 当前生效输入的引用。
@@ -2016,11 +2106,62 @@ impl Widget for Bar {
         );
         let label_w = texts.measure(label, FONT_SIZE);
         self.label_width.set(label_w);
+
+        // 持焦态两条反馈 (P33 键义提示 / P6 焦点线)。提示宽度**先测后存**,
+        // `input_area` 才好在同一帧内让位 —— 顺序反了就会压字一帧。
+        //
+        // 提示只在**输入框为空**时出现。这不是省事, 是被框架逼出来的:
+        // `TextInput::paint` **既不裁剪也不横向滚动** (源码是整串一次性
+        // `push_text`, 没有任何 scroll offset), 所以「让位」保护得了命中测试,
+        // 保护不了字形 —— 有字时长查询照旧会画进提示的地盘。空态下要避的只剩
+        // 占位文案, 那是**可测**的, 于是能给出真正的「放不下就不画」判据。
+        let focused = self.input_focused();
+        let hint_w = if focused && self.active_input().is_some_and(|t| t.value().is_empty()) {
+            let room = area.size.width - (BAR_PAD_X + label_w + BAR_LABEL_GAP) - BAR_PAD_X;
+            let w = texts.measure(BAR_KEY_HINT, FONT_SIZE);
+            let ph_w = texts.measure(&self.active_placeholder(), FONT_SIZE);
+            if room >= ph_w + BAR_HINT_GAP + BAR_LABEL_GAP + w {
+                w
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        self.hint_reserved.set(if hint_w > 0.0 {
+            hint_w + BAR_HINT_GAP
+        } else {
+            0.0
+        });
+
         let input_area = self.input_area(area, label_w);
         match self.active {
             ActiveBar::Filter => self.filter_ti.paint(input_area, rects, texts),
             ActiveBar::Search => self.search_ti.paint(input_area, rects, texts),
             ActiveBar::Hidden => {}
+        }
+
+        if hint_w > 0.0 {
+            // 右对齐推 x: 提示尾端贴栏的右内边距, 与输入区让出的宽度同源。
+            texts.push_text(
+                BAR_KEY_HINT,
+                area.origin.x + area.size.width - BAR_PAD_X - hint_w,
+                baseline,
+                FONT_SIZE,
+                th.text_secondary(),
+            );
+        }
+        if focused {
+            rects.push_rect(
+                Rect::from_xywh(
+                    area.origin.x,
+                    area.origin.y + FILTER_BAR_H - BAR_FOCUS_LINE,
+                    area.size.width,
+                    BAR_FOCUS_LINE,
+                ),
+                th.accent(),
+                0.0,
+            );
         }
     }
 
@@ -2170,6 +2311,328 @@ mod tests {
         assert!(applied.contains(r"\d{4}"), "应用后显示查询词: {applied}");
         let cleared = search_placeholder_text("");
         assert_eq!(cleared, SEARCH_PLACEHOLDER, "清除后复原空态文案");
+    }
+
+    /// 造一个生效角色 = 过滤的栏 (正式路径下 `active` 由 `sync` 从 LogApp 算出,
+    /// 这里直接置位 —— 本节只测 paint/event 两条反馈通路, 与 active 怎么来的无关)。
+    fn bar_for_test(focused: bool) -> Bar {
+        let mut bar = Bar::new();
+        bar.active = ActiveBar::Filter;
+        if focused {
+            let area = Rect::from_xywh(0.0, 0.0, 800.0, FILTER_BAR_H);
+            let mut msgs = danqing::widget::MsgQueue::new();
+            bar.event(&Event::FocusIn, area, &mut msgs);
+        }
+        bar
+    }
+
+    /// 「这个矩形以这个颜色被画了」—— 断言 paint 的产出, 不是标志位。
+    fn rect_painted(rects: &RectBatch, r: Rect, c: Color) -> bool {
+        let want = lin(c);
+        let got = rects.instance_rects();
+        let colors = rects.instance_colors();
+        got.iter()
+            .zip(colors.iter())
+            .any(|(g, col)| *g == r && *col == want)
+    }
+
+    /// 够宽的栏 —— 提示放得下, 让断言不受字体宽度摆动的干扰。
+    fn wide_bar_area() -> Rect {
+        Rect::from_xywh(0.0, 0.0, 1600.0, FILTER_BAR_H)
+    }
+
+    /// P33 / P6 回归锁: 栏持焦时必须**画出**键义提示与底边焦点线。
+    ///
+    /// 断言的是 paint 产出的**矩形与字形**, 不是标志位 —— 「有状态却没画」正是
+    /// 这一类缺陷的原始形态。未持焦态同时作对照: 两条反馈都不该出现。
+    #[test]
+    fn focused_bar_paints_key_hint_and_focus_line() {
+        let area = wide_bar_area();
+        let th = crate::config::AppTheme::Light.theme();
+        let mut blurred_rects = RectBatch::new();
+        let mut blurred_texts = TextBatch::new();
+        bar_for_test(false).paint(area, &mut blurred_rects, &mut blurred_texts);
+
+        let bar = bar_for_test(true);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+
+        let line = Rect::from_xywh(0.0, FILTER_BAR_H - BAR_FOCUS_LINE, 1600.0, BAR_FOCUS_LINE);
+        assert!(
+            rect_painted(&rects, line, th.accent()),
+            "持焦时底边应有一条 accent 焦点线: {rects:?}"
+        );
+        assert!(
+            texts.len() > blurred_texts.len(),
+            "持焦时须多画出提示字形: {} vs {}",
+            texts.len(),
+            blurred_texts.len()
+        );
+        // 提示是最后压入的一串字形, 故末位字形的颜色就是提示色。
+        // `TextBatch::instance_colors` 返回的是**线性**分量 (与 `RectBatch` 那支
+        // 返回 `[f32;4]` 不同型), 故按字段取 —— 也免得引框架私有的 `LinearRgba`。
+        let colors = texts.instance_colors();
+        assert_eq!(
+            colors
+                .last()
+                .map(|c| [c.r, c.g, c.b, c.a] == lin(th.text_secondary())),
+            Some(true),
+            "键义提示须用 text_secondary (与输入文本/占位可辨)"
+        );
+    }
+
+    /// P33 边界: **框里有字就不画提示** —— 框架的 `TextInput::paint` 既不裁剪也不
+    /// 横向滚动 (整串一次性 `push_text`), 「让位」保护得了命中测试、保护不了字形,
+    /// 长查询会直接画进提示的地盘。故只在空框时画, 那时要避的只剩占位文案。
+    ///
+    /// 但**焦点线不跟着消失**: 「焦点在哪」与「键义怎么说」是两件事。
+    #[test]
+    fn focused_bar_with_text_drops_the_hint_but_keeps_the_focus_line() {
+        let area = wide_bar_area();
+        let th = crate::config::AppTheme::Light.theme();
+        let mut bar = bar_for_test(true);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        bar.event(
+            &Event::Key {
+                key: Key::Character("a".to_string()),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(!bar.filter_ti.value().is_empty(), "前提: 框里已有字");
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+
+        assert_eq!(bar.hint_reserved.get(), 0.0, "有字时不画提示");
+        let line = Rect::from_xywh(0.0, FILTER_BAR_H - BAR_FOCUS_LINE, 1600.0, BAR_FOCUS_LINE);
+        assert!(
+            rect_painted(&rects, line, th.accent()),
+            "焦点线不该跟提示一起消失"
+        );
+    }
+
+    /// P33 回归锁: 让位宽度与提示绘制**同源** —— 提示占多少, 输入区就退多少。
+    ///
+    /// 两处各写一份式子迟早漂成「提示压在用户正打的正则上」或「点到的光标位置偏
+    /// 一格」(后者是本仓 `label_width` 已经踩过一次的形态)。
+    #[test]
+    fn focused_bar_gives_the_input_area_room_for_the_key_hint() {
+        let area = wide_bar_area();
+        let bar = bar_for_test(true);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+
+        let label_w = bar.label_width.get();
+        let reserved = bar.hint_reserved.get();
+        assert!(reserved > 0.0, "1600px 宽的栏放得下提示");
+        let full = area.size.width - (BAR_PAD_X + label_w + BAR_LABEL_GAP) - BAR_PAD_X;
+        let got = bar.input_area(area, label_w).size.width;
+        assert!(
+            (got - (full - reserved)).abs() < 0.01,
+            "输入区须正好让出提示占位: 实得 {got}, 应为 {}",
+            full - reserved
+        );
+
+        let blurred = bar_for_test(false);
+        let mut r2 = RectBatch::new();
+        let mut t2 = TextBatch::new();
+        blurred.paint(area, &mut r2, &mut t2);
+        assert_eq!(blurred.hint_reserved.get(), 0.0, "未持焦一分不让");
+    }
+
+    /// P33 边界: 窄窗放不下提示时**宁可不画**, 也不让它压在输入文本上;
+    /// 但焦点线仍在 (提示放不下 ≠ 焦点不可见)。
+    #[test]
+    fn narrow_bar_drops_the_key_hint_but_keeps_the_focus_line() {
+        let area = Rect::from_xywh(0.0, 0.0, 240.0, FILTER_BAR_H);
+        let bar = bar_for_test(true);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+
+        assert_eq!(bar.hint_reserved.get(), 0.0, "240px 宽的栏放不下提示");
+        let line = Rect::from_xywh(0.0, FILTER_BAR_H - BAR_FOCUS_LINE, 240.0, BAR_FOCUS_LINE);
+        assert!(
+            rect_painted(
+                &rects,
+                line,
+                crate::config::AppTheme::Light.theme().accent()
+            ),
+            "焦点线不该跟提示一起消失"
+        );
+    }
+
+    /// P33 内容锁: 提示点名的键 = 输入框**真的会吞**的键。
+    ///
+    /// 不写成「常量含某某字样」那种自证 —— 逐个键真喂给 TextInput, 吞得下的才要求
+    /// 提示点名。于是「框架改了键分支」和「有人为了排版把词删掉」都会红。
+    #[test]
+    fn key_hint_names_every_key_the_input_swallows() {
+        let area = Rect::from_xywh(0.0, 0.0, 400.0, FILTER_BAR_H);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let mut ti = TextInput::themed(&LightTheme).font_size(FONT_SIZE);
+        let mut swallows = |ti: &mut TextInput, key: Key| {
+            ti.event(
+                &Event::Key {
+                    key,
+                    pressed: true,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                },
+                area,
+                &mut msgs,
+            ) == EventResult::Consumed
+        };
+        // 被吞 = 语义相对失焦态翻转 (输入空格 / 移光标), 提示必须逐键点名
+        for (name, key) in [
+            ("Space", Key::Named(NamedKey::Space)),
+            ("Home", Key::Named(NamedKey::Home)),
+            ("End", Key::Named(NamedKey::End)),
+        ] {
+            assert!(swallows(&mut ti, key), "{name} 应被输入框吞下 (本锁的前提)");
+            assert!(
+                BAR_KEY_HINT.contains(name),
+                "提示漏了 {name} —— 它持焦后已改归输入框"
+            );
+        }
+        // ↑↓ 是**没被吞**的那一半: 栏持焦时仍滚列表, 同样要点名
+        assert!(
+            !swallows(&mut ti, Key::Named(NamedKey::ArrowDown)),
+            "↓ 不该被输入框吞 —— 它仍要滚列表"
+        );
+        assert!(BAR_KEY_HINT.contains("↑↓"), "提示须点明 ↑↓ 仍滚列表");
+    }
+
+    /// 消息队列里有没有一条说中某句话的 notice。
+    fn said(msgs: &[Box<dyn std::any::Any>], needle: &str) -> bool {
+        msgs.iter().any(|m| {
+            matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::Notice(t, _)) if t.contains(needle)
+            )
+        })
+    }
+
+    /// M3/T12 (P20): 点列表区**末行下方空白**原先完全沉默 —— 现在说清「此处无行」。
+    ///
+    /// 归因**刻意不动**: 仍返回 `Ignored`, 点击照旧穿透去清焦点 (归因是 M4 的活)。
+    /// 所以这里同时锁住「出了声」与「没改归因」两件事。
+    #[test]
+    fn click_below_the_last_row_says_there_is_no_row() {
+        let (mut v, path) = cell_fixture("m3-p20");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let list_h = area.size.height - HEADER_H - STATUS_HEIGHT;
+        let ev = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(300.0, area.origin.y + HEADER_H + list_h + 8.0),
+        };
+        let mut msgs = danqing::widget::MsgQueue::new();
+        assert_eq!(
+            v.event(&ev, area, &mut msgs),
+            EventResult::Ignored,
+            "空白处点击的归因不变 (仍穿透)"
+        );
+        assert!(said(&msgs, "此处无行"), "须说清为什么没反应");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// M3/T11 回归锁: notice 是**第二条通道**, 不是常态串的一段。
+    ///
+    /// 两个具体缺陷都是写这一节时真发生过的:
+    /// ① `refresh_status` 曾把 notice 拼进 `status`, 而 paint 又单独画了一遍
+    ///    `notice` —— 同一句话在底栏出现**两次**;
+    /// ② `Info` 档曾与常态同用 `text_secondary()` —— **同色即同通道**, P27
+    ///    「错误在视觉上不存在」原样复活 (写这段时的 if/else 两个分支干脆写成了
+    ///    同一个值, 注释还写着「降噪」)。
+    ///
+    /// 所以这里断言的是**取色**与**不重复**, 不是「画了没有」。
+    #[test]
+    fn notice_is_drawn_once_in_a_color_of_its_own() {
+        let (mut v, path) = cell_fixture("m3-t11");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let th = v.theme.theme();
+        let status = v.status.clone();
+
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let plain = texts.instance_colors();
+
+        v.notice = Some(("此处无行".into(), crate::NoticeKind::Info));
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let with_notice = texts.instance_colors();
+
+        let n = "此处无行".chars().count();
+        assert_eq!(
+            with_notice.len() - plain.len(),
+            n,
+            "notice 只能多画它自己这一串 —— 多出来的就是被画了两遍: {status:?}"
+        );
+        // 颜色按**重数差**验, 不按下标取: notice 后面还压着设置入口与位置计数,
+        // 而插入点在 status 之后 —— 拿总长当下标会切到尾部那几串上去 (本测试第一版
+        // 就是这么错的)。前后两批只差 notice, 故差值就是它的字形数。
+        let want = lin(th.text_primary());
+        let before = plain
+            .iter()
+            .filter(|c| [c.r, c.g, c.b, c.a] == want)
+            .count();
+        let after = with_notice
+            .iter()
+            .filter(|c| [c.r, c.g, c.b, c.a] == want)
+            .count();
+        assert_eq!(
+            after - before,
+            n,
+            "Info 档 notice 须以 `text_primary` 画出 {n} 个字形 —— 与常态的 \
+             `text_secondary` 同色就是没分通道 (T11 判据: 同屏可辨)"
+        );
+        assert_ne!(
+            lin(th.text_primary()),
+            lin(th.text_secondary()),
+            "前提: 框架这两个 token 本身就不同色"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// M3/T12 (P22): 表格里点**无 glyph 行**的行首展开区 —— 原先照样发
+    /// `ToggleExpand`, 落地零反应。
+    ///
+    /// 两侧都断言: 「不发 ToggleExpand」**且**「有一条说清原因的 notice」。
+    /// 只测后者会放过「既出声又照发消息」的半吊子修法, 那样点一下仍然会折叠出
+    /// 一段并不存在的展开块。
+    #[test]
+    fn expand_glyph_on_a_leaf_row_says_why_instead_of_toggling() {
+        let (mut v, path) = cell_fixture("m3-p22");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        // 行 1 = `{"level":"INFO"}`, 无嵌套 → 不可展开
+        let ev = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(
+                LogView::expand_glyph_x(area) + 2.0,
+                HEADER_H + ROW_HEIGHT + 5.0,
+            ),
+        };
+        let mut msgs = danqing::widget::MsgQueue::new();
+        v.event(&ev, area, &mut msgs);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ToggleExpand(_)))),
+            "不可展开的行不得发 ToggleExpand (落地零反应正是原缺陷)"
+        );
+        assert!(said(&msgs, "无嵌套可展"), "须说清为什么展不开");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

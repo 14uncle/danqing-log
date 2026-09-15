@@ -4,9 +4,10 @@
 > 矩阵 (兼实机核对单): `tasks/matrix-interaction-polish.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
 > 构建序: **M1 (框架) → M2 → M3 → M4 → M5**; commit/push 点标 ⏸ 待用户点头。
-> 基线: 本仓 **133 绿** (51 lib + 74 main + 8 genlog); 框架 **600 lib** + 集成 59 绿
-> (2026-09-14 M1 完成后实测。**原记 115 / 583 都是旧数字** —— 115 是 selection-copy
-> 之前的, 那之后 main 从 56 涨到 74; 记账前先量, 别抄旧数)。
+> 基线: 本仓 **151 绿** (51 lib + 92 main + 8 genlog, 2026-09-15 M3 完成后实测);
+> 框架 **600 lib** + 集成 59 绿 (**M3 未动框架, 仍是 M1 后的数**)。
+> 记账前先量, 别抄旧数: 原记 133 (M1 后) / 115 (selection-copy 前) 都是那时的真数,
+> 只是会过期 —— main 从 74 → 82 (M2) → 92 (M3)。
 > **M0 (用户实机走查 5 条) 在 build 前**: P10 / P11 / P19 / P30 / P31。
 
 ## Phase M1: 框架 (danqing)
@@ -216,7 +217,7 @@
   - **实现**: 选区带在超限时换 `th.danger()` (拖选进行中即变)
   - 两条新测试: 超限用 danger / 未超限仍用 sel (不误报)
 
-- [ ] **P6 (由 M1 转入, 2026-09-14 归位)**: 过滤/搜索栏的**焦点不可见**
+- [x] **P6 (由 M1 转入, 2026-09-14 归位)**: 过滤/搜索栏的**焦点不可见**
   - **为什么转来**: 原挂在 M1 (框架), 但实现位置在**产品侧** ——
     `src/view.rs:1799` 的 `.chromeless()` 是**产品**选择的(为了去掉输入框自带边框,
     因为它嵌在过滤栏里), 框架只是「chromeless 时不画焦点描边」
@@ -228,6 +229,13 @@
     两栏 (过滤/搜索) 各自可辨; `chromeless` 的外观在未持焦时保持不变。
   - Files: `src/view.rs`
   - Scope: S
+  - **实现 (2026-09-15, 与 P33 同批)**: `Bar::input_focused()` (读
+    `TextInput::is_focused()`) 判据, 持焦时在栏**底边**画一条 2px `accent()` 线;
+    未持焦时一条不多画。守卫 `focused_bar_paints_key_hint_and_focus_line` /
+    `narrow_bar_drops_the_key_hint_but_keeps_the_focus_line` (后者同时锁
+    「提示放不下 ≠ 焦点不可见」)。
+  - **附记**: 「两栏各自可辨」由 `active` 单点决定 (同一槽位同一时刻只有一栏可见),
+    不存在两栏同时可辨的问题; 原措辞是把「切换角色」当成了「并排两栏」。
 
 - [x] **T10: 命绘同源收口 (S1 S2 S3)**
   - 说明: S1 行 y 映射 (paint 循环式 `view.rs:1045,1058` ↔ `row_at` `:695-697`);
@@ -245,7 +253,7 @@
 
 ## Phase M3: 拒绝要说清 (本仓, 依赖 M1)
 
-- [ ] **T11: notice 通道 + 错误态独立视觉 (P27)** 【已复核】—— **地基**
+- [x] **T11: notice 通道 + 错误态独立视觉 (P27)** 【已复核】—— **地基**
   - 说明: 现状所有状态拼进**同一个** `self.status`, 用 `th.text_secondary()` 画
     (`view.rs:1408-1414`), 错误与常态**同色同字号**。拆成**常态信息** (打开耗时 /
     行数 / FOLLOW / 模式 / 命中计数) 与**瞬时反馈 (notice)** 两条通道;
@@ -256,8 +264,22 @@
   - Verify: `cargo test`
   - Files: `src/view.rs`, `src/main.rs`
   - Scope: M
+  - **实现 (2026-09-15)**: `LogView::notice` 字段 (sync 从 `app.notice` 取),
+    paint 里与 `status` **各画各的**; 三档取色 —— 警示 `danger()` /
+    提示 `text_primary()` / 常态 `text_secondary()`。
+  - **写这节时自己踩了两个坑, 都是「分通道」的字面反转, 已修并加锁**:
+    ① `refresh_status` 把 notice 拼进了 `status`, 而 paint 又单独画一遍 `notice`
+    —— **同一句话在底栏出现两次** (且同色, 第一眼只像重复不像出错);
+    ② `Info` 档与常态同用 `text_secondary()` (那个 if/else 两个分支写成了同一个
+    值, 注释还写着「降噪」) —— **同色即同通道**, P27 原样复活。
+    守卫: `notice_is_not_folded_into_the_status_line` (main) /
+    `notice_is_drawn_once_in_a_color_of_its_own` (view, 已做 A/B: 把色改回
+    `text_secondary` 精确红在计数上)。
+  - **②「几何高度不变」的落实方式是「notice 画在已有状态栏行内」** ——
+    不新增行、不改 `STATUS_HEIGHT`, 故不存在「提示顶高状态栏」的路径;
+    这也正是截图取景不受影响的原因。
 
-- [ ] **T12: 九条沉默接入 (P20 P21 P22 P23 P24 P25 P26 P33 P34)**
+- [x] **T12: 九条沉默接入 (P20 P21 P22 P23 P24 P25 P26 P33 P34)**
   - 说明: 逐条给「为什么不行」的原因, 全部走 T11 的通道。
     P20 点空白 (`view.rs:1527-1568`) / P21 不可点桶行 (`histogram.rs:456-458`) /
     P22 无 glyph 行的展开区 (`view.rs:1531` 不校验可展开) / P23 Ctrl+T 无 JSONL
@@ -269,13 +291,59 @@
   - Verify: `cargo test`
   - Files: `src/view.rs`, `src/main.rs`, `src/histogram.rs`
   - Scope: L
+  - **实现 (2026-09-15)**: 八条走 T11 notice 通道 (P20–P26 P34); **P33 例外** ——
+    见下面那条与 spec §4 的裁决补记。
+  - **一条既有测试跟着改判** (`histogram.rs::readonly_sidebar_swallows_clicks_...`):
+    它原断言「只读侧栏不得发消息」, 与 P21 直接对立。改法是**保留「不穿透」这条
+    不变式、反转「不发声」那条**, 并加强成「恰好一条、且是带原因的 Notice」——
+    删掉它就等于把「只读态点击穿透去选中底下的行」这个真缺陷放回来。
 
-- [ ] **T13: 「被吞掉的输入必有原因」守卫**
+- [x] **T13: 「被吞掉的输入必有原因」守卫**
   - 说明: 把本仓孤例 (「正则无效」进底栏 `main.rs:1006-1008`) **升格为规则**
   - Acceptance: 守卫覆盖 T12 的 9 个触发点; 新增「被吞输入」时有处可挂 (不是逐条靠人记)
   - Verify: `cargo test`
   - Files: `src/main.rs` (或 `src/view.rs`)
   - Scope: S
+  - **实现 (2026-09-15)**: 落成**一张表**, 不是一个散落的测试集 ——
+    `main.rs::every_swallowed_key_says_why` 的 `rows` 即「键盘路径上被吞的输入」
+    的总清单, 每行 = (站点, **期望的原因片段**, 触发闭包)。于是「有处可挂」是字面
+    的: 再遇到按了没反应, 加一行即可, 且必须写出期望片段 (只写「有提示就算」会放过
+    原因写错的形态)。鼠标路径三条各有同构守卫, 在表的 doc comment 里互相指路
+    (`view.rs` 两条 + `histogram.rs` 一条)。
+  - **为什么不做成一条跨模块的表**: 三条鼠标站点在各自组件的 `event` 里, 要在一处
+    驱动它们得搭起整棵控件树 —— 那样测的就不再是那三个站点本身。
+
+### T12 的例外: P33 不走 notice 通道 (2026-09-15 改判, 已获用户批准动框架)
+
+**原计划 (spec §4)**: 「说清当前焦点下的键义 (至少 ↑↓)」, 与其余八条一样进 T11 的
+notice。
+
+**改判理由 —— 这八条与 P33 有一处根本不同: 前八条是「拒绝」, P33 是「改道」**。
+`Space`/`Home`/`End` 在栏持焦时**并没被拒绝**, 是输入框收下了:
+- notice 的语义是「你这个动作没生效, 因为 X」; P33 是「你这个动作生效了, 只是去到了
+  另一个地方」。用拒绝的口吻说改道, 是在说一句不准确的话。
+- 更要命的是**触发时机**: 键路径上没有「用户是想翻页还是想打空格」的判据, 只能按
+  键触发 —— 那就变成**每打一个空格都在底栏刷一条 notice**。写正则给日志做过滤时,
+  底栏会一路闪。
+
+**改法是把它做成「状态提示」而不是「事件反馈」**: 栏持焦时栏内右侧**常驻**一条
+`↑↓ 滚列表 · Space/Home/End 归输入框`, 与 P6 的焦点线同批 (同一个 `is_focused()`
+判据)。于是它随焦点出现、随焦点消失 —— 恰好是它该在的时机: 用户刚把焦点放进栏里。
+
+**框架改动授权没用上**: 用户批了「P33 批准动框架」, 但查证发现
+`TextInput::is_focused()` **早已是公开方法** (其 doc 明写「焦点态描边由外层经
+`Self::is_focused` 查询后画在自己的外壳矩形上」)—— 框架本来就是按「chromeless 由
+外层自绘焦点」设计的, P6/P33 正是那个外层。故本次**零框架改动**, 授权原样保留。
+
+**让位与绘制同源**: 提示宽度由 paint 测量后写进 `Bar::hint_reserved` (与
+`label_width` 同一套缓存), `input_area` 统一扣减 —— 于是「提示画在哪」与
+「点在哪儿放光标」不可能分岔。窄窗放不下时**不显示提示, 但焦点线照旧**。
+
+**守卫 (`view.rs`)**: `focused_bar_paints_key_hint_and_focus_line` (画了, 且用
+`text_secondary` 与输入文本可辨) / `focused_bar_gives_the_input_area_room_for_the_key_hint`
+(让位宽度 = 提示宽度 + 间隙) / `narrow_bar_drops_the_key_hint_but_keeps_the_focus_line` /
+`key_hint_names_every_key_the_input_swallows` (**内容锁, 且不是自证** —— 逐个键真喂给
+`TextInput`, 吞得下的才要求提示点名; 框架改了键分支或有人为排版删词都会红)。
 
 ## Phase M4: 前提与归属 (本仓, 依赖 M1)
 
