@@ -203,7 +203,13 @@ pub(crate) struct LogApp {
     /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
     search_clear_rev: u64,
     /// 一次性焦点请求：开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
-    focus_bar: bool,
+    /// 一次性焦点请求目标 (见 `focus_request`): `"log-bar"` = 过滤/搜索栏,
+    /// `"log-view"` = 日志列表。`None` = 不请求。
+    ///
+    /// 泛化自原先的 `focus_bar: bool` —— 打开文件后也得把焦点送进列表 (T14 之后
+    /// 高亮只在持焦时画, 否则打开文件看到的是「一行都没选中」, 而按 ↑↓ 只动底栏
+    /// 行号、屏上什么都不动: 本模块自己判据里的「按了没反应」)。
+    focus_target: Option<&'static str>,
     /// 已应用搜索的导航态 (命中表 + 当前位置)。
     search: Option<SearchNav>,
     search_query: String,
@@ -386,7 +392,7 @@ impl LogApp {
             expanded: ExpandMap::new(),
             sub_rows: std::collections::BTreeMap::new(),
             expand_rev: 0,
-            focus_bar: false,
+            focus_target: None,
             path: PathBuf::new(),
             follow: false,
             last_stat_poll: Instant::now(),
@@ -724,6 +730,12 @@ impl LogApp {
         self.follow = false;
         self.notice = None;
         self.notice_until = None;
+        // **把焦点送进列表** (T14 之后高亮只在持焦时画): 不送的话, 打开文件看到的
+        // 是「一行都没选中」, 而按 ↑↓ 只动底栏行号、屏上什么都不动 —— 正是本模块
+        // 自己那条判据要消灭的「按了没反应」。只在 **Fresh** (换了文件) 时送:
+        // rebuild/append 走的是 `apply_rebuild`/`apply_appended`, 不动焦点, 免得
+        // 轮转或追长时把正在栏里打字的用户拽走。
+        self.focus_target = Some("log-view");
         self.refresh_status();
     }
 
@@ -1082,7 +1094,7 @@ impl LogApp {
             self.mode = ViewMode::Raw;
         } else {
             self.mode = ViewMode::Table;
-            self.focus_bar = true;
+            self.focus_target = Some("log-bar");
         }
         self.refresh_status();
     }
@@ -1094,7 +1106,7 @@ impl LogApp {
     /// 没持焦 → 聚焦 (草稿原样留着); 已持焦 → 全选 (直接覆写)。
     /// 清空仍归 Esc, 那条路径没动。
     fn open_search(&mut self) {
-        self.focus_bar = true;
+        self.focus_target = Some("log-bar");
         self.search_refocus_rev += 1;
         self.refresh_status();
     }
@@ -1617,16 +1629,12 @@ impl App for LogApp {
 
     /// 焦点为空时的一次性恢复请求：开搜索/进表格时把焦点给栏 (via `log-bar`)。
     fn focus_request(&self) -> Option<&'static str> {
-        if self.focus_bar {
-            Some("log-bar")
-        } else {
-            None
-        }
+        self.focus_target
     }
 
     /// 消费焦点请求 (逐帧调用，一次性：置位后立即清除，避免 Esc 后误拉回)。
     fn focus_restored(&mut self) {
-        self.focus_bar = false;
+        self.focus_target = None;
     }
 
     fn window_title(&self) -> Option<String> {
@@ -2250,6 +2258,52 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// **打开文件后必须有人持焦** (review 轮补的第四条): T14 把「选中行高亮」改成
+    /// 只在 `LogView` 持焦时才画 (`visible_selection` 的焦点门禁), 而 `Ctrl+O`
+    /// 打开文件后**没有任何控件**持焦 —— 于是打开 1GB 日志看到的是「一行都没选中」,
+    /// 按 ↑↓ 只动底栏行号、屏上什么都不动: 正是本模块判据① (按了有没有立刻的
+    /// 变化) 要消灭的那一类。修法是 `apply_fresh` 尾部把焦点送进列表。
+    ///
+    /// **两半都要钉**: Fresh 送、append 不送。后者若也送, 后台追长 / 轮转会把正在
+    /// 过滤栏里打字的用户当场拽走 (焦点一挪, 接下来敲的字就不进栏了)。
+    #[test]
+    fn fresh_open_hands_focus_to_the_list_but_append_does_not() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("2026-09-05 12:00:01 ERROR one\n".as_bytes());
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+
+        // 打开文件 (Fresh): 焦点必须送进列表
+        app.focus_target = Some("log-bar"); // 假装用户正停在过滤栏
+        app.apply_fresh(p.clone(), out);
+        assert_eq!(
+            app.focus_target,
+            Some("log-view"),
+            "打开文件后须把焦点送进列表 —— T14 起高亮只在持焦时画, 不送就是「一行没选中」"
+        );
+
+        // 对照: **追加**不得动焦点 (用户可能正在栏里打字)
+        app.focus_target = Some("log-bar");
+        app.level_counts = Arc::new(levels::count_levels(&app.file));
+        app.levels_pending = false;
+        let p2 =
+            temp_log("2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n".as_bytes());
+        app.apply_appended(LogFile::open(&p2).unwrap(), None);
+        assert_eq!(
+            app.focus_target,
+            Some("log-bar"),
+            "追长/轮转不得抢焦点 —— 否则正在过滤栏里打的字当场丢失"
+        );
+
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
     /// 轮转/重建: 计数重新后台算, 且列名与子句表跟着换 —— JSONL 变明文后必须
     /// 降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
     #[test]
@@ -2583,7 +2637,7 @@ mod tests {
         app.open_search();
         assert_eq!(app.search_clear_rev, clear0, "Ctrl+F 不得再触发清空");
         assert_eq!(app.search_refocus_rev, refocus0 + 1, "改为请栏处理重聚焦");
-        assert!(app.focus_bar, "仍要把焦点送进栏");
+        assert_eq!(app.focus_target, Some("log-bar"), "仍要把焦点送进栏");
 
         // 对照: Esc 那条路**仍然**清空 (本项只动「回到搜索框」这一条)
         app.clear_search();
