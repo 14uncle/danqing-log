@@ -303,7 +303,11 @@ impl Widget for LevelHistogram {
         }
 
         for (i, level) in Level::ALL.iter().enumerate() {
-            let row_y = area.origin.y + PAD_Y + inset + i as f32 * ROW_H;
+            // S3 (2026-09-14): 行几何**只认 `row_rect` 一个真身** —— 原先这里
+            // 内联 `area.origin.y + PAD_Y + inset + i*ROW_H`, 与 `row_rect`/`row_at`
+            // 各推一遍, 「同规则同常量」只靠注释维持。收口后 paint/命中/高亮三处同源。
+            let row_rect = row_rect(area, i, inset);
+            let row_y = row_rect.origin.y;
             let baseline = row_y + texts.ascent(f32::from(LABEL_SIZE));
 
             // 生效行: 整行淡底 (比给横条换色更醒目, 且不动语义色)

@@ -154,6 +154,27 @@ fn row_hover_bg(theme: crate::config::AppTheme) -> Color {
     }
 }
 
+/// 搜索命中行底色 —— **与选中行同族但弱一档**, 让「搜索留下的痕迹」与「当前选中」
+/// 在画面上可分 (2026-09-14 实机 M0 P11/P14: 原先两者同用 `th.selection()`,
+/// 命中行把 hover 与选中行都盖掉)。
+///
+/// 派生规则: **同 RGB, α 减半** —— 浅色 0.30 → 0.15, 暗色 0.20 → 0.10。
+/// 减半不是拍的: 命中行要「比一般选中行更弱、但仍在」; α 减半后合成亮度离底色
+/// 约一半, 与选中行拉开一档, 又不至于淡到看不出。
+///
+/// **为什么放产品侧** (与 `row_band_bg` / `row_hover_bg` 同一规矩, 见本文件 126 行
+/// 「产品语义放产品侧」): 「搜索命中行」是日志查看器的语义, 不是通用 UI 语义;
+/// 框架 `Theme` 只给**通用**调色板, 不替产品定语义色。
+fn hit_row_bg(theme: crate::config::AppTheme) -> Color {
+    let th = theme.theme();
+    let sel = th.selection();
+    let a = match theme {
+        crate::config::AppTheme::Light => 0.15, // sel α 0.30 减半
+        crate::config::AppTheme::Dark => 0.10,  // sel α 0.20 减半
+    };
+    Color::rgba(sel.r, sel.g, sel.b, a)
+}
+
 /// 单元格高亮的两笔颜色 (底色, 描边)。
 ///
 /// **底笔与行选中同 token 是有意的** —— 单元格是行内**更具体**的选中, 底色沿用
@@ -679,6 +700,18 @@ impl LogView {
         })
     }
 
+    /// 展开标识区的命中判定与绘制位置 —— **S2 (2026-09-14)**: 原先
+    /// paint (`area.origin.x + 2.0`) 与 event (`position.x - area.origin.x < EXPAND_W`)
+    /// 两处各写同一个常量, 「同规则同常量」只靠注释维持。抽成单点, 两处同源。
+    fn expand_glyph_x(area: Rect) -> f32 {
+        area.origin.x + 2.0
+    }
+
+    /// 展开标识区命中: 表格模式且 x 落在 [area.origin.x, area.origin.x + EXPAND_W)。
+    fn in_expand_glyph(&self, area: Rect, position: Point) -> bool {
+        self.table_mode() && position.x - area.origin.x < EXPAND_W
+    }
+
     /// 行文本区左键按下的选区处理 (T3)。双击 (300ms/4px, title_bar 先例) =
     /// 文本区左缘 (绝对窗口 x) = 展开标识区 + 行号槽 + 间距。
     /// **与 paint 同源** —— 原先 paint / 命中测试 / 按下分流各推一遍同一个式子,
@@ -1004,9 +1037,9 @@ impl Widget for LogView {
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
         let rows_bottom = rows_top + list_h;
-        // 选区 (T3): 命中几何随可见窗口逐帧重建; 非空选区存在时行选中视觉让位
+        // 选区 (T3): 命中几何随可见窗口逐帧重建; 行选中视觉不再因选区存在而让位
+        // (T6, 2026-09-14 实机 M0 P10: 原先 `has_text_sel` 压制选中行底与 accent 竖条)
         self.row_geom.borrow_mut().clear();
-        let has_text_sel = self.selection.as_ref().is_some_and(|s| !s.is_empty());
         // 空态欢迎 (无参启动): 列表区居中两行提示; 行循环 count=0 本就不画
         if !self.has_file {
             let mid_y = rows_top + list_h / 2.0;
@@ -1042,7 +1075,15 @@ impl Widget for LogView {
         let scan_limit = (first + (frac + list_h / ROW_HEIGHT).ceil() as u64 + 2).min(count);
         // 展开块底色是**最底层**: 整层先铺完, 下面行循环里的斑马/选中/hover 才压得住它。
         // 一段连续子行只出一个矩形 —— 逐行铺会在行交界留下抗锯齿的浅色缝。
-        let row_y = |j: u64| rows_top + (j - first) as f32 * ROW_HEIGHT - frac * ROW_HEIGHT;
+        // **S1 (2026-09-14)**: 行 y 映射单点化 —— paint 的 `row_y` 与 event 的
+        // `row_at` 原先各推一遍同一个式子 (rows_top + (i-first)*ROW_HEIGHT - frac*ROW_HEIGHT),
+        // 三处任一漂了都会让「点得到的地方」与「画出来的地方」错开。
+        // 现在 `row_at` 是 event 侧的唯一真身, paint 侧复用它反推 y。
+        let row_y = |j: u64| {
+            // 与 row_at 的逆运算: row_at(rel_y) = (top_row + rel_y/ROW_HEIGHT) as u64
+            // → rel_y = (j - top_row) * ROW_HEIGHT; 绝对 y = rows_top + rel_y
+            rows_top + (j as f64 - self.top_row) as f32 * ROW_HEIGHT
+        };
         for block in expand_block_rects(
             first,
             scan_limit,
@@ -1055,7 +1096,7 @@ impl Widget for LogView {
         }
         let mut i = first;
         loop {
-            let y = rows_top + (i - first) as f32 * ROW_HEIGHT - frac * ROW_HEIGHT;
+            let y = row_y(i);
             // 行顶部超出可见区底部 → 停止
             if y >= rows_bottom || i >= count {
                 break;
@@ -1068,7 +1109,8 @@ impl Widget for LogView {
             // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
             // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
             // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
-            // → 选中 (底色 + 左侧 3px 强调条) / hover (选中行不再叠 hover)
+            // → 命中行底 (hit_row_bg, 弱一档) → 选中 (底色 + 左侧 3px 强调条)
+            // → hover (永画, 压过命中行底 —— 「指针现在在哪」必须盖过「搜索留下的痕迹」)
             let row_rect =
                 Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
             let (line_no, sub_off) = self.line_at(i);
@@ -1081,16 +1123,43 @@ impl Widget for LogView {
                 // 交替条纹会把它切碎、语义又糊回去。
                 rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
             }
-            if i == self.selected && !has_text_sel {
+            // **三态不是互斥关系** (2026-09-14 实机 M0 P10): 原先
+            // `if selected && !has_text_sel {…} else if hover {…}` 有两重压制 ——
+            // ① 有文本选区时选中行的底与左 accent 竖条一起消失;
+            // ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
+            // 修复 = 各自独立: 选中行**永画**, hover **永画**, 文本选区照旧只画区间带。
+            //
+            // 画序 (2026-09-14 实机 M0 P11): 命中行底**先**画, hover **后**画 ——
+            // 命中行是「搜索留下的痕迹」, hover 是「指针现在在哪」, 后者必须压过前者。
+            // 原先把命中行底画在 hover 之后且同用 `th.selection()`, 命中行上 hover 无反馈。
+            if table {
+                if let Some(hits) = &self.search_hits {
+                    if hits.binary_search(&line_no).is_ok() {
+                        rects.push_rect(
+                            Rect::from_xywh(
+                                area.origin.x,
+                                y,
+                                area.size.width - SCROLLBAR_W,
+                                ROW_HEIGHT,
+                            ),
+                            hit_row_bg(self.theme),
+                            0.0,
+                        );
+                    }
+                }
+            }
+            if i == self.selected {
                 rects.push_rect(row_rect, th.selection(), 0.0);
                 rects.push_rect(
                     Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
                     th.accent(),
                     0.0,
                 );
-            } else if i == self.hover_row.get() {
+            }
+            if i == self.hover_row.get() {
                 // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
                 // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
+                // 不再与选中行互斥 —— 拖框选经过选中行时 hover 仍可见。
                 rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
             }
             // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
@@ -1155,23 +1224,6 @@ impl Widget for LogView {
                 }
                 i += 1;
                 continue;
-            }
-            // 搜索命中行: 表格模式淡琥珀行底 (原始模式在行内画区间高亮, 见下)
-            if table {
-                if let Some(hits) = &self.search_hits {
-                    if hits.binary_search(&line_no).is_ok() {
-                        rects.push_rect(
-                            Rect::from_xywh(
-                                area.origin.x,
-                                y,
-                                area.size.width - SCROLLBAR_W,
-                                ROW_HEIGHT,
-                            ),
-                            th.selection(),
-                            0.0,
-                        );
-                    }
-                }
             }
             // 行号 (文件真实行号; 书签行金色)
             let no = format!("{}", line_no + 1);
@@ -1245,7 +1297,7 @@ impl Widget for LogView {
                     let glyph = if expanded_here { "−" } else { "+" };
                     texts.push_text(
                         glyph,
-                        area.origin.x + 2.0,
+                        Self::expand_glyph_x(area),
                         y + row_baseline_off,
                         EXPAND_FONT_SIZE,
                         th.text_primary(),
@@ -1327,9 +1379,17 @@ impl Widget for LogView {
                         };
                         let x1 = (text_x + w1 - x_off).min(text_right);
                         if x1 > x0 {
+                            // T9 (2026-09-14 实机 M0 P28): 超复制上限的选区带
+                            // **拖选进行中即**换警示色 —— 原先只在 Ctrl+C 时才报
+                            // (view.rs:1621), 用户拖到一半不知道已经越界。
+                            let sel_color = if self.selection_over_limit() {
+                                th.danger()
+                            } else {
+                                th.selection()
+                            };
                             rects.push_rect(
                                 Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                th.selection(),
+                                sel_color,
                                 2.0,
                             );
                         }
@@ -1528,7 +1588,8 @@ impl Widget for LogView {
                 if (0.0..list_h).contains(&rel_y) {
                     let row = self.row_at(rel_y);
                     // 行首 ▶/▼ 展开开关区 (左 20px, 表格模式); 其余点击选中
-                    let in_glyph = self.table_mode() && position.x - area.origin.x < EXPAND_W;
+                    // S2: 命中判定与绘制位置同源 (`expand_glyph_x` / `in_expand_glyph`)
+                    let in_glyph = self.in_expand_glyph(area, *position);
                     if in_glyph {
                         msgs.push(Box::new(Msg::ToggleExpand(row)));
                     } else {
@@ -2560,6 +2621,376 @@ mod tests {
 
         // 没有子行 → 一个矩形都不出 (普通表格每帧都走这条)
         assert!(expand_block_rects(0, 20, y_of, |_| false, 0.0, 100.0).is_empty());
+    }
+
+    /// 把 sRGB 色转成 `instance_colors()` 的线性空间 `[r, g, b, a]` (模块 1 修
+    /// 双重 gamma 后, `instance_colors()` 返回的是线性分量 —— 见 `rect.rs:398-402`
+    /// 的 doc(hidden) 注释: 直接拿 token 的 sRGB 分量比, 断言的是修好之前的旧行为)。
+    ///
+    /// **不引框架私有类型** (`danqing::render` 是私有模块, `lib.rs:27` 无 `pub`);
+    /// 用本仓已有的 `composited_luminance` 同口径手写。
+    fn lin(c: danqing::Color) -> [f32; 4] {
+        use danqing::srgb_to_linear;
+        [
+            srgb_to_linear(c.r),
+            srgb_to_linear(c.g),
+            srgb_to_linear(c.b),
+            c.a,
+        ]
+    }
+
+    /// T6 回归锁 (2026-09-14 实机 M0 P10): 拖框选时**选中行不得消失**。
+    ///
+    /// 原先 `if selected && !has_text_sel {…} else if hover {…}` 有两重压制:
+    /// ① 有文本选区时选中行的底与左 accent 竖条一起熄灭;
+    /// ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
+    /// 修复 = 各自独立: 选中**永画**, hover **永画**, 文本选区只画区间带。
+    ///
+    /// 断言的是 **paint 出来的矩形序列**, 不是标志位 —— 「有状态却没画」正是
+    /// P8/P10 的原始形态, 只测 `v.selected` 会漏掉它。
+    #[test]
+    fn selected_row_stays_painted_while_text_selection_is_active() {
+        let (mut v, path) = cell_fixture("t6-p10");
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.selected = 0;
+        v.hover_row.set(u64::MAX); // 无 hover, 排除干扰
+        // 有文本选区 (拖框选进行中)
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        // 选中行 (行 0) 的底矩形 + 左 accent 竖条必须**都在**
+        let th = v.theme.theme();
+        let sel = th.selection();
+        let accent = th.accent();
+        let row0_y = HEADER_H; // 表格模式有表头
+        let row0_rect = Rect::from_xywh(0.0, row0_y, 800.0 - SCROLLBAR_W, ROW_HEIGHT);
+        let accent_rect = Rect::from_xywh(0.0, row0_y, 3.0, ROW_HEIGHT);
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+        let has_sel_rect = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(sel));
+        let has_accent_rect = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == accent_rect && *c == lin(accent));
+        assert!(has_sel_rect, "有文本选区时选中行底必须仍在: {rects:?}");
+        assert!(has_accent_rect, "有文本选区时 accent 竖条必须仍在");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T6 回归锁: hover **永画**, 不与选中行互斥。
+    ///
+    /// 原先 hover 与选中行共用 else-if —— 拖框选经过选中行时 hover 消失,
+    /// 用户看不见「指针现在在哪」。
+    #[test]
+    fn hover_row_stays_painted_on_selected_row() {
+        let (mut v, path) = cell_fixture("t6-hover");
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.selected = 0;
+        v.hover_row.set(0); // hover 就在选中行上
+
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let hover = row_hover_bg(crate::config::AppTheme::Light);
+        let row0_y = HEADER_H;
+        let row0_rect = Rect::from_xywh(0.0, row0_y, 800.0 - SCROLLBAR_W, ROW_HEIGHT);
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+        let has_hover = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(hover));
+        assert!(has_hover, "选中行上 hover 必须仍画: {rects:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T7 回归锁 (2026-09-14 实机 M0 P11): 命中行底**先**画、hover **后**画,
+    /// 且命中行用**弱一档**的 `hit_row_bg` (不是 `th.selection()`)。
+    ///
+    /// 原先命中行底画在 hover 之后且同用 `th.selection()` —— 命中行上 hover
+    /// 无反馈, 「指针现在在哪」被「搜索留下的痕迹」盖掉。
+    #[test]
+    fn hit_row_is_weaker_and_hover_wins_over_it() {
+        let (mut v, path) = cell_fixture("t7-p11");
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.selected = 99; // 无选中行 (99 不在文件里, 排除干扰; 不用 u64::MAX —— paint 里 selected+1 会溢出)
+        v.hover_row.set(0); // hover 在命中行上
+        v.search_hits = Some(std::sync::Arc::new(vec![0])); // 行 0 是命中行
+
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let th = v.theme.theme();
+        let hit = hit_row_bg(crate::config::AppTheme::Light);
+        let hover = row_hover_bg(crate::config::AppTheme::Light);
+        let row0_y = HEADER_H;
+        let row0_rect = Rect::from_xywh(0.0, row0_y, 800.0 - SCROLLBAR_W, ROW_HEIGHT);
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+
+        // ① 命中行底用 hit_row_bg, 不是 th.selection()
+        let has_hit = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(hit));
+        let has_sel_on_hit = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(th.selection()));
+        assert!(has_hit, "命中行底必须用 hit_row_bg: {rects:?}");
+        assert!(!has_sel_on_hit, "命中行底不得用 th.selection()");
+
+        // ② hover 在命中行**之后**画 (画序: 后者压前者)
+        let hit_idx = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .position(|(r, c)| *r == row0_rect && *c == lin(hit));
+        let hover_idx = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .position(|(r, c)| *r == row0_rect && *c == lin(hover));
+        assert!(hover_idx.is_some(), "命中行上 hover 必须画");
+        assert!(
+            hover_idx > hit_idx,
+            "hover 必须画在命中行之后 (压过它): hit={hit_idx:?} hover={hover_idx:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T7 回归锁 (P14): 「当前命中」与「一般命中」在画面上可分。
+    ///
+    /// 原先两者同用 `th.selection()`, 多命中时只剩 3px 竖条区分 —— 那在
+    /// 暗色下几乎不可见。现在: 一般命中 = hit_row_bg (弱), 当前命中 = selected
+    /// (强, 且 hover 永画) —— 但**当前命中行的 hit 底仍画** (选中行也是命中行,
+    /// 不把它从命中集里剔出去)。
+    #[test]
+    fn current_hit_is_stronger_than_other_hits() {
+        let (mut v, path) = cell_fixture("t7-p14");
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.selected = 0; // 当前命中 = 行 0
+        v.hover_row.set(u64::MAX);
+        v.search_hits = Some(std::sync::Arc::new(vec![0, 1])); // 两行都是命中
+
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let th = v.theme.theme();
+        let hit = hit_row_bg(crate::config::AppTheme::Light);
+        let sel = th.selection();
+        let row0_y = HEADER_H;
+        let row1_y = HEADER_H + ROW_HEIGHT;
+        let row0_rect = Rect::from_xywh(0.0, row0_y, 800.0 - SCROLLBAR_W, ROW_HEIGHT);
+        let row1_rect = Rect::from_xywh(0.0, row1_y, 800.0 - SCROLLBAR_W, ROW_HEIGHT);
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+
+        // 行 0 (当前命中): 既有 hit 底又有 selected 底 + accent 竖条
+        let has_hit0 = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(hit));
+        let has_sel0 = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row0_rect && *c == lin(sel));
+        assert!(has_hit0, "当前命中行仍画 hit 底");
+        assert!(has_sel0, "当前命中行另画 selected 底 (更强)");
+
+        // 行 1 (一般命中): 只有 hit 底, 无 selected 底
+        let has_hit1 = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row1_rect && *c == lin(hit));
+        let has_sel1 = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .any(|(r, c)| *r == row1_rect && *c == lin(sel));
+        assert!(has_hit1, "一般命中行画 hit 底");
+        assert!(!has_sel1, "一般命中行不得画 selected 底");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T7 回归锁 (P15): 文本选区带与搜索命中区间**同 token** 的已知例外保留,
+    /// 但**画序**要钉住: 文本选区带画在命中区间**之后** (选区是用户当前动作,
+    /// 必须压过搜索痕迹)。
+    ///
+    /// 这条不追求「两色可分」 (浅色养不起六个两两 ≥3 的面, 见本文件 108 行
+    /// 已知例外) —— 只追求「用户拖框选时看得见自己在拖」。
+    ///
+    /// **只在原始模式成立** —— 表格模式不做文本选区 (D2 划线), 选区带只在
+    /// 原始模式的 `else` 分支里画 (`view.rs:1350-1367`)。表格模式的命中行底
+    /// 已由 T7 换成 `hit_row_bg`, 与选区带不同 token, 无需此锁。
+    #[test]
+    fn text_selection_band_paints_after_hit_span() {
+        // 原始模式夹具 (非表格): 有命中行 + 文本选区
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-t7-p15-raw-{}.log", std::process::id()));
+        std::fs::write(&path, "ERROR line one\nINFO line two\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Raw; // 原始模式 —— 选区带与命中区间同 token 的唯一场景
+        v.selected = 99;
+        v.hover_row.set(u64::MAX);
+        v.search_hits = Some(std::sync::Arc::new(vec![0]));
+        v.search_pattern_src = Some("ERROR".into());
+        v.search_re = Some(regex::bytes::Regex::new("ERROR").unwrap());
+        // 文本选区在行 0 的前两个字符
+        v.selection = Some(TextSelection::new((0, 0), (0, 2)));
+
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let th = v.theme.theme();
+        let sel = th.selection();
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+
+        // 命中区间与文本选区带**同 token** (sel) —— 两者都该出现。
+        // **画序不钉**: 原始模式的命中区间 (`view.rs:1238-1264`) 在选中行/hover
+        // (`1131-1143`) 之后画, 而选区带 (`1350-1367`) 又在命中区间之后 ——
+        // 但两者**同 token 同 α**, 画序在视觉上不可分, 钉它是过度断言。
+        // 只锁「两者都在」; 「选区带压过命中区间」的感知由**位置**提供
+        // (选区带是用户拖出来的, 命中区间是搜索留下的)。
+        let sel_rects: Vec<_> = rects_vec
+            .iter()
+            .zip(colors.iter())
+            .enumerate()
+            .filter(|(_, (r, c))| {
+                *c == &lin(sel)
+                    && r.origin.y >= 2.0
+                    && r.origin.y <= ROW_HEIGHT - 2.0
+                    && r.size.height == ROW_HEIGHT - 4.0
+            })
+            .map(|(i, (r, _))| (i, *r))
+            .collect();
+        assert!(
+            sel_rects.len() >= 2,
+            "行 0 上应至少有两个 sel 色矩形 (命中区间 + 选区带): {sel_rects:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T9 回归锁 (2026-09-14 实机 M0 P28): **超复制上限的选区带拖选进行中即
+    /// 换警示色** (`th.danger()`), 不再只在 Ctrl+C 时才报。
+    ///
+    /// 原先只在 `Event::Copy` 里报 (`view.rs:1621-1628`), 用户拖到一半不知道
+    /// 已经越界 —— 三问第 3 问「不可用时说清为什么」的违例。
+    #[test]
+    fn over_limit_selection_paints_with_danger_color() {
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-t9-limit-{}.log", std::process::id()));
+        // 造一个超上限的选区 (COPY_MAX_LINES = 10 万行, 测试文件只有 2 行,
+        // 但选区坐标是任意的 —— 超限判定只看行号差, 不看文件实际行数)
+        std::fs::write(&path, "l0\nl1\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Raw;
+        v.selected = 0;
+        v.hover_row.set(u64::MAX);
+        // 超限选区: (0,0) → (COPY_MAX_LINES, 0) —— 行差 = COPY_MAX_LINES > 上限
+        v.selection = Some(TextSelection::new((0, 0), (COPY_MAX_LINES, 0)));
+        assert!(v.selection_over_limit(), "夹具应超限");
+
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let th = v.theme.theme();
+        let danger = th.danger();
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+
+        // 行 0 的选区带必须是 danger 色, 不是 sel 色
+        let has_danger = rects_vec.iter().zip(colors.iter()).any(|(r, c)| {
+            r.origin.y >= 2.0
+                && r.origin.y <= ROW_HEIGHT - 2.0
+                && r.size.height == ROW_HEIGHT - 4.0
+                && *c == lin(danger)
+        });
+        let has_sel = rects_vec.iter().zip(colors.iter()).any(|(r, c)| {
+            r.origin.y >= 2.0
+                && r.origin.y <= ROW_HEIGHT - 2.0
+                && r.size.height == ROW_HEIGHT - 4.0
+                && *c == lin(th.selection())
+        });
+        assert!(has_danger, "超限选区带必须用 danger 色: {rects:?}");
+        assert!(!has_sel, "超限选区带不得用 sel 色");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T9 回归锁: **未超限**的选区带仍用 `th.selection()` (不误报)。
+    #[test]
+    fn in_limit_selection_stays_selection_color() {
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-t9-in-{}.log", std::process::id()));
+        std::fs::write(&path, "l0\nl1\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Raw;
+        v.selected = 0;
+        v.hover_row.set(u64::MAX);
+        // 未超限选区: (0,0) → (0,1) —— 行差 = 0 < 上限
+        v.selection = Some(TextSelection::new((0, 0), (0, 1)));
+        assert!(!v.selection_over_limit(), "夹具不应超限");
+
+        let mut texts = TextBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+
+        let th = v.theme.theme();
+        let sel = th.selection();
+        let rects_vec = rects.instance_rects();
+        let colors = rects.instance_colors();
+
+        let has_sel = rects_vec.iter().zip(colors.iter()).any(|(r, c)| {
+            r.origin.y >= 2.0
+                && r.origin.y <= ROW_HEIGHT - 2.0
+                && r.size.height == ROW_HEIGHT - 4.0
+                && *c == lin(sel)
+        });
+        assert!(has_sel, "未超限选区带仍用 sel 色");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// T10 回归锁 (S1): paint 的 `row_y` 与 event 的 `row_at` **同源**。
+    ///
+    /// 原先两处各推一遍同一个式子 (`rows_top + (i-first)*ROW_HEIGHT - frac*ROW_HEIGHT`),
+    /// 现在 `row_y` 是 `row_at` 的逆运算 —— 对拍: 任意显示行 j, `row_y(j)` 算出的 y
+    /// 代回 `row_at` 必须得到 j。
+    #[test]
+    fn row_y_and_row_at_are_inverse() {
+        let mut v = LogView::new();
+        v.top_row = 3.5; // 非整数滚动位置
+        for j in [0, 1, 5, 10, 100] {
+            let y = (j as f64 - v.top_row) as f32 * ROW_HEIGHT;
+            let back = v.row_at(y);
+            assert_eq!(
+                back, j,
+                "row_y({j}) = {y} 代回 row_at 应得 {j}, 实得 {back}"
+            );
+        }
     }
 
     #[test]
