@@ -12,7 +12,7 @@ use std::any::Any;
 
 use danqing::widget::{
     Box as UiBox, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay, Padding,
-    Row, Tabs, Text, Widget,
+    Row, Switch, Tabs, Text, Widget,
 };
 use danqing::{
     Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch, Theme,
@@ -36,13 +36,15 @@ fn content_width() -> f32 {
 }
 /// 页签**内容区**的固定高度 —— 各页签必须同高, 否则切换时卡片会跳。
 ///
-/// 取「最高那一页 + 余量」, 数值来自**实测** (`panel_contents_fit_fixed_height`
-/// 量的就是这三页): 常规 36 / 快捷键 125 / 关于 133.5 (有更新提示 165.5)。
-/// 180 = 165.5 + 14.5 余量。
+/// 取「最高那一页 + 余量」。**这里不抄具体数字**: 本行原先写着「常规 36 /
+/// 快捷键 125 / 关于 133.5 (有提示 165.5)」, 而 P36 给快捷键页加了两行之后
+/// 那一串**整段过期** (最高页也从关于换成了快捷键)。数字会漂, 判据不会 ——
+/// 真正的判据是 `panel_contents_fit_fixed_height` 那条守卫 (按各页自然高度实量,
+/// 越界即红), 要查当前值就去跑它。
 ///
 /// 曾取 216, 理由写的是「常规页 v1.x 要加授权行, 留余量免得再动常量」——
-/// **那条理由是错的**: 常规页实测只有 36px, 加两行也够不着上限; 真正贴着上限的
-/// 是关于页, 而关于页的内容是固定的、不会长。空留的 50px 全变成了卡片下沿的空白。
+/// **那条理由是错的**: 常规页当时实测只有 36px, 加两行也够不着上限; 空留的 50px
+/// 全变成了卡片下沿的空白。加内容时就地调这个常量, 别预留。
 /// 高度加在内容上而不是整个 Tabs 上 —— 这样 tab 栏与面板间距是外加的,
 /// 各页签的高度基准才一致。
 /// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
@@ -122,16 +124,44 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
         .width(CARD_WIDTH)
 }
 
-/// 「常规」页签: 可配置项的家 (目前只有主题)。
+/// 「常规」页签: 可配置项的家。
 ///
-/// 单列一行的确是空 —— v1 也确实只有这一个开关。留在原处(`关于`页)才是错的:
-/// 那儿是**只读**的产品身份页, 把可点击的开关混进去, 用户没法一眼分辨
-/// 「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
+/// 留在原处(`关于`页)才是错的: 那儿是**只读**的产品身份页, 把可点击的开关混进去,
+/// 用户没法一眼分辨「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
 fn general_content() -> impl Widget {
     Column::new()
         .gap(16.0)
         .cross_center()
         .child(theme_dropdown())
+        .child(histogram_switch())
+}
+
+/// 「显示级别侧栏」开关 (P37 / T20)。
+///
+/// **为什么需要它**: 侧栏被 `Ctrl+L` 收起后, 界面上没有任何「如何找回」的入口 ——
+/// 侧栏顶部那行只读提示随侧栏**一起消失**。⚙ 是设置卡的唯一入口, 找回入口就该在这儿。
+///
+/// **与 Ctrl+L 双向同步是免费得到的**: 开关读的是 `app.histogram_visible`, 两条路
+/// 改的是同一个状态、走同一个 `save_config` (整文件同源, 见 `config.rs` 的约定),
+/// 所以不存在「键盘关了、开关还亮着」的第二份真相。
+fn histogram_switch() -> impl Widget {
+    Row::new()
+        .gap(8.0)
+        .cross_center()
+        .child(
+            Text::new("显示级别侧栏".to_string())
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+        )
+        .child(
+            Switch::new()
+                .bind(|app: &LogApp| app.histogram_visible)
+                // `Switch::new()` 烘的是浅色 token —— 视图树只建一次, 不挂绑定
+                // 就会「切到暗色后开关轨道还是浅色的」(`Switch::bind_theme` 的 doc
+                // 正是为这个写的)。与 `theme_dropdown` 同法。
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                .on_toggle(|| Msg::ToggleHistogram),
+        )
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -175,7 +205,11 @@ fn close_row() -> impl Widget {
             CloseButton::new()
                 .on_click(|| Msg::CloseSettings)
                 .bind_color(|app: &LogApp| app.theme.theme().text_primary())
-                .bind_hover_color(|app: &LogApp| app.theme.theme().surface_variant()),
+                .bind_hover_color(|app: &LogApp| app.theme.theme().surface_variant())
+                // 焦点环走 accent: 框架默认是 `Color::WHITE`, 在**浅色卡片**上
+                // 等于没有 (卡片底是 `background()`) —— P8 的验收是「Tab 停上去
+                // 看得见」, 不绑色就只是把白圈画在白底上。
+                .bind_focus_color(|app: &LogApp| app.theme.theme().accent()),
         )
 }
 
@@ -213,13 +247,24 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 /// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
 /// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
-const SHORTCUT_KEYS: [(&str, &str); 6] = [
+const SHORTCUT_KEYS: [(&str, &str); 8] = [
     ("Ctrl+O", "打开文件"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+T", "表格 / 原始模式互切"),
     ("Ctrl+L", "级别侧栏 显示 / 收起"),
     ("Ctrl+B", "添加书签 / 去掉书签"),
     ("Ctrl+G", "跳下一书签"),
+    // P36 (2026-09-15): 单键两条。判据就是本表自己那句话 ——「只列**猜不出来**的」,
+    // 不是新造标准: 方向键/翻页键不必教 (常识), 但 `/` 是 Vim 习惯、`f` 是本应用
+    // 自造的词, 两个都猜不出来。它们原先只写在**仓外 README**, 而商店版用户没有
+    // 仓库语境 —— 那行字对他们等于不存在。
+    // 都限**原始模式**: 表格模式有常驻过滤栏, `/` 无栏可开。
+    //
+    // **原始模式下的 `b` / `'` 有意不列**: 它们与上面的 Ctrl+B / Ctrl+G 是**同一个
+    // 动作的两套按键** (切换书签 / 跳下一书签)。判据补一条「同一动作只列一条」——
+    // 不补的话, 上面那条「猜不出来的就列」在 `b`/`'` 上自相矛盾 (它们同样猜不出来)。
+    ("/", "搜索栏 (原始模式)"),
+    ("f", "跟随文件增长 (原始模式)"),
 ];
 
 /// 快捷键一览 —— 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 是「设置卡」的
@@ -570,6 +615,25 @@ mod tests {
         }
     }
 
+    /// 快捷键行的**横向**也要卡住 —— 上一条只管高度, 而框架的 `Text` **不换行**:
+    /// 文案宽过可用宽是**横向画到卡片外**, 高度一点不涨, 于是那条守卫看不见。
+    ///
+    /// 判据: 键列固定宽 + 间隙 + 作用文案实测宽 ≤ 卡片内容宽。
+    /// 现在有余量, 但这条是防**将来有人把某行文案改长**的 (改长一点点就顶穿右侧)。
+    #[test]
+    fn shortcut_rows_fit_the_card_width() {
+        let mut texts = TextBatch::default();
+        let w = content_width();
+        for (key, action) in SHORTCUT_KEYS {
+            let used = SHORTCUT_KEY_W + texts.measure(action, BODY_SIZE);
+            assert!(
+                used <= w,
+                "「{key} → {action}」宽 {used} > 卡片内容宽 {w}: \
+                 框架 Text 不换行, 会横向画到卡片外"
+            );
+        }
+    }
+
     /// 版本行的实测高度必须等于 `VERSION_ROW_H` —— 上一条拿它当最坏情况增量,
     /// 常量与实现脱钩就等于白算。
     #[test]
@@ -581,6 +645,24 @@ mod tests {
             .layout(Constraints::loose(Size::new(300.0, 100.0)), &mut texts)
             .height;
         assert_eq!(h, VERSION_ROW_H);
+    }
+
+    /// P36 (T19) 回归锁: 快捷键卡按**它自己写的判据**列单键, 且不把方向键塞进来。
+    ///
+    /// 判据是那张表头上的注释「只列**猜不出来**的」—— 本测试把这句话变成可执行的:
+    /// `/`(Vim 习惯) 与 `f`(本应用自造的词) 猜不出来 → 必须在; `→`/`←` 是方向键
+    /// → 必须不在 (完整清单在 README, 那是另一条通道)。
+    ///
+    /// **这条守卫本批漏写了, 是 review 抓出来的** —— 当时 todo 里已经写着「守卫:
+    /// `shortcut_card_lists_single_keys_but_not_arrow_keys`」, 但仓里根本没有这条
+    /// 测试: 文档宣称的守卫与真实存在的守卫**对不上**, 比没写守卫更坏 (它会让人
+    /// 以为已经挡住了)。写文档里的人名/测试名, 当时就该顺手 grep 一遍。
+    #[test]
+    fn shortcut_card_lists_single_keys_but_not_arrow_keys() {
+        let has = |key: &str| SHORTCUT_KEYS.iter().any(|(k, _)| *k == key);
+        assert!(has("/"), "`/` 猜不出来 (Vim 习惯), 必须在卡上");
+        assert!(has("f"), "`f` 是本应用自造的词, 必须在卡上");
+        assert!(!has("→") && !has("←"), "方向键属常识, 不进卡 (README 兜底)");
     }
 
     /// 回归锁 (2026-09-14): 合并行 `("Ctrl+B · Ctrl+G", "切换书签 / 下一书签")` 拆成两行时,

@@ -148,7 +148,8 @@ fn title_bar(theme: config::AppTheme, title: String) -> impl Widget {
         .embed(
             view::Bar::default()
                 .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                .bind_clear_search(|app: &LogApp| app.search_clear_rev)
+                .bind_refocus_search(|app: &LogApp| app.search_refocus_rev),
         )
 }
 
@@ -168,6 +169,10 @@ pub(crate) struct LogApp {
     base_status: String,
     /// 底栏合成文本 (base + 模式 + 过滤 + 搜索)。
     status: String,
+    /// 这一行 `status` 是不是**错误** (P27)。只由 [`Self::set_status_error`] 置位,
+    /// 由 [`Self::set_status`] / [`Self::refresh_status`] 清除 —— **单一写入点**,
+    /// 别处直接 `self.status = …` 会让标志与实际内容脱钩。
+    status_error: bool,
     mode: ViewMode,
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
@@ -197,10 +202,18 @@ pub(crate) struct LogApp {
     filter_clear_rev: u64,
     filter_elapsed: Option<Duration>,
     filter_job: AsyncJob<FilterOutcome>,
+    /// 「回到搜索栏」信号 (T21: Bar::bind_refocus_search 借此全选草稿)。
+    search_refocus_rev: u64,
     /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
     search_clear_rev: u64,
     /// 一次性焦点请求：开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
-    focus_bar: bool,
+    /// 一次性焦点请求目标 (见 `focus_request`): `"log-bar"` = 过滤/搜索栏,
+    /// `"log-view"` = 日志列表。`None` = 不请求。
+    ///
+    /// 泛化自原先的 `focus_bar: bool` —— 打开文件后也得把焦点送进列表 (T14 之后
+    /// 高亮只在持焦时画, 否则打开文件看到的是「一行都没选中」, 而按 ↑↓ 只动底栏
+    /// 行号、屏上什么都不动: 本模块自己判据里的「按了没反应」)。
+    focus_target: Option<&'static str>,
     /// 已应用搜索的导航态 (命中表 + 当前位置)。
     search: Option<SearchNav>,
     search_query: String,
@@ -226,7 +239,12 @@ pub(crate) struct LogApp {
     /// 上次 stat 轮询时刻 (250ms 节流)。
     last_stat_poll: Instant,
     /// 底栏提示 (截断/轮转等一次性事件)。
-    notice: Option<String>,
+    ///
+    /// **改它一律走 [`Self::set_notice`]**, 不直接赋值 —— 直接赋值会漏掉消退期限,
+    /// 那条提示就永远赖在底栏上 (T18/Q3 之前是 8 处各写各的)。
+    notice: Option<(String, NoticeKind)>,
+    /// notice 的消退时刻; `None` = 当前无提示。见 [`Self::set_notice`]。
+    notice_until: Option<Instant>,
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
     /// 在途打开作业 (async-open): Some = 打开/重建/追平进行中, UI 全程可响应;
@@ -240,6 +258,13 @@ pub(crate) struct LogApp {
     theme: config::AppTheme,
     /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
     histogram_visible: bool,
+    /// 配置读写路径。`None` = 用户真实配置 (`%APPDATA%\danqing-log\config.toml`)。
+    ///
+    /// **测试必须给临时路径** —— 见 [`Self::save_config`] 里那条 `#[cfg(test)]` 的
+    /// 硬拦。这不是洁癖: `save_to` 是**整文件覆盖写**, 而 `load_from` 对认不出的
+    /// `mode` 会取值域默认 (light) —— 一次 `cargo test` 就能把用户的主题**改掉**,
+    /// 并抹掉手写注释。
+    cfg_path: Option<std::path::PathBuf>,
     /// 设置卡当前页签**下标** —— 序号含义见 `settings.rs` 里 `.tab()` 处 (**唯一真身**,
     /// 别在这里另列一份, 加页签时会漂)。越界值无需在此防御: 框架 `Tabs` 自行钳制
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
@@ -247,10 +272,31 @@ pub(crate) struct LogApp {
     settings_tab: usize,
 }
 
+/// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    /// 警示 (打开失败/轮转/选区超限) —— 用 `danger()` 画。
+    Warn,
+    /// 提示 (复制回执等) —— 用 `text_secondary()` 画。
+    Info,
+}
+
 /// 应用消息。
 pub(crate) enum Msg {
     /// 滚轮/键盘滚动 N 显示行 (负 = 向上)。
     ScrollRows(f64),
+    /// **绝对**滚到某显示行 (T17 滚动条拖拽)。与 `ScrollRows` 的两点不同都是
+    /// 有意的: ① 它是绝对定位, 拖拽是「拇指在哪内容就在哪」而不是增量;
+    /// ② 它**不动 `selected`** —— 抓滚动条是「看」不是「选」, 见 todo T17 不变量 ③。
+    ///
+    /// `at_bottom` = 目标就在**条能被拖到的最底**。它存在只为一个理由: 跟随态下
+    /// app 的 `top_row` 用 `count-1` 口径, 而条能表达的最大值是 `count-可见行数`
+    /// —— 两者不等, 直接比 `top < top_row` 会把「在底部碰一下条」误判成「向上看」
+    /// 而**静默脱掉 FOLLOW** (T17 review 抓出来的)。带上这一位, 判断才有据可依。
+    ScrollTo {
+        top: f64,
+        at_bottom: bool,
+    },
     /// 点击选中显示行。
     Select(u64),
     /// 展开/折叠某显示行的嵌套 (表格模式)。
@@ -291,7 +337,11 @@ pub(crate) enum Msg {
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
-    Notice(String),
+    ///
+    /// **级别语义** (2026-09-14 实机 M0 P27): `NoticeKind::Warn` = 警示
+    /// (打开失败/轮转/选区超限), 用 `danger()` 画; `NoticeKind::Info` = 提示
+    /// (复制回执等), 用 `text_secondary()` 画 —— 两者同屏时**可辨**。
+    Notice(String, NoticeKind),
     // ---- 主题下拉 ----
     /// 通过下拉选择器选择主题 (索引)。
     /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管, 不再经应用消息。
@@ -305,8 +355,17 @@ pub(crate) enum Msg {
 impl LogApp {
     /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
     fn new_empty() -> Self {
-        let cfg = config::Config::load();
+        Self::new_empty_at(None)
+    }
+
+    /// 同上, 但可指定配置路径 (仅测试用; 见 `cfg_path` 字段)。
+    fn new_empty_at(cfg_path: Option<std::path::PathBuf>) -> Self {
+        let cfg = match &cfg_path {
+            Some(p) => config::Config::load_from(p),
+            None => config::Config::load(),
+        };
         Self {
+            cfg_path,
             window_sender: None,
             file: Arc::new(LogFile::empty()),
             has_file: false,
@@ -314,6 +373,7 @@ impl LogApp {
             selected: 0,
             base_status: EMPTY_STATUS.to_string(),
             status: String::new(),
+            status_error: false,
             mode: ViewMode::Raw,
             schema: None,
             level_counts: Arc::new(LevelCounts::default()),
@@ -326,6 +386,7 @@ impl LogApp {
             filter_clear_rev: 0,
             filter_elapsed: None,
             filter_job: AsyncJob::new(),
+            search_refocus_rev: 0,
             search_clear_rev: 0,
             search: None,
             search_query: String::new(),
@@ -336,11 +397,12 @@ impl LogApp {
             expanded: ExpandMap::new(),
             sub_rows: std::collections::BTreeMap::new(),
             expand_rev: 0,
-            focus_bar: false,
+            focus_target: None,
             path: PathBuf::new(),
             follow: false,
             last_stat_poll: Instant::now(),
             notice: None,
+            notice_until: None,
             maximized: false,
             open_job: None,
             loading_label: None,
@@ -412,11 +474,24 @@ impl LogApp {
     /// 「改主题」顺手抹掉侧栏开关 (config.rs 的 `round_trip_preserves_both_keys`
     /// 钉着这条)。
     fn save_config(&self) {
-        config::Config {
+        let cfg = config::Config {
             theme: self.theme,
             histogram: self.histogram_visible,
+        };
+        match &self.cfg_path {
+            Some(p) => cfg.save_to(p),
+            // **测试里不许落到真实配置**: 这条不是洁癖, 是实测过的坑 ——
+            // 本批的 T20 单测走 `update(Msg::ToggleHistogram)` → 这里 → 真实路径,
+            // 而 `save_to` 是**整文件覆盖写**、`load_from` 对认不出的 `mode` 取默认
+            // (light): 一次 `cargo test` 就能把用户的主题改掉、手写注释抹掉。
+            // 与其靠「下一个写测试的人记得」, 不如让它**写不出去**。
+            None => {
+                #[cfg(test)]
+                panic!("测试不得写真实配置 —— 请用 LogApp::new_empty_at(临时路径)");
+                #[cfg(not(test))]
+                cfg.save();
+            }
         }
-        .save();
     }
 
     /// 窗口标题：产品名 + 模式指示 (随 Ctrl+T 切换; 文件名在底栏显示)。
@@ -522,7 +597,7 @@ impl LogApp {
                 // 落点只合并不扫描 —— 否则 GB 级追平的过滤成本回到 UI 线程。
                 let old = Arc::clone(&self.file);
                 let filter = if !self.filter_applied.is_empty() && self.filtered.is_some() {
-                    Some((jsonl::parse_query(&self.filter_applied), old.line_count()))
+                    Some((self.parse_filter(&self.filter_applied), old.line_count()))
                 } else {
                     None
                 };
@@ -594,8 +669,7 @@ impl LogApp {
         self.sub_rows.clear();
         self.top_row = 0.0;
         self.selected = 0;
-        self.notice = Some("文件已截断/轮转".into());
-        self.refresh_status();
+        self.set_notice("文件已截断/轮转".into(), NoticeKind::Warn);
     }
 
     /// 热替换文件 (Ctrl+O / 拖拽): 异步管道发起 (在途旧 job 被 drop = 取消);
@@ -660,6 +734,13 @@ impl LogApp {
         self.sub_rows.clear();
         self.follow = false;
         self.notice = None;
+        self.notice_until = None;
+        // **把焦点送进列表** (T14 之后高亮只在持焦时画): 不送的话, 打开文件看到的
+        // 是「一行都没选中」, 而按 ↑↓ 只动底栏行号、屏上什么都不动 —— 正是本模块
+        // 自己那条判据要消灭的「按了没反应」。只在 **Fresh** (换了文件) 时送:
+        // rebuild/append 走的是 `apply_rebuild`/`apply_appended`, 不动焦点, 免得
+        // 轮转或追长时把正在栏里打字的用户拽走。
+        self.focus_target = Some("log-view");
         self.refresh_status();
     }
 
@@ -752,13 +833,16 @@ impl LogApp {
                     match job.kind() {
                         OpenKind::Fresh => {
                             log::warn!("打开失败：{e:#}");
-                            self.notice = Some(format!(
-                                "无法打开：{}",
-                                job.path()
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy())
-                                    .unwrap_or_default()
-                            ));
+                            self.set_notice(
+                                format!(
+                                    "无法打开：{}",
+                                    job.path()
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy())
+                                        .unwrap_or_default()
+                                ),
+                                NoticeKind::Warn,
+                            );
                         }
                         OpenKind::Rebuild => log::warn!("轮转重建失败：{e:#}"),
                         OpenKind::Append => log::warn!("tail 追加失败：{e:#}"),
@@ -795,7 +879,7 @@ impl LogApp {
         if self.filtered.is_none() {
             return;
         }
-        let clauses = jsonl::parse_query(&self.filter_applied);
+        let clauses = self.parse_filter(&self.filter_applied);
         let new_hits = jsonl::run_filter_from(&self.file, &clauses, from);
         self.merge_filter_hits(new_hits);
     }
@@ -867,9 +951,33 @@ impl LogApp {
         Some((verb, name, detail))
     }
 
+    /// 置一条底栏提示 —— **notice 的唯一入口** (T18)。
+    ///
+    /// 自带消退期限 (Q3 裁的「自动消退」): 提示是**对刚才那个动作**的回答,
+    /// 一直赖在底栏会变成噪声, 还会让「底栏读数」这件事失去可信度。
+    ///
+    /// **`NOTICE_TTL` 是待实机核对的估值**: spec 说「具体时长 build 时**实测定**,
+    /// 不估算」, 而本机跑不了真机走查 —— 故先取一个, 并挂进矩阵 §6 的核对单
+    /// (实机那轮把「太短没看见 / 太长碍事」两个方向都试一次)。
+    fn set_notice(&mut self, text: String, kind: NoticeKind) {
+        self.notice = Some((text, kind));
+        self.notice_until = Some(Instant::now() + NOTICE_TTL);
+        self.refresh_status();
+    }
+
+    /// notice 到点即消退 (T18/Q3)。抽成独立方法是为了**可测**: `tick` 要
+    /// `AnimationCtx`, 而本方法不必。
+    fn expire_notice(&mut self) {
+        if self.notice_until.is_some_and(|t| Instant::now() >= t) {
+            self.notice = None;
+            self.notice_until = None;
+            self.refresh_status();
+        }
+    }
+
     fn refresh_status(&mut self) {
         if let Some((verb, name, detail)) = self.loading_parts() {
-            self.status = format!("{verb} {name} · {detail}");
+            self.set_status(format!("{verb} {name} · {detail}"));
             // 无旧文件才上占位文案 (有旧文件: 列表照画, 进度只上底栏)
             self.loading_label = if self.has_file {
                 None
@@ -924,10 +1032,43 @@ impl LogApp {
         if self.follow {
             s.push_str(" · FOLLOW");
         }
-        if let Some(n) = &self.notice {
-            s.push_str(&format!(" · {n}"));
-        }
+        // notice **不进这个串** —— 它是第二条通道, 由 `LogView::paint` 单独取色单独
+        // 落笔 (T11)。此前把它拼进来, 结果是同一句话被画两遍 (串尾一遍、notice 段
+        // 又一遍), 而且「警示色」和「常态色」压在同一个字符串上根本没处分。
+        self.set_status(s);
+    }
+
+    /// 写底栏**常态**信息 —— 顺手清掉错误态 (错误是**这一句**的属性, 换句就没了)。
+    fn set_status(&mut self, s: String) {
         self.status = s;
+        self.status_error = false;
+    }
+
+    /// 写底栏**错误** —— **常驻红, 不消退**。
+    ///
+    /// P27 的收口 (2026-09-15 用户裁定「后者」): 「正则无效」这类错误**不走
+    /// notice 通道** —— notice 有 4 秒消退期, 而它是「你刚按的那下没生效」,
+    /// 不该自己消失。判据是 P27 原文那句「**错误在视觉上不存在**」: 修之前它与
+    /// 打开耗时/过滤统计同色同字号, 只有读文字才知道出错了。
+    fn set_status_error(&mut self, s: String) {
+        self.status = s;
+        self.status_error = true;
+    }
+
+    /// 解析过滤查询 —— **全应用唯一的过滤解析入口** (parse + 键名规范化)。
+    ///
+    /// 三处调用点 (应用过滤 / 巨量追平作业 / live-tail 重滤) 必须都走这里:
+    /// 键名规范化 (`LEVEL=ERROR` → `level=ERROR`) 只做在一处, 同一个查询串在不同
+    /// 路径上就会得到不同命中集 —— 而增量与全量不一致只在「开着过滤又赶上追加」
+    /// 时才现形, 是最难查的一类差异 (D2 红线同款理由)。
+    ///
+    /// `.log` 文件 schema 为 None → 跳过规范化, 行为与从前一字不差。
+    fn parse_filter(&self, query: &str) -> Vec<jsonl::Clause> {
+        let mut clauses = jsonl::parse_query(query);
+        if let Some(schema) = self.schema.as_deref() {
+            jsonl::normalize_clause_keys(&mut clauses, schema);
+        }
+        clauses
     }
 
     /// Enter (过滤): 应用。空查询 = 回全量; 非空走 AsyncJob (1GB 亚秒，不冻界面)。
@@ -942,9 +1083,9 @@ impl LogApp {
             self.refresh_status();
             return;
         }
-        let clauses = jsonl::parse_query(&query);
+        let clauses = self.parse_filter(&query);
         let file = Arc::clone(&self.file);
-        self.status = format!("{} · 过滤 \"{query}\" 中…", self.base_status);
+        self.set_status(format!("{} · 过滤 \"{query}\" 中…", self.base_status));
         self.filter_job.launch(move || {
             let t = Instant::now();
             let lines = jsonl::run_filter(&file, &clauses);
@@ -975,15 +1116,20 @@ impl LogApp {
             self.mode = ViewMode::Raw;
         } else {
             self.mode = ViewMode::Table;
-            self.focus_bar = true;
+            self.focus_target = Some("log-bar");
         }
         self.refresh_status();
     }
 
     /// 聚焦搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
+    ///
+    /// **T21 (P39): 不再「聚焦即干净开始」**。Ctrl+F 是「回到搜索框」的**反射键**,
+    /// 而原实现每次都把已输入未应用的草稿清掉 —— 反射键不该销毁工作。现在:
+    /// 没持焦 → 聚焦 (草稿原样留着); 已持焦 → 全选 (直接覆写)。
+    /// 清空仍归 Esc, 那条路径没动。
     fn open_search(&mut self) {
-        self.search_clear_rev += 1; // 聚焦即干净开始
-        self.focus_bar = true; // 自动聚焦搜索栏
+        self.focus_target = Some("log-bar");
+        self.search_refocus_rev += 1;
         self.refresh_status();
     }
 
@@ -1004,13 +1150,13 @@ impl LogApp {
         }
         let pattern = build_search_pattern(self.file.encoding(), &q);
         let Ok(re) = regex::bytes::Regex::new(&pattern) else {
-            self.status = format!("{} · 搜索 \"{q}\" 正则无效", self.base_status);
+            self.set_status_error(format!("{} · 搜索 \"{q}\" 正则无效", self.base_status));
             return;
         };
         self.search_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         self.search_query = q.clone();
         let file = Arc::clone(&self.file);
-        self.status = format!("{} · 搜索 \"{q}\" 中…", self.base_status);
+        self.set_status(format!("{} · 搜索 \"{q}\" 中…", self.base_status));
         self.search_job.launch(move || {
             let t = Instant::now();
             let (hits, total, _) = file.search(&re, SEARCH_HIT_CAP);
@@ -1071,6 +1217,9 @@ impl LogApp {
             let i = self.bookmarks.range(..line).count() + 1;
             let n = self.bookmarks.len();
             self.status.push_str(&format!(" · 书签 {i}/{n}"));
+        } else {
+            // M3 (P25): 无书签时 Ctrl+G 按了没反应 —— 说清为什么。
+            self.set_notice("尚无书签 (b 添加)".into(), NoticeKind::Info);
         }
     }
 }
@@ -1090,10 +1239,19 @@ pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64)
 /// 走完整正则路径; 误用 stats().encoding (检出 Utf16*) 会把它踢进字面量分支，
 /// `ERROR|FATAL` 之类交替正则静默失效 (review 当场抓住的回归)。
 fn build_search_pattern(enc: Encoding, query: &str) -> String {
+    // 两分支一律 `(?i)` 前缀 (2026-09-15, spec D2/D3): 默认大小写不敏感。
+    // UTF-8 用 `(?i)` 而非 `(?i-u)` —— 查询是用户的裸正则, `(?-u)` 会顺带把
+    // `\w`/`\d`/`\b` 降级成 ASCII 语义, 与大小写无关的行为不该被本模块改掉。
+    // 逃逸舱零代码: 用户写 `(?-i)` 即局部恢复敏感 (组内 flag 覆盖, 有测试锁)。
+    // 非 UTF-8 分支同理套在字节字面量外 —— `(?i)` 对 `(?-u)\xNN` 折叠成立, 已用
+    // 真 GBK 文件实测 (7884 命中行, 与手工 [eE] 展开逐字节一致)。
     if enc == Encoding::Utf8 {
-        query.to_string()
+        format!("(?i){query}")
     } else {
-        bytes_as_literal_regex(&encoding::encode_query(enc, query))
+        format!(
+            "(?i){}",
+            bytes_as_literal_regex(&encoding::encode_query(enc, query))
+        )
     }
 }
 
@@ -1102,6 +1260,26 @@ fn clamp_top(top: f64, line_count: u64) -> f64 {
     let max = line_count.saturating_sub(1) as f64;
     top.clamp(0.0, max)
 }
+
+/// 滚轮 delta → 要滚的显示行数 (**单一换算点**, T17)。
+///
+/// 三处滚轮 (内容区 LogView / 未认领的滚轮 / 将来任何新入口) 必须走同一支,
+/// 否则「在侧栏滚」与「在列表上滚」手感会不一样 —— 而 P30 补的正是这两处的
+/// **一致性**, 各写一份等于把刚修好的东西再拆开。
+///
+/// **框架不归一 delta** (普查 G10): `window/event.rs:150-154` 把 `LineDelta`
+/// (行数, 通常 ±1..3) 与 `PixelDelta` (像素, 精确触控板可达 ±100) 抹平成同一个
+/// `f32`, 下游**无从分辨**。按行数档取 3 倍再夹一个**每次事件**的上界: 不夹的话
+/// 触控板一次能跳几百行。夹的是单次事件, 不是总量, 连续滚不受影响。
+fn wheel_rows(delta_y: f32) -> f64 {
+    (-f64::from(delta_y) * 3.0).clamp(-WHEEL_MAX_ROWS, WHEEL_MAX_ROWS)
+}
+
+/// 单次滚轮事件最多滚多少显示行 (见 [`wheel_rows`])。
+const WHEEL_MAX_ROWS: f64 = 12.0;
+
+/// 底栏提示的停留时长 (见 `LogApp::set_notice`)。**待实机核对**。
+const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl App for LogApp {
     type Msg = Msg;
@@ -1117,6 +1295,17 @@ impl App for LogApp {
                 self.top_row = clamp_top(self.top_row + d, self.display_count());
                 // 方向键滚动时选中跟随首行，底栏读数即当前位置
                 self.selected = self.top_row as u64;
+            }
+            Msg::ScrollTo { top, at_bottom } => {
+                // 往回(上)拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)。
+                // **拖到条底不算往回** —— 见枚举上的注释: 跟随态的 `top_row` 比条能
+                // 表达的底还大, 不排除这一格就会「在底部碰一下条 → FOLLOW 没了」。
+                if !at_bottom && top < self.top_row && self.follow {
+                    self.follow = false;
+                    self.refresh_status();
+                }
+                // **不动 `selected`**: 抓滚动条是「看」不是「选」(T17 不变量 ③)。
+                self.top_row = clamp_top(top, self.display_count());
             }
             Msg::Select(row) => {
                 if row < self.display_count() {
@@ -1173,10 +1362,7 @@ impl App for LogApp {
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
-            Msg::Notice(text) => {
-                self.notice = Some(text);
-                self.refresh_status();
-            }
+            Msg::Notice(text, kind) => self.set_notice(text, kind),
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
                 // 通知窗口换底色。**这一步此前从缺** —— 于是切主题后标题栏那条
@@ -1219,6 +1405,23 @@ impl App for LogApp {
     }
 
     fn event(&mut self, event: &Event) {
+        // P30 (T17): **未认领的滚轮**转给列表滚动。
+        //
+        // 框架按点子命中分发滚轮、不向父级回落, 所以指针停在侧栏/过滤栏上时,
+        // 日志区根本收不到 —— 用户必须把指针挪回内容区才滚得动。这里补的是
+        // 另一半: 凡是**没有组件认领**的滚轮 (侧栏、过滤栏、标题栏、行外空白)
+        // 一律滚列表。**不需要位置数学**: 指针在日志区上时 LogView 已经
+        // `Consumed` 了, 能走到这里的本来就不是它。
+        if let Event::MouseWheel { delta, .. } = event {
+            // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
+            if !self.settings_open && self.has_file {
+                let rows = wheel_rows(delta.1);
+                if rows != 0.0 {
+                    self.update(Msg::ScrollRows(rows));
+                }
+            }
+            return;
+        }
         let Event::Key {
             key,
             pressed: true,
@@ -1241,6 +1444,9 @@ impl App for LogApp {
         }
         // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
         if !self.has_file {
+            // M3 (2026-09-14 实机 M0 P26): 空态按键被吞时**说清为什么** ——
+            // 原先 `return` 静默, 用户按 Ctrl+F/方向键毫无反应。
+            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
             return;
         }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
@@ -1255,8 +1461,20 @@ impl App for LogApp {
                     self.goto_next_bookmark();
                     return;
                 }
-                if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
-                    self.update(Msg::ToggleMode);
+                if s.eq_ignore_ascii_case("t") {
+                    if self.schema.is_some() {
+                        self.update(Msg::ToggleMode);
+                    } else {
+                        // M3 (P23): Ctrl+T 无 JSONL 时**说清为什么** —— 原先静默。
+                        self.set_notice("本文件非 JSONL, 无表格模式".into(), NoticeKind::Info);
+                    }
+                    return;
+                }
+                if s.eq_ignore_ascii_case("a") {
+                    // M3 (P34): Ctrl+A 被吞 —— 说清为什么 (行多选已裁挂 v1.x,
+                    // 见 docs/ROADMAP-v1x.md §四)。
+                    self.set_notice("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info);
+                    return;
                 }
             }
             return;
@@ -1293,12 +1511,18 @@ impl App for LogApp {
                 let file_line = self.file_line_of(self.selected);
                 if !self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
+                } else {
+                    // M3 (P24): → 在已展开行上按了没反应 —— 说清为什么。
+                    self.set_notice("本行已展开".into(), NoticeKind::Info);
                 }
             }
             Key::Named(NamedKey::ArrowLeft) if self.mode == ViewMode::Table => {
                 let file_line = self.file_line_of(self.selected);
                 if self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
+                } else {
+                    // M3 (P24): ← 在未展开行上按了没反应 —— 说清为什么。
+                    self.set_notice("本行未展开".into(), NoticeKind::Info);
                 }
             }
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
@@ -1343,6 +1567,20 @@ impl App for LogApp {
         let Key::Character(s) = key else {
             return None;
         };
+        // 模态守卫 (T16/P32): 设置卡开着时, 全局键**不得穿透到卡后**。
+        // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
+        // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
+        // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
+        // (`handler.rs:434-441`), 所以这个守卫只能加在产品侧。
+        //
+        // **位置很要紧: 必须在「ctrl + 字符」筛选之后**。框架在这一函数返回
+        // `Some` 时**直接 return, 不再走焦点分发** (`handler.rs:436-441`), 而卡内
+        // 控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠焦点分发收键 —— 守卫若放在函数
+        // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
+        // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
+        if self.settings_open {
+            return Some(Msg::Noop);
+        }
         if s.eq_ignore_ascii_case("f") {
             return Some(Msg::FocusSearch);
         }
@@ -1372,6 +1610,7 @@ impl App for LogApp {
 
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
     fn tick(&mut self, _ctx: &AnimationCtx) {
+        self.expire_notice();
         self.pickup_open_job();
         self.pickup_levels_job();
         if let Some(out) = self.filter_job.poll() {
@@ -1412,16 +1651,12 @@ impl App for LogApp {
 
     /// 焦点为空时的一次性恢复请求：开搜索/进表格时把焦点给栏 (via `log-bar`)。
     fn focus_request(&self) -> Option<&'static str> {
-        if self.focus_bar {
-            Some("log-bar")
-        } else {
-            None
-        }
+        self.focus_target
     }
 
     /// 消费焦点请求 (逐帧调用，一次性：置位后立即清除，避免 Esc 后误拉回)。
     fn focus_restored(&mut self) {
-        self.focus_bar = false;
+        self.focus_target = None;
     }
 
     fn window_title(&self) -> Option<String> {
@@ -1657,14 +1892,100 @@ mod tests {
         // UTF-8 存储 (含 UTF-16 转码副本) 保留完整正则语法 —— review 抓的回归：
         // 旧代码查 stats().encoding, 把 UTF-16 文件误踢进字面量分支，`ERROR|FATAL`
         // 变成逐字节字面匹配，命中恒空。
+        // 两分支的 `(?i)` 前缀是 2026-09-15 的默认不敏感 (spec D2/D3)。
         assert_eq!(
             build_search_pattern(Encoding::Utf8, "ERROR|FATAL"),
-            "ERROR|FATAL"
+            "(?i)ERROR|FATAL"
         );
-        // GBK 存储：转字节 → \xNN 字面量 (退化为字面量语义)
+        // GBK 存储：转字节 → \xNN 字面量 (退化为字面量语义), 外面套同一个 (?i)
         assert_eq!(
             build_search_pattern(Encoding::Gbk, "中文"),
-            "(?-u)\\xD6\\xD0\\xCE\\xC4"
+            "(?i)(?-u)\\xD6\\xD0\\xCE\\xC4"
+        );
+    }
+
+    #[test]
+    fn search_pattern_is_case_insensitive_by_default_with_opt_out() {
+        // 默认不敏感: 小写查询命中大写内容
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "error")).unwrap();
+        assert!(re.is_match(b"2026-09-15 ERROR boom"));
+        // 逃逸舱: `(?-i)` 组内覆盖, 用户想精确时零代码可用
+        let re =
+            regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "(?-i)error")).unwrap();
+        assert!(!re.is_match(b"2026-09-15 ERROR boom"), "逃逸舱须恢复敏感");
+        assert!(re.is_match(b"2026-09-15 error boom"));
+    }
+
+    #[test]
+    fn case_prefix_does_not_change_regex_class_semantics() {
+        // `(?i)` 而非 `(?i-u)`: `\w` 仍是 Unicode 语义 (含汉字), `\d` 仍是 Unicode 数字。
+        // 若误用 `(?-u)`, `\w` 会退化成 ASCII 类 —— 这两条断言就是那把锁。
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"\w+")).unwrap();
+        assert!(re.is_match("汉字".as_bytes()), "\\w 必须仍是 Unicode 语义");
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"^\d+$")).unwrap();
+        assert!(
+            re.is_match("１２３".as_bytes()),
+            "\\d 必须仍是 Unicode 数字类"
+        );
+    }
+
+    /// `parse_filter` 是过滤解析的**唯一入口**: 键名规范化只在有 schema 时发生,
+    /// 且用户输入的原文不改 (状态栏显示的是他敲的那串)。
+    #[test]
+    fn parse_filter_normalizes_keys_only_when_schema_present() {
+        let mut app = LogApp::new_empty();
+        let field = |p: &str| {
+            vec![jsonl::Clause::Field {
+                path: vec![p.to_string()],
+                op: jsonl::Op::Eq,
+                value: "ERROR".to_string(),
+            }]
+        };
+
+        // .log (无 schema): 键名原样 —— 与改造前一字不差
+        assert!(app.schema.is_none(), "new_empty 应无 schema");
+        assert_eq!(app.parse_filter("LEVEL=ERROR"), field("LEVEL"));
+
+        // JSONL (有 schema): 改写为列里的真实写法
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        assert_eq!(app.parse_filter("LEVEL=ERROR"), field("level"));
+        // 大小写已一致的照常通过
+        assert_eq!(app.parse_filter("level=ERROR"), field("level"));
+        // 裸词与多段路径不经规范化
+        assert_eq!(
+            app.parse_filter("boom"),
+            vec![jsonl::Clause::Bare("boom".into())]
+        );
+        assert_eq!(
+            app.parse_filter("a.b=1"),
+            vec![jsonl::Clause::Field {
+                path: vec!["a".into(), "b".into()],
+                op: jsonl::Op::Eq,
+                value: "1".into(),
+            }]
+        );
+    }
+
+    /// 过滤栏存的是**用户敲的原文**, 规范化只发生在解析层 —— 状态栏回显与
+    /// 清空重放 (`filter_applied`) 都拿它, 改掉会让用户看到自己没敲过的字。
+    #[test]
+    fn apply_filter_keeps_raw_query_for_display() {
+        let mut app = LogApp::new_empty();
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        app.apply_filter("LEVEL=ERROR".to_string());
+        assert_eq!(
+            app.filter_applied, "LEVEL=ERROR",
+            "存的是原文不是规范化结果"
         );
     }
 
@@ -1959,6 +2280,52 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// **打开文件后必须有人持焦** (review 轮补的第四条): T14 把「选中行高亮」改成
+    /// 只在 `LogView` 持焦时才画 (`visible_selection` 的焦点门禁), 而 `Ctrl+O`
+    /// 打开文件后**没有任何控件**持焦 —— 于是打开 1GB 日志看到的是「一行都没选中」,
+    /// 按 ↑↓ 只动底栏行号、屏上什么都不动: 正是本模块判据① (按了有没有立刻的
+    /// 变化) 要消灭的那一类。修法是 `apply_fresh` 尾部把焦点送进列表。
+    ///
+    /// **两半都要钉**: Fresh 送、append 不送。后者若也送, 后台追长 / 轮转会把正在
+    /// 过滤栏里打字的用户当场拽走 (焦点一挪, 接下来敲的字就不进栏了)。
+    #[test]
+    fn fresh_open_hands_focus_to_the_list_but_append_does_not() {
+        let mut app = LogApp::new_empty();
+        let p = temp_log("2026-09-05 12:00:01 ERROR one\n".as_bytes());
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+
+        // 打开文件 (Fresh): 焦点必须送进列表
+        app.focus_target = Some("log-bar"); // 假装用户正停在过滤栏
+        app.apply_fresh(p.clone(), out);
+        assert_eq!(
+            app.focus_target,
+            Some("log-view"),
+            "打开文件后须把焦点送进列表 —— T14 起高亮只在持焦时画, 不送就是「一行没选中」"
+        );
+
+        // 对照: **追加**不得动焦点 (用户可能正在栏里打字)
+        app.focus_target = Some("log-bar");
+        app.level_counts = Arc::new(levels::count_levels(&app.file));
+        app.levels_pending = false;
+        let p2 =
+            temp_log("2026-09-05 12:00:01 ERROR one\n2026-09-05 12:00:02 INFO two\n".as_bytes());
+        app.apply_appended(LogFile::open(&p2).unwrap(), None);
+        assert_eq!(
+            app.focus_target,
+            Some("log-bar"),
+            "追长/轮转不得抢焦点 —— 否则正在过滤栏里打的字当场丢失"
+        );
+
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
     /// 轮转/重建: 计数重新后台算, 且列名与子句表跟着换 —— JSONL 变明文后必须
     /// 降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
     #[test]
@@ -2063,5 +2430,452 @@ mod tests {
         assert!(app.filtered.is_none());
         assert!(app.search.is_none());
         std::fs::remove_file(&p).ok();
+    }
+
+    // ---- M3 (T12): 九条沉默接入的回归锁 ----
+    //
+    // 公共判据是「触发后**出声**且**说得对**」: 只测「有提示」会放过提示写错原因
+    // 的形态, 只测「返回 Consumed/Ignored」则完全测不出这一批改动 (M3 一律不动
+    // 归因, 只加原因)。
+
+    /// 敲一个无修饰键。
+    fn press(app: &mut LogApp, key: Key) {
+        app.event(&Event::Key {
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+    }
+
+    /// 敲一个 Ctrl+字母。
+    fn press_ctrl(app: &mut LogApp, ch: &str) {
+        app.event(&Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        });
+    }
+
+    /// 造一个开了真文件 (内容自定) 的 app, 交给 `f` 跑, 收尾删文件。
+    /// 走 `has_file` 门禁**之后**的键处理路径 —— 空态会先被 P26 那条拦下。
+    fn with_file<T>(content: &[u8], f: impl FnOnce(&mut LogApp) -> T) -> T {
+        let p = temp_log(content);
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        let out = f(&mut app);
+        std::fs::remove_file(&p).ok();
+        out
+    }
+
+    /// 取当前 notice 文本; 没有则连底栏一起报出来 (方便定位是「没出声」还是
+    /// 「声出到了别处」)。
+    fn notice_of(app: &LogApp) -> String {
+        app.notice
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_else(|| panic!("须有一条 notice; 当前底栏: {}", app.status))
+    }
+
+    /// 敲一个 Ctrl+字符键事件 (不经过 app, 供 `app_key_filter` 直调)。
+    fn ctrl_key(ch: &str) -> Event {
+        Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        }
+    }
+
+    /// T17 验收 ③: 拖滚动条**不改选中行** —— 抓条是「看」不是「选」。
+    ///
+    /// 对照在同一支测试里: 方向键那条路**会**动选中 (既有行为, 本项不动它)。
+    /// 有对照才说明这条不变量是**有意**分开的, 不是碰巧没动。
+    #[test]
+    fn scroll_to_does_not_move_the_selection() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let (mut app, p) = {
+            let p = temp_log(body.as_bytes());
+            let mut app = LogApp::new_empty();
+            app.file = Arc::new(LogFile::open(&p).unwrap());
+            app.has_file = true;
+            (app, p)
+        };
+        app.selected = 7;
+
+        app.update(Msg::ScrollTo {
+            top: 120.0,
+            at_bottom: false,
+        });
+        assert_eq!(app.top_row, 120.0, "绝对定位须原样落到 top_row");
+        assert_eq!(app.selected, 7, "抓滚动条不得动选中行");
+
+        app.update(Msg::ScrollRows(1.0));
+        assert_eq!(app.selected, 121, "对照: 滚轮/方向键那条路仍让选中跟随首行");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T17 回归锁: 在底部**碰一下滚动条**不得静默脱掉 FOLLOW。
+    ///
+    /// 跟随态下 app 的 `top_row` 是 `count-1`, 而滚动条能表达的最大值是
+    /// `count-可见行数` —— 两个口径差着 `可见行数-1` 行。原先直接比
+    /// `top < top_row`, 于是「在底部往下拖」也被判成「向上看」, ` · FOLLOW`
+    /// 悄悄从底栏消失。修法: 落到条底 (`at_bottom`) 时不参与这个判断、
+    /// 往回拖仍照旧。**A/B 实证**: 去掉 `!at_bottom` 那一项, 本测试第一段必红。
+    #[test]
+    fn touching_the_scroll_bar_at_the_bottom_keeps_follow() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let p = temp_log(body.as_bytes());
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+
+        // 条能表达的最底位比 app 的 `max_top()` 小 —— 正是当年误判的那一格
+        let bar_bottom = app.max_top() - 10.0;
+        app.follow = true;
+        app.top_row = app.max_top();
+        app.update(Msg::ScrollTo {
+            top: bar_bottom,
+            at_bottom: true,
+        });
+        assert!(app.follow, "拖到条底不该脱跟随 (用户没在往回看)");
+
+        // 对照: 真往回拖 (没到条底) 仍然脱跟随。**必须把 top_row 放回跟随位**
+        // —— 上一条已经把 top_row 拉到了 bar_bottom, 不放回去这条就不是「往回拖」。
+        app.follow = true;
+        app.top_row = app.max_top();
+        app.update(Msg::ScrollTo {
+            top: bar_bottom,
+            at_bottom: false,
+        });
+        assert!(!app.follow, "往回拖须停止跟随");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// P30 (T17): **未认领的滚轮**转给列表滚动 —— 指针停在侧栏/过滤栏上时,
+    /// 日志区收不到滚轮 (框架按点子命中分发、不向父级回落), 原先必须把指针挪回
+    /// 内容区才滚得动。
+    ///
+    /// 判据取**效果** (top_row 动了) 而不是「有没有走那个分支」。
+    #[test]
+    fn unclaimed_wheel_scrolls_the_list() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let p = temp_log(body.as_bytes());
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+
+        let wheel = |dy: f32| Event::MouseWheel {
+            delta: (0.0, dy),
+            position: danqing::Point::new(10.0, 400.0), // 侧栏上
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        app.event(&wheel(-1.0)); // 向下滚 (与 view 同向: delta.1 < 0 = 向下)
+        assert!(app.top_row > 0.0, "侧栏上的滚轮须滚得动列表");
+
+        // 模态不穿透: 卡开着时滚轮只属于卡
+        let before = app.top_row;
+        app.settings_open = true;
+        app.event(&wheel(-1.0));
+        assert_eq!(app.top_row, before, "设置卡开着时滚轮不得滚卡后的日志");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T17: 滚轮换算**单点** —— 内容区与「未认领」那一路必须是同一个手感。
+    ///
+    /// 顺带钉住上界: 框架把 `LineDelta`(行) 与 `PixelDelta`(像素) 抹平成同一个
+    /// `f32` (G10), 触控板一次给 ±100 时若不夹, 一滚就跳几百行。
+    #[test]
+    fn wheel_rows_is_clamped_and_sign_flipped() {
+        assert!(wheel_rows(-1.0) > 0.0, "与 danqing Scrollable 同向");
+        assert_eq!(wheel_rows(0.0), 0.0);
+        // 钉**值**而不是钉「有夹子」: 写 `<= WHEEL_MAX_ROWS` 的话, 把常量从 12
+        // 改成 50 它照样绿 —— 那就不叫守卫了。
+        assert_eq!(wheel_rows(-100.0), WHEEL_MAX_ROWS, "像素档夹到上界");
+        assert_eq!(wheel_rows(100.0), -WHEEL_MAX_ROWS);
+    }
+
+    /// T18 (P17): notice 自带消退期限 —— 到点清掉, 不留常驻噪声。
+    ///
+    /// 不真等 4 秒: 把期限拨到过去, 语义等价。
+    #[test]
+    fn notice_expires_when_its_deadline_passes() {
+        let mut app = LogApp::new_empty();
+        app.set_notice("已复制该行".into(), NoticeKind::Info);
+        assert!(app.notice.is_some());
+        app.expire_notice();
+        assert!(app.notice.is_some(), "未到点不得消退");
+
+        app.notice_until = Some(Instant::now() - Duration::from_millis(1));
+        app.expire_notice();
+        assert!(app.notice.is_none(), "到点须消退");
+        assert!(app.notice_until.is_none(), "期限也要一并清掉");
+    }
+
+    /// T20 (P37): 侧栏开关与 Ctrl+L 是**同一份状态** —— 两条入口同发一条消息。
+    ///
+    /// 「双向同步」不是两处赋值互相对, 而是只有一份真相: 开关读
+    /// `app.histogram_visible`、Ctrl+L 与开关都发 `Msg::ToggleHistogram`。
+    ///
+    /// **配置路径必须显式给临时文件**: 这条消息会 `save_config()`, 而默认路径是
+    /// 用户真实的 `config.toml` (整文件覆盖写)。本测试第一版就是这么写的, 被
+    /// review 抓出来 —— 现在 `save_config` 在测试里拿不到路径会直接 panic。
+    #[test]
+    fn histogram_toggle_is_one_state_for_both_entries() {
+        let p = temp_log(b"");
+        let mut app = LogApp::new_empty_at(Some(p.clone()));
+        let before = app.histogram_visible;
+        app.update(Msg::ToggleHistogram);
+        assert_eq!(app.histogram_visible, !before, "两条入口共用的那一支须翻转");
+        app.update(Msg::ToggleHistogram);
+        assert_eq!(app.histogram_visible, before, "再切一次回到原状");
+        // 落盘也走的是**同一个**路径 (整文件同源, 不碰用户真配置)
+        assert_eq!(
+            config::Config::load_from(&p).histogram,
+            before,
+            "切换须落盘到注入的路径"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T21 (P39): Ctrl+F **不清草稿** —— 它是「回到搜索框」的反射键,
+    /// 而原实现每次都销毁用户已输入未应用的内容。
+    ///
+    /// 这里锁的是**应用侧那一半** (不再发清空信号、改发重聚焦信号);
+    /// 「全选」那一半在 `view.rs::refocus_selects_the_existing_draft`。
+    #[test]
+    fn reopen_search_keeps_the_draft() {
+        let mut app = LogApp::new_empty();
+        let clear0 = app.search_clear_rev;
+        let refocus0 = app.search_refocus_rev;
+
+        app.open_search();
+        assert_eq!(app.search_clear_rev, clear0, "Ctrl+F 不得再触发清空");
+        assert_eq!(app.search_refocus_rev, refocus0 + 1, "改为请栏处理重聚焦");
+        assert_eq!(app.focus_target, Some("log-bar"), "仍要把焦点送进栏");
+
+        // 对照: Esc 那条路**仍然**清空 (本项只动「回到搜索框」这一条)
+        app.clear_search();
+        assert_eq!(app.search_clear_rev, clear0 + 1, "Esc 仍须清空");
+    }
+
+    /// T16 (P32) 回归锁: 设置卡开着时, 全局键**不得穿透到卡后**。
+    ///
+    /// 逐条断言**卡后副作用没发生**, 而不是断言返回值是不是某个 `Msg` ——
+    /// 「不穿透」的实现可以是吞掉、也可以是别的, 判据应该绑在**后果**上。
+    ///
+    /// **Ctrl+O 不在表内 (有意)**: 它的穿透后果是弹一个**阻塞的原生文件对话框**,
+    /// 一旦回归, 这条测试不是红而是**挂住** —— 一个会挂死的守卫比没有守卫更坏。
+    /// 它的门禁与表内三条是同一个 `if`, 位置对了三条就都对了; 实机那一半由
+    /// 矩阵 §6 的「卡开着按 Ctrl+O」(P32) 覆盖。
+    #[test]
+    fn settings_modal_does_not_leak_global_keys_behind_the_card() {
+        let mut app = LogApp::new_empty();
+        app.settings_open = true;
+        for (name, ch) in [("Ctrl+F", "f"), ("Ctrl+T", "t"), ("Ctrl+L", "l")] {
+            let got = app.app_key_filter(&ctrl_key(ch));
+            let leaked = match got {
+                Some(Msg::FocusSearch) => "把焦点送到了卡后",
+                Some(Msg::ToggleMode) => "切了卡后的模式",
+                Some(Msg::ToggleHistogram) => "动了卡后的侧栏",
+                Some(Msg::OpenFile(_)) => "弹了文件对话框",
+                _ => "",
+            };
+            assert!(leaked.is_empty(), "{name} 穿透了设置卡: {leaked}");
+        }
+        // **反向对照 —— 本测试第一版缺的就是这半边, 于是漏掉了一个 Critical**:
+        // 卡内控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠**焦点分发**收键, 而框架在
+        // `app_key_filter` 返回 `Some` 时直接 return、不再分发 (`handler.rs:436-441`)。
+        // 所以非全局键**必须**放行 (`None`), 否则卡内键盘全死 —— 而上一段
+        // 「不该发生的副作用没发生」是**看不出**这一点的 (吞得越多它越绿)。
+        let plain = |k: Key| Event::Key {
+            key: k,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        for (name, ev) in [
+            ("↓ (下拉导航)", plain(Key::Named(NamedKey::ArrowDown))),
+            (
+                "Enter (下拉选中 / 关闭钮)",
+                plain(Key::Named(NamedKey::Enter)),
+            ),
+            ("Space (侧栏开关)", plain(Key::Named(NamedKey::Space))),
+            ("普通字符 (打字)", plain(Key::Character("x".into()))),
+        ] {
+            assert!(
+                app.app_key_filter(&ev).is_none(),
+                "{name} 必须放行给卡内控件 —— 守卫吞了它, 卡内键盘就死了"
+            );
+        }
+        // 这三条由 `LogApp::event` 那条路认领, 那里有同款门禁 —— 一并锁住
+        app.event(&ctrl_key("b"));
+        app.event(&ctrl_key("g"));
+        assert!(app.bookmarks.is_empty(), "Ctrl+B 不得在卡后加书签");
+        // Esc 仍须能关卡 (既有行为保持, 不被守卫吃掉)
+        assert!(
+            matches!(
+                app.app_key_filter(&Event::Key {
+                    key: Key::Named(NamedKey::Escape),
+                    pressed: true,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                }),
+                Some(Msg::CloseSettings)
+            ),
+            "Esc 必须仍能关闭设置卡"
+        );
+    }
+
+    /// T11 回归锁: notice 是**第二条通道**, 不得拼进 `status` 串。
+    ///
+    /// 曾把它拼进去, 而 `LogView::paint` 又单独画一遍 `notice` —— 同一句话在底栏
+    /// 出现**两次**。而两遍还是同色的, 第一眼只像「重复」不像「出错」, 所以这条
+    /// 必须由守卫而不是靠眼睛。
+    #[test]
+    fn notice_is_not_folded_into_the_status_line() {
+        let mut app = LogApp::new_empty();
+        app.refresh_status();
+        app.notice = Some(("此处无行".into(), NoticeKind::Info));
+        app.refresh_status();
+        assert!(app.notice.is_some(), "前提: notice 还在");
+        assert!(
+            !app.status.contains("此处无行"),
+            "notice 不得拼进 status (会被画两遍): {}",
+            app.status
+        );
+        // 反向对照: 常态信息该在的仍在 (别把整条底栏一起删了)
+        assert!(!app.status.is_empty(), "常态信息不得一起被删掉");
+    }
+
+    /// P27 收口 (2026-09-15 用户裁定「**后者**」): 无效正则这类错误**走 status 的
+    /// 错误态 (常驻红)**, **不进 notice 通道** —— notice 有 4 秒消退期, 而它是
+    /// 「你刚按的那下没生效」, 不该自己消失。
+    ///
+    /// 这条钉的是**标志与内容同真同假**: 置了错误态就得真有错误, 换了常态就得清掉
+    /// —— 脱钩了就是「绿水配红字」那类假信息。
+    #[test]
+    fn invalid_regex_marks_the_status_as_an_error_and_normal_status_clears_it() {
+        let mut app = LogApp::new_empty();
+        app.refresh_status();
+        assert!(!app.status_error, "起点不该是错误态");
+
+        // 未闭合分组 → 正则必然编译失败
+        app.apply_search("(".to_string());
+        assert!(app.status.contains("正则无效"), "须说清为什么搜不了");
+        assert!(
+            app.status_error,
+            "无效正则须把底栏标成错误 (paint 才会用 danger)"
+        );
+        assert!(
+            app.notice.is_none(),
+            "错误**不得**走 notice 通道 —— 那条 4 秒就消退, 用户裁定要常驻"
+        );
+        // **反向对照**: 常态刷新必须清掉标志 —— 否则红字会跟着后续所有信息一起红
+        app.refresh_status();
+        assert!(!app.status_error, "常态刷新须清掉错误态");
+        assert!(!app.status.contains("正则无效"), "常态刷新也该换掉那句话");
+    }
+
+    /// T13 —— 「被吞掉的输入必有原因」: **本表就是规则的挂载点**。
+    ///
+    /// M3 之前本仓只有一处出声 (正则无效进底栏), 其余静默。这条把那个孤例**升格
+    /// 为规则**: 再遇到「按了没反应」, 要做的不是「记得去加提示」, 而是**往这张表
+    /// 加一行** —— 行在, 判据在, 原因就漏不掉。
+    ///
+    /// 每行给的是**期望的原因片段**, 不是「有提示就算」: 后者会放过原因写错的形态。
+    /// 本表只收**键盘路径**上的吞键; 鼠标路径各有同构的守卫
+    /// (`view.rs::click_below_the_last_row_says_there_is_no_row` /
+    /// `expand_glyph_on_a_leaf_row_says_why_instead_of_toggling` /
+    /// `histogram.rs::readonly_sidebar_swallows_clicks_but_says_why`)。
+    #[test]
+    fn every_swallowed_key_says_why() {
+        type Run = Box<dyn Fn() -> String>;
+        let rows: Vec<(&str, &str, Run)> = vec![
+            (
+                "P26 空态按键",
+                "尚未打开文件",
+                Box::new(|| {
+                    let mut app = LogApp::new_empty();
+                    assert!(!app.has_file);
+                    press(&mut app, Key::Named(NamedKey::ArrowDown));
+                    notice_of(&app)
+                }),
+            ),
+            (
+                "P23 Ctrl+T 无 JSONL",
+                "非 JSONL",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        assert!(app.schema.is_none(), "前提: 无 JSONL schema");
+                        press_ctrl(app, "t");
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P24 ← 落在未展开行",
+                "未展开",
+                Box::new(|| {
+                    with_file(b"{\"a\":{\"b\":1}}\nplain\n", |app| {
+                        app.mode = ViewMode::Table;
+                        press(app, Key::Named(NamedKey::ArrowLeft));
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P24 → 落在已展开行",
+                "已展开",
+                Box::new(|| {
+                    with_file(b"{\"a\":{\"b\":1}}\nplain\n", |app| {
+                        app.mode = ViewMode::Table;
+                        app.toggle_expand(0); // 真展开 (行 0 含嵌套)
+                        assert!(app.expanded.is_expanded(0), "前提: 行 0 已展开");
+                        press(app, Key::Named(NamedKey::ArrowRight));
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                "P25 Ctrl+G 无书签",
+                "尚无书签",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        assert!(app.bookmarks.is_empty(), "前提: 无书签");
+                        press_ctrl(app, "g");
+                        notice_of(app)
+                    })
+                }),
+            ),
+            (
+                // 口径须与 `ROADMAP-v1x.md` §四 同源 —— 写成「暂不支持」之类
+                // 就又是一处各说各话, 故断言片段锁在 "v1.x" 上。
+                "P34 Ctrl+A 被吞",
+                "v1.x",
+                Box::new(|| {
+                    with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
+                        press_ctrl(app, "a");
+                        notice_of(app)
+                    })
+                }),
+            ),
+        ];
+        for (name, expect, run) in &rows {
+            let text = run();
+            assert!(
+                text.contains(expect),
+                "{name}: 被吞掉的输入须说出「{expect}」, 实得「{text}」"
+            );
+        }
     }
 }

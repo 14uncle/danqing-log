@@ -194,6 +194,8 @@ if (Test-Path $MsixPath) { Remove-Item $MsixPath -Force }
 & $MakeAppx pack /d $Stage /p $MsixPath /o
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: makeappx 失败"; exit 1 }
 
+# 注意: 这里算的是**未签名**的字节。tools/sign_msix_local.ps1 签完会就地重算并回写这个
+# .sha256 —— 所以签过名的包按本行此刻的值核对**必然对不上**, 那不是包坏了。
 $Bytes = [System.IO.File]::ReadAllBytes($MsixPath)
 $Sha = [System.Security.Cryptography.SHA256]::Create()
 $Hash = ([System.BitConverter]::ToString($Sha.ComputeHash($Bytes)) -replace '-', '').ToLower()

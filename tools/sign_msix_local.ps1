@@ -109,6 +109,16 @@ Write-Host "=== 3/4 signtool 签名 ==="
 & $Signtool sign /fd SHA256 /f $PfxPath /p $PfxPassword $Msix
 if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: signtool 失败"; exit 1 }
 
+# 签名改写了包字节 —— build_msix.ps1 写的 .sha256 从这一刻起不再匹配。
+# 就地重算回写, 让 sidecar 永远描述**磁盘上这个文件**: 否则上传前按 sidecar 自检
+# 会稳定报「包坏了」, 而包其实好好的。 (2026-09-16 实测踩到: 7434948e -> 2fdb0a0e)
+$Bytes = [System.IO.File]::ReadAllBytes($Msix)
+$Sha = [System.Security.Cryptography.SHA256]::Create()
+$Hash = ([System.BitConverter]::ToString($Sha.ComputeHash($Bytes)) -replace '-', '').ToLower()
+$Sha.Dispose()
+[System.IO.File]::WriteAllText("$Msix.sha256", $Hash, [System.Text.Encoding]::ASCII)
+Write-Host ("SHA256:  {0}  (签名后重算, 已回写 .sha256)" -f $Hash)
+
 Write-Host ""
 Write-Host "=== 4/4 卸载旧包 -> 安装 ==="
 # 先卸载: 同版本号覆盖安装**可能不换二进制** (pomodoro 实测), 别信

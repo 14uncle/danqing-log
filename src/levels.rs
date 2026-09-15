@@ -111,6 +111,11 @@ fn scan_group(head: &[u8], firsts: [u8; 3], hits: &mut u8) {
 /// `"no errors found"` 这类正文会污染计数, 而柱条数字必须可信。代价是
 /// `"error: ..."` 这类小写级别不识别, 归入 `其他`。
 ///
+/// **2026-09-15 复访后仍保持敏感** (spec case-insensitive D7 修正): 过滤与**字段
+/// 口径**都改了默认不敏感, 唯独这里不改 —— 行口径是子串匹配, 落在整行正文上,
+/// 一不敏感就会被散文污染; 且 .log 的桶**只读无可点**, 不受「桶计数 == 筛选
+/// 结果」的 D2 约束 (字段口径才受, 它已经跟随)。别把这条当漏改。
+///
 /// 与「逐个关键词 memmem 早退」的朴素写法**语义完全等价** (含优先级与大小写),
 /// 差别只在常数: 朴素版 1GB 明文 157ms, 本版实测见 `tasks/todo-level-histogram.md`。
 pub fn classify_level(line: &[u8]) -> Level {
@@ -139,7 +144,7 @@ const LEVEL_COLUMN_NAMES: [&str; 6] = [
     "priority",
 ];
 
-/// 字段值分类: **前缀匹配**, 与过滤子句 `Op::Prefix` 同语义。
+/// 字段值分类: **前缀匹配 + ASCII 大小写不敏感**, 与过滤子句 `Op::Prefix` 同语义。
 ///
 /// 为什么不复用 [`classify_level`] (子串匹配): 计数口径必须与**点下去之后的
 /// 筛选结果**一致, 否则柱条数字与实际行数打架 (spec D2 一致性红线)。
@@ -147,16 +152,21 @@ const LEVEL_COLUMN_NAMES: [&str; 6] = [
 /// 而 `level=WARN` 筛出 0 行。改成前缀匹配 + 子句用 `level=WARN*` 之后,
 /// 两边对同一 token 走同一个判断 —— 一致性是构造保证, 不是碰巧。
 ///
+/// **大小写不敏感是同一理由的延续 (2026-09-15)**: 过滤侧已改默认不敏感 (spec
+/// case-insensitive D5), 分类器若停在敏感, 写着 `"level":"warn"` 的文件就会
+/// 「筛得出这些行、桶计数却归其他」—— 红线当场破。故两边共用
+/// [`jsonl::starts_with_ascii_ci`], 折叠口径也天然一致。
+///
 /// 六个 token 首字母互不相同 (F/E/W/I/D/T), 故前缀匹配天然互斥, 无需优先级。
 pub fn classify_field_value(value: &[u8]) -> Level {
     // 首字母互斥 (F/E/W/I/D/T) → 一次分派 + 一次前缀校验, 无优先级问题。
-    match value.first() {
-        Some(b'F') if value.starts_with(b"FATAL") => Level::Fatal,
-        Some(b'E') if value.starts_with(b"ERROR") => Level::Error,
-        Some(b'W') if value.starts_with(b"WARN") => Level::Warn,
-        Some(b'I') if value.starts_with(b"INFO") => Level::Info,
-        Some(b'D') if value.starts_with(b"DEBUG") => Level::DebugTrace,
-        Some(b'T') if value.starts_with(b"TRACE") => Level::DebugTrace,
+    match value.first().map(|b| b.to_ascii_uppercase()) {
+        Some(b'F') if jsonl::starts_with_ascii_ci(value, b"FATAL") => Level::Fatal,
+        Some(b'E') if jsonl::starts_with_ascii_ci(value, b"ERROR") => Level::Error,
+        Some(b'W') if jsonl::starts_with_ascii_ci(value, b"WARN") => Level::Warn,
+        Some(b'I') if jsonl::starts_with_ascii_ci(value, b"INFO") => Level::Info,
+        Some(b'D') if jsonl::starts_with_ascii_ci(value, b"DEBUG") => Level::DebugTrace,
+        Some(b'T') if jsonl::starts_with_ascii_ci(value, b"TRACE") => Level::DebugTrace,
         _ => Level::Other,
     }
 }
@@ -873,7 +883,12 @@ mod tests {
             Level::Other,
             "ERR 不是 ERROR 的前缀方向"
         );
-        assert_eq!(classify_field_value(b"error"), Level::Other, "大小写敏感");
+        // 大小写不敏感 (2026-09-15 口径翻转: 原断言为 `error` → Other)。
+        // 翻转理由 = 过滤侧同批改了不敏感; 分类器停在敏感就会「筛得出、计数归其他」,
+        // D2 红线破。非回归 —— 见 spec case-insensitive D7。
+        assert_eq!(classify_field_value(b"error"), Level::Error);
+        assert_eq!(classify_field_value(b"warn"), Level::Warn);
+        assert_eq!(classify_field_value(b"Fatal"), Level::Fatal);
         assert_eq!(classify_field_value(b""), Level::Other);
     }
 
@@ -968,33 +983,37 @@ mod tests {
     /// 这条断言的就是 spec 的一致性红线 —— 不是「差不多」, 是同一个数字。
     #[test]
     fn field_counts_equal_filter_hits_bucket_by_bucket() {
+        // fixture 含**混合大小写**的级别值 (2026-09-15 起两侧均不敏感, 必须同口径):
+        // 小写 error / 首字母大写 Warn / 小写 fatal 是这把锁真正要盯的部分。
         let content = b"{\"level\":\"INFO\",\"msg\":\"started\"}\n\
                         {\"level\":\"INFO\",\"msg\":\"handle error failed\"}\n\
                         {\"level\":\"ERROR\",\"msg\":\"disk full\"}\n\
                         {\"level\":\"WARNING\",\"msg\":\"slow query\"}\n\
                         {\"level\":\"ERR\",\"msg\":\"odd spelling\"}\n\
                         {\"severity\":\"DEBUG\",\"msg\":\"no level field\"}\n\
-                        {\"level\":\"error\",\"msg\":\"lowercase\"}\n";
+                        {\"level\":\"error\",\"msg\":\"lowercase\"}\n\
+                        {\"level\":\"Warn\",\"msg\":\"mixed case\"}\n\
+                        {\"level\":\"fatal\",\"msg\":\"lowercase fatal\"}\n";
         let p = temp_file(content);
         let f = LogFile::open(&p).unwrap();
-        assert_eq!(f.line_count(), 7);
+        assert_eq!(f.line_count(), 9);
 
         let counts = count_levels_field(&f, "level");
         assert_eq!(counts.get(Level::Info), 2, "含正文写 error 的那条");
-        assert_eq!(counts.get(Level::Error), 1);
-        assert_eq!(counts.get(Level::Warn), 1, "WARNING 靠前缀吃到");
-        assert_eq!(counts.get(Level::Fatal), 0);
+        assert_eq!(counts.get(Level::Error), 2, "ERROR + 小写 error");
+        assert_eq!(
+            counts.get(Level::Warn),
+            2,
+            "WARNING 靠前缀吃到 + Warn 混合写"
+        );
+        assert_eq!(counts.get(Level::Fatal), 1, "小写 fatal");
         assert_eq!(
             counts.get(Level::DebugTrace),
             0,
             "DEBUG 在 severity 列, 不算"
         );
-        assert_eq!(
-            counts.get(Level::Other),
-            3,
-            "ERR + 无 level 字段 + 小写 error"
-        );
-        assert_eq!(counts.total(), 7, "6 桶之和 == 总行数");
+        assert_eq!(counts.get(Level::Other), 2, "ERR (太短) + 无 level 字段");
+        assert_eq!(counts.total(), 9, "6 桶之和 == 总行数");
 
         for l in Level::ALL {
             let Some(q) = field_query("level", l) else {

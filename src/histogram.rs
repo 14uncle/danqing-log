@@ -101,7 +101,9 @@ fn row_at(area: Rect, p: Point, inset: f32) -> Option<usize> {
 
 /// 「清除筛选」文本在给定矩形内**两轴居中**的落点 (返回 x 与 baseline y)。
 /// 调用方传**悬停底色块** (用户眼里的「按钮」), 不是行矩形 —— 两者中心差 2.5px。
-/// 抽成纯函数: 居中数学有守卫 (`clear_row_text_is_centered_in_its_button`)。
+/// 抽成纯函数, 两条守卫各管一层:
+/// `centered_text_origin_puts_the_box_middle_in_the_rect` (公式) 与
+/// `clear_row_label_ink_is_centered_in_the_button` (调用点, 量**画出来的 ink**)。
 fn centered_text_origin(row: Rect, text_w: f32, line_h: f32, ascent: f32) -> (f32, f32) {
     let x = row.origin.x + (row.size.width - text_w) / 2.0;
     let baseline = row.origin.y + (row.size.height - line_h) / 2.0 + ascent;
@@ -151,6 +153,12 @@ pub(crate) struct LevelHistogram {
     file_open: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
+    /// `active` 重算所依据的**已应用过滤原串**。
+    ///
+    /// 缓存理由: `active` 的判定要过规范化 (`parse_filter`), 那是分配型操作,
+    /// 不该进每帧的 `sync`。判定依据只有两个来源 —— 用户改了过滤串、或换文件
+    /// 导致子句表变了 —— 两者任一变化才重算 (子句表的变化由 `queries` 自身比对)。
+    active_src: String,
     /// 鼠标悬停的行 (仅**可点**的行会进这里)。
     ///
     /// 人工验收反馈: 没有 hover 反馈, 用户不知道哪些行能点 (spec 原 Open Question
@@ -175,6 +183,7 @@ impl LevelHistogram {
         Self {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
+            active_src: String::new(),
             visible: true,
             pending: false,
             file_open: false,
@@ -250,17 +259,28 @@ impl Widget for LevelHistogram {
         self.accent = t.accent();
         self.palette = view::LevelPalette::for_cell(&t);
         self.counts = *app.level_counts.as_ref();
+        let queries_changed = self.queries != app.level_queries;
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
         self.pending = app.levels_pending;
         self.file_open = app.has_file;
-        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
+        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `LEVEL=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
-        self.active = Level::ALL.iter().copied().find(|l| {
-            self.queries[*l as usize]
-                .as_deref()
-                .is_some_and(|q| q == app.filter_applied)
-        });
+        //
+        // **比的是规范化之后的子句集, 不是原串** (2026-09-15 review 抓):
+        // 键名大小写不同 (`LEVEL=ERROR*`) 的手打查询筛的是**同一批行**, 指示器与
+        // `清除筛选` 必须跟着亮 —— 拿原串比会出现最别扭的一种状态: 结果确实被筛了,
+        // 侧栏却说没有筛选生效、清除行也点不动。
+        // 两侧都过 `parse_filter` (同一道规范化), 等值判定才与匹配口径同源。
+        if queries_changed || self.active_src != app.filter_applied {
+            self.active_src = app.filter_applied.clone();
+            let applied = app.parse_filter(&app.filter_applied);
+            self.active = Level::ALL.iter().copied().find(|l| {
+                self.queries[*l as usize]
+                    .as_deref()
+                    .is_some_and(|q| app.parse_filter(q) == applied)
+            });
+        }
     }
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
@@ -303,7 +323,11 @@ impl Widget for LevelHistogram {
         }
 
         for (i, level) in Level::ALL.iter().enumerate() {
-            let row_y = area.origin.y + PAD_Y + inset + i as f32 * ROW_H;
+            // S3 (2026-09-14): 行几何**只认 `row_rect` 一个真身** —— 原先这里
+            // 内联 `area.origin.y + PAD_Y + inset + i*ROW_H`, 与 `row_rect`/`row_at`
+            // 各推一遍, 「同规则同常量」只靠注释维持。收口后 paint/命中/高亮三处同源。
+            let row_rect = row_rect(area, i, inset);
+            let row_y = row_rect.origin.y;
             let baseline = row_y + texts.ascent(f32::from(LABEL_SIZE));
 
             // 生效行: 整行淡底 (比给横条换色更醒目, 且不动语义色)
@@ -453,7 +477,18 @@ impl Widget for LevelHistogram {
         };
         // 不可点 (明文模式 / 无子句的桶 / 没有生效筛选时的清除行) —— 吞掉点击,
         // 不让它穿透到底下的列表 (点在有东西的地方不该毫无回应地选中底下的行)。
+        // M3 (2026-09-14 实机 M0 P21): 吞掉时**说清为什么** —— 原先静默,
+        // 用户不知道是没点中还是程序没响应。
         if !self.is_row_clickable(i) {
+            let reason = if i == CLEAR_ROW {
+                "无生效筛选可清除"
+            } else {
+                "本级别不可点选 (仅统计)"
+            };
+            msgs.push(Box::new(Msg::Notice(
+                reason.into(),
+                crate::NoticeKind::Info,
+            )));
             return EventResult::Consumed;
         }
         if i == CLEAR_ROW {
@@ -582,6 +617,49 @@ mod tests {
         assert_eq!(w.hover.get(), None, "移出后 hover 清空");
     }
 
+    /// **指示器跟着规范化走, 不跟原串走** (2026-09-15 review 抓的缺口)。
+    ///
+    /// 键名大小写不同 (`LEVEL=ERROR*`) 的手打查询, 过滤结果与 `level=ERROR*`
+    /// 逐行相同; 若拿原串比, 侧栏会进入最别扭的状态 —— 结果确实被筛了, 却没有任何
+    /// 桶行高亮, 且「清除筛选」点不动 (它只在 `active.is_some()` 时可点)。
+    #[test]
+    fn active_bucket_follows_normalized_filter_not_raw_string() {
+        let mut app = LogApp::new_empty();
+        app.schema = Some(std::sync::Arc::new(crate::jsonl::Schema {
+            columns: vec![crate::jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        app.level_queries = levels::level_queries_for("level");
+        let mut w = LevelHistogram::new();
+
+        app.filter_applied = "LEVEL=ERROR*".into();
+        w.sync(&app);
+        assert_eq!(
+            w.active,
+            Some(Level::Error),
+            "键名大小写不同仍是同一个筛选 → 桶行必须高亮"
+        );
+        assert!(w.is_row_clickable(CLEAR_ROW), "有生效筛选 → 清除行必须可点");
+
+        // 大小写一致的写法照旧 (不得因归一化反而失配)
+        app.filter_applied = "level=ERROR*".into();
+        w.sync(&app);
+        assert_eq!(w.active, Some(Level::Error), "同写法照旧点亮");
+
+        // 真正不等价的查询不得点亮
+        app.filter_applied = "status=500".into();
+        w.sync(&app);
+        assert_eq!(w.active, None, "另一个查询不是这个桶");
+
+        // 空过滤 = 无生效
+        app.filter_applied.clear();
+        w.sync(&app);
+        assert_eq!(w.active, None);
+        assert!(!w.is_row_clickable(CLEAR_ROW), "无筛选时清除行不可点");
+    }
+
     /// 「清除筛选」行点击要发出消息 (走与「再点生效行」同一套切换语义)。
     #[test]
     fn clear_row_click_emits_message() {
@@ -608,10 +686,15 @@ mod tests {
         assert!(!q.is_empty(), "清除行点击必须发出消息");
     }
 
-    /// 只读侧栏 (全 None 子句表) 下点击必须被吞掉, 且不发出任何消息 ——
-    /// 否则点空侧栏会穿透去选中底下的日志行。
+    /// 只读侧栏 (全 None 子句表) 下点击仍必须被**吞掉** (不穿透去选中底下的日志行),
+    /// 但不再静默 —— M3 (P21) 起每次吞掉都附一条说明。
+    ///
+    /// 本测试原名 `readonly_sidebar_swallows_clicks_without_message`, 断言「不发
+    /// 任何消息」。P21 把「静默吞掉」判成了缺陷 (用户分不清「没点中」与「程序没
+    /// 响应」), 故**跟着改判**: 「不穿透」这条不变式原样保留, 「不发声」那条反转
+    /// 成「必须恰好说一条, 且是带原因的 Notice」。
     #[test]
-    fn readonly_sidebar_swallows_clicks_without_message() {
+    fn readonly_sidebar_swallows_clicks_but_says_why() {
         let mut w = LevelHistogram::new();
         assert!(w.queries.iter().all(Option::is_none), "新建即只读");
         let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
@@ -629,9 +712,14 @@ mod tests {
             assert_eq!(
                 w.event(&ev, area, &mut q),
                 EventResult::Consumed,
-                "第 {i} 行点击应被吞"
+                "第 {i} 行点击应被吞 (不穿透)"
             );
-            assert!(q.is_empty(), "只读侧栏不得发消息");
+            assert_eq!(q.len(), 1, "第 {i} 行吞掉时须**恰好**说一条原因");
+            let msg = q[0].downcast_ref::<Msg>().expect("消息应是 Msg");
+            assert!(
+                matches!(msg, Msg::Notice(text, _) if !text.is_empty()),
+                "第 {i} 行的拒绝须带上原因 (非空 Notice)"
+            );
         }
     }
 
@@ -782,15 +870,21 @@ mod tests {
         }
     }
 
-    /// 「清除筛选」是整宽按钮行, 文本必须**两轴居中**于**悬停底色块** —— 不是行矩形:
-    /// 底色块 `[ry-2, ry+24]` 与行矩形 `[ry, ry+28]` 中心差 2.5px,
-    /// 2026-09-14 用户实机:「按钮内偏下」。(浮点断言留 ε, 不比精确值。)
+    /// **纯函数那一层**: 给定盒子宽度, `centered_text_origin` 把它放在矩形正中
+    /// (两轴)。浮点断言留 ε, 不比精确值。
+    ///
+    /// **只管公式, 不管喂进去的数**。这一条此前叫
+    /// `clear_row_text_is_centered_in_its_button` —— **名过其实**: 它喂的是
+    /// **合成矩形** (`x = 3.0`, 真实调用点是 `area.x + 2.0`) 和**写死的 `48.0`**,
+    /// 从不碰 `texts.measure()` 也不碰真实 `area`。而本模块**恰恰栽在「宽度错」上过**
+    /// (`✕` U+2715 是 0×0 空字形却占着 6px advance, 把整串文本顶偏)。
+    /// 名字改准, 免得下一个读的人以为调用点被覆盖了 —— 「宣称有守卫比没守卫更坏」。
     #[test]
-    fn clear_row_text_is_centered_in_its_button() {
-        let btn = Rect::from_xywh(3.0, 100.0, HIST_WIDTH - 4.0, ROW_H - 2.0);
+    fn centered_text_origin_puts_the_box_middle_in_the_rect() {
+        let btn = Rect::from_xywh(2.0, 100.0, HIST_WIDTH - 4.0, ROW_H - 2.0);
         let (x, baseline) = centered_text_origin(btn, 48.0, 15.0, 11.58);
         assert!(
-            (x - (3.0 + (HIST_WIDTH - 4.0 - 48.0) / 2.0)).abs() < 0.01,
+            (x - (2.0 + (HIST_WIDTH - 4.0 - 48.0) / 2.0)).abs() < 0.01,
             "水平居中于按钮"
         );
         // 文本行盒 [baseline-ascent, baseline-ascent+line_h] 的中点 = 按钮中点
@@ -798,6 +892,75 @@ mod tests {
         assert!(
             (text_mid - (100.0 + (ROW_H - 2.0) / 2.0)).abs() < 0.01,
             "垂直居中于按钮"
+        );
+    }
+
+    /// **调用点那一层** (2026-09-15 用户裁定「彻底版」): 量的是**画出来的字形矩形**
+    /// (`TextBatch::instance_rects`, 本批新加), 不是算出来的盒子 ——
+    /// 「清除筛选」的 ink 包围盒中心必须与悬停色块中心重合。
+    ///
+    /// **为什么非要量 ink**: `measure` 给的是 **advance 之和**, 眼睛看的是 **ink**。
+    /// `push_text` 按 `round(pen_x + bearing_x)` 落点、按 `info.width` 定宽, 两者天生
+    /// 不等; 更要命的是缺字 —— `✕` (U+2715) 不在内嵌子集里, 是 **0×0 空字形却照样
+    /// 占 6px advance**, 于是「按 advance 居中」的文本在屏上是偏的, 而当时
+    /// **没有任何一把尺能量到**, 只能靠人眼在手写基准里比。这条把「看着居中」
+    /// 第一次变成可断言的事。
+    #[test]
+    fn clear_row_label_ink_is_centered_in_the_button() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let paint = |active: Option<Level>, hover: Option<usize>| {
+            let mut w = LevelHistogram::new();
+            w.active = active;
+            w.hover.set(hover);
+            let mut rects = RectBatch::new();
+            let mut texts = TextBatch::new();
+            w.paint(area, &mut rects, &mut texts);
+            (rects.instance_rects(), texts.instance_rects())
+        };
+
+        let (_, base_txt) = paint(None, None);
+        // **色块的对照组必须也带 active** —— 生效行自己就有一个色块, 拿「无 active」
+        // 那一版比会把两个块一起算成「悬停带来的」(第一版就是这么写错的)。
+        // (字形的对照用 `None` 那版: 它没有清除行, 差值就是那 4 个字形。)
+        let (active_rects, with_txt) = paint(Some(Level::Info), None);
+        let (hot_rects, _) = paint(Some(Level::Info), Some(CLEAR_ROW));
+
+        // ① 底色块 = **悬停**前后唯一多出来的那个矩形
+        let extra: Vec<Rect> = hot_rects
+            .iter()
+            .copied()
+            .filter(|r| !active_rects.contains(r))
+            .collect();
+        assert_eq!(extra.len(), 1, "悬停应恰好多一个底色块, 实得 {extra:?}");
+        let block = extra[0];
+
+        // ② 「清除筛选」的 4 个字形 = 有 active 时多出来的那一串。它插在底部提示
+        //    **之前**, 故出现在序列中段 —— 按第一处差异定位, 不按下标硬取。
+        assert_eq!(
+            with_txt.len(),
+            base_txt.len() + 4,
+            "「清除筛选」应是 4 个字形 (少数一个 = 有字形没画出来)"
+        );
+        let i = base_txt
+            .iter()
+            .zip(with_txt.iter())
+            .position(|(a, b)| a != b)
+            .expect("有 active 时应当多出标签");
+        let label = &with_txt[i..i + 4];
+
+        // ③ ink 包围盒中心 == 色块中心
+        let left = label.iter().map(|g| g.origin.x).fold(f32::MAX, f32::min);
+        let right = label
+            .iter()
+            .map(|g| g.origin.x + g.size.width)
+            .fold(f32::MIN, f32::max);
+        let ink_c = (left + right) / 2.0;
+        let btn_c = block.origin.x + block.size.width / 2.0;
+        assert!(
+            (ink_c - btn_c).abs() <= 0.5,
+            "「清除筛选」ink 中心 {ink_c} 与色块中心 {btn_c} 差 {:.1}px —— \
+             按 advance 居中不等于看着居中",
+            (ink_c - btn_c).abs()
         );
     }
 }
