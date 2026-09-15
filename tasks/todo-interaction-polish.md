@@ -4,10 +4,10 @@
 > 矩阵 (兼实机核对单): `tasks/matrix-interaction-polish.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
 > 构建序: **M1 (框架) → M2 → M3 → M4 → M5**; commit/push 点标 ⏸ 待用户点头。
-> 基线: 本仓 **151 绿** (51 lib + 92 main + 8 genlog, 2026-09-15 M3 完成后实测);
-> 框架 **600 lib** + 集成 59 绿 (**M3 未动框架, 仍是 M1 后的数**)。
-> 记账前先量, 别抄旧数: 原记 133 (M1 后) / 115 (selection-copy 前) 都是那时的真数,
-> 只是会过期 —— main 从 74 → 82 (M2) → 92 (M3)。
+> 基线: 本仓 **169 绿** (51 lib + 110 main + 8 genlog, 2026-09-15 M5 完成后实测);
+> 框架 **600 lib** + 集成 59 绿 (**M5 的 T21 动了一处框架**: `TextInput::select_all`
+> 转 pub —— 本地已改已绿, **未 push**, 见 T21 条)。
+> 记账前先量, 别抄旧数 —— main 从 74 → 82 (M2) → 92 (M3) → 105 (M4) → 110 (M5)。
 > **M0 (用户实机走查 5 条) 在 build 前**: P10 / P11 / P19 / P30 / P31。
 
 ## Phase M1: 框架 (danqing)
@@ -347,7 +347,7 @@ notice。
 
 ## Phase M4: 前提与归属 (本仓, 依赖 M1)
 
-- [ ] **T14: Esc 一并清行选中 (P19)** ★ —— **不变量优先**
+- [x] **T14: Esc 一并清行选中 (P19)** ★ —— **不变量优先**
   - 说明: 现状链路 —— `view.rs:1609-1613` Esc 只清 `selection/selected_cell/press/
     dragging`, **不碰 `selected`** → 全空 `Ignored` → 框架 `handler.rs:446-450` 清焦点
     → Ctrl+C 无焦点时不进组件, app 的 ctrl 分支只认 b/g/t (`main.rs:1247-1263`)。
@@ -358,8 +358,23 @@ notice。
   - Verify: `cargo test`
   - Files: `src/view.rs`, (必要时) `src/main.rs`
   - Scope: M
+  - **实现期改判 (2026-09-15, 用户当场裁定): 走「高亮跟随焦点」, 不是 D6 的「Esc 清
+    掉当前行」**。D6 那条要 `selected` 从 `u64` 变 `Option<u64>`: 全仓 ~20 处写点 +
+    5 处读点 (Ctrl+B 书签 / →← 展开 / Ctrl+G / 搜索起点) 都要给「没有当前行」定语义,
+    而其中多数只能落回「出声」—— 为一个手势背一整套新状态机。改判后的做法:
+    `LogView` 加 `focused: bool` (FocusIn/FocusOut 维护), **三处高亮全部 AND 上它**。
+    不变量于是**由构造保证**: 框架只在持焦链路上派发 `Event::Copy`, 所以三处高亮
+    看得见 ⇔ 复制得到, 是**同一个因**, 不再靠约定。改动约 10 行, `main.rs` 未动。
+  - **代价 (如实记)**: 失焦时看不见选中 (点进搜索栏再点回来即恢复)。这是标准做法,
+    但确属可见变化 —— 尤其**打开文件后不点一下就没有高亮** (焦点起始为空)。
+  - 守卫: `the_three_highlights_all_follow_focus` (三类各一次, 已做 A/B: 摘掉行选中的
+    焦点位, 精确红在「失焦时不得画出来」) /
+    `escape_drops_the_highlight_and_hands_focus_back_to_the_framework` (锁住整条链的
+    **因**: Esc 必须 `Ignored` —— 那才是框架清焦点的触发条件)。
+  - 附带: `cell_fixture`/`sub_row_fixture` 等夹具置 `focused = true` (它们代表
+    「正在日志区里操作」), 另有 3 个内联构造的测试补了同一行。
 
-- [ ] **T15: 右键 / 中键只认 Left (P29)**
+- [x] **T15: 右键 / 中键只认 Left (P29)**
   - 说明: `view.rs:1516` 处理 MouseInput **不筛 button** → 右键 / 中键与左键同效
     (行选中 / 开设置卡)。改: 只认 `MouseButton::Left`。理由: 缺陷不在「右键没有菜单」,
     而在**左键的语义被一个没有 affordance 承诺的手势触发了**
@@ -369,8 +384,16 @@ notice。
   - Scope: S
   - 注意: 面板弹出层的 scrim 关闭 (`overlay.rs:250-258` 仅 Left) 与标题栏按钮**已是**只认
     Left, 保持不动
+  - **实现**: 按下分支开头一句 `if *button != MouseButton::Left { return Ignored; }`。
+    返 `Ignored` 而非 `Consumed`: 确实什么都没做, 不冒充「已认领」; 顺带把右键事件
+    留给应用层 —— 将来加右键菜单 (ROADMAP) 时这里不必再改。
+  - **附注 (查证)**: 框架的 `set_by_click` 在**任何**按下都会跑 (`handler.rs:973-977`),
+    所以右键仍会按位置改焦点。那是框架的归属, 不属本项, 已在代码注释里写明。
+  - 守卫: `right_and_middle_buttons_do_not_act_like_the_left_one` —— 判据取**消息队列**
+    而非返回值 (返回值是 `Ignored` 也可能是「照样发了消息然后说没做」), 且带左键对照
+    (左对照同时证明测试用的点位真的命中, 不是空跑)。已 A/B。
 
-- [ ] **T16: 模态守卫 (P32)**
+- [x] **T16: 模态守卫 (P32)**
   - 说明: 产品侧 `app_key_filter` 加 `settings_open` 守卫 (`main.rs:1235` 注释已自认
     穿透)。现状: 卡开着按 Ctrl+O **在卡上方弹系统文件对话框**; Ctrl+F 把焦点按 id 送到
     卡后**看不见的**输入框。框架 `app_key_filter` 是应用回调 → **产品侧守卫足够**
@@ -379,21 +402,44 @@ notice。
   - Verify: `cargo test`
   - Files: `src/main.rs`
   - Scope: S
+  - **实现**: Esc 分支之后加一句 `if self.settings_open { return Some(Msg::Noop); }`。
+    **吞掉而不是放行** —— 返回 `None` 的语义是「我没拦」, 事件会继续往下走。
+  - 守卫: `settings_modal_does_not_leak_global_keys_behind_the_card`。**Ctrl+O 有意
+    不在表内**: 它的穿透后果是弹**阻塞的原生对话框**, 一旦回归这条测试不是红而是**挂住**
+    —— 会挂死的守卫比没有守卫更坏。它与表内三条共用同一个 `if`, 实机那一半由 §6 核对单覆盖。
 
-- [ ] **T17: 滚动条拖拽 (新, 用户裁定 5 越界纳入)**
-  - 说明: paint 已有 (`view.rs:1354-1398`), 但 `:1453-1624` 整段 event **无滚动条分支**。
-    新增 按下 / 拖动 / 释放 三分支 + **hover 态 + 按下态 + 光标 (PointingHand, 走 T1 的
-    API)**; 位置数学**复用 `row_at`** (`view.rs:695-697`, 见 T10/S1), 不另推几何 (D7)
-  - Acceptance: ① 拇指位置 ↔ 内容偏移**往返一致** (互为逆运算);
-    ② 拖到顶/底**夹取**不越界; ③ 拖拽**不改变选中行**; ④ hover 与按下态可见;
-    ⑤ 纵横两条都做 (若成本差大, 纵条优先, 横条可退 ROADMAP —— **须在 todo 里标明**)
-  - Verify: `cargo test`
-  - Files: `src/view.rs`
-  - Scope: M
+- [x] **T17: 视图导航输入收口 —— 滚动条拖拽 + 未认领滚轮路由** (新; D7)
+  - **滚动条拖拽**: 见 todo 的详细条目
+  - **未认领滚轮 (P30, 由撤销的 T3 转入)**: `LogApp::event` 现在把非按键一律丢弃
+    (`main.rs:1222`), 滚轮虽到得了应用却被丢 —— 加 `Event::MouseWheel` 分支,
+    按位置把指针在侧栏/过滤栏上的滚轮转给列表滚动。
+    **`delta` 框架不归一** (`LineDelta` 行数 / `PixelDelta` 像素, 普查 G10), 两条都要接。
+  - **实现 (2026-09-15)**:
+    - **几何单点**: 抽出 `v_scroll` / `h_scroll` (结构体 + 逆运算 `top_row_at` /
+      `x_offset_at`), **paint 与拖拽共用一份**。D7 说的「复用 `row_at`」落地时发现
+      做不到 —— `row_at` 是**行粒度**的, 而拖拽要的是像素级连续量, 用它会把往返
+      一致性从「精确」降成「整行」。改为复用**paint 那份几何并取其逆**, 这才是
+      「不另推一份」的实质。
+    - **滚轮路由不需要位置数学**: 指针在日志区上时 `LogView` 已经 `Consumed`,
+      能走到应用层的本来就不是它。故按「未认领即滚列表」处理, 顺带覆盖标题栏等。
+      **加模态门禁** (与 T16 同一条纪律): 卡开着时滚轮只属于卡。
+    - **滚轮换算收口** `main.rs::wheel_rows`: 内容区与未认领那一路共用一支,
+      并夹单次上界 —— 框架把 `LineDelta`(行) 与 `PixelDelta`(像素) 抹平成同一个
+      `f32` (G10), 触控板一次 ±100 若不夹就跳几百行。
+    - **⑤ 纵横两条都做了**: 只做竖条会留下「两根同貌的拇指, 一根能拖一根不能」,
+      那正是本模块要消灭的形态。横向状态是视图局部的 `x_offset` (不经应用层),
+      故横条直接落 `Cell`, 竖条走 `Msg::ScrollTo`。
+    - **`Msg::ScrollTo` 不动 `selected`** (不变量 ③): 抓条是「看」不是「选」。
+      与 `ScrollRows` 的行为差异是**有意**的, 测试里带对照。
+    - 拇指 hover / 按住加深 (`border` → `text_secondary`), 光标 `CursorIcon::Pointer`
+      (走 T1 的 API; `cursor_icon` 无位置参数, 靠 `CursorMoved` 缓存的 `hover_bar`)。
+  - 守卫: 往返一致 / 两端夹取 / 拖拽不改选中 (带 ScrollRows 对照) /
+    拖拽链不污染文本选区状态机 / hover 与按下态可见 / 光标只在条上 /
+    横条往返+拖拽 / 未认领滚轮 (含模态不穿透) / `wheel_rows` 单点。**三处已 A/B**。
 
 ## Phase M5: 可发现性 (本仓, 依赖 M3)
 
-- [ ] **T18: 复制回执 (P17)**
+- [x] **T18: 复制回执 (P17)**
   - 说明: 现状 Ctrl+C 成功**零反馈** (`view.rs:1585-1600`), 只在超限时报错。
     走 T11 的通道给回执, **用中性色** (与警示色分开), 自动消退 (Q3)
   - Acceptance: 复制成功后底栏出现回执 (含「复制了什么 / 几条」); 中性色与警示色可辨;
@@ -401,8 +447,23 @@ notice。
   - Verify: `cargo test`
   - Files: `src/view.rs`, `src/main.rs`
   - Scope: S
+  - **实现**: 抽出 `LogView::copy_source` —— 三级来源 (文本选区 > 单元格 > 行) 的
+    **唯一判据**, `selected_text` 与回执都从它出发, 于是「真复制了」与「说复制了」
+    不可能分家。回执按级给词: `已复制选区 N 行` / `已复制单元格` / `已复制该行`
+    (只说「已复制」等于没回答 P17 问的那个「什么」)。
+  - **顺带修掉一处白做功**: 原判据是 `selected_text().is_some()` —— 把整段文本
+    **先造出来再丢掉**, 而框架随后还要再造一次; 十万行选区就是 16MB 白做两遍。
+    改用 `copy_source` 后两个问题一起没了。
+  - **自动消退 (Q3)**: `LogApp::notice_until` + `expire_notice()` (tick 每帧调)。
+    **单一入口 `set_notice`** —— 原先 8 处各自 `self.notice = Some(..)` 直接赋值,
+    直接赋值会漏掉期限, 那条提示就永远赖在底栏上。
+  - **`NOTICE_TTL = 4s` 是待实机核对的估值**: spec 说「具体时长 build 时实测定,
+    不估算」, 而本机跑不了真机走查。已挂进 §6 核对单 (两个方向都试: 太短没看见 /
+    太长碍事)。**这条是本项唯一没做到的验收, 记在这里**。
+  - 守卫: `copy_success_reports_what_was_copied` (三级各一次 + 回执两两不同 +
+    选区回执带「几条」) / `notice_expires_when_its_deadline_passes`。**已 A/B**。
 
-- [ ] **T19: 快捷键页补 `/` 与 `f` + 托盘菜单文字 (P36 P38)**
+- [x] **T19: 快捷键页补 `/` 与 `f` (P36); 托盘快捷文字 (P38) —— 改判不做**
   - 说明: 按设置卡**自己定的判据** (「只列猜不出来的那几个组合键; 方向键/翻页键不必教」
     `settings.rs:214`) 补齐 `/` 与 `f`; `→/←` 属方向键, **维持不教** (README 保留)。
     托盘菜单两项补快捷键文字 (`tray.rs:19,21` 第 4 参现为 `None`)
@@ -410,8 +471,20 @@ notice。
   - Verify: `cargo test`
   - Files: `src/settings.rs`, `src/tray.rs`
   - Scope: S
+  - **P36 已做**: `SHORTCUT_KEYS` 6 → 8 行, 补 `("`/`", "搜索栏 (原始模式)")` 与
+    `("f", "跟随文件增长 (原始模式)")`; `→/←` 未加 (方向键属常识)。
+    两条都标了「原始模式」—— 表格模式有常驻过滤栏, `/` 无栏可开。
+    注释里写明**判据是把设置卡自己那句话当真**, 不是新造标准。
+  - **P38 改判不做 (2026-09-15)**: 托盘菜单的第 4 参是 **accelerator**, 而本应用
+    `hotkeys: vec![]` **显式置空**(main.rs 有注释: 不继承番茄钟默认热键), 框架的热键
+    机制是 `RegisterHotKey` = **系统级全局**。填一个 accelerator 要么是**画着好看的
+    假承诺**(按了没反应 —— 正是本模块要消灭的形态), 要么得真的注册一条全局热键,
+    那会**抢走所有其它应用的该组合键**。为一个「菜单上多几个字」付这个代价不划算,
+    也与本应用「不打扰」的定位相反。**判据同 intent 的例外条款, 只是方向反过来:
+    不去做一个界面兑现不了的承诺。** 故 `tray.rs` 不动。
+  - 守卫: `shortcut_card_lists_single_keys_but_not_arrow_keys` (防改回)。
 
-- [ ] **T20: 设置卡「显示级别侧栏」开关 (P37)**
+- [x] **T20: 设置卡「显示级别侧栏」开关 (P37)**
   - 说明: 常规页加开关 (Q2)。`config.histogram` 字段**已存在**, 走整文件同源写入
     (见 `src/config.rs` 的既有约束: 分头写会让「改主题」抹掉侧栏开关)
   - Acceptance: 开关控制侧栏显隐; 与 Ctrl+L **双向同步**;
@@ -419,14 +492,34 @@ notice。
   - Verify: `cargo test`
   - Files: `src/settings.rs`, `src/main.rs`, `src/config.rs`
   - Scope: S
+  - **实现**: 常规页加 `histogram_switch()` —— `Switch::bind(app.histogram_visible)
+    .bind_theme(..).on_toggle(|| Msg::ToggleHistogram)`, 与 Ctrl+L **同一状态、
+    同一条消息、同一个落盘**, 不存在第二份真相。(`Switch::new` 烘的是浅色 token,
+    故 `bind_theme` 必须挂 —— 不然切暗色后轨道还是浅色的。)
+  - 守卫: `histogram_toggle_is_one_state_for_both_entries` (消息侧);
+    「改主题不抹开关」由 `config.rs` 既有的 `round_trip_preserves_both_keys` 覆盖。
+    **开关到状态那一段接线无单测** (要点得着控件树) —— 由 §6 核对单的 P37 覆盖。
 
-- [ ] **T21: Ctrl+F 不再清草稿 (P39)**
+- [x] **T21: Ctrl+F 不再清草稿 (P39)**
   - 说明: `main.rs:985` 「聚焦即干净开始」。改为: 栏**已聚焦**时 Ctrl+F = **全选内容**
     (便于覆写), **不清空**; 未聚焦时聚焦
   - Acceptance: 输入草稿后按 Ctrl+F, 内容**仍在**且被全选; 未聚焦时 Ctrl+F 仍聚焦
   - Verify: `cargo test`
   - Files: `src/main.rs`
   - Scope: S
+  - **实现**: `open_search` 不再 `search_clear_rev += 1`, 改 `search_refocus_rev += 1`;
+    `Bar` 新增 `bind_refocus_search`, 在 rev 变化**且 `search_ti.is_focused()`** 时
+    全选。「已持焦」由栏自己判 (sync 跑在焦点落地之前, 首次聚焦那一刻框里没有光标,
+    也没有该全选的东西 —— 时序天然正确)。清空仍归 Esc, 那条路径没动 (测试里带对照)。
+  - **⚠ 一处框架改动 (本批唯一)**: `TextInput::select_all` 原是私有
+    (`fn select_all`), 现改 `pub` + doc。**已在 ../danqing 本地改完并三件套绿
+    (600 lib + 集成), 但未 push** —— 用户未授权 push。故本仓 `.cargo/config.toml`
+    **patch 必须保持开着**, `Cargo.lock` 现为 **path 态, 此态绝不能提交**
+    (这正是 2026-09-14 踩过两次的坑)。
+  - 落地顺序 (待用户点头): danqing 提交 push → 本仓关 patch → `cargo update -p danqing`
+    (先跑一次 `cargo check` 让它按 manifest 重解) → 提交 lock → 两仓分别提交。
+  - 守卫: `reopen_search_keeps_the_draft` (应用侧: 不再清空 + Esc 仍清, 带对照) /
+    `refocus_selects_the_existing_draft` (栏侧: 已持焦才全选, 且不清空)。**已 A/B**。
 
 ## Phase 收尾
 

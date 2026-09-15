@@ -12,7 +12,7 @@ use std::any::Any;
 
 use danqing::widget::{
     Box as UiBox, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay, Padding,
-    Row, Tabs, Text, Widget,
+    Row, Switch, Tabs, Text, Widget,
 };
 use danqing::{
     Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch, Theme,
@@ -122,16 +122,44 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
         .width(CARD_WIDTH)
 }
 
-/// 「常规」页签: 可配置项的家 (目前只有主题)。
+/// 「常规」页签: 可配置项的家。
 ///
-/// 单列一行的确是空 —— v1 也确实只有这一个开关。留在原处(`关于`页)才是错的:
-/// 那儿是**只读**的产品身份页, 把可点击的开关混进去, 用户没法一眼分辨
-/// 「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
+/// 留在原处(`关于`页)才是错的: 那儿是**只读**的产品身份页, 把可点击的开关混进去,
+/// 用户没法一眼分辨「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
 fn general_content() -> impl Widget {
     Column::new()
         .gap(16.0)
         .cross_center()
         .child(theme_dropdown())
+        .child(histogram_switch())
+}
+
+/// 「显示级别侧栏」开关 (P37 / T20)。
+///
+/// **为什么需要它**: 侧栏被 `Ctrl+L` 收起后, 界面上没有任何「如何找回」的入口 ——
+/// 侧栏顶部那行只读提示随侧栏**一起消失**。⚙ 是设置卡的唯一入口, 找回入口就该在这儿。
+///
+/// **与 Ctrl+L 双向同步是免费得到的**: 开关读的是 `app.histogram_visible`, 两条路
+/// 改的是同一个状态、走同一个 `save_config` (整文件同源, 见 `config.rs` 的约定),
+/// 所以不存在「键盘关了、开关还亮着」的第二份真相。
+fn histogram_switch() -> impl Widget {
+    Row::new()
+        .gap(8.0)
+        .cross_center()
+        .child(
+            Text::new("显示级别侧栏".to_string())
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+        )
+        .child(
+            Switch::new()
+                .bind(|app: &LogApp| app.histogram_visible)
+                // `Switch::new()` 烘的是浅色 token —— 视图树只建一次, 不挂绑定
+                // 就会「切到暗色后开关轨道还是浅色的」(`Switch::bind_theme` 的 doc
+                // 正是为这个写的)。与 `theme_dropdown` 同法。
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                .on_toggle(|| Msg::ToggleHistogram),
+        )
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -217,13 +245,20 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 /// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
 /// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
-const SHORTCUT_KEYS: [(&str, &str); 6] = [
+const SHORTCUT_KEYS: [(&str, &str); 8] = [
     ("Ctrl+O", "打开文件"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+T", "表格 / 原始模式互切"),
     ("Ctrl+L", "级别侧栏 显示 / 收起"),
     ("Ctrl+B", "添加书签 / 去掉书签"),
     ("Ctrl+G", "跳下一书签"),
+    // P36 (2026-09-15): 单键两条。判据就是本表自己那句话 ——「只列**猜不出来**的」,
+    // 不是新造标准: 方向键/翻页键不必教 (常识), 但 `/` 是 Vim 习惯、`f` 是本应用
+    // 自造的词, 两个都猜不出来。它们原先只写在**仓外 README**, 而商店版用户没有
+    // 仓库语境 —— 那行字对他们等于不存在。
+    // 都限**原始模式**: 表格模式有常驻过滤栏, `/` 无栏可开。
+    ("/", "搜索栏 (原始模式)"),
+    ("f", "跟随文件增长 (原始模式)"),
 ];
 
 /// 快捷键一览 —— 放设置卡而不是散在界面各处: 状态栏右下的 ⚙ 是「设置卡」的

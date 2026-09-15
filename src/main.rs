@@ -148,7 +148,8 @@ fn title_bar(theme: config::AppTheme, title: String) -> impl Widget {
         .embed(
             view::Bar::default()
                 .bind_clear_filter(|app: &LogApp| app.filter_clear_rev)
-                .bind_clear_search(|app: &LogApp| app.search_clear_rev),
+                .bind_clear_search(|app: &LogApp| app.search_clear_rev)
+                .bind_refocus_search(|app: &LogApp| app.search_refocus_rev),
         )
 }
 
@@ -197,6 +198,8 @@ pub(crate) struct LogApp {
     filter_clear_rev: u64,
     filter_elapsed: Option<Duration>,
     filter_job: AsyncJob<FilterOutcome>,
+    /// 「回到搜索栏」信号 (T21: Bar::bind_refocus_search 借此全选草稿)。
+    search_refocus_rev: u64,
     /// 搜索栏清空信号 (Bar::bind_clear_search 借此原地 clear)。
     search_clear_rev: u64,
     /// 一次性焦点请求：开搜索 / 进表格时置 true, `focus_restored` 消费后清除。
@@ -226,7 +229,12 @@ pub(crate) struct LogApp {
     /// 上次 stat 轮询时刻 (250ms 节流)。
     last_stat_poll: Instant,
     /// 底栏提示 (截断/轮转等一次性事件)。
+    ///
+    /// **改它一律走 [`Self::set_notice`]**, 不直接赋值 —— 直接赋值会漏掉消退期限,
+    /// 那条提示就永远赖在底栏上 (T18/Q3 之前是 8 处各写各的)。
     notice: Option<(String, NoticeKind)>,
+    /// notice 的消退时刻; `None` = 当前无提示。见 [`Self::set_notice`]。
+    notice_until: Option<Instant>,
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
     /// 在途打开作业 (async-open): Some = 打开/重建/追平进行中, UI 全程可响应;
@@ -260,6 +268,10 @@ pub(crate) enum NoticeKind {
 pub(crate) enum Msg {
     /// 滚轮/键盘滚动 N 显示行 (负 = 向上)。
     ScrollRows(f64),
+    /// **绝对**滚到某显示行 (T17 滚动条拖拽)。与 `ScrollRows` 的两点不同都是
+    /// 有意的: ① 它是绝对定位, 拖拽是「拇指在哪内容就在哪」而不是增量;
+    /// ② 它**不动 `selected`** —— 抓滚动条是「看」不是「选」, 见 todo T17 不变量 ③。
+    ScrollTo(f64),
     /// 点击选中显示行。
     Select(u64),
     /// 展开/折叠某显示行的嵌套 (表格模式)。
@@ -339,6 +351,7 @@ impl LogApp {
             filter_clear_rev: 0,
             filter_elapsed: None,
             filter_job: AsyncJob::new(),
+            search_refocus_rev: 0,
             search_clear_rev: 0,
             search: None,
             search_query: String::new(),
@@ -354,6 +367,7 @@ impl LogApp {
             follow: false,
             last_stat_poll: Instant::now(),
             notice: None,
+            notice_until: None,
             maximized: false,
             open_job: None,
             loading_label: None,
@@ -607,8 +621,7 @@ impl LogApp {
         self.sub_rows.clear();
         self.top_row = 0.0;
         self.selected = 0;
-        self.notice = Some(("文件已截断/轮转".into(), NoticeKind::Warn));
-        self.refresh_status();
+        self.set_notice("文件已截断/轮转".into(), NoticeKind::Warn);
     }
 
     /// 热替换文件 (Ctrl+O / 拖拽): 异步管道发起 (在途旧 job 被 drop = 取消);
@@ -673,6 +686,7 @@ impl LogApp {
         self.sub_rows.clear();
         self.follow = false;
         self.notice = None;
+        self.notice_until = None;
         self.refresh_status();
     }
 
@@ -765,7 +779,7 @@ impl LogApp {
                     match job.kind() {
                         OpenKind::Fresh => {
                             log::warn!("打开失败：{e:#}");
-                            self.notice = Some((
+                            self.set_notice(
                                 format!(
                                     "无法打开：{}",
                                     job.path()
@@ -774,7 +788,7 @@ impl LogApp {
                                         .unwrap_or_default()
                                 ),
                                 NoticeKind::Warn,
-                            ));
+                            );
                         }
                         OpenKind::Rebuild => log::warn!("轮转重建失败：{e:#}"),
                         OpenKind::Append => log::warn!("tail 追加失败：{e:#}"),
@@ -881,6 +895,30 @@ impl LogApp {
             "…".to_string()
         };
         Some((verb, name, detail))
+    }
+
+    /// 置一条底栏提示 —— **notice 的唯一入口** (T18)。
+    ///
+    /// 自带消退期限 (Q3 裁的「自动消退」): 提示是**对刚才那个动作**的回答,
+    /// 一直赖在底栏会变成噪声, 还会让「底栏读数」这件事失去可信度。
+    ///
+    /// **`NOTICE_TTL` 是待实机核对的估值**: spec 说「具体时长 build 时**实测定**,
+    /// 不估算」, 而本机跑不了真机走查 —— 故先取一个, 并挂进矩阵 §6 的核对单
+    /// (实机那轮把「太短没看见 / 太长碍事」两个方向都试一次)。
+    fn set_notice(&mut self, text: String, kind: NoticeKind) {
+        self.notice = Some((text, kind));
+        self.notice_until = Some(Instant::now() + NOTICE_TTL);
+        self.refresh_status();
+    }
+
+    /// notice 到点即消退 (T18/Q3)。抽成独立方法是为了**可测**: `tick` 要
+    /// `AnimationCtx`, 而本方法不必。
+    fn expire_notice(&mut self) {
+        if self.notice_until.is_some_and(|t| Instant::now() >= t) {
+            self.notice = None;
+            self.notice_until = None;
+            self.refresh_status();
+        }
     }
 
     fn refresh_status(&mut self) {
@@ -997,9 +1035,14 @@ impl LogApp {
     }
 
     /// 聚焦搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
+    ///
+    /// **T21 (P39): 不再「聚焦即干净开始」**。Ctrl+F 是「回到搜索框」的**反射键**,
+    /// 而原实现每次都把已输入未应用的草稿清掉 —— 反射键不该销毁工作。现在:
+    /// 没持焦 → 聚焦 (草稿原样留着); 已持焦 → 全选 (直接覆写)。
+    /// 清空仍归 Esc, 那条路径没动。
     fn open_search(&mut self) {
-        self.search_clear_rev += 1; // 聚焦即干净开始
-        self.focus_bar = true; // 自动聚焦搜索栏
+        self.focus_bar = true;
+        self.search_refocus_rev += 1;
         self.refresh_status();
     }
 
@@ -1089,8 +1132,7 @@ impl LogApp {
             self.status.push_str(&format!(" · 书签 {i}/{n}"));
         } else {
             // M3 (P25): 无书签时 Ctrl+G 按了没反应 —— 说清为什么。
-            self.notice = Some(("尚无书签 (b 添加)".into(), NoticeKind::Info));
-            self.refresh_status();
+            self.set_notice("尚无书签 (b 添加)".into(), NoticeKind::Info);
         }
     }
 }
@@ -1123,6 +1165,26 @@ fn clamp_top(top: f64, line_count: u64) -> f64 {
     top.clamp(0.0, max)
 }
 
+/// 滚轮 delta → 要滚的显示行数 (**单一换算点**, T17)。
+///
+/// 三处滚轮 (内容区 LogView / 未认领的滚轮 / 将来任何新入口) 必须走同一支,
+/// 否则「在侧栏滚」与「在列表上滚」手感会不一样 —— 而 P30 补的正是这两处的
+/// **一致性**, 各写一份等于把刚修好的东西再拆开。
+///
+/// **框架不归一 delta** (普查 G10): `window/event.rs:150-154` 把 `LineDelta`
+/// (行数, 通常 ±1..3) 与 `PixelDelta` (像素, 精确触控板可达 ±100) 抹平成同一个
+/// `f32`, 下游**无从分辨**。按行数档取 3 倍再夹一个**每次事件**的上界: 不夹的话
+/// 触控板一次能跳几百行。夹的是单次事件, 不是总量, 连续滚不受影响。
+fn wheel_rows(delta_y: f32) -> f64 {
+    (-f64::from(delta_y) * 3.0).clamp(-WHEEL_MAX_ROWS, WHEEL_MAX_ROWS)
+}
+
+/// 单次滚轮事件最多滚多少显示行 (见 [`wheel_rows`])。
+const WHEEL_MAX_ROWS: f64 = 12.0;
+
+/// 底栏提示的停留时长 (见 `LogApp::set_notice`)。**待实机核对**。
+const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+
 impl App for LogApp {
     type Msg = Msg;
 
@@ -1137,6 +1199,15 @@ impl App for LogApp {
                 self.top_row = clamp_top(self.top_row + d, self.display_count());
                 // 方向键滚动时选中跟随首行，底栏读数即当前位置
                 self.selected = self.top_row as u64;
+            }
+            Msg::ScrollTo(top) => {
+                // 向上拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)
+                if top < self.top_row && self.follow {
+                    self.follow = false;
+                    self.refresh_status();
+                }
+                // **不动 `selected`**: 抓滚动条是「看」不是「选」(T17 不变量 ③)。
+                self.top_row = clamp_top(top, self.display_count());
             }
             Msg::Select(row) => {
                 if row < self.display_count() {
@@ -1193,10 +1264,7 @@ impl App for LogApp {
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
-            Msg::Notice(text, kind) => {
-                self.notice = Some((text, kind));
-                self.refresh_status();
-            }
+            Msg::Notice(text, kind) => self.set_notice(text, kind),
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
                 // 通知窗口换底色。**这一步此前从缺** —— 于是切主题后标题栏那条
@@ -1239,6 +1307,23 @@ impl App for LogApp {
     }
 
     fn event(&mut self, event: &Event) {
+        // P30 (T17): **未认领的滚轮**转给列表滚动。
+        //
+        // 框架按点子命中分发滚轮、不向父级回落, 所以指针停在侧栏/过滤栏上时,
+        // 日志区根本收不到 —— 用户必须把指针挪回内容区才滚得动。这里补的是
+        // 另一半: 凡是**没有组件认领**的滚轮 (侧栏、过滤栏、标题栏、行外空白)
+        // 一律滚列表。**不需要位置数学**: 指针在日志区上时 LogView 已经
+        // `Consumed` 了, 能走到这里的本来就不是它。
+        if let Event::MouseWheel { delta, .. } = event {
+            // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
+            if !self.settings_open && self.has_file {
+                let rows = wheel_rows(delta.1);
+                if rows != 0.0 {
+                    self.update(Msg::ScrollRows(rows));
+                }
+            }
+            return;
+        }
         let Event::Key {
             key,
             pressed: true,
@@ -1263,8 +1348,7 @@ impl App for LogApp {
         if !self.has_file {
             // M3 (2026-09-14 实机 M0 P26): 空态按键被吞时**说清为什么** ——
             // 原先 `return` 静默, 用户按 Ctrl+F/方向键毫无反应。
-            self.notice = Some(("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info));
-            self.refresh_status();
+            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
             return;
         }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
@@ -1284,16 +1368,14 @@ impl App for LogApp {
                         self.update(Msg::ToggleMode);
                     } else {
                         // M3 (P23): Ctrl+T 无 JSONL 时**说清为什么** —— 原先静默。
-                        self.notice = Some(("本文件非 JSONL, 无表格模式".into(), NoticeKind::Info));
-                        self.refresh_status();
+                        self.set_notice("本文件非 JSONL, 无表格模式".into(), NoticeKind::Info);
                     }
                     return;
                 }
                 if s.eq_ignore_ascii_case("a") {
                     // M3 (P34): Ctrl+A 被吞 —— 说清为什么 (行多选已裁挂 v1.x,
                     // 见 docs/ROADMAP-v1x.md §四)。
-                    self.notice = Some(("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info));
-                    self.refresh_status();
+                    self.set_notice("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info);
                     return;
                 }
             }
@@ -1333,8 +1415,7 @@ impl App for LogApp {
                     self.toggle_expand(file_line);
                 } else {
                     // M3 (P24): → 在已展开行上按了没反应 —— 说清为什么。
-                    self.notice = Some(("本行已展开".into(), NoticeKind::Info));
-                    self.refresh_status();
+                    self.set_notice("本行已展开".into(), NoticeKind::Info);
                 }
             }
             Key::Named(NamedKey::ArrowLeft) if self.mode == ViewMode::Table => {
@@ -1343,8 +1424,7 @@ impl App for LogApp {
                     self.toggle_expand(file_line);
                 } else {
                     // M3 (P24): ← 在未展开行上按了没反应 —— 说清为什么。
-                    self.notice = Some(("本行未展开".into(), NoticeKind::Info));
-                    self.refresh_status();
+                    self.set_notice("本行未展开".into(), NoticeKind::Info);
                 }
             }
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
@@ -1376,6 +1456,15 @@ impl App for LogApp {
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
+        }
+        // 模态守卫 (T16/P32): 设置卡开着时, 全局键**不得穿透到卡后**。
+        // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
+        // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
+        // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
+        // (`handler.rs:434-441`), 所以这个守卫只能加在产品侧。
+        // **吞掉, 不是放行**: 返回 `None` 的含义是「我没拦」, 事件会继续往下走。
+        if self.settings_open {
+            return Some(Msg::Noop);
         }
         let Event::Key {
             key,
@@ -1418,6 +1507,7 @@ impl App for LogApp {
 
     /// 心跳拾取异步作业结果 (OnDemand 可见态 ~60fps tick, 完成至显示 ≤16ms)。
     fn tick(&mut self, _ctx: &AnimationCtx) {
+        self.expire_notice();
         self.pickup_open_job();
         self.pickup_levels_job();
         if let Some(out) = self.filter_job.poll() {
@@ -2158,6 +2248,181 @@ mod tests {
             .as_ref()
             .map(|(t, _)| t.clone())
             .unwrap_or_else(|| panic!("须有一条 notice; 当前底栏: {}", app.status))
+    }
+
+    /// 敲一个 Ctrl+字符键事件 (不经过 app, 供 `app_key_filter` 直调)。
+    fn ctrl_key(ch: &str) -> Event {
+        Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        }
+    }
+
+    /// T17 验收 ③: 拖滚动条**不改选中行** —— 抓条是「看」不是「选」。
+    ///
+    /// 对照在同一支测试里: 方向键那条路**会**动选中 (既有行为, 本项不动它)。
+    /// 有对照才说明这条不变量是**有意**分开的, 不是碰巧没动。
+    #[test]
+    fn scroll_to_does_not_move_the_selection() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let (mut app, p) = {
+            let p = temp_log(body.as_bytes());
+            let mut app = LogApp::new_empty();
+            app.file = Arc::new(LogFile::open(&p).unwrap());
+            app.has_file = true;
+            (app, p)
+        };
+        app.selected = 7;
+
+        app.update(Msg::ScrollTo(120.0));
+        assert_eq!(app.top_row, 120.0, "绝对定位须原样落到 top_row");
+        assert_eq!(app.selected, 7, "抓滚动条不得动选中行");
+
+        app.update(Msg::ScrollRows(1.0));
+        assert_eq!(app.selected, 121, "对照: 滚轮/方向键那条路仍让选中跟随首行");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// P30 (T17): **未认领的滚轮**转给列表滚动 —— 指针停在侧栏/过滤栏上时,
+    /// 日志区收不到滚轮 (框架按点子命中分发、不向父级回落), 原先必须把指针挪回
+    /// 内容区才滚得动。
+    ///
+    /// 判据取**效果** (top_row 动了) 而不是「有没有走那个分支」。
+    #[test]
+    fn unclaimed_wheel_scrolls_the_list() {
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let p = temp_log(body.as_bytes());
+        let mut app = LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+
+        let wheel = |dy: f32| Event::MouseWheel {
+            delta: (0.0, dy),
+            position: danqing::Point::new(10.0, 400.0), // 侧栏上
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        app.event(&wheel(-1.0)); // 向下滚 (与 view 同向: delta.1 < 0 = 向下)
+        assert!(app.top_row > 0.0, "侧栏上的滚轮须滚得动列表");
+
+        // 模态不穿透: 卡开着时滚轮只属于卡
+        let before = app.top_row;
+        app.settings_open = true;
+        app.event(&wheel(-1.0));
+        assert_eq!(app.top_row, before, "设置卡开着时滚轮不得滚卡后的日志");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T17: 滚轮换算**单点** —— 内容区与「未认领」那一路必须是同一个手感。
+    ///
+    /// 顺带钉住上界: 框架把 `LineDelta`(行) 与 `PixelDelta`(像素) 抹平成同一个
+    /// `f32` (G10), 触控板一次给 ±100 时若不夹, 一滚就跳几百行。
+    #[test]
+    fn wheel_rows_is_clamped_and_sign_flipped() {
+        assert!(wheel_rows(-1.0) > 0.0, "与 danqing Scrollable 同向");
+        assert_eq!(wheel_rows(0.0), 0.0);
+        assert!(wheel_rows(-100.0) <= WHEEL_MAX_ROWS, "像素档不得跳几百行");
+        assert!(wheel_rows(100.0) >= -WHEEL_MAX_ROWS);
+    }
+
+    /// T18 (P17): notice 自带消退期限 —— 到点清掉, 不留常驻噪声。
+    ///
+    /// 不真等 4 秒: 把期限拨到过去, 语义等价。
+    #[test]
+    fn notice_expires_when_its_deadline_passes() {
+        let mut app = LogApp::new_empty();
+        app.set_notice("已复制该行".into(), NoticeKind::Info);
+        assert!(app.notice.is_some());
+        app.expire_notice();
+        assert!(app.notice.is_some(), "未到点不得消退");
+
+        app.notice_until = Some(Instant::now() - Duration::from_millis(1));
+        app.expire_notice();
+        assert!(app.notice.is_none(), "到点须消退");
+        assert!(app.notice_until.is_none(), "期限也要一并清掉");
+    }
+
+    /// T20 (P37): 侧栏开关与 Ctrl+L 是**同一份状态** —— 两条入口同发一条消息。
+    ///
+    /// 「双向同步」不是两处赋值互相对, 而是只有一份真相: 开关读
+    /// `app.histogram_visible`、Ctrl+L 与开关都发 `Msg::ToggleHistogram`。
+    #[test]
+    fn histogram_toggle_is_one_state_for_both_entries() {
+        let mut app = LogApp::new_empty();
+        let before = app.histogram_visible;
+        app.update(Msg::ToggleHistogram);
+        assert_eq!(app.histogram_visible, !before, "两条入口共用的那一支须翻转");
+        app.update(Msg::ToggleHistogram);
+        assert_eq!(app.histogram_visible, before, "再切一次回到原状");
+    }
+
+    /// T21 (P39): Ctrl+F **不清草稿** —— 它是「回到搜索框」的反射键,
+    /// 而原实现每次都销毁用户已输入未应用的内容。
+    ///
+    /// 这里锁的是**应用侧那一半** (不再发清空信号、改发重聚焦信号);
+    /// 「全选」那一半在 `view.rs::refocus_selects_the_existing_draft`。
+    #[test]
+    fn reopen_search_keeps_the_draft() {
+        let mut app = LogApp::new_empty();
+        let clear0 = app.search_clear_rev;
+        let refocus0 = app.search_refocus_rev;
+
+        app.open_search();
+        assert_eq!(app.search_clear_rev, clear0, "Ctrl+F 不得再触发清空");
+        assert_eq!(app.search_refocus_rev, refocus0 + 1, "改为请栏处理重聚焦");
+        assert!(app.focus_bar, "仍要把焦点送进栏");
+
+        // 对照: Esc 那条路**仍然**清空 (本项只动「回到搜索框」这一条)
+        app.clear_search();
+        assert_eq!(app.search_clear_rev, clear0 + 1, "Esc 仍须清空");
+    }
+
+    /// T16 (P32) 回归锁: 设置卡开着时, 全局键**不得穿透到卡后**。
+    ///
+    /// 逐条断言**卡后副作用没发生**, 而不是断言返回值是不是某个 `Msg` ——
+    /// 「不穿透」的实现可以是吞掉、也可以是别的, 判据应该绑在**后果**上。
+    ///
+    /// **Ctrl+O 不在表内 (有意)**: 它的穿透后果是弹一个**阻塞的原生文件对话框**,
+    /// 一旦回归, 这条测试不是红而是**挂住** —— 一个会挂死的守卫比没有守卫更坏。
+    /// 它的门禁与表内三条是同一个 `if`, 位置对了三条就都对了; 实机那一半由
+    /// 矩阵 §6 的「卡开着按 Ctrl+O」(P32) 覆盖。
+    #[test]
+    fn settings_modal_does_not_leak_global_keys_behind_the_card() {
+        let mut app = LogApp::new_empty();
+        app.settings_open = true;
+        for (name, ch) in [("Ctrl+F", "f"), ("Ctrl+T", "t"), ("Ctrl+L", "l")] {
+            let got = app.app_key_filter(&ctrl_key(ch));
+            let leaked = match got {
+                Some(Msg::FocusSearch) => "把焦点送到了卡后",
+                Some(Msg::ToggleMode) => "切了卡后的模式",
+                Some(Msg::ToggleHistogram) => "动了卡后的侧栏",
+                Some(Msg::OpenFile(_)) => "弹了文件对话框",
+                _ => "",
+            };
+            assert!(leaked.is_empty(), "{name} 穿透了设置卡: {leaked}");
+        }
+        // 这三条由 `LogApp::event` 那条路认领, 那里有同款门禁 —— 一并锁住
+        app.event(&ctrl_key("b"));
+        app.event(&ctrl_key("g"));
+        assert!(app.bookmarks.is_empty(), "Ctrl+B 不得在卡后加书签");
+        // Esc 仍须能关卡 (既有行为保持, 不被守卫吃掉)
+        assert!(
+            matches!(
+                app.app_key_filter(&Event::Key {
+                    key: Key::Named(NamedKey::Escape),
+                    pressed: true,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                }),
+                Some(Msg::CloseSettings)
+            ),
+            "Esc 必须仍能关闭设置卡"
+        );
     }
 
     /// T11 回归锁: notice 是**第二条通道**, 不得拼进 `status` 串。
