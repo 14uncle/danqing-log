@@ -1,13 +1,19 @@
 # TODO: interaction-polish (交互打磨)
 
 > spec: `docs/specs/SPEC-interaction-polish.md` | plan: `tasks/plan-interaction-polish.md`
-> 矩阵 (兼实机核对单): `tasks/matrix-interaction-polish.md`
+> 矩阵 (**兼人工验收清单**, 清单见其 §6 —— **唯一真身**, 别处只许指过来不许抄): `tasks/matrix-interaction-polish.md`
 > 逐条勾选推进; 每任务完成后跑三件套 (fmt + clippy + test)。
 > 构建序: **M1 (框架) → M2 → M3 → M4 → M5**; commit/push 点标 ⏸ 待用户点头。
 > 基线: 本仓 **169 绿** (51 lib + 110 main + 8 genlog, 2026-09-15 M5 完成后实测);
 > 框架 **600 lib** + 集成 59 绿 (**M5 的 T21 动了一处框架**: `TextInput::select_all`
 > 转 pub —— 已 push `24bd9a4`, 见 T21 条)。
 > 记账前先量, 别抄旧数 —— main 从 74 → 82 (M2) → 92 (M3) → 105 (M4) → 110 (M5)。
+> **后续尖端实测** (`#[test]` 计数, 逐提交量): `bfa8c21` **169** —— 即上面那个 169,
+> **不是写错了, 只是停在 M5 没往后记** → `38b4cd4` review 轮 **173** →
+> `ffb3ae6` case-insensitive **178** → `24dc2d5` **179** (`cargo test` 实测同为
+> 51 lib + 120 main + 8 genlog = 179, 与计数一致)。
+> **注意**: case-insensitive 模块与本模块**同 crate 交错**, 故尖端那个数**不是本模块
+> 单独的** —— 别再拿它当本模块基线, 要看本模块的量就 checkout `38b4cd4`。
 > **M0 (用户实机走查 5 条) 在 build 前**: P10 / P11 / P19 / P30 / P31。
 
 ## Phase M1: 框架 (danqing)
@@ -406,7 +412,7 @@ notice。
     **吞掉而不是放行** —— 返回 `None` 的语义是「我没拦」, 事件会继续往下走。
   - 守卫: `settings_modal_does_not_leak_global_keys_behind_the_card`。**Ctrl+O 有意
     不在表内**: 它的穿透后果是弹**阻塞的原生对话框**, 一旦回归这条测试不是红而是**挂住**
-    —— 会挂死的守卫比没有守卫更坏。它与表内三条共用同一个 `if`, 实机那一半由 §6 核对单覆盖。
+    —— 会挂死的守卫比没有守卫更坏。它与表内三条共用同一个 `if`, 实机那一半由 §6 人工验收清单覆盖。
 
 - [x] **T17: 视图导航输入收口 —— 滚动条拖拽 + 未认领滚轮路由** (新; D7)
   - **滚动条拖拽**: 见 todo 的详细条目
@@ -458,7 +464,7 @@ notice。
     **单一入口 `set_notice`** —— 原先 8 处各自 `self.notice = Some(..)` 直接赋值,
     直接赋值会漏掉期限, 那条提示就永远赖在底栏上。
   - **`NOTICE_TTL = 4s` 是待实机核对的估值**: spec 说「具体时长 build 时实测定,
-    不估算」, 而本机跑不了真机走查。已挂进 §6 核对单 (两个方向都试: 太短没看见 /
+    不估算」, 而本机跑不了真机走查。已挂进 §6 人工验收清单 (两个方向都试: 太短没看见 /
     太长碍事)。**这条是本项唯一没做到的验收, 记在这里**。
   - 守卫: `copy_success_reports_what_was_copied` (三级各一次 + 回执两两不同 +
     选区回执带「几条」) / `notice_expires_when_its_deadline_passes`。**已 A/B**。
@@ -498,7 +504,7 @@ notice。
     故 `bind_theme` 必须挂 —— 不然切暗色后轨道还是浅色的。)
   - 守卫: `histogram_toggle_is_one_state_for_both_entries` (消息侧);
     「改主题不抹开关」由 `config.rs` 既有的 `round_trip_preserves_both_keys` 覆盖。
-    **开关到状态那一段接线无单测** (要点得着控件树) —— 由 §6 核对单的 P37 覆盖。
+    **开关到状态那一段接线无单测** (要点得着控件树) —— 由 §6 人工验收清单的 P37 覆盖。
 
 - [x] **T21: Ctrl+F 不再清草稿 (P39)**
   - 说明: `main.rs:985` 「聚焦即干净开始」。改为: 栏**已聚焦**时 Ctrl+F = **全选内容**
@@ -580,8 +586,11 @@ Required, 全部已修并加锁**。本模块五阶段的 review 一栏至此才
   - **P31: 成立且修复有效** —— 用户确认跑的是 **RustRover debug 本地构建**
     (patch 开着, 框架 `ec8ae09` 即 T2 修复在), 「不会走出模态」= **修复已生效**,
     静态判定不被推翻。这是本批**第一个改完即被实机确认的修复**。
-- [ ] **人工验收**: `tasks/matrix-interaction-polish.md` §6 核对单**全走一遍**
-  (兼「剪枝」与「验收」; 8 个区域)
+- [ ] **人工验收清单全过 (用户实机)**: `tasks/matrix-interaction-polish.md` **§6**
+  **全走一遍** (兼「剪枝」与「验收」; 8 个区域 + 已知不修 3 条 + 主观项 2 条)。
+  **本节措辞对齐本仓惯例** —— 此前叫「実机人工验收清单」(日文「実」, 且不叫「验收」),
+  `grep 验收清单` 搜不到本模块, 用户 2026-09-15 报「又找不到了」。
+  **走查前先读 §6.0**: 要在**无 patch 的独立工作树**里建, 别用可能被并行会话改脏的工作区。
 - [ ] **全过后**: 重拍商店截图 → 打 tag → GitHub Release → 商店提交 (v1.0 链路)
 
 ## 明确不做 (防「顺手修好」)

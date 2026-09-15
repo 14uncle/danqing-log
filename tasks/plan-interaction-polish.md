@@ -1,7 +1,7 @@
 # Implementation Plan: interaction-polish (交互打磨)
 
 > spec: `docs/specs/SPEC-interaction-polish.md` · todo: `tasks/todo-interaction-polish.md`
-> 矩阵: `tasks/matrix-interaction-polish.md` (39 条粗糙点, 兼**实机核对单**)
+> 矩阵: `tasks/matrix-interaction-polish.md` (39 条粗糙点, 兼**人工验收清单**)
 > 2026-09-14 plan 阶段。能力地图与 spec 均已批 (用户裁定 5/6/7 + 「yes」)。
 > 构建序 **M1 → M2 → M3 → M4 → M5**; commit/push 点标 ⏸ 待用户点头。
 
@@ -103,7 +103,7 @@
 
 - [ ] **M0 高风险 5 条实机走查** (用户, build 前): P10 / P11 / P19 / P30 / P31
   —— 逐条标「成立 / 不成立 / 看错了 / 还有别的」
-- [ ] **人工验收**: `tasks/matrix-interaction-polish.md` §6 核对单**全走一遍**
+- [ ] **人工验收**: `tasks/matrix-interaction-polish.md` §6 人工验收清单**全走一遍**
   (兼「剪枝」与「验收」两个职能, 不多走一轮)
 - [ ] 全过后: 重拍商店截图 → 打 tag → GitHub Release → 商店提交 (v1.0 链路)
 
@@ -130,5 +130,5 @@
   侧栏不可点行**有意不给 hover**、表格**不做单元格词级框选** —— 三条都要有断言守着
   (防「改回」), 而不是顺手「修好」。
 - **每任务完成跑三件套**; **所有 commit/push 点都标 ⏸ 待用户点头**。
-- **本批 39 条无一条经运行态证实** —— M0 与最终核对单就是这件事的对策, 期间若
+- **本批 39 条无一条经运行态证实** —— M0 与最终人工验收清单就是这件事的对策, 期间若
   实机推翻某条, **以实机为准并回写矩阵** (本仓规矩: 结论要有对照组)。
