@@ -101,7 +101,9 @@ fn row_at(area: Rect, p: Point, inset: f32) -> Option<usize> {
 
 /// 「清除筛选」文本在给定矩形内**两轴居中**的落点 (返回 x 与 baseline y)。
 /// 调用方传**悬停底色块** (用户眼里的「按钮」), 不是行矩形 —— 两者中心差 2.5px。
-/// 抽成纯函数: 居中数学有守卫 (`clear_row_text_is_centered_in_its_button`)。
+/// 抽成纯函数, 两条守卫各管一层:
+/// `centered_text_origin_puts_the_box_middle_in_the_rect` (公式) 与
+/// `clear_row_label_ink_is_centered_in_the_button` (调用点, 量**画出来的 ink**)。
 fn centered_text_origin(row: Rect, text_w: f32, line_h: f32, ascent: f32) -> (f32, f32) {
     let x = row.origin.x + (row.size.width - text_w) / 2.0;
     let baseline = row.origin.y + (row.size.height - line_h) / 2.0 + ascent;
@@ -868,15 +870,21 @@ mod tests {
         }
     }
 
-    /// 「清除筛选」是整宽按钮行, 文本必须**两轴居中**于**悬停底色块** —— 不是行矩形:
-    /// 底色块 `[ry-2, ry+24]` 与行矩形 `[ry, ry+28]` 中心差 2.5px,
-    /// 2026-09-14 用户实机:「按钮内偏下」。(浮点断言留 ε, 不比精确值。)
+    /// **纯函数那一层**: 给定盒子宽度, `centered_text_origin` 把它放在矩形正中
+    /// (两轴)。浮点断言留 ε, 不比精确值。
+    ///
+    /// **只管公式, 不管喂进去的数**。这一条此前叫
+    /// `clear_row_text_is_centered_in_its_button` —— **名过其实**: 它喂的是
+    /// **合成矩形** (`x = 3.0`, 真实调用点是 `area.x + 2.0`) 和**写死的 `48.0`**,
+    /// 从不碰 `texts.measure()` 也不碰真实 `area`。而本模块**恰恰栽在「宽度错」上过**
+    /// (`✕` U+2715 是 0×0 空字形却占着 6px advance, 把整串文本顶偏)。
+    /// 名字改准, 免得下一个读的人以为调用点被覆盖了 —— 「宣称有守卫比没守卫更坏」。
     #[test]
-    fn clear_row_text_is_centered_in_its_button() {
-        let btn = Rect::from_xywh(3.0, 100.0, HIST_WIDTH - 4.0, ROW_H - 2.0);
+    fn centered_text_origin_puts_the_box_middle_in_the_rect() {
+        let btn = Rect::from_xywh(2.0, 100.0, HIST_WIDTH - 4.0, ROW_H - 2.0);
         let (x, baseline) = centered_text_origin(btn, 48.0, 15.0, 11.58);
         assert!(
-            (x - (3.0 + (HIST_WIDTH - 4.0 - 48.0) / 2.0)).abs() < 0.01,
+            (x - (2.0 + (HIST_WIDTH - 4.0 - 48.0) / 2.0)).abs() < 0.01,
             "水平居中于按钮"
         );
         // 文本行盒 [baseline-ascent, baseline-ascent+line_h] 的中点 = 按钮中点
@@ -884,6 +892,75 @@ mod tests {
         assert!(
             (text_mid - (100.0 + (ROW_H - 2.0) / 2.0)).abs() < 0.01,
             "垂直居中于按钮"
+        );
+    }
+
+    /// **调用点那一层** (2026-09-15 用户裁定「彻底版」): 量的是**画出来的字形矩形**
+    /// (`TextBatch::instance_rects`, 本批新加), 不是算出来的盒子 ——
+    /// 「清除筛选」的 ink 包围盒中心必须与悬停色块中心重合。
+    ///
+    /// **为什么非要量 ink**: `measure` 给的是 **advance 之和**, 眼睛看的是 **ink**。
+    /// `push_text` 按 `round(pen_x + bearing_x)` 落点、按 `info.width` 定宽, 两者天生
+    /// 不等; 更要命的是缺字 —— `✕` (U+2715) 不在内嵌子集里, 是 **0×0 空字形却照样
+    /// 占 6px advance**, 于是「按 advance 居中」的文本在屏上是偏的, 而当时
+    /// **没有任何一把尺能量到**, 只能靠人眼在手写基准里比。这条把「看着居中」
+    /// 第一次变成可断言的事。
+    #[test]
+    fn clear_row_label_ink_is_centered_in_the_button() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let paint = |active: Option<Level>, hover: Option<usize>| {
+            let mut w = LevelHistogram::new();
+            w.active = active;
+            w.hover.set(hover);
+            let mut rects = RectBatch::new();
+            let mut texts = TextBatch::new();
+            w.paint(area, &mut rects, &mut texts);
+            (rects.instance_rects(), texts.instance_rects())
+        };
+
+        let (_, base_txt) = paint(None, None);
+        // **色块的对照组必须也带 active** —— 生效行自己就有一个色块, 拿「无 active」
+        // 那一版比会把两个块一起算成「悬停带来的」(第一版就是这么写错的)。
+        // (字形的对照用 `None` 那版: 它没有清除行, 差值就是那 4 个字形。)
+        let (active_rects, with_txt) = paint(Some(Level::Info), None);
+        let (hot_rects, _) = paint(Some(Level::Info), Some(CLEAR_ROW));
+
+        // ① 底色块 = **悬停**前后唯一多出来的那个矩形
+        let extra: Vec<Rect> = hot_rects
+            .iter()
+            .copied()
+            .filter(|r| !active_rects.contains(r))
+            .collect();
+        assert_eq!(extra.len(), 1, "悬停应恰好多一个底色块, 实得 {extra:?}");
+        let block = extra[0];
+
+        // ② 「清除筛选」的 4 个字形 = 有 active 时多出来的那一串。它插在底部提示
+        //    **之前**, 故出现在序列中段 —— 按第一处差异定位, 不按下标硬取。
+        assert_eq!(
+            with_txt.len(),
+            base_txt.len() + 4,
+            "「清除筛选」应是 4 个字形 (少数一个 = 有字形没画出来)"
+        );
+        let i = base_txt
+            .iter()
+            .zip(with_txt.iter())
+            .position(|(a, b)| a != b)
+            .expect("有 active 时应当多出标签");
+        let label = &with_txt[i..i + 4];
+
+        // ③ ink 包围盒中心 == 色块中心
+        let left = label.iter().map(|g| g.origin.x).fold(f32::MAX, f32::min);
+        let right = label
+            .iter()
+            .map(|g| g.origin.x + g.size.width)
+            .fold(f32::MIN, f32::max);
+        let ink_c = (left + right) / 2.0;
+        let btn_c = block.origin.x + block.size.width / 2.0;
+        assert!(
+            (ink_c - btn_c).abs() <= 0.5,
+            "「清除筛选」ink 中心 {ink_c} 与色块中心 {btn_c} 差 {:.1}px —— \
+             按 advance 居中不等于看着居中",
+            (ink_c - btn_c).abs()
         );
     }
 }
