@@ -51,10 +51,21 @@ const AUX_FONT_SIZE: u16 = 12;
 const GUTTER_MIN: f32 = 56.0;
 /// 文本与行号槽间距。
 const GUTTER_GAP: f32 = 12.0;
-/// 展开标识区宽度 (行首 ▶/▼, 独立于行号槽, 不与行号重叠)。
+/// 展开标识区宽度 (行首 +/-, 独立于行号槽, 不与行号重叠)。
 const EXPAND_W: f32 = 20.0;
 /// 展开标识字号 (比正文大一号, 12px 太小看不清)。
 const EXPAND_FONT_SIZE: u16 = 16;
+/// 展开标识的两个字符: 折叠 / 展开。**必须全是 ASCII**。
+///
+/// 内嵌 `ofl-mono.ttf` 是 **GB2312 子集**, 不在里面的字符是 **0×0 空字形** ——
+/// 静默不画、不报错、不 panic。探针实测 MISSING: `−` (U+2212) / `✕` (U+2715) /
+/// `▶`(U+25B6) / `▼`(U+25BC)。
+/// **2026-09-15 用户实机报「展开之后 `-` 没有显示」, 正是代码里写了 `−` (U+2212)**
+/// —— 而紧挨着的注释本来就写着「用 ASCII `+-` 保可用」, 是代码没照注释做。
+/// 产品侧够不着框架的字体探针, 故把「只许 ASCII」提成常量, 由
+/// `expand_glyph_is_ascii_and_lights_up_on_hover` 钉住。
+const GLYPH_COLLAPSED: &str = "+";
+const GLYPH_EXPANDED: &str = "-";
 /// 底栏状态行高度。
 const STATUS_HEIGHT: f32 = 26.0;
 /// 过滤栏高度 (表格模式)。
@@ -726,6 +737,11 @@ pub(crate) struct LogView {
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
     hover_row: std::cell::Cell<u64>,
+    /// 指针是否正落在**展开标识列**上 (P3)。与 `hover_row` 分开判: 光标停在行
+    /// 文本上不该点亮标识。**这里不 parse 那一行** —— 「这一行到底有没有 glyph」
+    /// 交给 paint 判 (它本来就逐可见行 `parse_line` 一次); 鼠标一动就解析整行是
+    /// T17 明确修掉过的同类倒退 (那次是 `bars()` 的 `display_count()`)。
+    hover_expand: std::cell::Cell<bool>,
     // ---- 文本选区 (T3, 仅原始模式) ----
     /// 文本选区 (锚点/光标点 = 显示行 + 解码字节偏移); None 或空 = 无选区。
     selection: Option<TextSelection>,
@@ -788,6 +804,7 @@ impl LogView {
             settings_hover: std::cell::Cell::new(false),
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
+            hover_expand: std::cell::Cell::new(false),
             selection: None,
             last_expand_rev: 0,
             selected_cell: None,
@@ -1499,7 +1516,7 @@ impl Widget for LogView {
                 // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
                 // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
                 // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
-                // 两条都可见; 表格模式的 ▶/▼ 在 [0,EXPAND_W) 内, 不撞。
+                // 两条都可见; 表格模式的 +/- 在 [0,EXPAND_W) 内, 不撞。
                 rects.push_rect(
                     Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
                     bookmark_color(self.theme),
@@ -1556,17 +1573,27 @@ impl Widget for LogView {
                 // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
                 let parsed = jsonl::parse_line(raw);
                 // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
-                // (字体是 GB2312 子集, 无 ▶/▼ 几何形, 用 ASCII +- 保可用)
+                // (字体是 GB2312 子集, 无 +/- 几何形, 用 ASCII +- 保可用)
                 let expanded_here = self.expanded.is_expanded(line_no);
                 let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
                 if expanded_here || expandable {
-                    let glyph = if expanded_here { "−" } else { "+" };
+                    // 字符见 `GLYPH_EXPANDED` / `GLYPH_COLLAPSED` 上的说明
+                    // (ASCII 约束是硬要求, 不是风格)。
+                    let glyph = if expanded_here {
+                        GLYPH_EXPANDED
+                    } else {
+                        GLYPH_COLLAPSED
+                    };
+                    // P3 的另一半: **可点却无任何 hover 指示**。悬停时换 accent 色。
+                    // 只在真有 glyph 的行点亮 —— `hover_expand` 只说明指针在展开列里,
+                    // 「这一行画不画 glyph」是 paint 才知道的事 (见字段注释)。
+                    let hot = self.hover_expand.get() && i == self.hover_row.get();
                     texts.push_text(
                         glyph,
                         Self::expand_glyph_x(area),
                         y + row_baseline_off,
                         EXPAND_FONT_SIZE,
-                        th.text_primary(),
+                        if hot { th.accent() } else { th.text_primary() },
                     );
                 }
                 for (cx, cw, col) in &cols {
@@ -1836,11 +1863,17 @@ impl Widget for LogView {
                     }
                 }
                 let rel_y = position.y - area.origin.y - chrome_top;
-                if (0.0..list_h).contains(&rel_y) {
+                let in_list = (0.0..list_h).contains(&rel_y);
+                if in_list {
                     self.hover_row.set(self.row_at(rel_y));
                 } else {
                     self.hover_row.set(u64::MAX);
                 }
+                // P3: 展开标识可点, 原先悬停时屏上零反馈。只认最左那 `EXPAND_W`
+                // 一列 (`in_expand_glyph` 内含 table_mode 判定), 且指针得真在列表里
+                // —— 列表下方空白反算出的越界行不该点亮任何东西。
+                self.hover_expand
+                    .set(in_list && self.in_expand_glyph(area, *position));
                 // 框选跟手 (T3): 按下未抬起期间, 超阈值即升级/更新选区;
                 // 命中失败 (拖出列表/不可选行) 冻结 caret 在最后有效点
                 if let Some((arow, abyte, pos0)) = self.press {
@@ -1861,6 +1894,7 @@ impl Widget for LogView {
                 // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
                 // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
                 self.hover_bar.set(None);
+                self.hover_expand.set(false); // P3: 同第三个缓存, 离窗必须一起清
                 // 按下未拖动就离窗 = 放弃潜伏选区; 框选中离窗保留
                 // (窗口最大化下边缘拖出是常态, 回窗继续跟手)
                 if !self.dragging {
@@ -1957,7 +1991,7 @@ impl Widget for LogView {
                 let rel_y = position.y - area.origin.y - chrome_top;
                 if (0.0..list_h).contains(&rel_y) {
                     let row = self.row_at(rel_y);
-                    // 行首 ▶/▼ 展开开关区 (左 20px, 表格模式); 其余点击选中
+                    // 行首 +/- 展开开关区 (左 20px, 表格模式); 其余点击选中
                     // S2: 命中判定与绘制位置同源 (`expand_glyph_x` / `in_expand_glyph`)
                     let in_glyph = self.in_expand_glyph(area, *position);
                     if in_glyph {
@@ -2135,13 +2169,17 @@ impl Widget for LogView {
         self.focused = false;
     }
 
-    /// 指针停在滚动条上 → 手型 (T17)。
+    /// 指针停在滚动条上 (T17) 或展开标识列上 (P3) → 手型。
     ///
     /// 注意这是**整节点**表态的 API (`mod.rs:181-191`): 它没有位置参数, 于是
-    /// 「只有条上才手型」只能靠 `CursorMoved` 缓存的位置 (`bar_hover`) 判断。
-    /// 框架每帧重算光标, 与那份缓存同频, 不会用到过期位置。
+    /// 「只有条上/标识上才手型」只能靠 `CursorMoved` 缓存的位置 (`hover_bar` /
+    /// `hover_expand`) 判断。框架每帧重算光标, 与那两份缓存同频, 不会用到过期位置。
     fn cursor_icon(&self) -> Option<CursorIcon> {
-        self.hover_bar.get().map(|_| CursorIcon::Pointer)
+        if self.hover_bar.get().is_some() || self.hover_expand.get() {
+            Some(CursorIcon::Pointer)
+        } else {
+            None
+        }
     }
 
     /// 当前可复制文本, 三级优先 (2026-09-14 翻案旧 spec「Ctrl+C 只认文本选区」):
@@ -3078,6 +3116,80 @@ mod tests {
             "不可展开的行不得发 ToggleExpand (落地零反应正是原缺陷)"
         );
         assert!(said(&msgs, "无嵌套可展"), "须说清为什么展不开");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// P3 回归锁 (2026-09-15 用户实机报「点行首 `+/−`, hover 没有 UI 反馈,
+    /// 展开之后 `-` 没有显示」)。**两个缺陷一起钉**:
+    ///
+    /// ① **展开后标识不显示** —— 原先写的是 `−` (U+2212), 不在内嵌 GB2312 子集里,
+    ///    是 0×0 空字形, **静默不画也不报错**。产品侧够不着框架的字体探针, 故守卫
+    ///    钉一条更强的约束: **只许 ASCII**。U+2212 一旦写回来, 这条立刻红。
+    /// ② **可点却无 hover 指示** —— 悬停时须换 `accent` 色。
+    #[test]
+    fn expand_glyph_is_ascii_and_lights_up_on_hover() {
+        // ① 字符集约束
+        for g in [GLYPH_COLLAPSED, GLYPH_EXPANDED] {
+            assert!(
+                g.is_ascii(),
+                "展开标识 {g:?} 非 ASCII —— 内嵌子集里没有它, 会被静默画成 0×0"
+            );
+        }
+        // **反向对照**: 证明上面那条断言真分得开 —— `−`(U+2212) 与 `-`(U+002D)
+        // 肉眼几乎一样, 这正是它一路活到实机才被发现的原因。
+        assert!(
+            !'−'.is_ascii(),
+            "U+2212 必须判为非 ASCII, 否则上面那条形同虚设"
+        );
+
+        // ② hover: 一行**真嵌套** (可展开, 画 `+`) + 一行叶子 (不画 glyph)
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-p3-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            "{\"level\":\"ERROR\",\"ctx\":{\"k\":\"v\"}}\n{\"level\":\"INFO\"}\n",
+        )
+        .unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        v.focused = true;
+        v.gutter_w.set(56.0);
+        v.mode = ViewMode::Table;
+        v.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let accent = lin(v.theme.theme().accent());
+        let accent_glyphs = |v: &mut LogView| {
+            let mut texts = TextBatch::new();
+            let mut rects = RectBatch::new();
+            v.paint(area, &mut rects, &mut texts);
+            texts
+                .instance_colors()
+                .iter()
+                .filter(|c| [c.r, c.g, c.b, c.a] == accent)
+                .count()
+        };
+
+        let cold = accent_glyphs(&mut v);
+        // 指针落在第 0 行 (可展开) 的展开列里
+        v.hover_expand.set(true);
+        v.hover_row.set(0);
+        assert_eq!(
+            accent_glyphs(&mut v),
+            cold + 1,
+            "悬停展开标识须**恰好多一个** accent 字形 —— A/B: 摘掉 `hot` 判断, 这条必红"
+        );
+
+        // **反向对照**: 指针在展开列之外 (行文本上) 不得点亮标识 —— 否则那是
+        // 另一条假反馈 (标识可点、行文本不可点, 两者不能共用一个 hover 信号)
+        v.hover_expand.set(false);
+        assert_eq!(accent_glyphs(&mut v), cold, "不在展开列上就不得点亮标识");
         std::fs::remove_file(&path).ok();
     }
 
