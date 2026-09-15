@@ -205,6 +205,35 @@
   **最终 rev**: danqing `b4b43e1` / 本仓 lock 钉 `danqing#b4b43e1b`。
   **模块五阶段 (spec→plan→build→review→code-simplify) 全闭 + 人工验收通过。**
   余下全是 v1.0 发布链 (重拍截图 → 打 tag → GitHub Release → 商店提交), 待逐项点头。
+- 2026-09-15 (**搜索/过滤默认大小写不敏感 —— 进 v1.0 阻塞发布**): 用户先质询性能
+  → 实测对拍后当场两项裁定 (**默认不敏感、不加开关** / GBK 字节面假命中类**接受写明**)。
+  五段走完 (spec→plan→build→review→code-simplify)。
+  **范围**: 搜索 UTF-8 走 `(?i)` (保 Unicode 类语义, `(?-i)` 是零代码逃逸舱) /
+  非 UTF-8 走 `(?i)` + 既有字节字面化 (实测与手工 `[eE]` 展开逐字节一致) /
+  Bare 裸词换手写 `contains_ascii_ci` (memchr2 驱动 + 验窗 —— **memmem 无折叠模式**) /
+  Flat 值比较不敏感 + **键走 schema 规范化** (键走不敏感正则是实测 1822ms/1GB 的
+  22x 退化路) / 直方图**字段口径**跟随不敏感 (D2 逐桶相等红线), **行口径保持敏感**
+  (反污染是 `levels.rs:110` 既定设计, .log 桶只读不受红线约束 —— 读码后修正 spec
+  原案) / 高亮已与搜索同源 (只加锁)。跨仓: logfile `b35e2bb` 已 push, lock 复钉同 rev。
+  **三条值得记的**:
+  ① **穷举 regex oracle 当场抓出真 bug** —— `contains_ascii_ci` 初版首字节变体取
+     `first`/`to_ascii_uppercase()`, 大写首字节时两值相同 → memchr2 退化成单字节搜索、
+     **漏掉小写候选** (`"error level"` 搜 `ERROR` 假阴)。肉眼绝看不出, 对拍一眼命中。
+  ② **对照组把「超预算」定成「原线不可达」** —— Bare 190ms 超我写 spec 时估的 150ms;
+     同轮对照: **regex 引擎自己**的 `(?i-u)error` 整缓冲扫描也要 181ms → 不是手写
+     实现慢, 是那条线任何实现都达不到。搜索最差形态同理 (`(?i)` 897 / `(?i-u)` 675 /
+     敏感 129; 7x 来自 regex prefilter 在折叠下失效)。两条线按实测重订并留痕 (spec §4)。
+  ③ **review 抓到一条我没想到的一致性缺口** —— 直方图「生效桶 / 清除筛选」指示器拿
+     **原串**比 (`queries[i] == filter_applied`), 故手打 `LEVEL=ERROR*` 时结果确实被
+     筛了、却无桶行高亮且**清除行点不动**。改为两侧同过 `parse_filter` 比子句集
+     (+ 按变更缓存, 不进每帧 sync)。另修 logbench 违反 D9 的第二条构造线
+     (`--filter "LEVEL=ERROR"` 修前报 **0 命中** —— 而那正是性能数字与验收弹药的来源)。
+  实测 (热缓存 1GB): 搜索短字面 71→115ms / Flat 过滤 40ms (近零代价) / 打开管道未受影响。
+  **余**: 人工验收 (spec §7 六条) 待用户; 之后才轮到 v1.0 发布链 (截图→tag→Release→商店)。
+  **并发事故 (值得记)**: 推进期间**另一会话在同一批文件上并发写** (`main.rs`/`view.rs`),
+  其提交 `ee770f5` 把本模块 main.rs/view.rs 的改动**一起提交了** (用户裁定: 留着不动)。
+  判活的证据是 `stat -c '%y'` 的 mtime —— `git status` 只说「有改动」, mtime 才说
+  「**此刻**有人在写」
 - 当前: **UI 改造五模块已闭环; v1.0 收尾是唯一主线** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
@@ -526,12 +555,17 @@
   **上轮失败教训** (`docs/SPEC-dark-theme.md` 产出当前暗色): 对比度数值全达标仍难看 ——
   **对比度合格 ≠ 好看**, 本轮判据是整屏观感
 - 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
-- 测试基线: **115 绿** (51 lib + 56 main + 8 genlog), 2026-09-13 实测
-  (含设置卡溢出守卫与 `VERSION_ROW_H` 同源两条、暗色语义色板的两条 AA 守卫、
-  跨面阶梯守卫、浅色语义色 AA 守卫、**展开块整段铺一次守卫**;
-  lib = expand/levels/open/search, main = view/main/settings;
-  引擎 51 条随迁 `danqing-logfile`, 另有 `danqing-encoding` 10 条)。
-  框架侧 **583 lib + 全部集成测试绿**
+- 测试基线: **178 绿** (51 lib + 119 main + 8 genlog), 2026-09-15 实测
+  (上一版记的 115 是 09-13 旧值 —— selection-copy / interaction-polish /
+  case-insensitive 三个模块的守卫都还没进去。别拿 115 当回归基线)。
+  含: 设置卡溢出守卫与 `VERSION_ROW_H` 同源、暗色语义色板 AA 守卫、
+  跨面阶梯守卫、浅色语义色 AA 守卫、展开块整段铺一次守卫、
+  case-insensitive 的穷举 oracle / 逃逸舱 / `\w` 类语义 / D2 逐桶相等 /
+  直方图指示器规范化; lib = expand/levels/open/search,
+  main = view/main/settings/histogram。
+  引擎侧 **58 条** (随迁 + 本次 7 条), 另有 `danqing-encoding` 10 条。
+  框架侧: 本模块**未动 danqing** (零改动), 故未复测 —— 上一次记档是
+  2026-09-14 的 **592 lib + 集成全绿** (更早的 583 已过期)
 - POC 及格线不过则终止, 仓库转档案 (clipboard 先例); 余前提③ = 发布后首单外检
 
 ## 必读

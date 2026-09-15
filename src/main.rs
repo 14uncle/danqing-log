@@ -586,7 +586,7 @@ impl LogApp {
                 // 落点只合并不扫描 —— 否则 GB 级追平的过滤成本回到 UI 线程。
                 let old = Arc::clone(&self.file);
                 let filter = if !self.filter_applied.is_empty() && self.filtered.is_some() {
-                    Some((jsonl::parse_query(&self.filter_applied), old.line_count()))
+                    Some((self.parse_filter(&self.filter_applied), old.line_count()))
                 } else {
                     None
                 };
@@ -862,7 +862,7 @@ impl LogApp {
         if self.filtered.is_none() {
             return;
         }
-        let clauses = jsonl::parse_query(&self.filter_applied);
+        let clauses = self.parse_filter(&self.filter_applied);
         let new_hits = jsonl::run_filter_from(&self.file, &clauses, from);
         self.merge_filter_hits(new_hits);
     }
@@ -1021,6 +1021,22 @@ impl LogApp {
         self.status = s;
     }
 
+    /// 解析过滤查询 —— **全应用唯一的过滤解析入口** (parse + 键名规范化)。
+    ///
+    /// 三处调用点 (应用过滤 / 巨量追平作业 / live-tail 重滤) 必须都走这里:
+    /// 键名规范化 (`LEVEL=ERROR` → `level=ERROR`) 只做在一处, 同一个查询串在不同
+    /// 路径上就会得到不同命中集 —— 而增量与全量不一致只在「开着过滤又赶上追加」
+    /// 时才现形, 是最难查的一类差异 (D2 红线同款理由)。
+    ///
+    /// `.log` 文件 schema 为 None → 跳过规范化, 行为与从前一字不差。
+    fn parse_filter(&self, query: &str) -> Vec<jsonl::Clause> {
+        let mut clauses = jsonl::parse_query(query);
+        if let Some(schema) = self.schema.as_deref() {
+            jsonl::normalize_clause_keys(&mut clauses, schema);
+        }
+        clauses
+    }
+
     /// Enter (过滤): 应用。空查询 = 回全量; 非空走 AsyncJob (1GB 亚秒，不冻界面)。
     fn apply_filter(&mut self, query: String) {
         self.filter_applied = query.clone();
@@ -1033,7 +1049,7 @@ impl LogApp {
             self.refresh_status();
             return;
         }
-        let clauses = jsonl::parse_query(&query);
+        let clauses = self.parse_filter(&query);
         let file = Arc::clone(&self.file);
         self.status = format!("{} · 过滤 \"{query}\" 中…", self.base_status);
         self.filter_job.launch(move || {
@@ -1189,10 +1205,19 @@ pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64)
 /// 走完整正则路径; 误用 stats().encoding (检出 Utf16*) 会把它踢进字面量分支，
 /// `ERROR|FATAL` 之类交替正则静默失效 (review 当场抓住的回归)。
 fn build_search_pattern(enc: Encoding, query: &str) -> String {
+    // 两分支一律 `(?i)` 前缀 (2026-09-15, spec D2/D3): 默认大小写不敏感。
+    // UTF-8 用 `(?i)` 而非 `(?i-u)` —— 查询是用户的裸正则, `(?-u)` 会顺带把
+    // `\w`/`\d`/`\b` 降级成 ASCII 语义, 与大小写无关的行为不该被本模块改掉。
+    // 逃逸舱零代码: 用户写 `(?-i)` 即局部恢复敏感 (组内 flag 覆盖, 有测试锁)。
+    // 非 UTF-8 分支同理套在字节字面量外 —— `(?i)` 对 `(?-u)\xNN` 折叠成立, 已用
+    // 真 GBK 文件实测 (7884 命中行, 与手工 [eE] 展开逐字节一致)。
     if enc == Encoding::Utf8 {
-        query.to_string()
+        format!("(?i){query}")
     } else {
-        bytes_as_literal_regex(&encoding::encode_query(enc, query))
+        format!(
+            "(?i){}",
+            bytes_as_literal_regex(&encoding::encode_query(enc, query))
+        )
     }
 }
 
@@ -1837,14 +1862,100 @@ mod tests {
         // UTF-8 存储 (含 UTF-16 转码副本) 保留完整正则语法 —— review 抓的回归：
         // 旧代码查 stats().encoding, 把 UTF-16 文件误踢进字面量分支，`ERROR|FATAL`
         // 变成逐字节字面匹配，命中恒空。
+        // 两分支的 `(?i)` 前缀是 2026-09-15 的默认不敏感 (spec D2/D3)。
         assert_eq!(
             build_search_pattern(Encoding::Utf8, "ERROR|FATAL"),
-            "ERROR|FATAL"
+            "(?i)ERROR|FATAL"
         );
-        // GBK 存储：转字节 → \xNN 字面量 (退化为字面量语义)
+        // GBK 存储：转字节 → \xNN 字面量 (退化为字面量语义), 外面套同一个 (?i)
         assert_eq!(
             build_search_pattern(Encoding::Gbk, "中文"),
-            "(?-u)\\xD6\\xD0\\xCE\\xC4"
+            "(?i)(?-u)\\xD6\\xD0\\xCE\\xC4"
+        );
+    }
+
+    #[test]
+    fn search_pattern_is_case_insensitive_by_default_with_opt_out() {
+        // 默认不敏感: 小写查询命中大写内容
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "error")).unwrap();
+        assert!(re.is_match(b"2026-09-15 ERROR boom"));
+        // 逃逸舱: `(?-i)` 组内覆盖, 用户想精确时零代码可用
+        let re =
+            regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "(?-i)error")).unwrap();
+        assert!(!re.is_match(b"2026-09-15 ERROR boom"), "逃逸舱须恢复敏感");
+        assert!(re.is_match(b"2026-09-15 error boom"));
+    }
+
+    #[test]
+    fn case_prefix_does_not_change_regex_class_semantics() {
+        // `(?i)` 而非 `(?i-u)`: `\w` 仍是 Unicode 语义 (含汉字), `\d` 仍是 Unicode 数字。
+        // 若误用 `(?-u)`, `\w` 会退化成 ASCII 类 —— 这两条断言就是那把锁。
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"\w+")).unwrap();
+        assert!(re.is_match("汉字".as_bytes()), "\\w 必须仍是 Unicode 语义");
+        let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"^\d+$")).unwrap();
+        assert!(
+            re.is_match("１２３".as_bytes()),
+            "\\d 必须仍是 Unicode 数字类"
+        );
+    }
+
+    /// `parse_filter` 是过滤解析的**唯一入口**: 键名规范化只在有 schema 时发生,
+    /// 且用户输入的原文不改 (状态栏显示的是他敲的那串)。
+    #[test]
+    fn parse_filter_normalizes_keys_only_when_schema_present() {
+        let mut app = LogApp::new_empty();
+        let field = |p: &str| {
+            vec![jsonl::Clause::Field {
+                path: vec![p.to_string()],
+                op: jsonl::Op::Eq,
+                value: "ERROR".to_string(),
+            }]
+        };
+
+        // .log (无 schema): 键名原样 —— 与改造前一字不差
+        assert!(app.schema.is_none(), "new_empty 应无 schema");
+        assert_eq!(app.parse_filter("LEVEL=ERROR"), field("LEVEL"));
+
+        // JSONL (有 schema): 改写为列里的真实写法
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        assert_eq!(app.parse_filter("LEVEL=ERROR"), field("level"));
+        // 大小写已一致的照常通过
+        assert_eq!(app.parse_filter("level=ERROR"), field("level"));
+        // 裸词与多段路径不经规范化
+        assert_eq!(
+            app.parse_filter("boom"),
+            vec![jsonl::Clause::Bare("boom".into())]
+        );
+        assert_eq!(
+            app.parse_filter("a.b=1"),
+            vec![jsonl::Clause::Field {
+                path: vec!["a".into(), "b".into()],
+                op: jsonl::Op::Eq,
+                value: "1".into(),
+            }]
+        );
+    }
+
+    /// 过滤栏存的是**用户敲的原文**, 规范化只发生在解析层 —— 状态栏回显与
+    /// 清空重放 (`filter_applied`) 都拿它, 改掉会让用户看到自己没敲过的字。
+    #[test]
+    fn apply_filter_keeps_raw_query_for_display() {
+        let mut app = LogApp::new_empty();
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        app.apply_filter("LEVEL=ERROR".to_string());
+        assert_eq!(
+            app.filter_applied, "LEVEL=ERROR",
+            "存的是原文不是规范化结果"
         );
     }
 

@@ -146,8 +146,15 @@ fn main() {
     if let Some(q) = &filter {
         println!("\n== JSONL 字段过滤 ==");
         println!("查询           : {q}");
+        // 键名规范化必须与 app 同源 —— 否则 `--filter "LEVEL=ERROR"` 在这里报 0 命中、
+        // 在 app 里筛出错误行, 而本工具正是 §4 性能数字与 §7 验收弹药的来源
+        // (审查抓到: 这是 `parse_query` 的第二条构造线, 违反 spec D9)。
+        let mut clauses = jsonl::parse_query(q);
+        if let Some(s) = &schema {
+            jsonl::normalize_clause_keys(&mut clauses, s);
+        }
         let t = Instant::now();
-        let hits = jsonl::run_filter(&file, &jsonl::parse_query(q));
+        let hits = jsonl::run_filter(&file, &clauses);
         let el = t.elapsed();
         let secs = el.as_secs_f64();
         let thr = if secs > 0.0 {

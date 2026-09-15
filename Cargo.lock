@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "danqing-logfile"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing-logfile#baee0a8b2265845585884f8e86d52288633d0f95"
+source = "git+https://github.com/14uncle/danqing-logfile#b35e2bbe5203fb7bc7e9cf742a6e615abfdee30c"
 dependencies = [
  "anyhow",
  "danqing-encoding",

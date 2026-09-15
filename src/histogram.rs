@@ -151,6 +151,12 @@ pub(crate) struct LevelHistogram {
     file_open: bool,
     /// 当前生效的过滤对应的桶 (行高亮); None = 无。
     active: Option<Level>,
+    /// `active` 重算所依据的**已应用过滤原串**。
+    ///
+    /// 缓存理由: `active` 的判定要过规范化 (`parse_filter`), 那是分配型操作,
+    /// 不该进每帧的 `sync`。判定依据只有两个来源 —— 用户改了过滤串、或换文件
+    /// 导致子句表变了 —— 两者任一变化才重算 (子句表的变化由 `queries` 自身比对)。
+    active_src: String,
     /// 鼠标悬停的行 (仅**可点**的行会进这里)。
     ///
     /// 人工验收反馈: 没有 hover 反馈, 用户不知道哪些行能点 (spec 原 Open Question
@@ -175,6 +181,7 @@ impl LevelHistogram {
         Self {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
+            active_src: String::new(),
             visible: true,
             pending: false,
             file_open: false,
@@ -250,17 +257,28 @@ impl Widget for LevelHistogram {
         self.accent = t.accent();
         self.palette = view::LevelPalette::for_cell(&t);
         self.counts = *app.level_counts.as_ref();
+        let queries_changed = self.queries != app.level_queries;
         self.queries = app.level_queries.clone();
         self.visible = app.histogram_visible;
         self.pending = app.levels_pending;
         self.file_open = app.has_file;
-        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `level=ERROR*`
+        // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `LEVEL=ERROR*`
         // 与点柱条走同一条判定, 两者行为一致。
-        self.active = Level::ALL.iter().copied().find(|l| {
-            self.queries[*l as usize]
-                .as_deref()
-                .is_some_and(|q| q == app.filter_applied)
-        });
+        //
+        // **比的是规范化之后的子句集, 不是原串** (2026-09-15 review 抓):
+        // 键名大小写不同 (`LEVEL=ERROR*`) 的手打查询筛的是**同一批行**, 指示器与
+        // `清除筛选` 必须跟着亮 —— 拿原串比会出现最别扭的一种状态: 结果确实被筛了,
+        // 侧栏却说没有筛选生效、清除行也点不动。
+        // 两侧都过 `parse_filter` (同一道规范化), 等值判定才与匹配口径同源。
+        if queries_changed || self.active_src != app.filter_applied {
+            self.active_src = app.filter_applied.clone();
+            let applied = app.parse_filter(&app.filter_applied);
+            self.active = Level::ALL.iter().copied().find(|l| {
+                self.queries[*l as usize]
+                    .as_deref()
+                    .is_some_and(|q| app.parse_filter(q) == applied)
+            });
+        }
     }
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
@@ -595,6 +613,49 @@ mod tests {
             EventResult::Ignored
         );
         assert_eq!(w.hover.get(), None, "移出后 hover 清空");
+    }
+
+    /// **指示器跟着规范化走, 不跟原串走** (2026-09-15 review 抓的缺口)。
+    ///
+    /// 键名大小写不同 (`LEVEL=ERROR*`) 的手打查询, 过滤结果与 `level=ERROR*`
+    /// 逐行相同; 若拿原串比, 侧栏会进入最别扭的状态 —— 结果确实被筛了, 却没有任何
+    /// 桶行高亮, 且「清除筛选」点不动 (它只在 `active.is_some()` 时可点)。
+    #[test]
+    fn active_bucket_follows_normalized_filter_not_raw_string() {
+        let mut app = LogApp::new_empty();
+        app.schema = Some(std::sync::Arc::new(crate::jsonl::Schema {
+            columns: vec![crate::jsonl::Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        app.level_queries = levels::level_queries_for("level");
+        let mut w = LevelHistogram::new();
+
+        app.filter_applied = "LEVEL=ERROR*".into();
+        w.sync(&app);
+        assert_eq!(
+            w.active,
+            Some(Level::Error),
+            "键名大小写不同仍是同一个筛选 → 桶行必须高亮"
+        );
+        assert!(w.is_row_clickable(CLEAR_ROW), "有生效筛选 → 清除行必须可点");
+
+        // 大小写一致的写法照旧 (不得因归一化反而失配)
+        app.filter_applied = "level=ERROR*".into();
+        w.sync(&app);
+        assert_eq!(w.active, Some(Level::Error), "同写法照旧点亮");
+
+        // 真正不等价的查询不得点亮
+        app.filter_applied = "status=500".into();
+        w.sync(&app);
+        assert_eq!(w.active, None, "另一个查询不是这个桶");
+
+        // 空过滤 = 无生效
+        app.filter_applied.clear();
+        w.sync(&app);
+        assert_eq!(w.active, None);
+        assert!(!w.is_row_clickable(CLEAR_ROW), "无筛选时清除行不可点");
     }
 
     /// 「清除筛选」行点击要发出消息 (走与「再点生效行」同一套切换语义)。
