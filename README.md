@@ -1,5 +1,11 @@
 # 丹青日志 LogLens (danqing-log)
 
+**LogLens** — a fast large-file log & JSONL viewer for Windows, written in Rust.
+Opens GB-scale files instantly (1 GiB indexed in 92 ms) with a virtualized scroll
+view, tail-follow + live filtering, regex search with highlighting, and a JSONL
+column view with nested expand and field filtering. Free & open source (Apache-2.0) —
+no account, no telemetry, nothing leaves your machine.
+
 Windows 上的大文件日志 / JSONL 查看分析器 —— 丹青第四件产品。
 GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索高亮、JSONL 列化 + 嵌套展开 + 字段过滤。
 
