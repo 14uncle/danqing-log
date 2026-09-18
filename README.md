@@ -12,6 +12,8 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 **v1.0 = 免费层单二进制全功能**，GitHub 永久免费开源。多文件时间戳合并、字段分析、导出、
 工作台会话持久化属付费层（$29 个人 / $59 企业买断），见 [`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md)。
 
+![LogLens 截图：1 GiB JSONL 表格模式，嵌套字段子行展开，左侧级别统计侧栏（暗色主题）](docs/images/screenshot-jsonl-dark.png)
+
 ## 实测数字
 
 1 GiB 实测（release，本机，`logbench` 无窗口基准；完整报告见
