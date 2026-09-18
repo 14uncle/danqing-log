@@ -281,7 +281,27 @@
   先问跑的是哪个二进制**, 别急着改第二刀。对照实验: 本机带 patch 构建启动,
   用户亲手验收通过 (焦点路径打进设置卡深处, Alt+F4 干净退出)。
   danqing `dc8283e` / 本仓 lock 复钉 `danqing#dc8283e8`; 184 测试全绿。
-- 当前: **UI 改造五模块已闭环; v1.0 收尾是唯一主线** ——
+- 2026-09-18 (**v1.0.0 GitHub 已发布; MS Store 余用户提交一步**):
+  **包从 dev HEAD `1c1bd67` 重打** —— 09-16 那批 (基线 `b63e4f7`) 不含之后的下拉
+  穿透修复 (`96ad269` 复钉 danqing#dc8283e8), 已挪 `_stale/pre-dropdown-fix-b63e4f7/`。
+  三件套绿 (184 测试) → 便携 zip 4,785,863 B / sha256 `2ecec027…`;
+  MSIX 已签 (`CFC2703D`, signtool verify OK) / 签名后 sha256 `4b88721a…`
+  (sidecar 一致, f76bd21 的重算逻辑生效); 两包 exe 与 `target/release` 三方同哈希
+  `f03e342b…`; MSIX 已本机侧载 (`14uncle.LogLens_1.0.0.0_x64__3y3rwcp1ep416`)。
+  **git**: master 合入 dev (`1ed1894`, --no-ff) 并 push; **tag `v1.0.0` 在发布点重打**
+  并 push (旧 tag `b2d8351` 09-16 已删, 这次是真发布点)。
+  **GitHub Release 已发布** (`gh api` 核实 latest / 两资产齐): zip + `.sha256`,
+  正文 = `docs/release-notes-v1.0.0.md` 去掉文件头元信息段 (作者/日期/「唯一真身」
+  告诫不对外)。
+  **MS Store 余下 = Partner Center 网页提交 (用户本人账号)** —— 截图用户已自备;
+  提交包 = `release-archives/log/msix/danqing-log-store-v1.0.0-x64.msix`;
+  检查单 `docs/ms-store-copy.md` 「提交前检查单」; 隐私政策走贴文本
+  `docs/privacy-policy.md`; 文案/关键词/完整信任说明同文件。
+  **插曲 (教训)**: agent 见 CLAUDE.md 记「截图 ⬜」便自行开拍, 拍到第 2 张被用户
+  中断 —— **截图用户早已线下备好, CLAUDE.md 状态滞后于用户线下动作**。
+  发布类动手前先问一句「哪些物料你已备好」。期间动过用户配置主题 (已还原 dark)
+  并 kill 过应用一次; 抓到两张图已删, 未流出。
+- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布, MS Store 提交是唯一余步** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
      `color-pipeline` / `theme-recalibrate` / `component-polish` / `token-completion` /
