@@ -201,6 +201,15 @@ pub(crate) struct LogApp {
     filtered: Option<Arc<Vec<u64>>>,
     /// 已应用的过滤查询。
     filter_applied: String,
+    /// **落账**过滤查询 —— 产出当前 `filtered` 行集的那一串。
+    ///
+    /// 与 `filter_applied` 的差异只在「作业在途」窗口: `apply_filter` 发起时
+    /// 即写 `filter_applied`, 而行集要等 job 拾取才换 (评审 R5)。窗口内两者
+    /// 脱钩, 凡消费「行集 ↔ 过滤串」对应关系的 (分析快照) 必须读本字段;
+    /// 增量过滤合并在本窗口内直接禁行 (全程重跑会覆盖, 合并是白干+错账)。
+    filter_landed: String,
+    /// 过滤作业在途 (发起未拾取)。见上。
+    filter_pending: bool,
     /// 过滤栏清空信号 (Bar::bind_clear_filter 借此原地 clear)。
     filter_clear_rev: u64,
     filter_elapsed: Option<Duration>,
@@ -442,6 +451,8 @@ impl LogApp {
             levels_pending: false,
             filtered: None,
             filter_applied: String::new(),
+            filter_landed: String::new(),
+            filter_pending: false,
             filter_clear_rev: 0,
             filter_elapsed: None,
             filter_job: AsyncJob::new(),
@@ -663,7 +674,10 @@ impl LogApp {
         let field = col.name.clone();
         let file = Arc::clone(&self.file);
         let rows = self.filtered.clone();
-        self.analysis_filter_src = self.filter_applied.clone();
+        // 快照串必须与行集同源 (评审 R5): `filter_applied` 在作业在途窗口里
+        // 已是新串而行集还是旧的 —— 读落账串, 保证「作用域标注说的过滤」
+        // 就是「实际跑了的行集」的产出者; 新过滤落账后 stale 标注自然出现。
+        self.analysis_filter_src = self.filter_landed.clone();
         self.analysis_running = true;
         self.analysis_launches += 1;
         self.analysis_job.launch(move || {
@@ -918,6 +932,8 @@ impl LogApp {
         self.bookmarks.retain(|&l| l < new_count);
         self.filtered = None;
         self.filter_applied.clear();
+        self.filter_landed.clear();
+        self.filter_pending = false;
         // 换文件/重建 = 分析结果作废 (D8 后半句: 文件语境没了);
         // 在途作业作废 —— 旧文件的分析结果不得贴到新文件 (async-open C1 同款纪律)
         self.analysis_result = None;
@@ -986,6 +1002,8 @@ impl LogApp {
         self.selected = 0;
         self.filtered = None;
         self.filter_applied.clear();
+        self.filter_landed.clear();
+        self.filter_pending = false;
         self.analysis_result = None;
         self.analysis_filter_src.clear();
         self.analysis_running = false;
@@ -1144,6 +1162,11 @@ impl LogApp {
         if self.filter_applied.is_empty() {
             return;
         }
+        // 过滤在途窗口禁行 (R5 族): 此刻 `filtered` 还是旧串的行集,
+        // 把新串的增量命中合进去是错账 —— 在途的全程重跑本就会覆盖追加行。
+        if self.filter_pending {
+            return;
+        }
         if self.filtered.is_none() {
             return;
         }
@@ -1158,6 +1181,9 @@ impl LogApp {
     /// 就漏, 只补不摘就重, 两种都让底栏行数与侧栏柱条一起偏 (且一起偏就意味着
     /// D2 的对照检查看不出来)。
     fn drop_filter_hits_from(&mut self, from: u64) {
+        if self.filter_pending {
+            return; // 同 append_filter_hits: 在途窗口内不动旧行集
+        }
         let Some(existing) = &self.filtered else {
             return;
         };
@@ -1344,7 +1370,12 @@ impl LogApp {
         self.filter_applied = query.clone();
         self.filter_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         if query.is_empty() {
+            // 回全量同步生效 —— 顺手作废旧一轮在途过滤: 它晚到会覆盖掉
+            // 这里的 None (评审 R5 同族: 在途窗口内行集与过滤串脱钩)。
+            self.filter_job.invalidate();
+            self.filter_pending = false;
             self.filtered = None;
+            self.filter_landed.clear();
             self.filter_elapsed = None;
             self.top_row = 0.0;
             self.selected = 0;
@@ -1354,6 +1385,7 @@ impl LogApp {
         let clauses = self.parse_filter(&query);
         let file = Arc::clone(&self.file);
         self.set_status(format!("{} · 过滤 \"{query}\" 中…", self.base_status));
+        self.filter_pending = true;
         self.filter_job.launch(move || {
             let t = Instant::now();
             let lines = jsonl::run_filter(&file, &clauses);
@@ -1367,7 +1399,10 @@ impl LogApp {
     /// Esc (过滤): 清已应用过滤，回到全量。
     fn clear_filter(&mut self) {
         self.filter_clear_rev += 1;
+        self.filter_job.invalidate(); // 在途结果不得晚到复活 (同 R5 族)
+        self.filter_pending = false;
         self.filter_applied.clear();
+        self.filter_landed.clear();
         self.filter_elapsed = None;
         self.filtered = None;
         self.top_row = 0.0;
@@ -1947,6 +1982,8 @@ impl App for LogApp {
             self.analysis_result = Some(a);
         }
         if let Some(out) = self.filter_job.poll() {
+            self.filter_pending = false;
+            self.filter_landed = self.filter_applied.clone();
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
             self.top_row = 0.0;
@@ -2229,6 +2266,80 @@ mod tests {
             "空文件 0 行"
         );
         std::fs::remove_file(cfg.with_extension("license.key")).ok();
+    }
+
+    /// 评审 R5: 过滤作业在途窗口内, `filter_applied` 是新串而 `filtered`
+    /// 行集还是旧的 —— 分析快照必须读**落账串** (与行集同源), 否则结果
+    /// 看起来新鲜、数字其实是上一个过滤的 (stale 永 false 的静默错数)。
+    #[test]
+    fn analyze_snapshots_landed_filter_not_pending_one() {
+        let cfg = temp_cfg_path("fawin");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "d".into(),
+                width_chars: 1,
+            }],
+        }));
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        // 过滤 A 已落账
+        app.filtered = Some(Arc::new(vec![0, 2]));
+        app.filter_applied = "level=ERROR".to_string();
+        app.filter_landed = "level=ERROR".to_string();
+        // 发起过滤 B → 在途窗口: applied=B, 行集与 landed 仍是 A
+        app.apply_filter("status=500".to_string());
+        assert!(app.filter_pending);
+        assert_eq!(app.filter_applied, "status=500");
+        // 窗口内发起分析: 快照取落账串 A (与行集同源)
+        app.analyze_field(0);
+        assert_eq!(
+            app.analysis_filter_src, "level=ERROR",
+            "分析快照必须与行集同源 (落账串), 不能读在途的新串"
+        );
+        // B 落账: landed 换串 —— 之后面板的 stale 判据 (src != applied) 仍成立
+        let mut landed = false;
+        for _ in 0..200 {
+            if let Some(out) = app.filter_job.poll() {
+                app.filter_pending = false;
+                app.filter_landed = app.filter_applied.clone();
+                app.filtered = Some(Arc::new(out.lines));
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(landed, "过滤作业应完成");
+        assert_eq!(app.filter_landed, "status=500");
+        std::fs::remove_file(cfg.with_extension("license.key")).ok();
+    }
+
+    /// R5 同族: Esc 清过滤 / 空查询回全量, 都得作废**在途**的过滤作业 ——
+    /// 否则它晚到把行集贴回来, 底栏显示「无过滤」而列表是过滤后的。
+    #[test]
+    fn clear_filter_kills_pending_filter_job() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("faclr")));
+        app.has_file = true;
+        app.apply_filter("level=ERROR".to_string());
+        assert!(app.filter_pending);
+        app.clear_filter();
+        assert!(!app.filter_pending);
+        assert!(app.filtered.is_none());
+        assert!(app.filter_landed.is_empty());
+        // 在途作业的结果晚到也不得复活
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut resurrected = false;
+        for _ in 0..50 {
+            if app.filter_job.poll().is_some() {
+                resurrected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!resurrected, "invalidate 后在途结果必须被丢弃, poll 不出");
+        assert!(app.filtered.is_none());
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! (免费态弹升级提示且不发起扫描)。本组件只管呈现与命中。
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -27,6 +28,14 @@ use danqing_log::analysis::{Analysis, AnalysisResult};
 /// 共用, 同规则同常量。
 const ROW_BACK: usize = 0;
 const ROW_RERUN: usize = 1;
+
+/// 选择器态字段行上限 (评审 R6): 无上限时 30-50 列的宽 schema 把直方图挤到
+/// 零高、底部字段不可达。超上限的列不进面板 (仍可走字段过滤语法查询) ——
+/// 选择器没有滚动机构, 封顶 + 「还有 N 列」行是 spec Open Question 的落地。
+const MAX_PICKER_FIELDS: usize = 16;
+
+/// 枚举取值展示的字符上限 (spec 已知局限: 32 字符, 同列宽惯例)。
+const ENUM_VALUE_CHARS: usize = 32;
 
 /// 侧栏「字段分析」区。
 pub(crate) struct AnalysisPanel {
@@ -44,8 +53,12 @@ pub(crate) struct AnalysisPanel {
     stale: bool,
     /// 分析在途 (job 已发起未交付) —— 显示「分析中…」而不是空结果区。
     running: bool,
-    /// 悬停行 (仅可点行进)。
+    /// 悬停行 (仅可点行进) —— **纯视觉**, 光标驱动 (直方图同款);
+    /// 点击判定不读它, 读 `pressed` 锚点。
     hover: Cell<Option<usize>>,
+    /// 按下锚点行 (可点行才记): 抬起时与命中行比对, 同才触发。
+    /// 与 hover 分家 —— 按下拖出再抬起不该触发, 也不该残留高亮。
+    pressed: Cell<Option<usize>>,
     // 主题色 sync 期解析缓存, paint 零查表 (与 histogram 同款)。
     bg: Color,
     text_primary: Color,
@@ -64,6 +77,7 @@ impl AnalysisPanel {
             stale: false,
             running: false,
             hover: Cell::new(None),
+            pressed: Cell::new(None),
             bg: Color::rgb(1.0, 1.0, 1.0),
             text_primary: Color::rgb(0.12, 0.12, 0.12),
             text_secondary: Color::rgb(0.40, 0.40, 0.42),
@@ -71,16 +85,24 @@ impl AnalysisPanel {
         }
     }
 
-    /// 选择器态的行数 (标题行 + 字段行)。
+    /// 选择器态实际展示的字段行数 (封顶 MAX_PICKER_FIELDS)。
+    fn shown_fields(&self) -> usize {
+        self.columns.len().min(MAX_PICKER_FIELDS)
+    }
+
+    /// 选择器态的行数 (标题行 + 字段行 + 超限时的「还有 N 列」行)。
     fn picker_rows(&self) -> usize {
-        1 + self.columns.len()
+        1 + self.shown_fields() + usize::from(self.columns.len() > MAX_PICKER_FIELDS)
     }
 
     /// 结果态的行数 (顶部两行 + 作用域行 + 内容行)。
     fn result_rows(&self) -> usize {
         let Some(a) = &self.result else { return 0 };
         let content = match &a.result {
-            AnalysisResult::Numeric(_) => 7, // count/min/max/mean/p50/p95/p99
+            // count/min/max/mean/p50/p95/p99 + 采样标注行 (评审 R1: 漏算它会让
+            // 面板自然高度少一行, 「分位数为采样估计」被窗口底边裁掉 —— 而这条
+            // 恰在旗舰实测路径 (超 reservoir 上限) 上必现)。
+            AnalysisResult::Numeric(s) => 7 + usize::from(s.sampled),
             AnalysisResult::Enum(e) => e.top.len() + usize::from(e.others > 0 || e.capped),
         };
         // +作用域行 + (跳过/采样标注行)
@@ -126,6 +148,16 @@ impl AnalysisPanel {
         };
         (i < rows).then_some(i)
     }
+
+    /// 该行可点吗 —— hover 留痕与按下锚点共用同一判据 (直方图
+    /// `is_row_clickable` 同款: 可点性是单一事实源)。
+    fn row_clickable(&self, row: usize) -> bool {
+        if self.result.is_some() {
+            row == ROW_BACK + 1 || row == ROW_RERUN + 1
+        } else {
+            row >= 1 && row <= self.shown_fields()
+        }
+    }
 }
 
 impl Widget for AnalysisPanel {
@@ -164,10 +196,15 @@ impl Widget for AnalysisPanel {
         if area.size.width < 1.0 || area.size.height < 1.0 {
             return;
         }
+        // 裁剪兜底 (评审 R4): 文本以 measure 截断为主, 但 rect span 先于 text span
+        // 渲染, 任何漏网的超长内容不得盖画到 LogView 行内容上。
+        rects.push_clip(area);
+        texts.push_clip(area);
         rects.push_rect(area, self.bg, 0.0);
         let x = area.origin.x + PAD_X;
         let right = area.origin.x + area.size.width - PAD_X;
-        let bar_full_w = (area.size.width - 2.0 * PAD_X).max(1.0);
+        let avail_w = (area.size.width - 2.0 * PAD_X).max(1.0);
+        let bar_full_w = avail_w;
 
         // 标题行 (选择器 = 「字段分析」, 结果 = 「字段分析 · <field>」)
         let title = match &self.result {
@@ -175,12 +212,27 @@ impl Widget for AnalysisPanel {
             None => "字段分析".to_string(),
         };
         let base0 = self.row_rect(area, 0).origin.y + texts.ascent(f32::from(LABEL_SIZE));
-        texts.push_text(&title, x, base0, LABEL_SIZE, self.text_secondary);
+        // 「分析中…」尾随标题 —— 在途时给它留出位置, 别让两段叠着溢出。
+        let suffix_w = if self.running {
+            texts.measure("  分析中…", LABEL_SIZE)
+        } else {
+            0.0
+        };
+        let title_fit = fit(texts, &title, (avail_w - suffix_w).max(1.0));
+        texts.push_text(
+            title_fit.as_ref(),
+            x,
+            base0,
+            LABEL_SIZE,
+            self.text_secondary,
+        );
 
         match &self.result {
             None => {
-                // 选择器: 字段名逐行可点 (与直方图桶行同一交互语言)
-                for (i, name) in self.columns.iter().enumerate() {
+                // 选择器: 字段名逐行可点 (与直方图桶行同一交互语言),
+                // 封顶 MAX_PICKER_FIELDS, 超出的列给一行指示 (R6)。
+                let shown = self.shown_fields();
+                for (i, name) in self.columns.iter().take(shown).enumerate() {
                     let row = i + 1;
                     let r = self.row_rect(area, row);
                     let hovered = self.hover.get() == Some(row);
@@ -201,12 +253,24 @@ impl Widget for AnalysisPanel {
                     } else {
                         self.text_primary
                     };
+                    let name_fit = fit(texts, name, avail_w);
                     texts.push_text(
-                        name,
+                        name_fit.as_ref(),
                         x,
                         r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
                         LABEL_SIZE,
                         color,
+                    );
+                }
+                if self.columns.len() > shown {
+                    let r = self.row_rect(area, shown + 1);
+                    let more = format!("… 还有 {} 列", self.columns.len() - shown);
+                    texts.push_text(
+                        &more,
+                        x,
+                        r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                        LABEL_SIZE,
+                        self.text_secondary,
                     );
                 }
             }
@@ -237,8 +301,9 @@ impl Widget for AnalysisPanel {
                     scope.push_str(&format!(" · 跳过 {} 行", a.skipped));
                 }
                 let r = self.row_rect(area, 3);
+                let scope_fit = fit(texts, &scope, avail_w);
                 texts.push_text(
-                    &scope,
+                    scope_fit.as_ref(),
                     x,
                     r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
                     LABEL_SIZE,
@@ -266,8 +331,9 @@ impl Widget for AnalysisPanel {
                         }
                         if s.sampled {
                             let r = self.row_rect(area, content_start + rows.len());
+                            let note = fit(texts, "分位数为采样估计", avail_w);
                             texts.push_text(
-                                "分位数为采样估计",
+                                note.as_ref(),
                                 x,
                                 r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
                                 LABEL_SIZE,
@@ -287,9 +353,26 @@ impl Widget for AnalysisPanel {
                                 self.accent,
                                 2.0,
                             );
-                            texts.push_text(val, x, base, LABEL_SIZE, self.text_primary);
                             let cs = count.to_string();
                             let cw = texts.measure(&cs, LABEL_SIZE);
+                            // 取值先按 spec 惯例截 32 字符, 再按剩余宽度截
+                            // (计数右对齐, 给它留出位置)。
+                            let val_cap: Cow<'_, str> = if val.chars().count() > ENUM_VALUE_CHARS {
+                                Cow::Owned(format!(
+                                    "{}…",
+                                    val.chars().take(ENUM_VALUE_CHARS).collect::<String>()
+                                ))
+                            } else {
+                                Cow::Borrowed(val.as_str())
+                            };
+                            let val_fit = fit(texts, &val_cap, (avail_w - cw - 8.0).max(1.0));
+                            texts.push_text(
+                                val_fit.as_ref(),
+                                x,
+                                base,
+                                LABEL_SIZE,
+                                self.text_primary,
+                            );
                             texts.push_text(&cs, right - cw, base, LABEL_SIZE, self.text_secondary);
                         }
                         if e.others > 0 || e.capped {
@@ -299,8 +382,9 @@ impl Widget for AnalysisPanel {
                             } else {
                                 format!("其他（{} 行）", e.others)
                             };
+                            let label_fit = fit(texts, &label, avail_w);
                             texts.push_text(
-                                &label,
+                                label_fit.as_ref(),
                                 x,
                                 r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
                                 LABEL_SIZE,
@@ -313,12 +397,29 @@ impl Widget for AnalysisPanel {
         }
         // 分析在途: 标题行旁标「分析中…」(结果未到前不拿空区冒充)
         if self.running {
-            let tw = texts.measure(&title, LABEL_SIZE);
+            let tw = texts.measure(title_fit.as_ref(), LABEL_SIZE);
             texts.push_text("  分析中…", x + tw, base0, LABEL_SIZE, self.accent);
         }
+        texts.pop_clip();
+        rects.pop_clip();
     }
 
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        // hover: 只在**可点**行上留痕, 光标驱动 (直方图同款) —— 评审 R2:
+        // 原先只在按下瞬间置位, 字段行没有悬停反馈 (「可点行无 hover = 用户
+        // 不知道能点」), 且按下拖出再抬起会残留高亮。
+        match event {
+            Event::CursorMoved(p) => {
+                self.hover
+                    .set(self.row_at(area, *p).filter(|&r| self.row_clickable(r)));
+                return EventResult::Ignored;
+            }
+            Event::CursorLeft => {
+                self.hover.set(None);
+                return EventResult::Ignored;
+            }
+            _ => {}
+        }
         let Event::MouseInput {
             button,
             pressed,
@@ -331,16 +432,22 @@ impl Widget for AnalysisPanel {
         if *button != danqing::event::MouseButton::Left {
             return EventResult::Ignored;
         }
-        let Some(row) = self.row_at(area, *position) else {
+        let row = self.row_at(area, *position);
+        if *pressed {
+            // 锚点只记可点行; 点在有东西的地方一律吞掉, 不穿透到底层列表。
+            self.pressed.set(row.filter(|&r| self.row_clickable(r)));
+            return if row.is_some() {
+                EventResult::Consumed
+            } else {
+                EventResult::Ignored
+            };
+        }
+        // 抬起: 与按下锚点同一条可点行才触发 (按下拖出再抬起 = 取消)。
+        let anchor = self.pressed.take();
+        let Some(row) = row else {
             return EventResult::Ignored;
         };
-        if *pressed {
-            self.hover.set(Some(row));
-            return EventResult::Consumed;
-        }
-        // 抬起: 命中即触发
-        let was = self.hover.replace(None);
-        if was != Some(row) {
+        if anchor != Some(row) {
             return EventResult::Consumed;
         }
         if self.result.is_some() {
@@ -357,7 +464,7 @@ impl Widget for AnalysisPanel {
                 }
                 _ => {}
             }
-        } else if row >= 1 && row <= self.columns.len() {
+        } else if row >= 1 && row <= self.shown_fields() {
             msgs.push(Box::new(Msg::AnalyzeField(row - 1)));
         }
         EventResult::Consumed
@@ -380,6 +487,27 @@ fn fmt_num(x: f64) -> String {
         return format!("{x:.0}");
     }
     format!("{x:.2}")
+}
+
+/// 文本适配可用宽度: 超宽按字符截断加省略号 (评审 R4 —— 侧栏 112px,
+/// 长字段名/长取值/「4021125 行 · 基于旧过滤 · 跳过 12 行」这类作用域行
+/// 必撞; 截断是主防, paint 里的 push_clip 是兜底)。
+fn fit<'a>(texts: &mut TextBatch, s: &'a str, max_w: f32) -> Cow<'a, str> {
+    if texts.measure(s, LABEL_SIZE) <= max_w {
+        return Cow::Borrowed(s);
+    }
+    let ell_w = texts.measure("…", LABEL_SIZE);
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cand_w = texts.measure(&out, LABEL_SIZE)
+            + texts.measure(ch.encode_utf8(&mut [0; 4]), LABEL_SIZE);
+        if cand_w + ell_w > max_w {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -506,5 +634,233 @@ mod tests {
         app.filter_applied = String::new();
         panel.sync(&app);
         assert!(panel.stale, "过滤变更后旧结果必须标注 (D8)");
+    }
+
+    /// 行账目守卫 (评审 R1): result_rows 必须等于 paint 实际画出的行数 ——
+    /// 漏一行 = 该行被窗口底边裁掉 (采样标注恰在旗舰路径上必现)。
+    #[test]
+    fn result_rows_accounts_for_sampled_note_and_others_row() {
+        use danqing_log::analysis::{EnumStats, NumericStats};
+        let mut app = LogApp::new_empty_at(Some(temp_cfg("rows")));
+        app.has_file = true;
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "d".into(),
+                width_chars: 1,
+            }],
+        }));
+        let mut panel = AnalysisPanel::new();
+        // 数值 + 采样: 2(顶部) + 1(作用域) + 7(统计) + 1(采样标注) + 1(标题) = 12
+        app.analysis_result = Some(Analysis {
+            field: "d".into(),
+            scope_rows: 4_000_000,
+            skipped: 0,
+            result: AnalysisResult::Numeric(NumericStats {
+                count: 4_000_000,
+                min: 0.0,
+                max: 9.0,
+                mean: 4.5,
+                p50: 4.0,
+                p95: 8.0,
+                p99: 9.0,
+                sampled: true,
+            }),
+        });
+        panel.sync(&app);
+        assert_eq!(panel.result_rows(), 12, "数值+采样: 标注行必须计入高度");
+        // 数值未采样: 11
+        if let Some(a) = &mut app.analysis_result {
+            a.result = AnalysisResult::Numeric(NumericStats {
+                count: 3,
+                min: 0.0,
+                max: 9.0,
+                mean: 4.5,
+                p50: 4.0,
+                p95: 8.0,
+                p99: 9.0,
+                sampled: false,
+            });
+        }
+        panel.sync(&app);
+        assert_eq!(panel.result_rows(), 11);
+        // 枚举: 2 个 top + 其他行 → 2+1+3+1 = 7
+        app.analysis_result = Some(Analysis {
+            field: "d".into(),
+            scope_rows: 9,
+            skipped: 0,
+            result: AnalysisResult::Enum(EnumStats {
+                top: vec![("a".into(), 5), ("b".into(), 3)],
+                others: 1,
+                capped: false,
+                total: 9,
+            }),
+        });
+        panel.sync(&app);
+        assert_eq!(panel.result_rows(), 7, "其他行必须计入高度");
+        // 枚举无其他: 2+1+1+1 = 5
+        if let Some(a) = &mut app.analysis_result {
+            a.result = AnalysisResult::Enum(EnumStats {
+                top: vec![("a".into(), 5)],
+                others: 0,
+                capped: false,
+                total: 5,
+            });
+        }
+        panel.sync(&app);
+        assert_eq!(panel.result_rows(), 5);
+    }
+
+    /// hover 光标驱动 (评审 R2): 可点行留痕、不可点行不留、CursorLeft 清空;
+    /// 按下拖出再抬起 = 取消, 不触发也不残留。
+    #[test]
+    fn hover_follows_cursor_and_drag_out_cancels_click() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg("hover")));
+        app.has_file = true;
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "level".into(),
+                    width_chars: 5,
+                },
+                danqing_log::jsonl::Column {
+                    name: "duration_ms".into(),
+                    width_chars: 11,
+                },
+            ],
+        }));
+        let mut panel = AnalysisPanel::new();
+        panel.sync(&app);
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 400.0);
+        let mut msgs = MsgQueue::default();
+        let row_center =
+            |r: usize| Point::new(HIST_WIDTH / 2.0, PAD_Y + r as f32 * ROW_H + ROW_H / 2.0);
+        // 光标到字段行 2 → hover 留痕
+        panel.event(&Event::CursorMoved(row_center(2)), area, &mut msgs);
+        assert_eq!(panel.hover.get(), Some(2));
+        // 光标到标题行 (不可点) → 不留痕
+        panel.event(&Event::CursorMoved(row_center(0)), area, &mut msgs);
+        assert_eq!(panel.hover.get(), None, "不可点行不留 hover");
+        // 按下字段行 2, 拖到字段行 1 抬起 → 不触发
+        let down = |p: Point| Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: true,
+            position: p,
+        };
+        let up = |p: Point| Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: false,
+            position: p,
+        };
+        panel.event(&down(row_center(2)), area, &mut msgs);
+        panel.event(&Event::CursorMoved(row_center(1)), area, &mut msgs);
+        panel.event(&up(row_center(1)), area, &mut msgs);
+        assert!(
+            !msgs
+                .iter()
+                .filter_map(|m| m.downcast_ref::<Msg>())
+                .any(|m| matches!(m, Msg::AnalyzeField(_))),
+            "按下拖出再抬起不得触发分析"
+        );
+        // CursorLeft 清空 hover
+        panel.event(&Event::CursorMoved(row_center(1)), area, &mut msgs);
+        assert_eq!(panel.hover.get(), Some(1));
+        panel.event(&Event::CursorLeft, area, &mut msgs);
+        assert_eq!(panel.hover.get(), None);
+    }
+
+    /// 选择器封顶 (评审 R6): 宽 schema 不得把直方图挤到零高;
+    /// 「还有 N 列」行不可点。
+    #[test]
+    fn picker_caps_rows_and_overflow_row_is_inert() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg("cap")));
+        app.has_file = true;
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: (0..30)
+                .map(|i| danqing_log::jsonl::Column {
+                    name: format!("f{i}"),
+                    width_chars: 3,
+                })
+                .collect(),
+        }));
+        let mut panel = AnalysisPanel::new();
+        panel.sync(&app);
+        assert_eq!(panel.picker_rows(), 1 + MAX_PICKER_FIELDS + 1);
+        let c = Constraints::loose(Size::new(HIST_WIDTH, 800.0));
+        let mut texts = TextBatch::default();
+        let h = panel.layout(c, &mut texts).height;
+        assert_eq!(
+            h,
+            2.0 * PAD_Y + (1 + MAX_PICKER_FIELDS + 1) as f32 * ROW_H,
+            "30 列 schema 的自然高度必须封顶"
+        );
+        // 「还有 N 列」行 (row 17): 按下抬起 → 无消息
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 800.0);
+        let mut msgs = MsgQueue::default();
+        let p = Point::new(
+            HIST_WIDTH / 2.0,
+            PAD_Y + (MAX_PICKER_FIELDS + 1) as f32 * ROW_H + ROW_H / 2.0,
+        );
+        let down = Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: true,
+            position: p,
+        };
+        let up = Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: false,
+            position: p,
+        };
+        panel.event(&down, area, &mut msgs);
+        panel.event(&up, area, &mut msgs);
+        assert!(
+            !msgs
+                .iter()
+                .filter_map(|m| m.downcast_ref::<Msg>())
+                .any(|m| matches!(m, Msg::AnalyzeField(_))),
+            "「还有 N 列」行不可点"
+        );
+        // 最后一行真实字段 (row 16) 仍可点
+        let p16 = Point::new(
+            HIST_WIDTH / 2.0,
+            PAD_Y + MAX_PICKER_FIELDS as f32 * ROW_H + ROW_H / 2.0,
+        );
+        let down16 = Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: true,
+            position: p16,
+        };
+        let up16 = Event::MouseInput {
+            button: danqing::event::MouseButton::Left,
+            pressed: false,
+            position: p16,
+        };
+        panel.event(&down16, area, &mut msgs);
+        panel.event(&up16, area, &mut msgs);
+        let saw = msgs
+            .iter()
+            .filter_map(|m| m.downcast_ref::<Msg>())
+            .find_map(|m| {
+                if let Msg::AnalyzeField(i) = m {
+                    Some(*i)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(saw, Some(MAX_PICKER_FIELDS - 1), "封顶内的字段行仍可点");
+    }
+
+    /// fit: 短文本原样 (借用), 长文本截断加省略号且量得出 ≤ max_w。
+    #[test]
+    fn fit_truncates_to_width_with_ellipsis() {
+        let mut texts = TextBatch::default();
+        let short = fit(&mut texts, "level", 92.0);
+        assert!(matches!(short, Cow::Borrowed(_)), "短文本不该分配");
+        let long = "x".repeat(80);
+        let out = fit(&mut texts, &long, 92.0);
+        assert!(out.ends_with('…'));
+        assert!(
+            texts.measure(&out, LABEL_SIZE) <= 92.0,
+            "截断结果必须量得出 ≤ max_w"
+        );
     }
 }

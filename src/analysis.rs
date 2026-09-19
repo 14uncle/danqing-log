@@ -47,9 +47,9 @@ pub struct NumericStats {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumStats {
     pub top: Vec<(String, u64)>,
-    /// 「其他」桶计数 (Top N 之外的行数)。
+    /// 「其他」桶计数 (Top N 之外的行数 + distinct 超限被并入的行数)。
     pub others: u64,
-    /// true = distinct 值超上限, 有值被直接并入其他桶。
+    /// true = distinct 值超上限 (超出的取值没进 map, 其行数已并入 `others`)。
     pub capped: bool,
     pub total: u64,
 }
@@ -224,6 +224,10 @@ fn analyze_enum(file: &LogFile, field: &str, rows: Option<&[u64]>, scope_rows: u
     let mut total = 0u64;
     let mut skipped = 0u64;
     let mut capped = false;
+    // distinct 超限后被丢值**本身**但行数照计 —— 并入「其他」桶,
+    // 否则高基数列的分布数字凭空少一大截 (评审: request_id 类 400 万 distinct
+    // 时侧栏只显示得出 1 万)。
+    let mut overflow = 0u64;
 
     for_each_row(file, rows, None, |line| {
         let Some(v) = scan_field(line, field) else {
@@ -241,14 +245,14 @@ fn analyze_enum(file: &LogFile, field: &str, rows: Option<&[u64]>, scope_rows: u
         } else if counts.len() < ENUM_CAP {
             counts.insert(s, 1);
         } else {
-            capped = true; // distinct 超限: 丢弃值本身, 总数照计
+            capped = true; // distinct 超限: 丢弃值本身, 行数并入其他
+            overflow += 1;
         }
     });
 
     let mut all: Vec<(String, u64)> = counts.into_iter().collect();
     all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let others = all.len().saturating_sub(ENUM_TOP);
-    let others_count: u64 = all.iter().skip(ENUM_TOP).map(|(_, c)| c).sum();
+    let others_count: u64 = all.iter().skip(ENUM_TOP).map(|(_, c)| c).sum::<u64>() + overflow;
     all.truncate(ENUM_TOP);
     Analysis {
         field: field.to_string(),
@@ -257,7 +261,9 @@ fn analyze_enum(file: &LogFile, field: &str, rows: Option<&[u64]>, scope_rows: u
         result: AnalysisResult::Enum(EnumStats {
             top: all,
             others: others_count,
-            capped: capped || others > 0,
+            // 「distinct 超限」与「Top N 之外还有值」是两个语义, 不压成一位 ——
+            // 面板对二者措辞不同 (「取值过多已合并」只在真超限时出现)。
+            capped,
             total,
         }),
     }
@@ -454,6 +460,48 @@ mod tests {
             &[r#"{"d":1}"#, r#"{"d":2}"#, r#"{"d":3}"#, r#"{"d":"x"}"#],
         );
         assert_eq!(analyze_field(&lf, "d", None), analyze_field(&lf, "d", None));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn enum_beyond_top20_merges_into_others_without_capped() {
+        // 21 个 distinct (未超 ENUM_CAP): 「其他」= Top20 之外那 1 个取值的行数,
+        // capped = false —— 「Top N 之外还有值」不等于「取值过多已合并」。
+        let lines: Vec<String> = (0..21).map(|i| format!(r#"{{"s":"v{i}"}}"#)).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (p, lf) = temp_jsonl("top20", &refs);
+        let AnalysisResult::Enum(s) = analyze_field(&lf, "s", None).result else {
+            panic!()
+        };
+        assert_eq!(s.top.len(), 20);
+        assert_eq!(s.others, 1, "第 21 个取值的那 1 行进其他桶");
+        assert!(!s.capped, "distinct 未超上限不得标「取值过多已合并」");
+        assert_eq!(s.total, 21);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn enum_distinct_overflow_merges_rows_into_others() {
+        // distinct 超 ENUM_CAP: 超出的取值不进 map, 但其**行数**必须并入其他桶,
+        // 且 capped = true (评审抓的分叉: 原先超限行被静默丢弃)。
+        let cap = 10_000usize;
+        let extra = 37usize;
+        let lines: Vec<String> = (0..cap + extra)
+            .map(|i| format!(r#"{{"s":"v{i}"}}"#))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (p, lf) = temp_jsonl("overflow", &refs);
+        let AnalysisResult::Enum(s) = analyze_field(&lf, "s", None).result else {
+            panic!()
+        };
+        assert!(s.capped, "distinct 超限必须标注");
+        let top_sum: u64 = s.top.iter().map(|(_, c)| c).sum();
+        assert_eq!(
+            top_sum + s.others,
+            s.total,
+            "top + 其他 必须等于总数 —— 一行都不许凭空消失"
+        );
+        assert_eq!(s.others, (cap - 20 + extra) as u64);
         std::fs::remove_file(p).ok();
     }
 }
