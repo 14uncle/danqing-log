@@ -1,5 +1,9 @@
 # 丹青日志 LogLens (danqing-log)
 
+[![GitHub Release](https://img.shields.io/github/v/release/14uncle/danqing-log)](https://github.com/14uncle/danqing-log/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)](LICENSE-MIT)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B%20x64-blue)](#下载)
+
 **LogLens** — a fast large-file log & JSONL viewer for Windows, written in Rust.
 Opens GB-scale files instantly (1 GiB indexed in 92 ms) with a virtualized scroll
 view, tail-follow + live filtering, regex search with highlighting, and a JSONL
@@ -35,6 +39,21 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 行索引为**步进表**（`memchr` SIMD 扫 `\n`，每 `INDEX_STRIDE` 行记一个绝对偏移，段内前扫定位），
 不是逐行偏移表 —— 1 GB 文件行索引内存 ≤ 16 MB（`SPEC` 验收上界）。
 
+## 和同类工具怎么选
+
+一句话定位：**klogg 的速度 × LogViewPlus 的结构化**。
+
+- **对 klogg**：同为 mmap 架构，速度同档（不声称碾压）。缝在功能与维护 —— klogg 最近一次
+  release 是四年多前、commit 停了 22 个月（2026-09-16 查证），无 JSONL 支持，编码检测
+  保守（GBK 中文日志会被当成 ISO-8859-1）。
+- **对 LogViewPlus**：功能全，但全量解析 = 打开慢的结构性代价，且是付费商业软件。
+  LogLens 走 mmap + 虚拟视口，结构性快；v1.0 全功能免费。
+- **对 VS Code / 记事本**：GB 级文件要么拒开要么卡死；JSON 扩展能列化，但占着编辑器、
+  吃编辑器资源。
+
+> 完整对比表与逐项证据日期见 [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md)「竞品对比」
+> 与 [DEEP_COMPETITIVE_RESEARCH.md](docs/DEEP_COMPETITIVE_RESEARCH.md)。
+
 ## 功能
 
 - **打开**：启动传参 / `Ctrl+O` / 拖到 exe 上；异步索引，1 GB 以上文件全程可响应，
@@ -50,6 +69,9 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
   字段名与值**均默认大小写不敏感**（`LEVEL=error` 等价于 `level=ERROR`）
 - **编码**：UTF-8（含 BOM）/ UTF-16 LE·BE（有无 BOM 均可）/ GBK（原字节索引 + 行级 CP936 解码，
   中文可搜）/ 其余单字节编码 Latin-1 兜底
+
+  ![LogLens 截图：GBK 中文日志实拍 —— 订单/支付中文日志原样显示不乱码，左侧级别计数正常，
+  底栏 `GBK · 32 MiB · 32 万行 · 打开 40 ms`（暗色主题）](docs/images/screenshot-gbk-cn-dark.png)
 - **级别直方图**：左侧侧栏 6 桶计数（FATAL / ERROR / WARN / INFO / DEBUG / 其他）+ 对数刻度横条
   —— 线性刻度下 Info 454 万会把 Fatal 4760 压成亚像素，而后者才是要抓的那根。
   JSONL 模式下点柱条即筛出该级别（可点的行有 hover 反馈），侧栏底部出现 `清除筛选`
@@ -64,8 +86,13 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 
 ## 下载
 
-- **GitHub Releases**（主）：本仓 Releases 页取 `danqing-log-v<版本>-win-x64.zip`
-- **Microsoft Store**（辅）：免费层同版本上架，v1.0 完成时开放
+- **GitHub Releases**（主）：[最新版](https://github.com/14uncle/danqing-log/releases/latest)
+  取 `danqing-log-v<版本>-win-x64.zip` —— 不到 5 MB，解压即用，不写注册表
+- **Microsoft Store**（辅）：**已提交，认证中（2026-09-19）**，链接过审后补上 —— 商店版
+  由商店代管更新，且**零网络请求**（便携版唯一的联网动作是启动时查一次新版本，
+  见[隐私政策](docs/privacy-policy.md)）
+
+> 系统要求：Windows 10 1809+（x64）、DirectX 12 兼容显卡。两个渠道是同一个免费层，功能一致。
 
 ## 用法
 
