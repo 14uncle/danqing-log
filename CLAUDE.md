@@ -21,6 +21,20 @@
   代销商注册 / 商店 add-on 等 v1.0 过审硬顺序) 见 `tasks/todo-v1x-licensing.md` 末节。
   下一步: review 阶段; 之后按地图顺序起 `field-analytics` (腿二) spec —— 它有引擎前置
   (字符串切取→真 parser 边界, SPEC-jsonl-table:16), 动 danqing-logfile。
+- 2026-09-19 (**腿二 field-analytics build 完成, 待 review**): spec (D1–D8, 两裁定:
+  侧栏扩展 + 跟随过滤) → plan → T1–T5 全绿零 commit。产出: `danqing-logfile/src/scan.rs`
+  (**顶层字段扫描器** —— 单遍状态机零 Value 树, 与 serde_json 差分对拍 3000 行×5 字段全等;
+  抓到 serde 浮点解析与 str::parse 差 1 ulp 的真差异, 对拍按整数全等+浮点 1e-15 容差收口)
+  / `src/analysis.rs` (数值流式四项 + reservoir 分位数上限 100 万值标「采样估计」,
+  枚举 Top20+其他桶+混合类型跳过计数, 作用域跟随过滤行集) / `src/analysis_panel.rs`
+  (侧栏两态组件: 字段行逐点即分析 = 门控点位, 结果视图含作用域行+「基于旧过滤」标注;
+  **下拉改逐行可点** —— 下拉建树冻结而 schema 开文件才有) / `logbench --analyze`。
+  **实测 (1GiB 热缓存): 全文件单列 1001ms (≤1.5s 目标过), 跟随过滤 124ms**,
+  已进 PERFORMANCE_REPORT.md。门控接 licensing (`ShowUpgradePrompt` 的 allow(dead_code)
+  已删 —— 第一条真腿接上门)。**坑**: patch 态下兄弟仓加新模块 clippy 报找不到 →
+  `cargo clean -p <crate>` 即解 (陈旧 rmeta)。测试: 本仓 242 + logfile 68 全绿。
+  **联动待办**: danqing-logfile 未 push (patch 顶着, lock path 态勿提交);
+  人工验收需真公钥回填后做付费态。
 - 2026-09-05: 开枪 + 当日建仓 + POC 双前提判过 → 用户发起 spec = 转正; 深夜 /build auto 零 commit core-viewer T1–T7 全绿
 - 2026-09-06: jsonl-table / live-tail 闭环 (均 spec→plan→build→review + 人工验收); app-chrome A1–A5 + settings S1–S5 落地; 过滤/搜索栏已重构成真 TextInput (IME 三补丁删除); 切浅色主题 (白底不回头) + 命名「丹青日志 LogLens」+ Ctrl+O
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修
