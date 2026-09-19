@@ -84,4 +84,6 @@
       R2 hover 光标驱动化 / R3 枚举超限行并入其他+capped 语义拆分 / R4 文本截断
       +clip 兜底 / R5 过滤落账串+在途闸 / R6 选择器封顶 16 列）; 修复锁测试 8 条,
       基线 242→250; Optional 6 条记录在案未修（见 spec 评审记）
-- [ ] 进 code-simplify 阶段（licensing 与 field-analytics 两模块都欠）
+- [x] 进 code-simplify 阶段（licensing 与 field-analytics 两模块都欠）——
+      2026-09-19 完成: 4 处简化（枚举计数器死代码/别名残留/同义 arm 合并/
+      COM 起手式提公用）, 行为零变化, 250 绿不破; 详见两份 spec 简化记

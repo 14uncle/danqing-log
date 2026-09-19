@@ -50,8 +50,8 @@
 
 | 模块 | spec 文件 | 状态 |
 |---|---|---|
-| `licensing` | `SPEC-v1x-licensing.md` | review 完成（2026-09-19, 231 测试绿）, 待 code-simplify |
-| `field-analytics` | `SPEC-v1x-field-analytics.md` | review 完成（2026-09-19, 6 Required 全修, 250+68 绿）, 待 code-simplify |
+| `licensing` | `SPEC-v1x-licensing.md` | **五段全收口**（2026-09-19: review 修复 + simplify, 250 测试绿）; 待人工验收（需真公钥回填） |
+| `field-analytics` | `SPEC-v1x-field-analytics.md` | **五段全收口**（2026-09-19: review 6 Required 全修 + simplify, 250+68 绿）; 待人工验收 |
 | `export` | `SPEC-v1x-export.md` | 未开工 |
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | 未开工 |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | 未开工 |

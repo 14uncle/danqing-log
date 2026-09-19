@@ -208,3 +208,15 @@ todo T4 旧设计文字。
 修复后基线: 本仓 lib 88 / main 151 / genlog 8 / keygen 3 = **250**，
 clippy -D warnings 零警告，fmt 净。licensing 修复 delta 复核三条全过
 （剪辑键放行无新洞 / 购买防重入配对完整 / 长度闸与 Debug 遮蔽到位）。
+
+## 简化记（2026-09-19 code-simplify, 行为零变化, 250 绿不破）
+
+模块本身刚出评审即进简化，可收的不多，四处：
+
+1. `detect_column_type` 删掉写而不读的 `other` 计数器（`seen` 已含），
+   顺手修评审 Optional 的注释超 claim：「过半」→「≥ 一半（平票归数值）」
+2. `analysis_panel` paint 里 `bar_full_w = avail_w` 别名残留（R4 修复碎屑）合一
+3. licensing 侧两处：`map_store_snapshot` 两个同造 `Paid` 的 arm 合并；
+   `store_license.rs` 的 COM+StoreContext 起手式提为 `store_context()` 共用
+4. 判定**不动**的：scan.rs（对拍锁着的字节合同，越素越好）、keygen.rs、
+   settings.rs 许可页、logbench —— 通读后无可简化项，不为动而动

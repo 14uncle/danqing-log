@@ -160,3 +160,10 @@ $tier$ 字段区分 personal/enterprise，$59/seat 的座位数不技术上强�
 - **核实后不采纳**: ed25519-dalek `default-features` 不裁 —— lock 里的 pkcs8 是「锁住但未启用」的可选依赖（`cargo tree -i` 实证不进编译闭包）; windows 0.61 不追 0.62（与 pomodoro 实测成稿一致优先）
 - **留痕**: RoInitialize 不配对 / 不带 catch_unwind（release `panic=abort`）—— 已在 store_license 模块头显性化
 - **新 Open Question**: trial 会话内到期口径 —— 当前 `allows()` 用调用时刻 now（实时关闸）, 与 D4「会话内不踢人」字面有张力; trial 上线那天若要严守 D4, 把 trial 有效性固化成会话常量
+
+## 简化记（2026-09-19 code-simplify, 行为零变化, 250 绿不破）
+
+两处：`map_store_snapshot` 两个同造 `Paid` 的 arm 合并为「有限过期 → Trial,
+否则 Paid」; `store_license.rs` 的 COM 单元 + `StoreContext::GetDefault`
+起手式从两个入口提为共用 `store_context()`。license.rs 其余 / keygen.rs /
+settings.rs 许可页通读后无可简化项。
