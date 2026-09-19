@@ -48,6 +48,20 @@ fn datetime_to_epoch(ticks: i64) -> u64 {
     u64::try_from(secs).unwrap_or(0)
 }
 
+/// COM 单元 + StoreContext: 查询与购买两个入口共用的起手式。
+/// WinRT 异步调用需 COM 单元; 同类型重复初始化返回 S_FALSE (Ok),
+/// 仅已有 STA 时报 RO_E_CHANGE_MODE —— 成败都继续, 失败时后续调用自会报错。
+fn store_context() -> Option<StoreContext> {
+    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+    match StoreContext::GetDefault() {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            log::warn!("StoreContext::GetDefault failed: {e}");
+            None
+        }
+    }
+}
+
 /// 查询授权快照 (阻塞; 调用方负责放工作线程 —— broker 调用可能耗时)。
 pub(crate) fn query_snapshot() -> StoreSnapshot {
     const NONE: StoreSnapshot = StoreSnapshot {
@@ -58,15 +72,8 @@ pub(crate) fn query_snapshot() -> StoreSnapshot {
     if !danqing::platform::is_packaged() {
         return NONE;
     }
-    // WinRT 异步调用需 COM 单元; 同类型重复初始化返回 S_FALSE (Ok),
-    // 仅已有 STA 时报 RO_E_CHANGE_MODE —— 成败都继续, 失败时后续调用自会报错。
-    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-    let context = match StoreContext::GetDefault() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            log::warn!("StoreContext::GetDefault failed: {e}");
-            return NONE;
-        }
+    let Some(context) = store_context() else {
+        return NONE;
     };
     // 查 add-on 级内购许可证。
     // pomodoro 实测坑: StoreAppLicense::IsActive 是**应用级**许可证,
@@ -113,13 +120,8 @@ pub(crate) fn purchase_full_version() -> PurchaseOutcome {
         log::info!("非 MSIX 环境, 不拉商店购买");
         return PurchaseOutcome::Failed;
     }
-    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-    let context = match StoreContext::GetDefault() {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            log::warn!("StoreContext::GetDefault failed: {e}");
-            return PurchaseOutcome::Failed;
-        }
+    let Some(context) = store_context() else {
+        return PurchaseOutcome::Failed;
     };
     // 桌面进程必须把购买对话框的属主设为我们的主窗口, 否则显示 UI 的
     // 调用直接失败 (IInitializeWithWindow 约定)。

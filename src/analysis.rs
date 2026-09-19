@@ -82,17 +82,15 @@ pub fn analyze_field(file: &LogFile, field: &str, rows: Option<&[u64]>) -> Analy
     }
 }
 
-/// 类型判定: 前 [`TYPE_VOTE_SAMPLE`] 行采样。全数值 → 数值列; 数值过半 →
-/// 数值列 (混合列, 少数派行跳过); 否则枚举列。
+/// 类型判定: 前 [`TYPE_VOTE_SAMPLE`] 行采样。数值占比 ≥ 一半 → 数值列
+/// (平票归数值 —— 混合列按多数类型分析, 少数派行跳过); 否则枚举列。
 pub fn detect_column_type(file: &LogFile, field: &str, rows: Option<&[u64]>) -> ColumnType {
     let mut num = 0u32;
-    let mut other = 0u32;
     let mut seen = 0u32;
     for_each_row(file, rows, Some(TYPE_VOTE_SAMPLE), |line| {
         seen += 1;
-        match scan_field(line, field) {
-            Some(v) if v.kind == FieldKind::Num => num += 1,
-            _ => other += 1,
+        if scan_field(line, field).is_some_and(|v| v.kind == FieldKind::Num) {
+            num += 1;
         }
     });
     if seen == 0 {

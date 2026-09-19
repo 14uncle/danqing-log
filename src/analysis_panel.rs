@@ -203,8 +203,8 @@ impl Widget for AnalysisPanel {
         rects.push_rect(area, self.bg, 0.0);
         let x = area.origin.x + PAD_X;
         let right = area.origin.x + area.size.width - PAD_X;
+        // 内容可用宽: 文本截断上限与枚举计数条满宽同源 (同一个数, 两个用途)。
         let avail_w = (area.size.width - 2.0 * PAD_X).max(1.0);
-        let bar_full_w = avail_w;
 
         // 标题行 (选择器 = 「字段分析」, 结果 = 「字段分析 · <field>」)
         let title = match &self.result {
@@ -347,7 +347,7 @@ impl Widget for AnalysisPanel {
                             let r = self.row_rect(area, content_start + i);
                             let base = r.origin.y + texts.ascent(f32::from(LABEL_SIZE));
                             let frac = bar_fraction(*count, max);
-                            let bw = (bar_full_w * frac).max(2.0);
+                            let bw = (avail_w * frac).max(2.0);
                             rects.push_rect(
                                 Rect::from_xywh(x, r.origin.y + ROW_H - 10.0, bw, 6.0),
                                 self.accent,

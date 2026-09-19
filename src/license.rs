@@ -328,13 +328,11 @@ pub fn map_store_snapshot(snap: &StoreSnapshot) -> Entitlement {
         return Entitlement::Free;
     }
     match snap.addon_expires_epoch {
-        None => Entitlement::Paid {
+        Some(e) if e < DURABLE_THRESHOLD_EPOCH => Entitlement::Trial { expires_epoch: e },
+        // 不过期 (None) 或 ≈ DateTime 最大值 = durable 买断
+        _ => Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         },
-        Some(e) if e >= DURABLE_THRESHOLD_EPOCH => Entitlement::Paid {
-            source: PaidSource::StoreAddOn,
-        },
-        Some(e) => Entitlement::Trial { expires_epoch: e },
     }
 }
 
