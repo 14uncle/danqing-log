@@ -20,6 +20,7 @@ mod app_update;
 mod config;
 mod histogram;
 mod settings;
+mod store_license;
 mod tray;
 mod view;
 
@@ -38,6 +39,7 @@ use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
+use danqing_log::license::{self, Entitlement, Feature, PaidSource};
 use danqing_log::logfile::{FileStat, INDEX_CANCELLED, LogFile};
 use danqing_log::open::{OpenJob, OpenKind, OpenOutcome};
 use danqing_log::search::{AsyncJob, SearchNav};
@@ -270,6 +272,29 @@ pub(crate) struct LogApp {
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
     /// 留在应用状态里: 重开卡片停在上次那页。
     settings_tab: usize,
+    /// 授权状态 (SPEC-v1x-licensing)。启动时判定一次 (D4: 失效不踢会话内的人),
+    /// 激活动作即时翻转。免费层下全功能行为与 v1.0 逐点一致 (暗发)。
+    entitlement: Entitlement,
+    /// 验签公钥。生产 = `license::PRODUCT_PUBKEY` 常量; 测试可注入 (公钥占位
+    /// 全零时任何 key 都验不过, 没有注入就没法测激活路径)。
+    license_pubkey: [u8; 32],
+    /// 商店版启动授权查询 (T5; AsyncJob 模式与 search/levels 同源)。
+    store_license_job: AsyncJob<Entitlement>,
+    /// 商店版购买流程 (T5)。
+    purchase_job: AsyncJob<store_license::PurchaseOutcome>,
+    /// 「许可」页 key 输入框的内容镜像 (widget 自持编辑器, 这里随 on_change 同步)。
+    license_key_input: String,
+    /// 激活结果反馈 (显示在「许可」页内 —— 底栏 notice 会被模态卡遮住, 看不见)。
+    license_feedback: Option<(String, NoticeKind)>,
+    /// 统一升级提示 (T7): 免费用户触发付费功能时弹出, 值为被拦的功能。
+    upgrade_prompt: Option<Feature>,
+    /// 商店购买是否在途 (评审 Required: pomodoro 成稿的防重入移植 ——
+    /// 在途时忽略再次发起; AsyncJob 代次语义下重复 launch 会让晚到的旧轮
+    /// 覆盖新轮结果被丢弃 = 用户付了钱会话内无感知)。
+    purchase_in_flight: bool,
+    /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
+    ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
+    license_clear_rev: u64,
 }
 
 /// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
@@ -334,6 +359,24 @@ pub(crate) enum Msg {
     CloseSettings,
     /// 打开 URL (反馈链接/发布页)。
     OpenUrl(String),
+    /// 「许可」页 key 输入框内容变化 (镜像进应用状态, 激活按钮读它)。
+    LicenseKeyInput(String),
+    /// 「许可」页点「激活」按钮 (读输入镜像走激活)。
+    ActivateLicenseClicked,
+    /// 「获取付费层」(T5): 商店版拉购买对话框, 便携版开购买页。
+    PurchasePaidLayer,
+    /// 免费用户触发付费功能 → 统一升级提示 (T7; 付费态不发, 两道闸)。
+    ///
+    /// 非 test 构建下暂无人构造 (本模块只造机制, D3 —— 构造点在腿二/三/四
+    /// 各自的 spec 模块), 故压 dead_code; 腿落地后回来删这行 allow。
+    #[allow(dead_code)]
+    ShowUpgradePrompt(Feature),
+    /// 关闭升级提示。
+    CloseUpgradePrompt,
+    /// 升级提示的「已有 key？去激活」: 关提示 → 开设置卡停「许可」页。
+    UpgradeGotoActivate,
+    /// 升级提示的「获取付费层」: 关提示 → 走购买 (与许可页按钮同源)。
+    UpgradePurchase,
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
@@ -364,6 +407,10 @@ impl LogApp {
             Some(p) => config::Config::load_from(p),
             None => config::Config::load(),
         };
+        // 测试构建一律 Free 起手且不读真实 license 文件 (hermetic);
+        // 真实加载只在非 test 构建的生产路径 (见 initial_entitlement)。
+        // T5 占位: 商店版 (is_packaged) 授权查询在 T5 接, 当前打包态也走这里。
+        let entitlement = Self::initial_entitlement(&cfg_path);
         Self {
             cfg_path,
             window_sender: None,
@@ -410,6 +457,30 @@ impl LogApp {
             theme: cfg.theme,
             histogram_visible: cfg.histogram,
             settings_tab: 0,
+            entitlement,
+            license_pubkey: license::PRODUCT_PUBKEY,
+            store_license_job: AsyncJob::new(),
+            purchase_job: AsyncJob::new(),
+            license_key_input: String::new(),
+            license_feedback: None,
+            upgrade_prompt: None,
+            purchase_in_flight: false,
+            license_clear_rev: 0,
+        }
+    }
+
+    /// 启动授权判定 (D4: 失效只以启动时判定)。测试构建恒 Free —— 读真实
+    /// license 文件 = 测试依赖用户机器状态, 与 save_config 的硬拦同一个理由。
+    fn initial_entitlement(cfg_path: &Option<std::path::PathBuf>) -> Entitlement {
+        #[cfg(test)]
+        {
+            let _ = cfg_path;
+            Entitlement::Free
+        }
+        #[cfg(not(test))]
+        match cfg_path {
+            Some(_) => Entitlement::Free,
+            None => license::load(),
         }
     }
 
@@ -491,6 +562,154 @@ impl LogApp {
                 #[cfg(not(test))]
                 cfg.save();
             }
+        }
+    }
+
+    /// license 文件路径: 生产 = 用户真实路径; 测试 = 注入配置路径的同名邻居
+    /// (与 cfg_path 同源注入 —— 测试永不碰真实 license, 与 save_config 同规:
+    /// 与其靠「下一个写测试的人记得」, 不如让它**写不出去**)。
+    fn license_path(&self) -> std::path::PathBuf {
+        match &self.cfg_path {
+            Some(p) => p.with_extension("license.key"),
+            None => {
+                #[cfg(test)]
+                panic!("测试不得读写真实 license —— 请用 LogApp::new_empty_at(临时路径)");
+                #[cfg(not(test))]
+                license::default_license_path()
+            }
+        }
+    }
+
+    /// 激活付费层 (SPEC-v1x-licensing D4): 校验通过即**即时**翻转授权状态,
+    /// 不要求重启; 落盘失败时状态照样翻转、只警示「重启后需重新激活」。
+    /// 反馈落在「许可」页内 (`license_feedback`) —— 底栏 notice 会被模态卡遮住。
+    fn activate_license(&mut self, key: String) {
+        match license::activate(&key, &self.license_path(), &self.license_pubkey) {
+            Ok(payload) => {
+                let tier_text = match payload.tier {
+                    license::Tier::Personal => "个人版",
+                    license::Tier::Enterprise => "企业版",
+                };
+                self.entitlement = Entitlement::Paid {
+                    source: PaidSource::License(payload),
+                };
+                // 激活成功 = key 已落盘, 输入框里的明文清掉 (安全评审: key 是
+                // 用户资产, 不该留在卡面上; rev 驱动 widget 侧清空, 见
+                // 设置卡 key_input_box 的 bind_clear)。Persist 分支保留原文
+                // (用户可能要重试复制)。
+                self.license_key_input.clear();
+                self.license_clear_rev += 1;
+                self.license_feedback =
+                    Some((format!("已激活付费层（{tier_text}）"), NoticeKind::Info));
+            }
+            Err(license::ActivateError::Persist(detail)) => {
+                // key 是真的但没落盘 —— 照样激活本次会话 (D4 即时生效),
+                // 重新验一次拿载荷 (verify_key 是纯函数, 成本可忽略)。
+                if let Ok(payload) = license::verify_key(&key, &self.license_pubkey) {
+                    self.entitlement = Entitlement::Paid {
+                        source: PaidSource::License(payload),
+                    };
+                }
+                self.license_feedback = Some((
+                    format!("已激活，但保存失败（重启后需重新激活）: {detail}"),
+                    NoticeKind::Warn,
+                ));
+            }
+            Err(license::ActivateError::Key(e)) => {
+                let text = match e {
+                    license::KeyError::Malformed => {
+                        "key 格式不对 —— 请完整复制邮件里的整串 key".to_string()
+                    }
+                    license::KeyError::BadSignature => {
+                        "key 校验失败 —— 内容可能被篡改，或不是本应用签发的 key".to_string()
+                    }
+                    license::KeyError::WrongProduct => {
+                        "这是其他产品的 key，不能用于丹青日志".to_string()
+                    }
+                };
+                self.license_feedback = Some((text, NoticeKind::Warn));
+            }
+        }
+    }
+
+    /// 商店授权查询回来了 (T5)。D4: **只许 Free → 其他** —— 会话内已激活的
+    /// 授权 (贴 key) 不被晚到的商店查询覆盖 (会话内不踢人)。
+    fn adopt_store_entitlement(&mut self, e: Entitlement) {
+        if self.entitlement == Entitlement::Free {
+            self.entitlement = e;
+        }
+    }
+
+    /// 购买结果回来了 (T5)。成功即永久解锁 (买断); 取消/失败只反馈。
+    /// 反馈落 `license_feedback` 而非底栏 notice —— 购买从设置卡/升级提示
+    /// 发起, 卡开着时底栏被模态遮住 (评审 Required; 与激活反馈同通道)。
+    fn adopt_purchase_outcome(&mut self, outcome: store_license::PurchaseOutcome) {
+        self.purchase_in_flight = false;
+        match outcome {
+            store_license::PurchaseOutcome::Purchased => {
+                self.entitlement = Entitlement::Paid {
+                    source: PaidSource::StoreAddOn,
+                };
+                self.license_feedback =
+                    Some(("已解锁付费层，感谢支持".to_string(), NoticeKind::Info));
+            }
+            store_license::PurchaseOutcome::Cancelled => {
+                self.license_feedback = Some(("购买已取消".to_string(), NoticeKind::Info));
+            }
+            store_license::PurchaseOutcome::Failed => {
+                // add-on 未进目录时商店会报「购买未完成」—— 上架窗口期属预期
+                // (pomodoro 实测), add-on 进目录即自愈。
+                self.license_feedback =
+                    Some(("购买未完成 · 可稍后重试".to_string(), NoticeKind::Warn));
+            }
+        }
+    }
+
+    /// 「获取付费层」(T5 机制层; UI 点位在 T6)。商店版拉起购买对话框
+    /// (后台线程, 结果走 tick 拾取); 便携版开购买页 —— `PURCHASE_URL`
+    /// 未回填时给提示, 不打开死链接 (D8; 该分支在两个入口都被
+    /// `show_purchase_button` 提前隐藏时实际不可达, 留作防御)。
+    fn purchase_paid_layer(&mut self) {
+        // 已是付费层: 不进购买流程 (评审 Optional —— 商店版已购再点会拿到
+        // AlreadyPurchased 然后弹「感谢支持」, 措辞错位)。
+        if matches!(self.entitlement, Entitlement::Paid { .. }) {
+            self.license_feedback =
+                Some(("你已是付费层，无需重复购买".to_string(), NoticeKind::Info));
+            return;
+        }
+        if danqing::platform::is_packaged() {
+            // 防重入 (评审 Required; pomodoro 的 PURCHASE_STATE CAS 在此处等价):
+            // 在途时忽略再次发起 —— 重复 launch 会拉多个系统购买框, 且晚到的
+            // 旧代次结果覆盖新代次后被 poll 丢弃 = 付了钱会话内无感知。
+            if !self.try_begin_purchase() {
+                self.license_feedback = Some(("购买正在进行中…".to_string(), NoticeKind::Info));
+                return;
+            }
+            self.purchase_job
+                .launch(store_license::purchase_full_version);
+        } else {
+            match license::PURCHASE_URL {
+                Some(url) => {
+                    if let Err(err) = open::that(url) {
+                        log::warn!("打开购买页失败：{err}");
+                    }
+                }
+                None => self.set_notice(
+                    "购买页即将上线；已有 key 请直接在设置卡「许可」页激活".to_string(),
+                    NoticeKind::Info,
+                ),
+            }
+        }
+    }
+
+    /// 购买发起闸 (纯状态, 可测): 在途 → false; 空闲 → 置位 + true。
+    /// 结果回来 (`adopt_purchase_outcome`) 复位。
+    fn try_begin_purchase(&mut self) -> bool {
+        if self.purchase_in_flight {
+            false
+        } else {
+            self.purchase_in_flight = true;
+            true
         }
     }
 
@@ -1359,6 +1578,33 @@ impl App for LogApp {
                     log::warn!("打开链接失败：{err}");
                 }
             }
+            Msg::LicenseKeyInput(s) => {
+                self.license_key_input = s;
+                // 继续输入 = 在改上一份答案, 旧反馈作废
+                self.license_feedback = None;
+            }
+            Msg::ActivateLicenseClicked => {
+                let key = self.license_key_input.trim().to_owned();
+                self.activate_license(key);
+            }
+            Msg::PurchasePaidLayer => self.purchase_paid_layer(),
+            Msg::ShowUpgradePrompt(f) => {
+                // 付费态不出现 (spec 成功判据): 门控点位先查 `allows` 再发,
+                // 这里再兜一道 —— 两道都守着「付费用户永远看不到升级提示」。
+                if !self.entitlement.allows(f) {
+                    self.upgrade_prompt = Some(f);
+                }
+            }
+            Msg::CloseUpgradePrompt => self.upgrade_prompt = None,
+            Msg::UpgradeGotoActivate => {
+                self.upgrade_prompt = None;
+                self.settings_tab = settings::LICENSE_TAB_INDEX;
+                self.settings_open = true;
+            }
+            Msg::UpgradePurchase => {
+                self.upgrade_prompt = None;
+                self.purchase_paid_layer();
+            }
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
@@ -1400,7 +1646,8 @@ impl App for LogApp {
                             1,
                         ),
                 )
-                .child(settings::settings_overlay(self.theme)),
+                .child(settings::settings_overlay(self.theme))
+                .child(settings::upgrade_overlay(self.theme)),
         )
     }
 
@@ -1541,13 +1788,16 @@ impl App for LogApp {
     /// 经此仍生效 (如 Ctrl+T 切模式)。仅拦截不破坏输入态的快捷键;
     /// Ctrl+Z/A/Y/C/X/V 等剪辑操作留 TextInput (走框架 clipboard 路由)。
     fn app_key_filter(&mut self, event: &Event) -> Option<Msg> {
-        // Esc 前置：设置卡 > (后续留给搜索/过滤栏)
+        // Esc 前置：升级提示 > 设置卡 > (后续留给搜索/过滤栏)
         if let Event::Key {
             key: Key::Named(NamedKey::Escape),
             pressed: true,
             ..
         } = event
         {
+            if self.upgrade_prompt.is_some() {
+                return Some(Msg::CloseUpgradePrompt);
+            }
             if self.settings_open {
                 // 本函数在焦点分发前运行 (无论有无焦点)，所以卡内主题下拉展开
                 // 时按 Esc 也走这条路径：整卡通关，而非先收下拉。与「设置卡
@@ -1567,7 +1817,7 @@ impl App for LogApp {
         let Key::Character(s) = key else {
             return None;
         };
-        // 模态守卫 (T16/P32): 设置卡开着时, 全局键**不得穿透到卡后**。
+        // 模态守卫 (T16/P32): 设置卡或升级提示开着时, 全局键**不得穿透到卡后**。
         // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
         // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
         // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
@@ -1578,7 +1828,19 @@ impl App for LogApp {
         // 控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠焦点分发收键 —— 守卫若放在函数
         // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
         // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
-        if self.settings_open {
+        // (T7 扩展: 升级提示同享此守卫 —— 它是第二个模态层。)
+        if self.settings_open || self.upgrade_prompt.is_some() {
+            // **剪辑组合键必须放行** (评审 Critical, 2026-09-19): 框架的剪贴板
+            // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里, 这里吞掉 =
+            // 许可页输入框没法 Ctrl+V 粘贴 key —— 而粘贴是 200+ 字符 key 的
+            // 唯一现实输入方式。放行后若焦点在卡后, 剪辑键落卡后 —— 与普通字符
+            // 今天的既有暴露面相同, 不因此更坏。
+            if matches!(
+                s.to_ascii_lowercase().as_str(),
+                "c" | "x" | "v" | "a" | "z" | "y"
+            ) {
+                return None;
+            }
             return Some(Msg::Noop);
         }
         if s.eq_ignore_ascii_case("f") {
@@ -1613,6 +1875,13 @@ impl App for LogApp {
         self.expire_notice();
         self.pickup_open_job();
         self.pickup_levels_job();
+        // T5: 商店授权查询 / 购买结果
+        if let Some(e) = self.store_license_job.poll() {
+            self.adopt_store_entitlement(e);
+        }
+        if let Some(outcome) = self.purchase_job.poll() {
+            self.adopt_purchase_outcome(outcome);
+        }
         if let Some(out) = self.filter_job.poll() {
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
@@ -1726,6 +1995,12 @@ fn run(path: Option<&Path>) -> Result<()> {
     // 一律空态骨架开局 (async-open): 带文件启动只发起 OpenJob 便立刻 run_app,
     // 窗口按 GPU 速度出现, 索引在 worker 后台跑 (spec 判据: ≤ 无文件启动 +200ms)。
     let mut app = LogApp::new_empty();
+    // 商店版 (MSIX 打包): 后台查授权 (broker 进程外调用可能耗时, 不堵窗口出现)。
+    // 便携版授权在构造时已从 license.key 加载 (initial_entitlement), 不走这里。
+    if danqing::platform::is_packaged() {
+        app.store_license_job
+            .launch(|| license::map_store_snapshot(&store_license::query_snapshot()));
+    }
     if let Some(p) = path {
         app.open_job = Some(OpenJob::launch(OpenKind::Fresh, p));
     }
@@ -1748,6 +2023,235 @@ fn run(path: Option<&Path>) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // ─── v1x-licensing T4: 便携版激活接线 ───
+
+    /// 测试密钥对 (与 license.rs 的测试密钥对无关 —— 各测试域各自独立,
+    /// 谁也不是产品公钥)。
+    fn test_sign(payload_json: &str) -> (String, [u8; 32]) {
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let sig = sk.sign(payload_json.as_bytes());
+        let key = format!(
+            "loglens1.{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes()),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        (key, sk.verifying_key().to_bytes())
+    }
+
+    const LICENSE_PAYLOAD: &str = r#"{"v":1,"product":"danqing-log","tier":"personal","email":"t@e.st","issued_at":"1760000000","nonce":"ab"}"#;
+
+    /// 注入用临时配置路径 (license 落点在它的同名邻居; 并行 flake 教训: 带 pid)。
+    fn temp_cfg_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "danqing-log-app-lic-{}-{tag}.toml",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn app_starts_free_in_test_mode() {
+        let app = LogApp::new_empty_at(Some(temp_cfg_path("free")));
+        assert_eq!(app.entitlement, Entitlement::Free);
+    }
+
+    #[test]
+    fn activate_license_flips_entitlement_and_persists() {
+        let cfg = temp_cfg_path("activate");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
+        // 落盘在注入路径的同名邻居, 且重启 (重新 load) 能验回 = 持久化语义
+        let lic = cfg.with_extension("license.key");
+        let loaded = license::load_from(&lic, &pk);
+        assert!(matches!(loaded, Entitlement::Paid { .. }));
+        std::fs::remove_file(&lic).ok();
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    #[test]
+    fn activate_license_bad_key_stays_free_and_writes_nothing() {
+        let cfg = temp_cfg_path("badkey");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let (mut key, pk) = test_sign(LICENSE_PAYLOAD);
+        key.push('x'); // 破坏尾段
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        assert_eq!(app.entitlement, Entitlement::Free);
+        assert!(
+            !cfg.with_extension("license.key").exists(),
+            "坏 key 不许落盘"
+        );
+    }
+
+    // ─── v1x-licensing T5: 商店半边状态采纳 ───
+
+    #[test]
+    fn store_query_only_upgrades_from_free_never_clobbers() {
+        // D4: 会话内已激活的授权不被晚到的商店查询覆盖 (会话内不踢人)。
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("storeadopt")));
+        app.adopt_store_entitlement(Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        });
+        assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
+        // 已 Paid 后, 商店侧再回 Free (例如查询失败 fail-open) 不许把人踢下来
+        app.adopt_store_entitlement(Entitlement::Free);
+        assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
+    }
+
+    #[test]
+    fn purchase_outcome_purchased_unlocks_failed_stays_free() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("purchase")));
+        app.adopt_purchase_outcome(store_license::PurchaseOutcome::Purchased);
+        assert!(matches!(
+            app.entitlement,
+            Entitlement::Paid {
+                source: PaidSource::StoreAddOn
+            }
+        ));
+        let mut app2 = LogApp::new_empty_at(Some(temp_cfg_path("purchase2")));
+        app2.adopt_purchase_outcome(store_license::PurchaseOutcome::Failed);
+        assert_eq!(app2.entitlement, Entitlement::Free);
+        app2.adopt_purchase_outcome(store_license::PurchaseOutcome::Cancelled);
+        assert_eq!(app2.entitlement, Entitlement::Free);
+    }
+
+    // ─── v1x-licensing T7: 统一升级提示 ───
+
+    #[test]
+    fn upgrade_prompt_shows_only_when_not_entitled() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("upg")));
+        app.update(Msg::ShowUpgradePrompt(Feature::Export));
+        assert_eq!(app.upgrade_prompt, Some(Feature::Export));
+        // 付费态不出现 (两道闸里的第二道): 激活后**先清掉上一个提示**再发,
+        // 提示必须不再出现
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        app.update(Msg::CloseUpgradePrompt);
+        app.update(Msg::ShowUpgradePrompt(Feature::Export));
+        assert_eq!(app.upgrade_prompt, None, "付费态不许出现升级提示");
+        std::fs::remove_file(temp_cfg_path("upg").with_extension("license.key")).ok();
+    }
+
+    #[test]
+    fn upgrade_goto_activate_opens_license_tab() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("upggoto")));
+        app.update(Msg::ShowUpgradePrompt(Feature::FieldAnalytics));
+        app.update(Msg::UpgradeGotoActivate);
+        assert_eq!(app.upgrade_prompt, None, "跳转后提示要关");
+        assert!(app.settings_open, "跳转后设置卡要开");
+        assert_eq!(
+            app.settings_tab,
+            settings::LICENSE_TAB_INDEX,
+            "停在「许可」页"
+        );
+    }
+
+    #[test]
+    fn esc_closes_upgrade_prompt_before_settings() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("upgesc")));
+        app.settings_open = true;
+        app.upgrade_prompt = Some(Feature::Export);
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        let msg = app.app_key_filter(&esc);
+        assert!(
+            matches!(msg, Some(Msg::CloseUpgradePrompt)),
+            "升级提示在最上层时 Esc 先关它"
+        );
+    }
+
+    // ─── 评审修复 (2026-09-19) ───
+
+    /// 评审 Critical 回归锁: 模态卡开着时 Ctrl+V 必须放行给焦点分发
+    /// (否则许可页输入框没法粘贴 key = 激活主路径断裂); 其它全局键仍拦。
+    #[test]
+    fn modal_card_passes_clipboard_keys_but_blocks_globals() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("clipboard")));
+        app.settings_open = true;
+        let mk = |ch: &str| Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        for combo in ["v", "c", "x", "a", "z", "y"] {
+            assert!(
+                app.app_key_filter(&mk(combo)).is_none(),
+                "Ctrl+{combo} 必须放行 (焦点分发里的剪贴板路由)"
+            );
+        }
+        // 大写 (Shift 态) 同样放行
+        assert!(app.app_key_filter(&mk("V")).is_none());
+        // 非剪辑全局键仍被拦 (Ctrl+F 不得穿透到卡后)
+        assert!(matches!(app.app_key_filter(&mk("f")), Some(Msg::Noop)));
+    }
+
+    /// 评审 Required: 购买防重入闸 —— 在途拒绝二次发起, 结果回来复位。
+    #[test]
+    fn purchase_in_flight_gate_blocks_reentry_and_resets() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("reentry")));
+        assert!(app.try_begin_purchase(), "空闲时应放行");
+        assert!(!app.try_begin_purchase(), "在途时应拦住");
+        app.adopt_purchase_outcome(store_license::PurchaseOutcome::Cancelled);
+        assert!(!app.purchase_in_flight, "结果回来要复位");
+        assert!(app.try_begin_purchase(), "复位后又能发起");
+    }
+
+    /// 评审 Required: 购买结果反馈落卡内 (`license_feedback`), 不走被模态
+    /// 遮住的底栏 notice。
+    #[test]
+    fn purchase_outcome_feedback_lands_in_card() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("pfb")));
+        app.adopt_purchase_outcome(store_license::PurchaseOutcome::Purchased);
+        assert!(app.license_feedback.is_some(), "成功反馈要在卡内可见");
+        assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
+    }
+
+    /// 评审 Optional: 已是付费层时「获取付费层」不再进购买流程。
+    #[test]
+    fn purchase_when_already_paid_only_answers_back() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("paidagain")));
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
+        app.purchase_paid_layer();
+        assert!(
+            matches!(&app.license_feedback, Some((t, _)) if t.contains("无需重复购买")),
+            "已购再点要给明确回话: {:?}",
+            app.license_feedback
+        );
+        assert!(!app.purchase_in_flight, "已购不得发起购买");
+        std::fs::remove_file(temp_cfg_path("paidagain").with_extension("license.key")).ok();
+    }
+
+    /// 安全评审: 激活成功后输入镜像清空 + rev  bumped (widget 侧 bind_clear
+    /// 会把框内明文一并清掉)。
+    #[test]
+    fn successful_activation_clears_key_input() {
+        let cfg = temp_cfg_path("clearonok");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.license_key_input = key.clone();
+        let rev0 = app.license_clear_rev;
+        app.activate_license(key);
+        assert!(app.license_key_input.is_empty(), "镜像要清");
+        assert_eq!(app.license_clear_rev, rev0 + 1, "清空代次要涨");
+        std::fs::remove_file(cfg.with_extension("license.key")).ok();
+    }
 
     /// expand_rev (M3/T6): 实际展开/折叠才 +1; parse 失败/无嵌套不涨 ——
     /// 守卫的触发源必须精确, 虚涨会误杀活着的选区 (LogView 侧见
