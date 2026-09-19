@@ -50,8 +50,8 @@
 
 | 模块 | spec 文件 | 状态 |
 |---|---|---|
-| `licensing` | `SPEC-v1x-licensing.md` | build 完成（2026-09-19, 224 测试绿）, **待 review** |
-| `field-analytics` | `SPEC-v1x-field-analytics.md` | build 完成（2026-09-19, 实测 1001ms/1GiB 过 ≤1.5s 目标），**待 review** |
+| `licensing` | `SPEC-v1x-licensing.md` | review 完成（2026-09-19, 231 测试绿）, 待 code-simplify |
+| `field-analytics` | `SPEC-v1x-field-analytics.md` | review 完成（2026-09-19, 6 Required 全修, 250+68 绿）, 待 code-simplify |
 | `export` | `SPEC-v1x-export.md` | 未开工 |
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | 未开工 |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | 未开工 |

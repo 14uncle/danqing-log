@@ -3,7 +3,7 @@
 - @author 十四叔
 - @date 2026/09/19
 - Spec: `docs/specs/SPEC-v1x-field-analytics.md` · Plan: `tasks/plan-v1x-field-analytics.md`
-- 状态: **build 完成（T1–T5 全绿, 本仓 242 + logfile 68 测试）, 待 review** —— 2026-09-19
+- 状态: **review 完成（2026-09-19, 6 Required 全修, 本仓 250 + logfile 68 测试绿）, 待 code-simplify** —— 2026-09-19
 
 ## Phase 1: 引擎前置（danqing-logfile）
 
@@ -53,11 +53,12 @@
 
 - [x] **T4: 侧栏「字段分析」区 + 门控**
   - 内容：`src/analysis_panel.rs` 新组件；侧栏容器改两段（直方图区 + 分析区，
-    分析区只在表格模式有 schema 时出现——.log 不显示不是灰掉）；字段下拉
-    （候选 = schema 列名）+「分析」按钮 + 结果区（数值 = 统计表；枚举 = Top 20
+    分析区只在表格模式有 schema 时出现——.log 不显示不是灰掉）；**字段行逐行
+    可点**（点字段即分析——下拉是建树冻结的框架控件而 schema 开文件后才有，
+    已改判，见 spec 实现记）+ 结果区（数值 = 统计表；枚举 = Top 20
     对数计数条，复用 `bar_fraction`）；AsyncJob 后台跑 + 结果作用域行（行数 +
     过滤串快照）+ 过滤变更后标「基于旧过滤 · 重跑」（比 rev/串）；换文件清空；
-    门控：免费态点分析 → `ShowUpgradePrompt(Feature::FieldAnalytics)`（此时
+    门控：免费态点字段行 → `ShowUpgradePrompt(Feature::FieldAnalytics)`（此时
     licensing 的 `#[allow(dead_code)]` 删掉）
   - Acceptance：免费态点分析弹提示且**无扫描发生**（job 未发起断言）；付费态
     出结果；.log 模式无此区；过滤变更后旧结果带标注；换文件清空
@@ -75,5 +76,12 @@
 
 - [x] spec §成功判据机器部分逐条过（差分/手算/标注/作用域/门控/性能 1001ms ≤ 1.5s）
 - [ ] 人工验收（用户实机）：demo-1gb.jsonl 跑 `duration_ms`（数值）/`level`（枚举），
-      免费态弹窗文案过一遍 —— 付费态路径需真公钥回填后做
-- [ ] 进 review 阶段（`/agent-skills:code-review-and-quality`）
+      免费态弹窗文案过一遍；**review 修复新增看点**：字段行 hover 反馈、采样标注行
+      不被裁、宽 schema（>16 列）封顶行、长取值/长作用域行截断 —— 付费态路径需
+      真公钥回填后做
+- [x] 进 review 阶段（`/agent-skills:code-review-and-quality`）—— 2026-09-19 完成:
+      REQUEST CHANGES, 无 Critical, **6 Required 全修**（R1 采样标注行漏算 /
+      R2 hover 光标驱动化 / R3 枚举超限行并入其他+capped 语义拆分 / R4 文本截断
+      +clip 兜底 / R5 过滤落账串+在途闸 / R6 选择器封顶 16 列）; 修复锁测试 8 条,
+      基线 242→250; Optional 6 条记录在案未修（见 spec 评审记）
+- [ ] 进 code-simplify 阶段（licensing 与 field-analytics 两模块都欠）

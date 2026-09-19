@@ -35,6 +35,16 @@
   `cargo clean -p <crate>` 即解 (陈旧 rmeta)。测试: 本仓 242 + logfile 68 全绿。
   **联动待办**: danqing-logfile 未 push (patch 顶着, lock path 态勿提交);
   人工验收需真公钥回填后做付费态。
+- 2026-09-19 (**licensing + field-analytics review 双双收口, 待 code-simplify**):
+  licensing 评审修复 delta 复核三条全过 (剪辑键放行无新洞 / 购买防重入配对完整 /
+  长度闸+Debug 遮蔽到位); field-analytics 评审 REQUEST CHANGES (无 Critical) —
+  引擎与算法原样通过, **6 Required 全修**: ①数值结果漏算采样标注行 (旗舰路径必裁,
+  行账目守卫测试锁) ②字段行无 hover (改光标驱动+pressed 锚点, 直方图同款)
+  ③枚举 distinct 超限行丢弃→并入「其他」, capped 语义拆分 (21 取值不再误标
+  「取值过多已合并」) ④面板文本 measure 截断+push_clip 兜底 (112px 侧栏溢出
+  盖画 LogView) ⑤分析快照改读 `filter_landed` 落账串 + `filter_pending` 在途闸
+  (同族顺手收: Esc/空查询作废在途过滤 job, live-tail 增量合并窗口禁行)
+  ⑥选择器字段行封顶 16+「还有 N 列」行。修复锁测试 +8, 基线 242→**250** 绿。
 - 2026-09-05: 开枪 + 当日建仓 + POC 双前提判过 → 用户发起 spec = 转正; 深夜 /build auto 零 commit core-viewer T1–T7 全绿
 - 2026-09-06: jsonl-table / live-tail 闭环 (均 spec→plan→build→review + 人工验收); app-chrome A1–A5 + settings S1–S5 落地; 过滤/搜索栏已重构成真 TextInput (IME 三补丁删除); 切浅色主题 (白底不回头) + 命名「丹青日志 LogLens」+ Ctrl+O
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修

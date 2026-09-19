@@ -2,7 +2,7 @@
 
 - @author 十四叔
 - @date 2026/09/19
-- 状态: 待 review
+- 状态: review 完成（2026-09-19, 6 条 Required 全修, 250 测试绿）, 待 code-simplify
 - 所属: 能力地图 `SPEC-v1x-map.md` 模块 `field-analytics`（构建顺序第 2 位，依赖 `licensing` 的门控机制）
 
 ## Objective
@@ -160,4 +160,51 @@ serde 全行 parse 同文件要秒级到十几秒，列发现事故在档）。
   `cargo clean -p danqing-logfile` 即解（陈旧 rmeta 指纹; patch/lock 陷阱家族新成员）
 - 混合类型测试的 fixtures 第一次写反了（2/5 不是过半）——修的是测试不是逻辑
 - 测试规模: 本仓 lib 86 / main 145 / genlog 8 / keygen 3 = **242**;
-  danqing-logfile 68（含 scan 11 条, 差分对拍 3000 行 × 5 字段）
+  danqing-logfile 68（含 scan 10 条, 差分对拍 3000 行 × 5 字段）
+
+## 评审记（2026-09-19, 单路深度评审: REQUEST CHANGES, 无 Critical, 6 Required 全修）
+
+引擎侧（scan.rs / 聚合算法）原样通过——评审逐条构造了对拍语料盲区形态
+（转义的转义 / 嵌套数组同名键 / 数字贴 `}` / 行尾 `\r`）全部免疫正确；
+reservoir 为教科书 Algorithm R，独立复跑实测数字与实现记吻合。包袱集中在
+面板层与两处聚合语义：
+
+1. **R1 数值结果漏算采样标注行**（`result_rows` 报 11 行、paint 画 12 行）——
+   「分位数为采样估计」在旗舰路径（超 reservoir 上限）上必被窗口底边裁掉。
+   修：`7 + usize::from(s.sampled)` + 行账目守卫测试（数值±采样 / 枚举±其他
+   四态钉住）。
+2. **R2 字段行无 hover 反馈**（只在按下瞬间置位，模块头宣称「与直方图桶行
+   同构」不属实；且按下拖出抬起残留高亮）——09-13 人工验收那条教训的原样
+   复发。修：hover 改光标驱动（CursorMoved 仅可点行留痕 / CursorLeft 清空，
+   直方图同款），点击判定改用独立的 `pressed` 锚点，可点性单一事实源
+   `row_clickable()`。
+3. **R3 枚举 distinct 超限行被丢弃而非并入「其他」**——高基数列（request_id
+   类）分布数字凭空少掉 99% 的行，且与 spec「超出并入其他并标注」、
+   `EnumStats::capped` 自身文档两边都冲突，还没进实现记。修：overflow 计数
+   并入 others；连带把 `capped || others > 0` 改回 `capped`（两语义曾被压成
+   一位，面板「其他（N 行）」成死代码）。两条测试锁语义分叉（21 distinct
+   不 capped / 10037 distinct 行数守恒 top+others==total）。
+4. **R4 结果视图文本无截断无裁剪**——spec 已知局限写明的「32 字符截断」
+   没实现；112px 侧栏上作用域行（stale+skipped 组合 ≈200px）、长字段名、
+   长取值全部溢出盖画到 LogView。修：measure 截断 + 省略号（`fit()` 助手，
+   枚举取值先截 32 字符再按宽截）为主防，`push_clip/pop_clip` 对为兜底。
+5. **R5 分析快照的过滤串与行集不同源**——`apply_filter` 发起即写
+   `filter_applied`，行集要等 job 拾取才换；窗口内点字段行 = 跑旧行集记
+   新串，stale 永 false。修：新增 `filter_landed`（产出当前行集的那一串）
+   + `filter_pending`（在途闸），分析快照读落账串；同族两洞顺手收——
+   clear_filter / 空查询回全量现在 `invalidate()` 在途作业（原先晚到结果
+   会复活贴回），live-tail 增量合并在在途窗口禁行。
+6. **R6 选择器高度无上限**——30-50 列的宽 schema（可观测性数据常态）把
+   直方图挤到零高、底部字段不可达。修：字段行封顶 16 + 「… 还有 N 列」
+   指示行（不可点），spec Open Question「侧栏空间分配」就此落地。
+
+Optional 未修（记录在案）：AsyncJob done 槽同帧双完成覆写（窗口极窄、自愈）；
+`AnalysisBack` 不作废在途作业（结果落地拽回结果视图）；logbench 枚举输出不
+显示 capped；D3 字面「结果区显示过滤串」未实现（精神达成：底栏常驻过滤串）；
+对拍语料可补数组套对象/非 ASCII 键名/ryu 指数三条；`columns_src` Arc 地址
+缓存靠隐式不变式防 ABA（脆弱非错误）。Nit 已顺手修：scan 测试条数 11→10、
+todo T4 旧设计文字。
+
+修复后基线: 本仓 lib 88 / main 151 / genlog 8 / keygen 3 = **250**，
+clippy -D warnings 零警告，fmt 净。licensing 修复 delta 复核三条全过
+（剪辑键放行无新洞 / 购买防重入配对完整 / 长度闸与 Debug 遮蔽到位）。
