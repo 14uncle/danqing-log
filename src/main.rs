@@ -16,6 +16,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod analysis_panel;
 mod app_update;
 mod config;
 mod histogram;
@@ -295,6 +296,17 @@ pub(crate) struct LogApp {
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
     ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
+    /// 字段分析后台作业 (腿二; AsyncJob 代次语义在此正是想要的: 重跑作废旧轮
+    /// —— 与购买防重入那次的「不可丢」相反, 见 plan 风险表的对照注)。
+    analysis_job: AsyncJob<danqing_log::analysis::Analysis>,
+    /// 最近一次分析结果 (None = 选择器态)。
+    analysis_result: Option<danqing_log::analysis::Analysis>,
+    /// 结果所基于的过滤串快照 (D8: 过滤变了不自动重跑, 标「基于旧过滤」)。
+    analysis_filter_src: String,
+    /// 分析在途 (面板标题旁显示「分析中…」)。
+    analysis_running: bool,
+    /// 发起计数 —— 测试断言门控拦截时**没有**发起扫描用的观测点。
+    analysis_launches: u32,
 }
 
 /// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
@@ -366,10 +378,6 @@ pub(crate) enum Msg {
     /// 「获取付费层」(T5): 商店版拉购买对话框, 便携版开购买页。
     PurchasePaidLayer,
     /// 免费用户触发付费功能 → 统一升级提示 (T7; 付费态不发, 两道闸)。
-    ///
-    /// 非 test 构建下暂无人构造 (本模块只造机制, D3 —— 构造点在腿二/三/四
-    /// 各自的 spec 模块), 故压 dead_code; 腿落地后回来删这行 allow。
-    #[allow(dead_code)]
     ShowUpgradePrompt(Feature),
     /// 关闭升级提示。
     CloseUpgradePrompt,
@@ -377,6 +385,10 @@ pub(crate) enum Msg {
     UpgradeGotoActivate,
     /// 升级提示的「获取付费层」: 关提示 → 走购买 (与许可页按钮同源)。
     UpgradePurchase,
+    /// 点分析面板的字段行: 分析该字段 (门控点位, D5)。
+    AnalyzeField(usize),
+    /// 结果视图「← 换个字段」: 清结果回选择器。
+    AnalysisBack,
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
@@ -466,6 +478,11 @@ impl LogApp {
             upgrade_prompt: None,
             purchase_in_flight: false,
             license_clear_rev: 0,
+            analysis_job: AsyncJob::new(),
+            analysis_result: None,
+            analysis_filter_src: String::new(),
+            analysis_running: false,
+            analysis_launches: 0,
         }
     }
 
@@ -630,6 +647,28 @@ impl LogApp {
                 self.license_feedback = Some((text, NoticeKind::Warn));
             }
         }
+    }
+
+    /// 字段分析入口 (腿二, D5 门控点位): 免费态弹升级提示且**不发起扫描**;
+    /// 付费态带 (文件, 字段名, 过滤行集快照) 进 worker。
+    fn analyze_field(&mut self, idx: usize) {
+        if !self.entitlement.allows(Feature::FieldAnalytics) {
+            self.update(Msg::ShowUpgradePrompt(Feature::FieldAnalytics));
+            return;
+        }
+        let Some(schema) = &self.schema else { return };
+        let Some(col) = schema.columns.get(idx) else {
+            return;
+        };
+        let field = col.name.clone();
+        let file = Arc::clone(&self.file);
+        let rows = self.filtered.clone();
+        self.analysis_filter_src = self.filter_applied.clone();
+        self.analysis_running = true;
+        self.analysis_launches += 1;
+        self.analysis_job.launch(move || {
+            danqing_log::analysis::analyze_field(&file, &field, rows.as_ref().map(|v| v.as_slice()))
+        });
     }
 
     /// 商店授权查询回来了 (T5)。D4: **只许 Free → 其他** —— 会话内已激活的
@@ -879,6 +918,12 @@ impl LogApp {
         self.bookmarks.retain(|&l| l < new_count);
         self.filtered = None;
         self.filter_applied.clear();
+        // 换文件/重建 = 分析结果作废 (D8 后半句: 文件语境没了);
+        // 在途作业作废 —— 旧文件的分析结果不得贴到新文件 (async-open C1 同款纪律)
+        self.analysis_result = None;
+        self.analysis_filter_src.clear();
+        self.analysis_running = false;
+        self.analysis_job.invalidate();
         self.filter_elapsed = None;
         self.search = None;
         self.search_query.clear();
@@ -941,6 +986,10 @@ impl LogApp {
         self.selected = 0;
         self.filtered = None;
         self.filter_applied.clear();
+        self.analysis_result = None;
+        self.analysis_filter_src.clear();
+        self.analysis_running = false;
+        self.analysis_job.invalidate();
         self.filter_clear_rev += 1;
         self.filter_elapsed = None;
         self.search_clear_rev += 1;
@@ -1605,6 +1654,10 @@ impl App for LogApp {
                 self.upgrade_prompt = None;
                 self.purchase_paid_layer();
             }
+            Msg::AnalyzeField(idx) => self.analyze_field(idx),
+            Msg::AnalysisBack => {
+                self.analysis_result = None;
+            }
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
@@ -1641,7 +1694,14 @@ impl App for LogApp {
                         .child(title_bar(self.theme, self.make_title()))
                         .fill(
                             Row::new()
-                                .fill(histogram::LevelHistogram::new(), 0)
+                                .fill(
+                                    // 侧栏 = 直方图 (吃剩余高度) + 字段分析区
+                                    // (自然高, 无 schema 时归零坍缩)。
+                                    Column::new()
+                                        .fill(histogram::LevelHistogram::new(), 1)
+                                        .fill(analysis_panel::AnalysisPanel::new(), 0),
+                                    0,
+                                )
                                 .fill(view::LogView::new(), 1),
                             1,
                         ),
@@ -1882,6 +1942,10 @@ impl App for LogApp {
         if let Some(outcome) = self.purchase_job.poll() {
             self.adopt_purchase_outcome(outcome);
         }
+        if let Some(a) = self.analysis_job.poll() {
+            self.analysis_running = false;
+            self.analysis_result = Some(a);
+        }
         if let Some(out) = self.filter_job.poll() {
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
@@ -2120,7 +2184,52 @@ mod tests {
         assert_eq!(app2.entitlement, Entitlement::Free);
     }
 
-    // ─── v1x-licensing T7: 统一升级提示 ───
+    // ─── v1x-field-analytics T4: 门控与发起 ───
+
+    #[test]
+    fn analyze_field_gated_for_free_and_launches_for_paid() {
+        let cfg = temp_cfg_path("fagate");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![jsonl::Column {
+                name: "d".into(),
+                width_chars: 1,
+            }],
+        }));
+        // 免费态: 弹升级提示, 不发起扫描
+        app.update(Msg::AnalyzeField(0));
+        assert_eq!(app.upgrade_prompt, Some(Feature::FieldAnalytics));
+        assert_eq!(app.analysis_launches, 0, "免费态不得发起扫描");
+        assert!(!app.analysis_running);
+        // 付费态: 发起并拾取
+        let (key, pk) = test_sign(LICENSE_PAYLOAD);
+        app.license_pubkey = pk;
+        app.activate_license(key);
+        app.update(Msg::CloseUpgradePrompt);
+        app.update(Msg::AnalyzeField(0));
+        assert_eq!(app.analysis_launches, 1);
+        assert!(app.analysis_running);
+        assert_eq!(app.upgrade_prompt, None);
+        // job 完成拾取 (空文件秒回; 自旋上限 2s 防 flake)
+        let mut picked = false;
+        for _ in 0..200 {
+            if let Some(a) = app.analysis_job.poll() {
+                app.analysis_running = false;
+                app.analysis_result = Some(a);
+                picked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(picked, "分析作业应完成");
+        assert_eq!(
+            app.analysis_result.as_ref().unwrap().scope_rows,
+            0,
+            "空文件 0 行"
+        );
+        std::fs::remove_file(cfg.with_extension("license.key")).ok();
+    }
 
     #[test]
     fn upgrade_prompt_shows_only_when_not_entitled() {

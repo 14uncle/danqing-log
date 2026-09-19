@@ -34,13 +34,13 @@ use crate::{LogApp, Msg};
 /// 侧栏宽度 (逻辑像素)。
 pub(crate) const HIST_WIDTH: f32 = 112.0;
 /// 左右内边距。
-const PAD_X: f32 = 10.0;
+pub(crate) const PAD_X: f32 = 10.0;
 /// 顶部内边距。
-const PAD_Y: f32 = 8.0;
+pub(crate) const PAD_Y: f32 = 8.0;
 /// 行高 (标签行 + 横条行 + 行距)。
-const ROW_H: f32 = 28.0;
+pub(crate) const ROW_H: f32 = 28.0;
 /// 标签/计数字号。
-const LABEL_SIZE: u16 = 12;
+pub(crate) const LABEL_SIZE: u16 = 12;
 /// 横条高度。
 const BAR_H: f32 = 6.0;
 /// 标签行与横条之间的间距。
@@ -67,7 +67,7 @@ const HINT_ROW_H: f32 = 20.0;
 ///
 /// paint/event 不重判这个函数, 而是看 layout 给出的实际宽度 (`area.size.width`)
 /// —— 判定只有一处, 不存在「宽度 0 却还在画/还在吃点击」的漏判。
-fn effective_width(visible: bool, available: f32) -> f32 {
+pub(crate) fn effective_width(visible: bool, available: f32) -> f32 {
     if visible && available >= MIN_CONTENT_WIDTH {
         HIST_WIDTH
     } else {

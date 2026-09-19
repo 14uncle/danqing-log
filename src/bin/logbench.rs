@@ -36,15 +36,20 @@ const HIT_CAP: usize = 1_000_000;
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
-        eprintln!("用法: logbench <日志文件> [--filter \"level=ERROR status=50*\"] [正则...]");
+        eprintln!(
+            "用法: logbench <日志文件> [--filter \"level=ERROR status=50*\"] [--analyze <字段>] [正则...]"
+        );
         std::process::exit(2);
     };
     let mut filter: Option<String> = None;
+    let mut analyze: Option<String> = None;
     let mut patterns: Vec<String> = Vec::new();
     let mut it = args;
     while let Some(a) = it.next() {
         if a == "--filter" {
             filter = it.next();
+        } else if a == "--analyze" {
+            analyze = it.next();
         } else {
             patterns.push(a);
         }
@@ -143,6 +148,8 @@ fn main() {
         s.open.as_millis() + t_detect.as_millis() + t_schema.as_millis() + t_levels.as_millis()
     );
 
+    // --analyze 的作用域跟随 --filter (D3): 命中行集留给分析复用
+    let mut filtered_rows: Option<Vec<u64>> = None;
     if let Some(q) = &filter {
         println!("\n== JSONL 字段过滤 ==");
         println!("查询           : {q}");
@@ -168,6 +175,51 @@ fn main() {
             s.line_count,
             el.as_millis(),
         );
+        filtered_rows = Some(hits);
+    }
+
+    if let Some(field) = &analyze {
+        println!(
+            "
+== 字段分析 =="
+        );
+        println!("字段           : {field}");
+        let t = Instant::now();
+        let a = danqing_log::analysis::analyze_field(&file, field, filtered_rows.as_deref());
+        let el = t.elapsed();
+        println!("作用域         : {} 行", a.scope_rows);
+        if a.skipped > 0 {
+            println!("跳过           : {} 行 (取不到/嵌套/类型不符)", a.skipped);
+        }
+        println!("耗时           : {} ms", el.as_millis());
+        match &a.result {
+            danqing_log::analysis::AnalysisResult::Numeric(st) => {
+                println!(
+                    "数值           : count={} min={} max={} mean={:.2} p50={} p95={} p99={}{}",
+                    st.count,
+                    st.min,
+                    st.max,
+                    st.mean,
+                    st.p50,
+                    st.p95,
+                    st.p99,
+                    if st.sampled {
+                        "  (分位数为采样估计)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            danqing_log::analysis::AnalysisResult::Enum(en) => {
+                println!("枚举 (Top {})  :", en.top.len());
+                for (v, c) in &en.top {
+                    println!("  {v:<32} {c}");
+                }
+                if en.others > 0 {
+                    println!("  其他(共 {} 行)", en.others);
+                }
+            }
+        }
     }
 
     println!("\n== 全文搜索 ==");
