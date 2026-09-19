@@ -4,6 +4,23 @@
 
 ## 状态
 
+- 2026-09-19 (**v1.x 付费层开工 —— licensing 模块 build 完成, 待 review**): 用户四裁决
+  (GitHub 轨 = License key + 代销 / 便携版无试用钟 / 首波 = 基建+腿二三四, 腿一第二波 /
+  免费层协同欠账搭车) → 能力地图 `docs/specs/SPEC-v1x-map.md` (七模块+顺序, 已批准) →
+  `SPEC-v1x-licensing` → plan/todo → /build auto **T1–T8 全绿零 commit**。
+  产出: `src/license.rs` (Ed25519 离线校验 + Entitlement 状态机 + license.key 持久化 +
+  商店快照映射纯函数) / `src/store_license.rs` (WinRT broker 查询+购买, pomodoro 成稿移植,
+  IsActive 陷阱写明; **StoreLicense 无 IsTrial —— crate 源码实证**, trial/买断靠
+  ExpirationDate 有限性区分) / `src/bin/keygen.rs` (私钥仓库外) / 设置卡「许可」页签
+  (第三页, LICENSE_TAB_INDEX 常量) / 统一升级提示对话框 / 隐私政策升 1.x + README 付费层节。
+  **评审双路已闭环**: 代码评审 REQUEST CHANGES (1 Critical 模态守卫吞 Ctrl+V +
+  2 Required 购买防重入/反馈通道) + 安全审计 PASS —— 全部修复, 含框架联动
+  `TextInput::bind_clear` (danqing 未 push, 本仓 patch 开着, lock 现为 path 态待复钉)。
+  **231 测试绿 (lib 79 / main 141 / genlog 8 / keygen 3)**, clippy 0, fmt 过。
+  **公钥占位全零 = 收银台未开业安全默认**; 用户侧待办 (keygen 生成真密钥对回填公钥 /
+  代销商注册 / 商店 add-on 等 v1.0 过审硬顺序) 见 `tasks/todo-v1x-licensing.md` 末节。
+  下一步: review 阶段; 之后按地图顺序起 `field-analytics` (腿二) spec —— 它有引擎前置
+  (字符串切取→真 parser 边界, SPEC-jsonl-table:16), 动 danqing-logfile。
 - 2026-09-05: 开枪 + 当日建仓 + POC 双前提判过 → 用户发起 spec = 转正; 深夜 /build auto 零 commit core-viewer T1–T7 全绿
 - 2026-09-06: jsonl-table / live-tail 闭环 (均 spec→plan→build→review + 人工验收); app-chrome A1–A5 + settings S1–S5 落地; 过滤/搜索栏已重构成真 TextInput (IME 三补丁删除); 切浅色主题 (白底不回头) + 命名「丹青日志 LogLens」+ Ctrl+O
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修

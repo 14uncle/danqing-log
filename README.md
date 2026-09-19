@@ -89,8 +89,12 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 - **GitHub Releases**（主）：[最新版](https://github.com/14uncle/danqing-log/releases/latest)
   取 `danqing-log-v<版本>-win-x64.zip` —— 不到 5 MB，解压即用，不写注册表
 - **Microsoft Store**（辅）：**已提交，认证中（2026-09-19）**，链接过审后补上 —— 商店版
-  由商店代管更新，且**零网络请求**（便携版唯一的联网动作是启动时查一次新版本，
-  见[隐私政策](docs/privacy-policy.md)）
+  由商店代管更新。联网行为：**v1.0 零网络请求**；v1.x 起商店版会查询付费层购买授权
+  （经 Windows 的商店服务，应用自身不发 HTTP），便携版唯一联网动作仍是启动时查一次
+  新版本（见[隐私政策](docs/privacy-policy.md)）
+- **付费层（v1.x，收银台在建）**：免费层永久免费不变；付费层是**新增**的批量 / 留存 /
+  交付能力（$29 个人 / $59 企业买断，见 [`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md)）。
+  便携版 license key 离线校验不联网；购买链接开业后回填此处
 
 > 系统要求：Windows 10 1809+（x64）、DirectX 12 兼容显卡。两个渠道是同一个免费层，功能一致。
 
