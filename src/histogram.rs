@@ -16,8 +16,10 @@
 //! 只读态在**顶部**给一行「仅统计·不可点选」说明 (2026-09-14: 两种模式侧栏长得一样,
 //! 用户实机把「活着但不能点」读成了「坏了」; 首版放底部角落同日被否 —— 谁看得到啊)。
 //!
-//! 布局: 本组件是 LogView 的 **sibling** (顶层 `Row[Histogram, LogView.fill]`),
-//! 不侵入 LogView 内部的坐标数学 —— 后者只是拿到一个更窄的 `area`。
+//! 布局: 本组件在 [`crate::sidebar::Sidebar`] 容器里 (直方图吃剩余高度 +
+//! 字段分析区自然高), 容器是 LogView 的 **sibling** —— 不侵入 LogView 内部的
+//! 坐标数学, 后者只是拿到一个更窄的 `area`。**宽度由容器给** (tight),
+//! 本组件不重判折叠 (2026-09-20 实机教训, 见 `sidebar.rs` 模块头)。
 
 use std::any::Any;
 
@@ -141,8 +143,6 @@ pub(crate) struct LevelHistogram {
     counts: LevelCounts,
     /// 每桶的点选子句 (来自当前文件的级别类列; 全 None = 只读侧栏)。
     queries: LevelQueries,
-    /// 用户开关 (`Ctrl+L`)。关掉时宽度归零, 与「窄窗自动折叠」同一条路径。
-    visible: bool,
     /// 计数是否仍在后台算。
     ///
     /// 未就绪时**必须显示「…」而不是 0** —— 0 会被读成「这个文件真的没有 ERROR」,
@@ -184,7 +184,6 @@ impl LevelHistogram {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
             active_src: String::new(),
-            visible: true,
             pending: false,
             file_open: false,
             active: None,
@@ -261,7 +260,6 @@ impl Widget for LevelHistogram {
         self.counts = *app.level_counts.as_ref();
         let queries_changed = self.queries != app.level_queries;
         self.queries = app.level_queries.clone();
-        self.visible = app.histogram_visible;
         self.pending = app.levels_pending;
         self.file_open = app.has_file;
         // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `LEVEL=ERROR*`
@@ -290,7 +288,10 @@ impl Widget for LevelHistogram {
         } else {
             0.0
         };
-        Size::new(effective_width(self.visible, max.width), h)
+        // 宽度**拿来即用** (截到 HIST_WIDTH): 折叠判定 (Ctrl+L / 窄窗) 在
+        // 侧栏容器做一次 —— 它拿得到整个 Row 的可用宽, 本组件拿不到
+        // (见 `sidebar.rs` 模块头: 在这里重判会把自己的宽误判成窄窗)。
+        Size::new(max.width.min(HIST_WIDTH), h)
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {

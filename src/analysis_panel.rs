@@ -20,7 +20,7 @@ use std::sync::Arc;
 use danqing::widget::{EventResult, MsgQueue, Node, Widget};
 use danqing::{Color, Constraints, Event, Point, Rect, RectBatch, Size, TextBatch, Theme};
 
-use crate::histogram::{LABEL_SIZE, PAD_X, PAD_Y, ROW_H, bar_fraction, effective_width};
+use crate::histogram::{HIST_WIDTH, LABEL_SIZE, PAD_X, PAD_Y, ROW_H, bar_fraction};
 use crate::{LogApp, Msg};
 use danqing_log::analysis::{Analysis, AnalysisResult};
 
@@ -34,8 +34,19 @@ const ROW_RERUN: usize = 1;
 /// 选择器没有滚动机构, 封顶 + 「还有 N 列」行是 spec Open Question 的落地。
 const MAX_PICKER_FIELDS: usize = 16;
 
+/// 面板自然高占可用高度的上限 (2026-09-20 人工验收: fill(0) 自然高无界,
+/// 结果态 25 行 ≈730px 在矮窗上把直方图 (fill 1) 挤到零高 —— 「只看到
+/// 分析区」。0.55 = 直方图在任何窗口高度下至少保住 45%)。
+const HEIGHT_BUDGET_FRAC: f32 = 0.55;
+
 /// 枚举取值展示的字符上限 (spec 已知局限: 32 字符, 同列宽惯例)。
 const ENUM_VALUE_CHARS: usize = 32;
+
+/// 高度 h 内放得下的行数 —— 全组件唯一的「高度 → 行数」换算
+/// (layout 定高 / paint / 命中测试共用, 账目与画笔同源)。
+fn rows_fit(h: f32) -> usize {
+    (((h - 2.0 * PAD_Y) / ROW_H).floor() as usize).max(1)
+}
 
 /// 侧栏「字段分析」区。
 pub(crate) struct AnalysisPanel {
@@ -85,18 +96,18 @@ impl AnalysisPanel {
         }
     }
 
-    /// 选择器态实际展示的字段行数 (封顶 MAX_PICKER_FIELDS)。
+    /// 选择器态字段行的绝对上限 (宽 schema 不刷屏; 超出的列仍可走过滤语法)。
     fn shown_fields(&self) -> usize {
         self.columns.len().min(MAX_PICKER_FIELDS)
     }
 
-    /// 选择器态的行数 (标题行 + 字段行 + 超限时的「还有 N 列」行)。
-    fn picker_rows(&self) -> usize {
+    /// 选择器态的**逻辑**行数 (不计高度预算: 标题 + 字段行 + 「还有 N 列」行)。
+    fn picker_logical_rows(&self) -> usize {
         1 + self.shown_fields() + usize::from(self.columns.len() > MAX_PICKER_FIELDS)
     }
 
-    /// 结果态的行数 (顶部两行 + 作用域行 + 内容行)。
-    fn result_rows(&self) -> usize {
+    /// 结果态的**逻辑**行数 (标题/换字段/重跑/作用域 + 内容行)。
+    fn result_logical_rows(&self) -> usize {
         let Some(a) = &self.result else { return 0 };
         let content = match &a.result {
             // count/min/max/mean/p50/p95/p99 + 采样标注行 (评审 R1: 漏算它会让
@@ -105,21 +116,60 @@ impl AnalysisPanel {
             AnalysisResult::Numeric(s) => 7 + usize::from(s.sampled),
             AnalysisResult::Enum(e) => e.top.len() + usize::from(e.others > 0 || e.capped),
         };
-        // +作用域行 + (跳过/采样标注行)
-        2 + 1 + content + 1
+        4 + content
     }
 
-    /// 内容自然高度 (无 schema / 侧栏关 → 0, 布局坍缩不占地)。
-    fn natural_height(&self) -> f32 {
+    fn logical_rows(&self) -> usize {
+        if self.result.is_some() {
+            self.result_logical_rows()
+        } else {
+            self.picker_logical_rows()
+        }
+    }
+
+    /// 预算内可见行数 —— **几何单一公式**, layout 定高 / paint 画行 /
+    /// 命中测试共用 (评审 R1 的「账目与画笔不同源」与人工验收的「面板把
+    /// 直方图挤到零高」都靠这一处防)。
+    fn visible_rows(&self, area_h: f32) -> usize {
+        self.logical_rows().min(rows_fit(area_h))
+    }
+
+    /// 内容自然高度 (无 schema → 0 坍缩)。上限 = 可用高度 ×
+    /// [`HEIGHT_BUDGET_FRAC`] —— 2026-09-20 人工验收: 结果态 25 行 ≈730px
+    /// 的自然高在矮窗上把直方图 (fill 1) 挤到零高, 「只看到分析区」;
+    /// 评审 R6 的原话本就是「可用高度的某比例」, 行数封顶只挡了选择器态。
+    fn natural_height(&self, avail_h: f32) -> f32 {
         if !self.has_schema {
             return 0.0;
         }
-        let rows = if self.result.is_some() {
-            self.result_rows()
-        } else {
-            self.picker_rows()
-        };
+        let rows = self
+            .logical_rows()
+            .min(rows_fit(avail_h * HEIGHT_BUDGET_FRAC));
         2.0 * PAD_Y + rows as f32 * ROW_H
+    }
+
+    /// 选择器态在高度 h 内的排布: (展示字段行数, 是否有「还有 N 列」行)。
+    /// 字段行让位于标题行与溢出指示行。
+    fn picker_plan(&self, h: f32) -> (usize, bool) {
+        let budget = self.visible_rows(h).saturating_sub(1); // 标题行
+        let mut shown = self.shown_fields().min(budget);
+        let more = self.columns.len() > shown;
+        if more && shown == budget && shown > 0 {
+            shown -= 1; // 给「还有 N 列」行腾位
+        }
+        (shown, more)
+    }
+
+    /// 枚举结果在高度 h 内的排布: (展示的 top 条数, 是否有「还有 K 条」行)。
+    /// chrome 4 行 (标题/换字段/重跑/作用域) 雷打不动; 「其他」行优先保住
+    /// (它承载 capped 语义), 装不下的 top 条目折叠进「还有 K 条」。
+    fn enum_plan(&self, e: &danqing_log::analysis::EnumStats, h: f32) -> (usize, bool) {
+        let budget = self.visible_rows(h).saturating_sub(4);
+        let others = usize::from(e.others > 0 || e.capped);
+        if e.top.len() + others <= budget {
+            return (e.top.len(), false);
+        }
+        (budget.saturating_sub(others + 1), true)
     }
 
     /// 行矩形 (选择器与结果共用同一行几何: 顶部 PAD_Y 起, 逐行 ROW_H)。
@@ -141,21 +191,17 @@ impl AnalysisPanel {
             return None;
         }
         let i = (y / ROW_H) as usize;
-        let rows = if self.result.is_some() {
-            self.result_rows()
-        } else {
-            self.picker_rows()
-        };
-        (i < rows).then_some(i)
+        (i < self.visible_rows(area.size.height)).then_some(i)
     }
 
     /// 该行可点吗 —— hover 留痕与按下锚点共用同一判据 (直方图
     /// `is_row_clickable` 同款: 可点性是单一事实源)。
-    fn row_clickable(&self, row: usize) -> bool {
+    fn row_clickable(&self, area: Rect, row: usize) -> bool {
         if self.result.is_some() {
             row == ROW_BACK + 1 || row == ROW_RERUN + 1
         } else {
-            row >= 1 && row <= self.shown_fields()
+            let (shown, _) = self.picker_plan(area.size.height);
+            row >= 1 && row <= shown
         }
     }
 }
@@ -188,8 +234,15 @@ impl Widget for AnalysisPanel {
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
         let max = constraints.max();
-        let w = effective_width(self.visible && self.has_schema, max.width);
-        Size::new(w, self.natural_height())
+        // 宽度**拿来即用** (截到 HIST_WIDTH): 折叠判定 (Ctrl+L / 窄窗) 归侧栏
+        // 容器 (见 `sidebar.rs` 模块头)。本组件只决定「有没有内容可显示」:
+        // 无 schema (.log) 或侧栏关 → 宽 0 → paint 的宽度闸自然不画。
+        let w = if self.visible && self.has_schema {
+            max.width.min(HIST_WIDTH)
+        } else {
+            0.0
+        };
+        Size::new(w, self.natural_height(max.height))
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
@@ -211,7 +264,7 @@ impl Widget for AnalysisPanel {
             Some(a) => format!("字段分析 · {}", a.field),
             None => "字段分析".to_string(),
         };
-        let base0 = self.row_rect(area, 0).origin.y + texts.ascent(f32::from(LABEL_SIZE));
+        let base0 = vcenter_base(texts, self.row_rect(area, 0).origin.y, ROW_H);
         // 「分析中…」尾随标题 —— 在途时给它留出位置, 别让两段叠着溢出。
         let suffix_w = if self.running {
             texts.measure("  分析中…", LABEL_SIZE)
@@ -229,9 +282,9 @@ impl Widget for AnalysisPanel {
 
         match &self.result {
             None => {
-                // 选择器: 字段名逐行可点 (与直方图桶行同一交互语言),
-                // 封顶 MAX_PICKER_FIELDS, 超出的列给一行指示 (R6)。
-                let shown = self.shown_fields();
+                // 选择器: 字段名逐行可点 (与直方图桶行同一交互语言);
+                // 展示行数 = 绝对封顶 ∩ 高度预算 (picker_plan 单点账目)。
+                let (shown, more) = self.picker_plan(area.size.height);
                 for (i, name) in self.columns.iter().take(shown).enumerate() {
                     let row = i + 1;
                     let r = self.row_rect(area, row);
@@ -257,18 +310,18 @@ impl Widget for AnalysisPanel {
                     texts.push_text(
                         name_fit.as_ref(),
                         x,
-                        r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                        vcenter_base(texts, r.origin.y, ROW_H),
                         LABEL_SIZE,
                         color,
                     );
                 }
-                if self.columns.len() > shown {
+                if more {
                     let r = self.row_rect(area, shown + 1);
                     let more = format!("… 还有 {} 列", self.columns.len() - shown);
                     texts.push_text(
                         &more,
                         x,
-                        r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                        vcenter_base(texts, r.origin.y, ROW_H),
                         LABEL_SIZE,
                         self.text_secondary,
                     );
@@ -287,7 +340,7 @@ impl Widget for AnalysisPanel {
                     texts.push_text(
                         label,
                         x,
-                        r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                        vcenter_base(texts, r.origin.y, ROW_H),
                         LABEL_SIZE,
                         color,
                     );
@@ -305,7 +358,7 @@ impl Widget for AnalysisPanel {
                 texts.push_text(
                     scope_fit.as_ref(),
                     x,
-                    r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                    vcenter_base(texts, r.origin.y, ROW_H),
                     LABEL_SIZE,
                     self.text_secondary,
                 );
@@ -324,7 +377,7 @@ impl Widget for AnalysisPanel {
                         ];
                         for (i, (label, val)) in rows.iter().enumerate() {
                             let r = self.row_rect(area, content_start + i);
-                            let base = r.origin.y + texts.ascent(f32::from(LABEL_SIZE));
+                            let base = vcenter_base(texts, r.origin.y, ROW_H);
                             texts.push_text(label, x, base, LABEL_SIZE, self.text_secondary);
                             let vw = texts.measure(val, LABEL_SIZE);
                             texts.push_text(val, right - vw, base, LABEL_SIZE, self.text_primary);
@@ -335,7 +388,7 @@ impl Widget for AnalysisPanel {
                             texts.push_text(
                                 note.as_ref(),
                                 x,
-                                r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                                vcenter_base(texts, r.origin.y, ROW_H),
                                 LABEL_SIZE,
                                 self.text_secondary,
                             );
@@ -343,9 +396,14 @@ impl Widget for AnalysisPanel {
                     }
                     AnalysisResult::Enum(e) => {
                         let max = e.top.first().map_or(0, |(_, c)| *c);
-                        for (i, (val, count)) in e.top.iter().enumerate() {
+                        // 展示条数 = 高度预算内能装的条数 (enum_plan 单点账目);
+                        // 装不下的折叠成「… 还有 K 条」, 「其他」行优先保住。
+                        let (shown, folded) = self.enum_plan(e, area.size.height);
+                        for (i, (val, count)) in e.top.iter().take(shown).enumerate() {
                             let r = self.row_rect(area, content_start + i);
-                            let base = r.origin.y + texts.ascent(f32::from(LABEL_SIZE));
+                            // 枚举行文本在「计数条之上」的区间里居中 —— 条占
+                            // 底部 [ROW_H-10, ROW_H-4], 文本区 = ROW_H-10。
+                            let base = vcenter_base(texts, r.origin.y, ROW_H - 10.0);
                             let frac = bar_fraction(*count, max);
                             let bw = (avail_w * frac).max(2.0);
                             rects.push_rect(
@@ -375,8 +433,21 @@ impl Widget for AnalysisPanel {
                             );
                             texts.push_text(&cs, right - cw, base, LABEL_SIZE, self.text_secondary);
                         }
+                        let mut tail_row = content_start + shown;
+                        if folded {
+                            let r = self.row_rect(area, tail_row);
+                            let more = format!("… 还有 {} 条取值", e.top.len() - shown);
+                            texts.push_text(
+                                &more,
+                                x,
+                                vcenter_base(texts, r.origin.y, ROW_H),
+                                LABEL_SIZE,
+                                self.text_secondary,
+                            );
+                            tail_row += 1;
+                        }
                         if e.others > 0 || e.capped {
-                            let r = self.row_rect(area, content_start + e.top.len());
+                            let r = self.row_rect(area, tail_row);
                             let label = if e.capped {
                                 format!("其他（{} 行, 取值过多已合并）", e.others)
                             } else {
@@ -386,7 +457,7 @@ impl Widget for AnalysisPanel {
                             texts.push_text(
                                 label_fit.as_ref(),
                                 x,
-                                r.origin.y + texts.ascent(f32::from(LABEL_SIZE)),
+                                vcenter_base(texts, r.origin.y, ROW_H),
                                 LABEL_SIZE,
                                 self.text_secondary,
                             );
@@ -410,8 +481,10 @@ impl Widget for AnalysisPanel {
         // 不知道能点」), 且按下拖出再抬起会残留高亮。
         match event {
             Event::CursorMoved(p) => {
-                self.hover
-                    .set(self.row_at(area, *p).filter(|&r| self.row_clickable(r)));
+                self.hover.set(
+                    self.row_at(area, *p)
+                        .filter(|&r| self.row_clickable(area, r)),
+                );
                 return EventResult::Ignored;
             }
             Event::CursorLeft => {
@@ -435,7 +508,8 @@ impl Widget for AnalysisPanel {
         let row = self.row_at(area, *position);
         if *pressed {
             // 锚点只记可点行; 点在有东西的地方一律吞掉, 不穿透到底层列表。
-            self.pressed.set(row.filter(|&r| self.row_clickable(r)));
+            self.pressed
+                .set(row.filter(|&r| self.row_clickable(area, r)));
             return if row.is_some() {
                 EventResult::Consumed
             } else {
@@ -464,8 +538,11 @@ impl Widget for AnalysisPanel {
                 }
                 _ => {}
             }
-        } else if row >= 1 && row <= self.shown_fields() {
-            msgs.push(Box::new(Msg::AnalyzeField(row - 1)));
+        } else {
+            let (shown, _) = self.picker_plan(area.size.height);
+            if row >= 1 && row <= shown {
+                msgs.push(Box::new(Msg::AnalyzeField(row - 1)));
+            }
         }
         EventResult::Consumed
     }
@@ -476,6 +553,15 @@ impl Widget for AnalysisPanel {
     fn children_mut(&mut self) -> &mut [Node] {
         &mut []
     }
+}
+
+/// 行内文本基线: 文本行盒在 `zone_h` 高度内垂直居中 (2026-09-20 人工验收:
+/// 顶对齐文本在 hover 块内读作「偏上不居中」—— 直方图「清除筛选」行同款
+/// 教训在档, 居中参照物是**可视块**不是逻辑行; hover 块与行矩形同心,
+/// 对行居中即对块居中)。
+fn vcenter_base(texts: &TextBatch, y: f32, zone_h: f32) -> f32 {
+    y + (zone_h - texts.line_height(f32::from(LABEL_SIZE))) / 2.0
+        + texts.ascent(f32::from(LABEL_SIZE))
 }
 
 /// f64 展示: 整数值不带小数点, 其余保留两位 (分位数不假装比采样更精确)。
@@ -667,7 +753,11 @@ mod tests {
             }),
         });
         panel.sync(&app);
-        assert_eq!(panel.result_rows(), 12, "数值+采样: 标注行必须计入高度");
+        assert_eq!(
+            panel.result_logical_rows(),
+            12,
+            "数值+采样: 标注行必须计入逻辑高度"
+        );
         // 数值未采样: 11
         if let Some(a) = &mut app.analysis_result {
             a.result = AnalysisResult::Numeric(NumericStats {
@@ -682,7 +772,7 @@ mod tests {
             });
         }
         panel.sync(&app);
-        assert_eq!(panel.result_rows(), 11);
+        assert_eq!(panel.result_logical_rows(), 11);
         // 枚举: 2 个 top + 其他行 → 2+1+3+1 = 7
         app.analysis_result = Some(Analysis {
             field: "d".into(),
@@ -696,7 +786,7 @@ mod tests {
             }),
         });
         panel.sync(&app);
-        assert_eq!(panel.result_rows(), 7, "其他行必须计入高度");
+        assert_eq!(panel.result_logical_rows(), 7, "其他行必须计入逻辑高度");
         // 枚举无其他: 2+1+1+1 = 5
         if let Some(a) = &mut app.analysis_result {
             a.result = AnalysisResult::Enum(EnumStats {
@@ -707,7 +797,7 @@ mod tests {
             });
         }
         panel.sync(&app);
-        assert_eq!(panel.result_rows(), 5);
+        assert_eq!(panel.result_logical_rows(), 5);
     }
 
     /// hover 光标驱动 (评审 R2): 可点行留痕、不可点行不留、CursorLeft 清空;
@@ -770,6 +860,8 @@ mod tests {
 
     /// 选择器封顶 (评审 R6): 宽 schema 不得把直方图挤到零高;
     /// 「还有 N 列」行不可点。
+    /// 选择器封顶 (评审 R6 + 2026-09-20 验收): 绝对封顶 (高窗) 与高度预算
+    /// (矮窗) 双闸; 「还有 N 列」行不可点。
     #[test]
     fn picker_caps_rows_and_overflow_row_is_inert() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg("cap")));
@@ -784,34 +876,51 @@ mod tests {
         }));
         let mut panel = AnalysisPanel::new();
         panel.sync(&app);
-        assert_eq!(panel.picker_rows(), 1 + MAX_PICKER_FIELDS + 1);
-        let c = Constraints::loose(Size::new(HIST_WIDTH, 800.0));
+        assert_eq!(panel.picker_logical_rows(), 1 + MAX_PICKER_FIELDS + 1);
         let mut texts = TextBatch::default();
-        let h = panel.layout(c, &mut texts).height;
+        // 高窗 (1200): 绝对封顶生效 —— 18 行全出
+        let tall = panel
+            .layout(
+                Constraints::loose(Size::new(HIST_WIDTH, 1200.0)),
+                &mut texts,
+            )
+            .height;
         assert_eq!(
-            h,
+            tall,
             2.0 * PAD_Y + (1 + MAX_PICKER_FIELDS + 1) as f32 * ROW_H,
-            "30 列 schema 的自然高度必须封顶"
+            "高窗: 绝对封顶 18 行"
         );
-        // 「还有 N 列」行 (row 17): 按下抬起 → 无消息
-        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 800.0);
+        // 矮窗 (800): 高度预算生效 —— 800*0.55=440 → 15 行, 且永不超过预算
+        let short = panel
+            .layout(Constraints::loose(Size::new(HIST_WIDTH, 800.0)), &mut texts)
+            .height;
+        assert!(
+            short <= 800.0 * HEIGHT_BUDGET_FRAC,
+            "面板自然高不得超可用高度的预算比例 (直方图保底): {short}"
+        );
+        let budget_rows = ((short - 2.0 * PAD_Y) / ROW_H) as usize;
+        // 事件面的行账目必须与 layout 产出的高度一致 (area = 实际分到的高度)
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, short);
+        let (shown, more) = panel.picker_plan(short);
+        assert!(more, "30 列在 15 行预算内必须有「还有 N 列」行");
+        assert_eq!(1 + shown + 1, budget_rows, "标题+字段+指示行 = 预算行数");
+        // 「还有 N 列」行: 按下抬起 → 无消息
         let mut msgs = MsgQueue::default();
-        let p = Point::new(
-            HIST_WIDTH / 2.0,
-            PAD_Y + (MAX_PICKER_FIELDS + 1) as f32 * ROW_H + ROW_H / 2.0,
-        );
-        let down = Event::MouseInput {
-            button: danqing::event::MouseButton::Left,
-            pressed: true,
-            position: p,
+        let click = |panel: &mut AnalysisPanel, msgs: &mut MsgQueue, row: usize| {
+            let p = Point::new(HIST_WIDTH / 2.0, PAD_Y + row as f32 * ROW_H + ROW_H / 2.0);
+            for pressed in [true, false] {
+                panel.event(
+                    &Event::MouseInput {
+                        button: danqing::event::MouseButton::Left,
+                        pressed,
+                        position: p,
+                    },
+                    area,
+                    msgs,
+                );
+            }
         };
-        let up = Event::MouseInput {
-            button: danqing::event::MouseButton::Left,
-            pressed: false,
-            position: p,
-        };
-        panel.event(&down, area, &mut msgs);
-        panel.event(&up, area, &mut msgs);
+        click(&mut panel, &mut msgs, shown + 1);
         assert!(
             !msgs
                 .iter()
@@ -819,23 +928,8 @@ mod tests {
                 .any(|m| matches!(m, Msg::AnalyzeField(_))),
             "「还有 N 列」行不可点"
         );
-        // 最后一行真实字段 (row 16) 仍可点
-        let p16 = Point::new(
-            HIST_WIDTH / 2.0,
-            PAD_Y + MAX_PICKER_FIELDS as f32 * ROW_H + ROW_H / 2.0,
-        );
-        let down16 = Event::MouseInput {
-            button: danqing::event::MouseButton::Left,
-            pressed: true,
-            position: p16,
-        };
-        let up16 = Event::MouseInput {
-            button: danqing::event::MouseButton::Left,
-            pressed: false,
-            position: p16,
-        };
-        panel.event(&down16, area, &mut msgs);
-        panel.event(&up16, area, &mut msgs);
+        // 预算内最后一行真实字段仍可点
+        click(&mut panel, &mut msgs, shown);
         let saw = msgs
             .iter()
             .filter_map(|m| m.downcast_ref::<Msg>())
@@ -846,7 +940,72 @@ mod tests {
                     None
                 }
             });
-        assert_eq!(saw, Some(MAX_PICKER_FIELDS - 1), "封顶内的字段行仍可点");
+        assert_eq!(saw, Some(shown - 1), "预算内的字段行仍可点");
+    }
+
+    /// 枚举结果的高度预算 (2026-09-20 人工验收根因): Top 20 全出 ≈730px
+    /// 在矮窗把直方图挤到零高。预算内折叠成「… 还有 K 条」, 「其他」行保住。
+    #[test]
+    fn enum_result_folds_into_height_budget_and_keeps_others_row() {
+        use danqing_log::analysis::EnumStats;
+        let mut app = LogApp::new_empty_at(Some(temp_cfg("fold")));
+        app.has_file = true;
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "d".into(),
+                width_chars: 1,
+            }],
+        }));
+        app.analysis_result = Some(Analysis {
+            field: "d".into(),
+            scope_rows: 210,
+            skipped: 0,
+            result: AnalysisResult::Enum(EnumStats {
+                top: (0..20).map(|i| (format!("v{i}"), 20 - i as u64)).collect(),
+                others: 10,
+                capped: false,
+                total: 220,
+            }),
+        });
+        let mut panel = AnalysisPanel::new();
+        panel.sync(&app);
+        assert_eq!(
+            panel.result_logical_rows(),
+            4 + 21,
+            "逻辑行: Top20+其他 全量"
+        );
+        let mut texts = TextBatch::default();
+        // 矮窗 (800 → 预算 15 行): 自然高不得超预算, 折叠行出现
+        let h = panel
+            .layout(Constraints::loose(Size::new(HIST_WIDTH, 800.0)), &mut texts)
+            .height;
+        assert!(h <= 800.0 * HEIGHT_BUDGET_FRAC, "结果态同样受预算约束: {h}");
+        let (shown, folded) = {
+            let AnalysisResult::Enum(e) = &panel.result.as_ref().unwrap().result else {
+                panic!()
+            };
+            panel.enum_plan(e, h)
+        };
+        assert!(folded, "21 条内容在 15 行预算内必须折叠");
+        // chrome 4 + shown + 折叠行 1 + 其他行 1 = 预算行数
+        let budget_rows = ((h - 2.0 * PAD_Y) / ROW_H) as usize;
+        assert_eq!(4 + shown + 1 + 1, budget_rows, "折叠后总行数 = 预算行数");
+        assert!(shown < 20, "部分 top 条目折叠进「还有 K 条」");
+        // 高窗 (2000 → 预算 ≥ 逻辑行): 全量展示不折叠
+        let tall = panel
+            .layout(
+                Constraints::loose(Size::new(HIST_WIDTH, 2000.0)),
+                &mut texts,
+            )
+            .height;
+        let (shown_tall, folded_tall) = {
+            let AnalysisResult::Enum(e) = &panel.result.as_ref().unwrap().result else {
+                panic!()
+            };
+            panel.enum_plan(e, tall)
+        };
+        assert_eq!(shown_tall, 20);
+        assert!(!folded_tall, "空间够时不折叠");
     }
 
     /// fit: 短文本原样 (借用), 长文本截断加省略号且量得出 ≤ max_w。

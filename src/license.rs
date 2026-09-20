@@ -24,9 +24,13 @@ const PRODUCT: &str = "danqing-log";
 /// 当前 payload 版本。格式演进时旧版本 key 必须明确拒绝, 不猜着解。
 const PAYLOAD_VERSION: u64 = 1;
 
-/// 产品公钥 —— **占位全零**, 用户跑 keygen 生成真密钥对后回填 (plan 用户侧清单 2)。
-/// 全零下任何 key 都验不过 = 「收银台未开业」, 安全默认。
-pub const PRODUCT_PUBKEY: [u8; 32] = [0u8; 32];
+/// 产品公钥 —— 2026-09-19 用户生成真密钥对后回填 (私钥在仓库外
+/// `~/.danqing-log-keys/danqing-log.secret`, 永不入库)。此前为全零占位
+/// = fail-closed「收银台未开业」; 回填后便携版激活通路真实可用。
+pub const PRODUCT_PUBKEY: [u8; 32] = [
+    137, 81, 131, 96, 243, 121, 90, 1, 90, 246, 84, 95, 150, 186, 184, 224, 173, 33, 217, 176, 248,
+    24, 187, 184, 106, 149, 190, 38, 30, 164, 250, 247,
+];
 
 /// 付费档位 (D7: 同一 key 格式, seat 数不技术强制, 君子协定写明)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

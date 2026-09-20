@@ -227,7 +227,9 @@ fn tier_status_text() -> impl Widget {
 
 /// key 输入框。主题跟随照 `view.rs` 的 `base_input` 范式: 构造值只作首帧
 /// 兜底, `bind_theme` 每帧重取 (回归锁 `filter_input_color_follows_theme`
-/// 钉的是同一个坑)。
+/// 钉的是同一个坑)。**占位色不传主题色**: `bind_theme` 不刷新占位色
+/// (框架设计如此), 亮主题深灰到了暗主题就是暗底暗字 (2026-09-20 人工
+/// 验收) —— 用与过滤/搜索栏同款的中性灰, 明暗两底都可辨。
 fn key_input_box() -> impl Widget {
     let input = TextInput::themed(&LightTheme)
         .bind_theme(|app: &LogApp| app.theme.theme())
@@ -237,7 +239,7 @@ fn key_input_box() -> impl Widget {
         .font_size(BODY_SIZE)
         .placeholder(
             "粘贴 license key（loglens1.…）",
-            LightTheme.text_secondary(),
+            Color::rgb(0.45, 0.45, 0.48), // 与 base_input 占位灰同款
         )
         .on_change(|s: &str| Msg::LicenseKeyInput(s.to_owned()));
     UiBox::new(Color::TRANSPARENT)

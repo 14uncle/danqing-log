@@ -21,6 +21,7 @@ mod app_update;
 mod config;
 mod histogram;
 mod settings;
+mod sidebar;
 mod store_license;
 mod tray;
 mod view;
@@ -1731,10 +1732,13 @@ impl App for LogApp {
                             Row::new()
                                 .fill(
                                     // 侧栏 = 直方图 (吃剩余高度) + 字段分析区
-                                    // (自然高, 无 schema 时归零坍缩)。
-                                    Column::new()
-                                        .fill(histogram::LevelHistogram::new(), 1)
-                                        .fill(analysis_panel::AnalysisPanel::new(), 0),
+                                    // (自然高, 无 schema 时归零坍缩)。宽度折叠
+                                    // 判定 (Ctrl+L / 窄窗) 归容器 —— 只有 Row 的
+                                    // 直接子项拿得到整个 Row 的可用宽 (sidebar.rs)。
+                                    sidebar::Sidebar::new(
+                                        histogram::LevelHistogram::new(),
+                                        analysis_panel::AnalysisPanel::new(),
+                                    ),
                                     0,
                                 )
                                 .fill(view::LogView::new(), 1),
