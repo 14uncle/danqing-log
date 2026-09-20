@@ -220,3 +220,34 @@ clippy -D warnings 零警告，fmt 净。licensing 修复 delta 复核三条全�
    `store_license.rs` 的 COM+StoreContext 起手式提为 `store_context()` 共用
 4. 判定**不动**的：scan.rs（对拍锁着的字节合同，越素越好）、keygen.rs、
    settings.rs 许可页、logbench —— 通读后无可简化项，不为动而动
+
+## 人工验收（2026-09-20 用户实机, 三轮过）
+
+验收四条发现, 逐条修完 → 复验通过。**两条是本模块自己的问题, 两条是
+「腿二改造把 v1.0 的东西碰坏了」**:
+
+1. **字段行文字在 hover 块内不居中** —— 面板所有行文本顶对齐
+   (baseline = 行顶 + ascent), 而 hover 块与行矩形同心 → 读作「按钮内偏下」。
+   修: `vcenter_base()` 文本行盒行内居中 (直方图「清除筛选」行同款教训,
+   连参照物注释一并写明); 枚举行的文本区再避开底部计数条。
+2. **许可页粘贴长 key 渲染溢出框外** —— 框架 `TextInput::paint` 从不裁剪,
+   262 字符单行平铺越界 (过滤/搜索栏是同一颗未爆的雷)。修在**框架**
+   (danqing 联动): 选区/正文/占位/preedit/光标一律裁进边框内侧, 回归锁
+   `overflowing_text_is_clipped_inside_input_area`。附带 `#[doc(hidden)]`
+   字形观测面 `TextBatch::glyph_clips` (与 `text_input::text_color` 同处置)。
+3. **侧栏直方图整块消失**（最重）—— 根因**不在本模块的预算**, 而在腿二把
+   直方图从 `Row` 的 Fit 子项挪进 `Column` 的 fill 位置: `effective_width`
+   的折叠判据是「整个 Row 的可用宽 ≥ 640」(窄窗自动收起), 而列的子项拿到的
+   是 cross_max = 侧栏自己的 112 → `112 >= 640` 不成立 → **宽度归零、整块不画**。
+   实机表现: 侧栏只剩字段分析区, 而枚举结果 (INFO/DEBUG/… 计数与直方图同源)
+   看着像直方图却没有颜色与 hover。
+   修: 新增 `src/sidebar.rs` 容器 —— 折叠判定必须在**拿得到整个 Row 宽的那一层**
+   做一次 (容器是 Row 子项 → 判一次 → 给内部 Column 钉 tight 宽 → 子组件
+   一律「拿来即用」)。删掉直方图里已成死状态的 `visible` 字段。回归锁
+   `sidebar_keeps_a_real_width_so_the_histogram_actually_paints` **真画一遍**
+   并断言直方图产出字形 (此前的测试从没画过侧栏, 正是漏网原因)。
+   附: 面板结果态自然高在矮窗上仍会把直方图挤到零高 —— 高度预算
+   (`HEIGHT_BUDGET_FRAC = 0.55`, 装不下折叠为「… 还有 K 条取值」) 同期落地。
+4. **暗色主题下许可页占位文本不可辨** —— 许可框占位色传的是亮主题的
+   `text_secondary` (深灰), 而框架 `bind_theme` **有意不刷新占位色** →
+   暗底暗字。修: 改用与过滤/搜索栏同款的中性灰 `rgb(0.45,0.45,0.48)`, 明暗通吃。

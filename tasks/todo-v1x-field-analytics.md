@@ -75,10 +75,11 @@
 ## Checkpoint C
 
 - [x] spec §成功判据机器部分逐条过（差分/手算/标注/作用域/门控/性能 1001ms ≤ 1.5s）
-- [ ] 人工验收（用户实机）：demo-1gb.jsonl 跑 `duration_ms`（数值）/`level`（枚举），
-      免费态弹窗文案过一遍；**review 修复新增看点**：字段行 hover 反馈、采样标注行
-      不被裁、宽 schema（>16 列）封顶行、长取值/长作用域行截断 —— 付费态路径需
-      真公钥回填后做
+- [x] 人工验收（用户实机）—— **2026-09-20 通过**（三轮）: demo-1gb.jsonl 数值/枚举两路
+      跑通, 免费态弹窗、付费态激活、hover 居中、采样标注行不裁、粘贴不溢出、
+      暗色占位可辨、**直方图与字段分析区共存**。四条发现全修, 最重的一条是
+      直方图整块消失 → 根因是腿二把它挪进 Column 后宽度折叠判定口径变了
+      (详见 spec 人工验收节 + `src/sidebar.rs` 模块头)
 - [x] 进 review 阶段（`/agent-skills:code-review-and-quality`）—— 2026-09-19 完成:
       REQUEST CHANGES, 无 Critical, **6 Required 全修**（R1 采样标注行漏算 /
       R2 hover 光标驱动化 / R3 枚举超限行并入其他+capped 语义拆分 / R4 文本截断

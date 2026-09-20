@@ -167,3 +167,17 @@ $tier$ 字段区分 personal/enterprise，$59/seat 的座位数不技术上强�
 否则 Paid」; `store_license.rs` 的 COM 单元 + `StoreContext::GetDefault`
 起手式从两个入口提为共用 `store_context()`。license.rs 其余 / keygen.rs /
 settings.rs 许可页通读后无可简化项。
+
+## 人工验收（2026-09-20 用户实机, 通过）
+
+许可页两处实机发现, 均已修:
+
+1. **长 key 粘贴渲染溢出录入框** —— 框架 `TextInput::paint` 无裁剪。修在
+   **danqing** (联动一笔): 内容一律裁进边框内侧 + 回归锁
+   `overflowing_text_is_clipped_inside_input_area`; 过滤/搜索栏同款隐患一并收。
+2. **暗色主题占位文本不可辨** —— `bind_theme` 有意不刷新占位色, 而许可框传的是
+   亮主题 `text_secondary` (深灰) → 暗底暗字。改用与过滤/搜索栏同款中性灰。
+
+真公钥已回填 (`PRODUCT_PUBKEY`, 私钥在仓库外 `~/.danqing-log-keys/`),
+便携版激活通路实机走通 (激活成功 + 输入框清空 + 反馈落页内)。商店半边仍待
+v1.0 过审后提交 add-on (外部硬顺序)。

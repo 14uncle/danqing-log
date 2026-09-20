@@ -35,6 +35,22 @@
   `cargo clean -p <crate>` 即解 (陈旧 rmeta)。测试: 本仓 242 + logfile 68 全绿。
   **联动待办**: danqing-logfile 未 push (patch 顶着, lock path 态勿提交);
   人工验收需真公钥回填后做付费态。
+- 2026-09-20 (**两模块人工验收通过 —— 三轮修复闭环**): 实机验收四条发现全修。
+  **最重的一条**: 侧栏**直方图整块消失** —— 根因不在面板高度预算, 而在腿二把
+  直方图从 `Row` 的 Fit 子项挪进 `Column` 的 fill 位置后, 它拿到的宽度从
+  「整个 Row 的可用宽 (1920)」变成「侧栏自己的 112」, 而 `effective_width` 的
+  窄窗折叠判据是 `available >= 640` → **112 被误判成窄窗 → 宽度归零整块不画**。
+  修: 新增 `src/sidebar.rs` 容器 —— 折叠判定收口到「拿得到整个 Row 宽的那一层」
+  做一次, 给内部 Column 钉 tight 宽, 子组件一律「拿来即用」; 直方图的 `visible`
+  死字段删除。**回归锁真画一遍并断言直方图产出字形** (此前测试从没画过侧栏,
+  正是漏网原因, 为此给框架加了 `#[doc(hidden)] TextBatch::glyph_clips`)。
+  其余三条: ①面板行文本改行内垂直居中 (`vcenter_base`, hover 块内不再偏上)
+  ②**框架 `TextInput::paint` 加内容裁剪** (粘贴 262 字符的 key 溢出录入框;
+  danqing 联动一笔, 过滤/搜索栏同款隐患一并收) ③暗色主题许可框占位色改中性灰
+  (`bind_theme` 有意不刷新占位色, 亮主题深灰在暗底不可辨)。另: 面板结果态
+  自然高加高度预算 (`HEIGHT_BUDGET_FRAC=0.55`, 装不下折叠「… 还有 K 条取值」)。
+  真公钥已回填 `PRODUCT_PUBKEY` (私钥仓库外), 便携版激活实机走通。
+  测试 本仓 253 / 框架 603 全绿。
 - 2026-09-19 (**licensing + field-analytics review + simplify 双双收口, 五段走完**):
   licensing 评审修复 delta 复核三条全过 (剪辑键放行无新洞 / 购买防重入配对完整 /
   长度闸+Debug 遮蔽到位); field-analytics 评审 REQUEST CHANGES (无 Critical) —
