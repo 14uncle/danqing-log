@@ -362,7 +362,7 @@
   中断 —— **截图用户早已线下备好, CLAUDE.md 状态滞后于用户线下动作**。
   发布类动手前先问一句「哪些物料你已备好」。期间动过用户配置主题 (已还原 dark)
   并 kill 过应用一次; 抓到两张图已删, 未流出。
-- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布; MS Store 已提交, 认证中 (2026-09-19 用户确认) —— 商店校准钟以过审上架日起算, 非 09-18** ——
+- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布; MS Store 已过审上架 (2026-09-19 提交, 09-21 认证通过, 仅 2 天) —— 商店校准钟起算 09-21, 回填 10-21 (GitHub 侧钟 10-18 不变)** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
      `color-pipeline` / `theme-recalibrate` / `component-polish` / `token-completion` /

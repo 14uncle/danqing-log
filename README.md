@@ -87,7 +87,7 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 
 - **GitHub Releases**（主）：[最新版](https://github.com/14uncle/danqing-log/releases/latest)
   取 `danqing-log-v<版本>-win-x64.zip` —— 不到 5 MB，解压即用，不写注册表
-- **Microsoft Store**（辅）：**已提交，认证中（2026-09-19）**，链接过审后补上 —— 商店版
+- **Microsoft Store**（辅）：**已过审上架（2026-09-19 提交，09-21 认证通过）**，商店页链接待补 —— 商店版
   由商店代管更新。联网行为：**v1.0 零网络请求**；v1.x 起商店版会查询付费层购买授权
   （经 Windows 的商店服务，应用自身不发 HTTP），便携版唯一联网动作仍是启动时查一次
   新版本（见[隐私政策](docs/privacy-policy.md)）

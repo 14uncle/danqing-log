@@ -84,5 +84,5 @@
 1. 注册 Lemon Squeezy / Gumroad + 提现；核实「自带 key 列表分发」（定 D2 逃逸舱去留）
 2. `cargo run --bin keygen -- generate <仓库外路径>` 生成真密钥对 → `pubkey` 子命令
    输出贴回 `license.rs` 的 `PRODUCT_PUBKEY`
-3. v1.0 商店过审后: trial 时长（建议 30 天, 待裁）+ add-on 创建（Offer ID 须 =
+3. ~~v1.0 商店过审后~~ **前置已解锁（v1.0 过审上架 2026-09-21）**: trial 时长（建议 30 天, 待裁）+ add-on 创建（Offer ID 须 =
    `danqing-log-full`, 图标 300×300 超采样工艺）+ IARC 改答「是」+ `PURCHASE_URL` 回填

@@ -159,7 +159,8 @@ Error 43,464 / **Fatal 4,760**，一眼知道该看哪行），也是排障的�
   —— **已清**（两仓 working tree 均 clean，`dev` 无领先 origin 的提交）
 - **v1.0 收尾工作面**（不属本文件付费层，但挡在 v1.x 前面）：
   ~~等级直方图~~（**已交付**，待验收）· ~~README 重写~~（**已完成**）/
-  **余下**：MSIX 打包 + Store 上架 / 版本号 `1.0.0` + git tag
+  ~~**余下**：MSIX 打包 + Store 上架 / 版本号 `1.0.0` + git tag~~ —— **全部落地**
+  （GitHub v1.0.0 已发布 2026-09-18；Store 09-19 提交、**09-21 过审上架**，纯免费层）
 - 腿一依赖 live-tail 已有的增量索引能力（`append_from` / `lines_from` / `run_filter_from`）
 
 ## 六、相关文档
