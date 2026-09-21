@@ -35,7 +35,7 @@ cargo run --release --bin logbench -- test-data/test-1g.jsonl
 cargo run --release --bin logbench -- test-data/test-1g.jsonl --filter "level=ERROR status=500"
 ```
 
-## 预期性能指标
+## 预期性能指标（POC 期，2026-09-11 大小写敏感时代值；现行值见 `PERFORMANCE_REPORT.md`）
 
 | 指标 | 目标值 | 实测值 | 状态 |
 |------|--------|--------|------|

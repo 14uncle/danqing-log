@@ -44,12 +44,11 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
 一句话定位：**klogg 的速度 × LogViewPlus 的结构化**。
 
 - **对 klogg**：同为 mmap 架构，速度同档（不声称碾压）。缝在功能与维护 —— klogg 最近一次
-  release 是四年多前、commit 停了 22 个月（2026-09-16 查证），无 JSONL 支持，编码检测
-  保守（GBK 中文日志会被当成 ISO-8859-1）。
-- **对 LogViewPlus**：功能全，但全量解析 = 打开慢的结构性代价，且是付费商业软件。
-  LogLens 走 mmap + 虚拟视口，结构性快；v1.0 全功能免费。
-- **对 VS Code / 记事本**：GB 级文件要么拒开要么卡死；JSON 扩展能列化，但占着编辑器、
-  吃编辑器资源。
+  release 是四年多前、commit 停了 22 个月（2026-09-16 查证），无 JSONL 支持。
+- **对 LogViewPlus**：功能全，但全量解析 = 打开慢的结构性代价（1 GB 冷启动本机实测约
+  60 秒），且是付费商业软件。LogLens 走 mmap + 虚拟视口，结构性快；v1.0 全功能免费。
+- **对 VS Code**：能开但慢 —— 1 GB 明文日志本机实测约 10 秒（2026-09-20）；JSONL 列化
+  要靠扩展（Daucloud 同文件冷启动实测约 7 秒），还占着编辑器、吃编辑器资源。
 
 > 完整对比表与逐项证据日期见 [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md)「竞品对比」
 > 与 [DEEP_COMPETITIVE_RESEARCH.md](docs/DEEP_COMPETITIVE_RESEARCH.md)。
