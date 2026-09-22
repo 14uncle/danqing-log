@@ -7,7 +7,7 @@
 #
 # Usage (from repo root):
 #   powershell -NoProfile -File tools/package_portable.ps1
-#   powershell -NoProfile -File tools/package_portable.ps1 -Version 1.0.0
+#   powershell -NoProfile -File tools/package_portable.ps1 -Version 1.0.1
 #
 # Always runs cargo build --release before packaging.
 
