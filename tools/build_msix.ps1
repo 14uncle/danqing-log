@@ -6,7 +6,7 @@
 #
 # 用法 (仓库根目录):
 #   powershell -NoProfile -File tools/build_msix.ps1
-#   powershell -NoProfile -File tools/build_msix.ps1 -Version 1.0.0
+#   powershell -NoProfile -File tools/build_msix.ps1 -Version 1.0.1
 #
 # 默认标识**就是** Partner Center 的真实值 (2026-09-13 回填) —— 直接跑出来的包即可提交。
 # 要改身份走 `-AppName` / `-PublisherCN` / `-PublisherDisplayName` 覆盖。

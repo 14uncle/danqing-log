@@ -1,5 +1,9 @@
 # 竞品对比指南
 
+> ⚠️ **本文档是 POC 期产物（2026-09-21 清扫时保留作档案）**。权威口径以
+> `PERFORMANCE_REPORT.md`（实测数字 + 竞品对比表）、`docs/DEEP_COMPETITIVE_RESEARCH.md` §2.2、
+> `docs/ROADMAP-v1x.md` §六（对外口径基准）为准。本文数字若与它们冲突，以它们为准。
+
 ## 快速开始
 
 ### 1. 运行竞品对比测试
@@ -19,10 +23,10 @@ test_competitive.bat
 
 | 场景 | 我们 | klogg | LogViewPlus |
 |------|------|-------|-------------|
-| 冷启动 (1GB) | ~600ms | 秒级 | 慢 |
-| 热启动 (1GB) | ~90ms | 快 | 慢 |
-| 搜索 | 69ms | 快 | 慢 |
-| JSONL 字段过滤 | 70ms | N/A | N/A |
+| 冷启动 (1GB) | ~600ms | 未实测 | 60 s（实测） |
+| 热启动 (1GB) | ~90ms | 未实测 | 未实测 |
+| 搜索 | 115ms | 未实测 | 未实测 |
+| JSONL 字段过滤 | 40ms | N/A（无 JSONL） | 未实测 |
 
 ### 功能对比
 
@@ -32,7 +36,7 @@ test_competitive.bat
 | JSONL 列化 | ✅ | ❌ | ❌ |
 | 字段过滤 | ✅ | ❌ | ❌ |
 | 嵌套展开 | ✅ | ❌ | ❌ |
-| ANSI 颜色 | ✅ | ❌ | ✅ |
+| ANSI 颜色 | ❌ | ❌ | ✅ |
 | 活跃维护 | ✅ | ❌ | ✅ |
 | 价格 | $0 / $29 | 免费 | $45/$95 |
 
@@ -42,7 +46,7 @@ test_competitive.bat
 
 > **丹青日志 LogLens**：klogg 的速度 × LogViewPlus 的结构化
 > 
-> 专业日志查看器，JSONL 列化独家功能
+> 原生桌面、秒开的 JSONL 列化
 
 ### 2. 三栏对比图
 
@@ -51,8 +55,8 @@ test_competitive.bat
 │  丹青日志        │    klogg        │  LogViewPlus    │
 │    LogLens      │                 │                 │
 ├─────────────────┼─────────────────┼─────────────────┤
-│ 打开: ~600ms    │ 打开: 秒级      │ 打开: 慢        │
-│ 搜索: 69ms      │ 搜索: 快        │ 搜索: 慢        │
+│ 打开: ~600ms    │ 打开: 未实测    │ 打开: 60s实测   │
+│ 搜索: 115ms     │ 搜索: 未实测    │ 搜索: 未实测    │
 │ JSONL: ✅       │ JSONL: ❌       │ JSONL: ❌       │
 │ 维护: 活跃      │ 维护: 停更4年   │ 维护: 活跃      │
 │ 价格: $0/$29    │ 价格: 免费      │ 价格: $45/$95   │
@@ -61,25 +65,8 @@ test_competitive.bat
 
 ### 3. Show HN 稿件
 
-**标题**：
-> Show HN: 丹青日志 LogLens – klogg 的速度 × LogViewPlus 的结构化
-
-**正文**：
-> 你好 HN！
->
-> 我开发了丹青日志 LogLens，一个专业的大文件日志查看器。
->
-> **核心优势**：
-> - 速度：与 klogg 同档（mmap 架构），1GB 文件搜索 69ms
-> - 功能：JSONL 列化 + 字段过滤（独家）
-> - 维护：活跃开发，定期更新
->
-> **为什么做这个**：
-> - klogg 停更4年，273 open issue 未解决
-> - LogViewPlus 性能差，价格高
-> - JSONL 日志无专业工具
->
-> 欢迎试用！GitHub: https://github.com/14uncle/danqing-log
+> ⚠️ **POC 期旧稿已废（2026-09-21 清扫）**：原稿是中文、引用敏感时代旧值（69ms）。
+> 定稿英文文案见农场 `danqing/docs/intent/curated-channel-submission-plan-2026-09-20.md` 文案 3。
 
 ## 目标用户
 
@@ -92,7 +79,7 @@ test_competitive.bat
 
 **迁移理由**：
 - ✅ 相同性能（mmap 架构）
-- ✅ 更多功能（JSONL、ANSI 颜色）
+- ✅ 更多功能（JSONL 列化 + 字段过滤）
 - ✅ 活跃维护
 
 ### 2. LogViewPlus 迁移用户

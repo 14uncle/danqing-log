@@ -27,3 +27,5 @@ desktop.ini
 # 缺失时按 tools/build_msix.ps1 头部注释补 (nuget 取 Microsoft.Windows.SDK.BuildTools)。
 tools/sdk-tools/
 __pycache__/
+*.secret
+*.license.key

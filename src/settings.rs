@@ -2,7 +2,7 @@
 //! @date 2026/09/06
 //!
 //! 轻量设置卡：danqing::Overlay 承载 scrim/居中/模态门控 + **不透明**卡
-//! (多页签: 常规 / 快捷键 / 关于)。
+//! (多页签: 常规 / 快捷键 / 许可 / 关于)。
 //!
 //! 为什么分页签: 单列堆叠在加上「快捷键」段后会把卡片顶得很高 (矮窗口下顶到边),
 //! 而分页签后每一页各自只有原来那么高 —— 也用上了框架自带 `Tabs` (自绘 tab 栏 + 指示线)。
@@ -11,16 +11,18 @@
 use std::any::Any;
 
 use danqing::widget::{
-    Box as UiBox, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay, Padding,
-    Row, Switch, Tabs, Text, Widget,
+    Box as UiBox, Button, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay,
+    Padding, Row, Switch, Tabs, Text, TextInput, Widget,
 };
 use danqing::{
-    Color, Constraints, Edges, Event, Key, NamedKey, Point, Rect, RectBatch, Size, TextBatch, Theme,
+    Color, Constraints, Edges, Event, Key, LightTheme, NamedKey, Point, Rect, RectBatch, Size,
+    TextBatch, Theme,
 };
 
 use crate::LogApp;
 use crate::Msg;
 use crate::config::{self, AppTheme};
+use danqing_log::license::{self, Entitlement, PaidSource};
 
 /// 卡片宽度。
 const CARD_WIDTH: f32 = 360.0;
@@ -100,15 +102,19 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                 .child(
                     Tabs::new(&t)
                         // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
-                        // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 关于)。
+                        // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 许可 / 3 = 关于)。
                         // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
                         // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
-                        // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例)。
+                        // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例);
+                        // 许可 (SPEC-v1x-licensing D8) 在快捷键后、关于前。
+                        // 别处要引用「许可」下标, 用同文件相邻的 [`LICENSE_TAB_INDEX`] 常量。
                         .tab("常规")
                         .tab("快捷键")
+                        .tab("许可")
                         .tab("关于")
                         .child(panel_box(general_content()))
                         .child(panel_box(shortcuts_section(content_w)))
+                        .child(panel_box(license_content(content_w)))
                         .child(panel_box(about_content(content_w)))
                         // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
                         // 第一页更省事), 且 Esc/点遮罩关闭不丢。
@@ -124,10 +130,15 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
         .width(CARD_WIDTH)
 }
 
+/// 「许可」页签下标 —— 与 `.tab()` 链同文件相邻, 是唯一合法引用点 (T7 升级
+/// 提示的「去激活」要跳这页)。别处别抄数字 (2026-09-13 序号双抄漂过的教训)。
+pub(crate) const LICENSE_TAB_INDEX: usize = 2;
+
 /// 「常规」页签: 可配置项的家。
 ///
 /// 留在原处(`关于`页)才是错的: 那儿是**只读**的产品身份页, 把可点击的开关混进去,
-/// 用户没法一眼分辨「哪些能改、哪些只是展示」。v1.x 的授权行也归这页。
+/// 用户没法一眼分辨「哪些能改、哪些只是展示」。v1.x 的授权有独立「许可」页签
+/// (SPEC-v1x-licensing D8), 不归这页。
 fn general_content() -> impl Widget {
     Column::new()
         .gap(16.0)
@@ -162,6 +173,212 @@ fn histogram_switch() -> impl Widget {
                 .bind_theme(|app: &LogApp| app.theme.theme())
                 .on_toggle(|| Msg::ToggleHistogram),
         )
+}
+
+// ─── 「许可」页签 (SPEC-v1x-licensing D8) ─────────────────────────────
+
+/// 当前层一行字。试用天数按剩余整天数算, 不做日历换算 (零依赖)。
+/// 纯逻辑形态 `*_at` 供测试; UI 用无参版 (读系统时钟)。
+fn entitlement_label_at(e: &Entitlement, now_epoch: u64) -> String {
+    match e {
+        Entitlement::Free => "当前：免费层 —— 单文件全功能，永久免费".to_string(),
+        Entitlement::Trial { expires_epoch } => {
+            let days = expires_epoch.saturating_sub(now_epoch) / 86_400;
+            format!("当前：付费层试用中（剩余约 {days} 天）")
+        }
+        Entitlement::Paid { source } => match source {
+            PaidSource::License(p) => {
+                let tier = match p.tier {
+                    license::Tier::Personal => "个人版",
+                    license::Tier::Enterprise => "企业版",
+                };
+                format!("当前：付费层 · {tier}（{}）", license::mask_email(&p.email))
+            }
+            PaidSource::StoreAddOn => "当前：付费层 · 商店内购".to_string(),
+        },
+    }
+}
+
+fn entitlement_label(e: &Entitlement) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    entitlement_label_at(e, now)
+}
+
+/// 「许可」页: 当前层 / key 激活 / 按钮行 / 激活反馈。
+/// 反馈显示在页内 —— 底栏 notice 会被模态卡遮住, 看不见 (main.rs 同注)。
+fn license_content(content_w: f32) -> impl Widget {
+    Column::new()
+        .gap(12.0)
+        .cross_center()
+        .child(content_row(tier_status_text(), content_w))
+        .child(content_row(key_input_box(), content_w))
+        .child(content_row(license_buttons_row(), content_w))
+        .child(content_row(license_feedback_text(), content_w))
+}
+
+fn tier_status_text() -> impl Widget {
+    Text::bind(|app: &LogApp| entitlement_label(&app.entitlement))
+        .font_size(BODY_SIZE)
+        .bind_color(|app: &LogApp| app.theme.theme().text_primary())
+}
+
+/// key 输入框。主题跟随照 `view.rs` 的 `base_input` 范式: 构造值只作首帧
+/// 兜底, `bind_theme` 每帧重取 (回归锁 `filter_input_color_follows_theme`
+/// 钉的是同一个坑)。**占位色不传主题色**: `bind_theme` 不刷新占位色
+/// (框架设计如此), 亮主题深灰到了暗主题就是暗底暗字 (2026-09-20 人工
+/// 验收) —— 用与过滤/搜索栏同款的中性灰, 明暗两底都可辨。
+fn key_input_box() -> impl Widget {
+    let input = TextInput::themed(&LightTheme)
+        .bind_theme(|app: &LogApp| app.theme.theme())
+        // 激活成功后清空框内明文 key (应用侧 bump `license_clear_rev`;
+        // 框架 `TextInput::bind_clear`, 2026-09-19 下沉的机制)。
+        .bind_clear(|app: &LogApp| app.license_clear_rev)
+        .font_size(BODY_SIZE)
+        .placeholder(
+            "粘贴 license key（loglens1.…）",
+            Color::rgb(0.45, 0.45, 0.48), // 与 base_input 占位灰同款
+        )
+        .on_change(|s: &str| Msg::LicenseKeyInput(s.to_owned()));
+    UiBox::new(Color::TRANSPARENT)
+        .width(content_width())
+        .child(input)
+}
+
+/// 「激活」+「获取付费层」按钮行。
+///
+/// `Button` 没有 `bind_theme` (框架缺口, 已知): 用 `bind_color` 每帧跟随
+/// 主题 accent, hover 自动提亮绑定色 1.2 倍 (button.rs paint 段), 主题切换
+/// 不会留残色。radius/padding 取自构造主题的间距 token —— 明暗两主题的
+/// 间距 token 相同, 只有颜色流动, 故构造期取哪个都无碍。
+fn license_buttons_row() -> impl Widget {
+    let label = |s: &str| {
+        Text::new(s.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE)
+    };
+    let mut row = Row::new().gap(8.0).cross_center().child(
+        Button::themed(&LightTheme, label("激活"))
+            .bind_color(|app: &LogApp| app.theme.theme().accent())
+            .on_click(|| Msg::ActivateLicenseClicked),
+    );
+    if show_purchase_button() {
+        row = row.child(
+            // 购买在途时标签变「购买中…」(与 main.rs 的防重入闸配对;
+            // 按钮藏不了 —— 无运行时显隐绑定 —— 至少文案不撒谎)。
+            Button::themed(
+                &LightTheme,
+                Text::bind(|app: &LogApp| {
+                    if app.purchase_in_flight {
+                        "购买中…".to_string()
+                    } else {
+                        "获取付费层".to_string()
+                    }
+                })
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+            )
+            .bind_color(|app: &LogApp| app.theme.theme().accent())
+            .on_click(|| Msg::PurchasePaidLayer),
+        );
+    }
+    row
+}
+
+/// 「获取付费层」按钮显隐 (D8): 便携版在 `PURCHASE_URL` 回填前**隐藏**
+/// (不给死链接); 商店版始终显示 (add-on 进目录前的窗口期点购买报
+/// 「购买未完成」属预期, pomodoro 实测)。构造期求值即可: `PURCHASE_URL`
+/// 是编译期常量, `is_packaged` 是进程级常量, 两者在进程生命内都不变。
+fn show_purchase_button() -> bool {
+    license::PURCHASE_URL.is_some() || danqing::platform::is_packaged()
+}
+
+fn license_feedback_text() -> impl Widget {
+    Text::bind(|app: &LogApp| {
+        app.license_feedback
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default()
+    })
+    .font_size(BODY_SIZE)
+    .bind_color(|app: &LogApp| match &app.license_feedback {
+        Some((_, crate::NoticeKind::Warn)) => app.theme.theme().danger(),
+        _ => app.theme.theme().text_secondary(),
+    })
+}
+
+/// 统一升级提示 (SPEC-v1x-licensing D3 / T7): 免费用户触发付费功能时弹出。
+/// 与设置卡同族 (Overlay scrim + 不透明 `background()` 卡), 内容 = 功能名 +
+/// 一句分层说明 + 两个入口 (购买 / 去激活)。关闭路: 点遮罩 / Esc /
+/// 任一入口按钮 —— 故卡面无独立关闭钮。
+pub(crate) fn upgrade_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    let label = |s: &str| {
+        Text::new(s.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE)
+    };
+    let mut buttons = Row::new().gap(8.0).cross_center().child(
+        Button::themed(&LightTheme, label("已有 key？去激活"))
+            .bind_color(|app: &LogApp| app.theme.theme().accent())
+            .on_click(|| Msg::UpgradeGotoActivate),
+    );
+    if show_purchase_button() {
+        buttons = buttons.child(
+            Button::themed(
+                &LightTheme,
+                Text::bind(|app: &LogApp| {
+                    if app.purchase_in_flight {
+                        "购买中…".to_string()
+                    } else {
+                        "获取付费层".to_string()
+                    }
+                })
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+            )
+            .bind_color(|app: &LogApp| app.theme.theme().accent())
+            .on_click(|| Msg::UpgradePurchase),
+        );
+    }
+    let card = UiBox::new(t.background())
+        // 底色走绑定 (同设置卡): 视图树只建一次, 构造值不跟主题切换走。
+        .bind_color(|app: &LogApp| app.theme.theme().background())
+        .radius(12.0)
+        .child(Padding::new(
+            Edges {
+                top: 24.0,
+                right: CARD_PAD_X,
+                bottom: 16.0,
+                left: CARD_PAD_X,
+            },
+            Column::new()
+                .gap(16.0)
+                .cross_center()
+                .child(
+                    Text::bind(|app: &LogApp| match app.upgrade_prompt {
+                        Some(f) => format!("「{}」是付费层功能", f.label()),
+                        None => String::new(),
+                    })
+                    .font_size(BODY_SIZE)
+                    .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+                )
+                .child(
+                    Text::new(
+                        "付费层 = 批量 / 留存 / 交付：$29 个人买断 · $59 企业，永久使用"
+                            .to_string(),
+                    )
+                    .font_size(BODY_SIZE)
+                    .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+                )
+                .child(buttons),
+        ))
+        .width(CARD_WIDTH);
+    Overlay::themed(&t, Center::new(card).fill_max())
+        .bind_open(|app: &LogApp| app.upgrade_prompt.is_some())
+        .on_scrim_click(|| Msg::CloseUpgradePrompt)
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -587,6 +804,78 @@ mod tests {
     /// 画到卡片外面去 (框架的 `Box`/`Column` 都不裁剪)。这条测试就是那句话的
     /// 可执行版本: 谁把某一页加高到越过 `PANEL_CONTENT_H`, 这里立刻红,
     /// 而不是等他肉眼在卡片外沿发现多出来一行。
+    /// 「许可」页当前层文案: 五态 (D8)。
+    #[test]
+    fn entitlement_label_covers_all_states() {
+        use danqing_log::license::{Payload, Tier};
+        assert_eq!(
+            entitlement_label_at(&Entitlement::Free, 1_700_000_000),
+            "当前：免费层 —— 单文件全功能，永久免费"
+        );
+        assert_eq!(
+            entitlement_label_at(
+                &Entitlement::Trial {
+                    expires_epoch: 1_700_000_000 + 3 * 86_400
+                },
+                1_700_000_000
+            ),
+            "当前：付费层试用中（剩余约 3 天）"
+        );
+        // 过期瞬间 = 剩余 0 天 (文案不撒谎; 门控那侧 allows_at 同口径关闸)
+        assert_eq!(
+            entitlement_label_at(
+                &Entitlement::Trial {
+                    expires_epoch: 1_700_000_000
+                },
+                1_700_000_000
+            ),
+            "当前：付费层试用中（剩余约 0 天）"
+        );
+        let paid = |tier: Tier| Entitlement::Paid {
+            source: PaidSource::License(Payload {
+                tier,
+                email: "alice@example.com".into(),
+                issued_at: "1760000000".into(),
+                nonce: "n".into(),
+                expires: None,
+            }),
+        };
+        assert_eq!(
+            entitlement_label_at(&paid(Tier::Personal), 0),
+            "当前：付费层 · 个人版（a***@example.com）"
+        );
+        assert_eq!(
+            entitlement_label_at(&paid(Tier::Enterprise), 0),
+            "当前：付费层 · 企业版（a***@example.com）"
+        );
+        assert_eq!(
+            entitlement_label_at(
+                &Entitlement::Paid {
+                    source: PaidSource::StoreAddOn
+                },
+                0
+            ),
+            "当前：付费层 · 商店内购"
+        );
+    }
+
+    /// 「获取付费层」按钮显隐 (D8): 测试环境 = 便携版且 `PURCHASE_URL` 未回填
+    /// → 必须隐藏 (不给死链接)。回填后本测试转红, 届时改写为「显示」。
+    #[test]
+    fn purchase_button_hidden_until_shop_opens() {
+        assert!(
+            !show_purchase_button(),
+            "PURCHASE_URL 占位期间便携版不显示购买按钮"
+        );
+    }
+
+    #[test]
+    fn license_tab_index_matches_tab_chain() {
+        // tripwire (评审 Nit 修正自称): 这条只锁「改了常量没改测试」——
+        // 它证不了常量与 .tab() 链的真一致, 只逼你重排链子时回来看一眼。
+        assert_eq!(LICENSE_TAB_INDEX, 2, "「许可」是第三个页签 (0 起)");
+    }
+
     #[test]
     fn panel_contents_fit_fixed_height() {
         let w = content_width();
@@ -595,11 +884,19 @@ mod tests {
 
         let mut general = general_content();
         let mut shortcuts = shortcuts_section(w);
+        let mut license = license_content(w);
         let mut about = about_content(w);
+        // 许可页两条 `Text::bind` 行 (当前层/反馈) 在合成几何处是空串,
+        // 量不出真实行高 —— 手动补两行 (评审 Optional: 口径与名义对齐)。
+        let bind_lines = 2.0 * texts.line_height(f32::from(BODY_SIZE));
 
         let cases = [
             ("常规", natural_height(&mut general, c, &mut texts)),
             ("快捷键", natural_height(&mut shortcuts, c, &mut texts)),
+            (
+                "许可(含绑定行)",
+                natural_height(&mut license, c, &mut texts) + bind_lines,
+            ),
             // 关于页会随「有新版本」长出一行, 按**最坏情况**(提示存在)算
             (
                 "关于(含更新提示)",

@@ -4,6 +4,67 @@
 
 ## 状态
 
+- 2026-09-19 (**v1.x 付费层开工 —— licensing 模块 build 完成, 待 review**): 用户四裁决
+  (GitHub 轨 = License key + 代销 / 便携版无试用钟 / 首波 = 基建+腿二三四, 腿一第二波 /
+  免费层协同欠账搭车) → 能力地图 `docs/specs/SPEC-v1x-map.md` (七模块+顺序, 已批准) →
+  `SPEC-v1x-licensing` → plan/todo → /build auto **T1–T8 全绿零 commit**。
+  产出: `src/license.rs` (Ed25519 离线校验 + Entitlement 状态机 + license.key 持久化 +
+  商店快照映射纯函数) / `src/store_license.rs` (WinRT broker 查询+购买, pomodoro 成稿移植,
+  IsActive 陷阱写明; **StoreLicense 无 IsTrial —— crate 源码实证**, trial/买断靠
+  ExpirationDate 有限性区分) / `src/bin/keygen.rs` (私钥仓库外) / 设置卡「许可」页签
+  (第三页, LICENSE_TAB_INDEX 常量) / 统一升级提示对话框 / 隐私政策升 1.x + README 付费层节。
+  **评审双路已闭环**: 代码评审 REQUEST CHANGES (1 Critical 模态守卫吞 Ctrl+V +
+  2 Required 购买防重入/反馈通道) + 安全审计 PASS —— 全部修复, 含框架联动
+  `TextInput::bind_clear` (danqing 未 push, 本仓 patch 开着, lock 现为 path 态待复钉)。
+  **231 测试绿 (lib 79 / main 141 / genlog 8 / keygen 3)**, clippy 0, fmt 过。
+  **公钥占位全零 = 收银台未开业安全默认**; 用户侧待办 (keygen 生成真密钥对回填公钥 /
+  代销商注册 / 商店 add-on 等 v1.0 过审硬顺序) 见 `tasks/todo-v1x-licensing.md` 末节。
+  下一步: review 阶段; 之后按地图顺序起 `field-analytics` (腿二) spec —— 它有引擎前置
+  (字符串切取→真 parser 边界, SPEC-jsonl-table:16), 动 danqing-logfile。
+- 2026-09-19 (**腿二 field-analytics build 完成, 待 review**): spec (D1–D8, 两裁定:
+  侧栏扩展 + 跟随过滤) → plan → T1–T5 全绿零 commit。产出: `danqing-logfile/src/scan.rs`
+  (**顶层字段扫描器** —— 单遍状态机零 Value 树, 与 serde_json 差分对拍 3000 行×5 字段全等;
+  抓到 serde 浮点解析与 str::parse 差 1 ulp 的真差异, 对拍按整数全等+浮点 1e-15 容差收口)
+  / `src/analysis.rs` (数值流式四项 + reservoir 分位数上限 100 万值标「采样估计」,
+  枚举 Top20+其他桶+混合类型跳过计数, 作用域跟随过滤行集) / `src/analysis_panel.rs`
+  (侧栏两态组件: 字段行逐点即分析 = 门控点位, 结果视图含作用域行+「基于旧过滤」标注;
+  **下拉改逐行可点** —— 下拉建树冻结而 schema 开文件才有) / `logbench --analyze`。
+  **实测 (1GiB 热缓存): 全文件单列 1001ms (≤1.5s 目标过), 跟随过滤 124ms**,
+  已进 PERFORMANCE_REPORT.md。门控接 licensing (`ShowUpgradePrompt` 的 allow(dead_code)
+  已删 —— 第一条真腿接上门)。**坑**: patch 态下兄弟仓加新模块 clippy 报找不到 →
+  `cargo clean -p <crate>` 即解 (陈旧 rmeta)。测试: 本仓 242 + logfile 68 全绿。
+  **联动待办**: danqing-logfile 未 push (patch 顶着, lock path 态勿提交);
+  人工验收需真公钥回填后做付费态。
+- 2026-09-20 (**两模块人工验收通过 —— 三轮修复闭环**): 实机验收四条发现全修。
+  **最重的一条**: 侧栏**直方图整块消失** —— 根因不在面板高度预算, 而在腿二把
+  直方图从 `Row` 的 Fit 子项挪进 `Column` 的 fill 位置后, 它拿到的宽度从
+  「整个 Row 的可用宽 (1920)」变成「侧栏自己的 112」, 而 `effective_width` 的
+  窄窗折叠判据是 `available >= 640` → **112 被误判成窄窗 → 宽度归零整块不画**。
+  修: 新增 `src/sidebar.rs` 容器 —— 折叠判定收口到「拿得到整个 Row 宽的那一层」
+  做一次, 给内部 Column 钉 tight 宽, 子组件一律「拿来即用」; 直方图的 `visible`
+  死字段删除。**回归锁真画一遍并断言直方图产出字形** (此前测试从没画过侧栏,
+  正是漏网原因, 为此给框架加了 `#[doc(hidden)] TextBatch::glyph_clips`)。
+  其余三条: ①面板行文本改行内垂直居中 (`vcenter_base`, hover 块内不再偏上)
+  ②**框架 `TextInput::paint` 加内容裁剪** (粘贴 262 字符的 key 溢出录入框;
+  danqing 联动一笔, 过滤/搜索栏同款隐患一并收) ③暗色主题许可框占位色改中性灰
+  (`bind_theme` 有意不刷新占位色, 亮主题深灰在暗底不可辨)。另: 面板结果态
+  自然高加高度预算 (`HEIGHT_BUDGET_FRAC=0.55`, 装不下折叠「… 还有 K 条取值」)。
+  真公钥已回填 `PRODUCT_PUBKEY` (私钥仓库外), 便携版激活实机走通。
+  测试 本仓 253 / 框架 603 全绿。
+- 2026-09-19 (**licensing + field-analytics review + simplify 双双收口, 五段走完**):
+  licensing 评审修复 delta 复核三条全过 (剪辑键放行无新洞 / 购买防重入配对完整 /
+  长度闸+Debug 遮蔽到位); field-analytics 评审 REQUEST CHANGES (无 Critical) —
+  引擎与算法原样通过, **6 Required 全修**: ①数值结果漏算采样标注行 (旗舰路径必裁,
+  行账目守卫测试锁) ②字段行无 hover (改光标驱动+pressed 锚点, 直方图同款)
+  ③枚举 distinct 超限行丢弃→并入「其他」, capped 语义拆分 (21 取值不再误标
+  「取值过多已合并」) ④面板文本 measure 截断+push_clip 兜底 (112px 侧栏溢出
+  盖画 LogView) ⑤分析快照改读 `filter_landed` 落账串 + `filter_pending` 在途闸
+  (同族顺手收: Esc/空查询作废在途过滤 job, live-tail 增量合并窗口禁行)
+  ⑥选择器字段行封顶 16+「还有 N 列」行。修复锁测试 +8, 基线 242→**250** 绿。
+  随后 code-simplify 4 处 (枚举计数器死代码/面板别名残留/map_store_snapshot
+  同义 arm 合并/store_context 起手式提公用), 行为零变化, 250 绿不破; scan.rs/
+  keygen/许可页通读后判定不动 (不为动而动)。**腿三 export 可起 spec**; 遗留:
+  人工验收需用户先跑 keygen 生成真密钥对回填公钥。
 - 2026-09-05: 开枪 + 当日建仓 + POC 双前提判过 → 用户发起 spec = 转正; 深夜 /build auto 零 commit core-viewer T1–T7 全绿
 - 2026-09-06: jsonl-table / live-tail 闭环 (均 spec→plan→build→review + 人工验收); app-chrome A1–A5 + settings S1–S5 落地; 过滤/搜索栏已重构成真 TextInput (IME 三补丁删除); 切浅色主题 (白底不回头) + 命名「丹青日志 LogLens」+ Ctrl+O
 - 2026-09-07: 无参启动空态; genlog 参数白名单; 浅色 UI 精修
@@ -301,7 +362,7 @@
   中断 —— **截图用户早已线下备好, CLAUDE.md 状态滞后于用户线下动作**。
   发布类动手前先问一句「哪些物料你已备好」。期间动过用户配置主题 (已还原 dark)
   并 kill 过应用一次; 抓到两张图已删, 未流出。
-- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布, MS Store 提交是唯一余步** ——
+- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布; MS Store 已过审上架 (2026-09-19 提交, 09-21 认证通过, 仅 2 天) —— 商店校准钟起算 09-21, 回填 10-21 (GitHub 侧钟 10-18 不变)** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
      `color-pipeline` / `theme-recalibrate` / `component-polish` / `token-completion` /

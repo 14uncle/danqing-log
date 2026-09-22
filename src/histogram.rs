@@ -16,8 +16,10 @@
 //! 只读态在**顶部**给一行「仅统计·不可点选」说明 (2026-09-14: 两种模式侧栏长得一样,
 //! 用户实机把「活着但不能点」读成了「坏了」; 首版放底部角落同日被否 —— 谁看得到啊)。
 //!
-//! 布局: 本组件是 LogView 的 **sibling** (顶层 `Row[Histogram, LogView.fill]`),
-//! 不侵入 LogView 内部的坐标数学 —— 后者只是拿到一个更窄的 `area`。
+//! 布局: 本组件在 [`crate::sidebar::Sidebar`] 容器里 (直方图吃剩余高度 +
+//! 字段分析区自然高), 容器是 LogView 的 **sibling** —— 不侵入 LogView 内部的
+//! 坐标数学, 后者只是拿到一个更窄的 `area`。**宽度由容器给** (tight),
+//! 本组件不重判折叠 (2026-09-20 实机教训, 见 `sidebar.rs` 模块头)。
 
 use std::any::Any;
 
@@ -34,13 +36,13 @@ use crate::{LogApp, Msg};
 /// 侧栏宽度 (逻辑像素)。
 pub(crate) const HIST_WIDTH: f32 = 112.0;
 /// 左右内边距。
-const PAD_X: f32 = 10.0;
+pub(crate) const PAD_X: f32 = 10.0;
 /// 顶部内边距。
-const PAD_Y: f32 = 8.0;
+pub(crate) const PAD_Y: f32 = 8.0;
 /// 行高 (标签行 + 横条行 + 行距)。
-const ROW_H: f32 = 28.0;
+pub(crate) const ROW_H: f32 = 28.0;
 /// 标签/计数字号。
-const LABEL_SIZE: u16 = 12;
+pub(crate) const LABEL_SIZE: u16 = 12;
 /// 横条高度。
 const BAR_H: f32 = 6.0;
 /// 标签行与横条之间的间距。
@@ -67,7 +69,7 @@ const HINT_ROW_H: f32 = 20.0;
 ///
 /// paint/event 不重判这个函数, 而是看 layout 给出的实际宽度 (`area.size.width`)
 /// —— 判定只有一处, 不存在「宽度 0 却还在画/还在吃点击」的漏判。
-fn effective_width(visible: bool, available: f32) -> f32 {
+pub(crate) fn effective_width(visible: bool, available: f32) -> f32 {
     if visible && available >= MIN_CONTENT_WIDTH {
         HIST_WIDTH
     } else {
@@ -141,8 +143,6 @@ pub(crate) struct LevelHistogram {
     counts: LevelCounts,
     /// 每桶的点选子句 (来自当前文件的级别类列; 全 None = 只读侧栏)。
     queries: LevelQueries,
-    /// 用户开关 (`Ctrl+L`)。关掉时宽度归零, 与「窄窗自动折叠」同一条路径。
-    visible: bool,
     /// 计数是否仍在后台算。
     ///
     /// 未就绪时**必须显示「…」而不是 0** —— 0 会被读成「这个文件真的没有 ERROR」,
@@ -184,7 +184,6 @@ impl LevelHistogram {
             counts: LevelCounts::default(),
             queries: levels::no_level_queries(),
             active_src: String::new(),
-            visible: true,
             pending: false,
             file_open: false,
             active: None,
@@ -261,7 +260,6 @@ impl Widget for LevelHistogram {
         self.counts = *app.level_counts.as_ref();
         let queries_changed = self.queries != app.level_queries;
         self.queries = app.level_queries.clone();
-        self.visible = app.histogram_visible;
         self.pending = app.levels_pending;
         self.file_open = app.has_file;
         // 生效行由**已应用的过滤串**反推, 不另存状态 —— 手打 `LEVEL=ERROR*`
@@ -290,7 +288,10 @@ impl Widget for LevelHistogram {
         } else {
             0.0
         };
-        Size::new(effective_width(self.visible, max.width), h)
+        // 宽度**拿来即用** (截到 HIST_WIDTH): 折叠判定 (Ctrl+L / 窄窗) 在
+        // 侧栏容器做一次 —— 它拿得到整个 Row 的可用宽, 本组件拿不到
+        // (见 `sidebar.rs` 模块头: 在这里重判会把自己的宽误判成窄窗)。
+        Size::new(max.width.min(HIST_WIDTH), h)
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {

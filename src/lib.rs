@@ -6,7 +6,9 @@
 //! logfile/jsonl 引擎已拆为兄弟 crate `danqing-logfile` (2026-09-10)。
 
 pub use danqing_logfile::{jsonl, logfile};
+pub mod analysis;
 pub mod expand;
 pub mod levels;
+pub mod license;
 pub mod open;
 pub mod search;

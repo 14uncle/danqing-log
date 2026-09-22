@@ -1,6 +1,6 @@
 [package]
 name = "danqing-log"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "丹青日志 LogLens —— 大文件日志/JSONL 查看分析器 (第四件产品)"
@@ -22,6 +22,30 @@ serde_json = { version = "1", features = ["preserve_order"] }
 open = "5"
 rfd = "0.15"
 dirs = "6"
+# 授权 key 离线校验 (SPEC-v1x-licensing D2): Ed25519 签名验签 + base64url 编解码。
+# verify-only 用法, 不引入任何网络能力; 私钥永不入库 (keygen 从仓库外路径读入)。
+ed25519-dalek = "2"
+base64 = "0.22"
+getrandom = "0.2"
+# 微软商店 IAP (SPEC-v1x-licensing T5): **不设编译期 feature** —— 商店版与便携版
+# 是同一个二进制, 运行时用 danqing::platform::is_packaged() 分流 (D1;
+# pomodoro freemium 三构建是前车之鉴)。features 与 pomodoro 实测成稿一致:
+# Win32_UI_Shell/WinRT = 购买对话框属主绑定 (IInitializeWithWindow) + COM 单元初始化;
+# Win32_UI_WindowsAndMessaging = EnumWindows 定位本进程主窗口。
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Services_Store",
+    "ApplicationModel",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+# 购买流程按 InAppOfferToken 在商店目录定位 add-on 时需命名 IIterable 类型
+# (本是 windows 的传递依赖, 提升为直接依赖 —— pomodoro 同款处理)
+[dependencies.windows-collections]
+version = "0.2"
 
 [profile.dev]
 opt-level = 1
