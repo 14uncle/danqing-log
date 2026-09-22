@@ -168,12 +168,12 @@
    `ms-store-copy` 教训; 评审补抓 §三「商店版不会有这个提示」/ 缓存表「仅便携版」/
    listing「不联网」三处漏网, 已一并清)。
 
-人工验收 —— **便携版** (用户实机, **开着 SteamTools = hosts 劫持态**):
-- [ ] a) 启动后日志**无**「更新检查失败」; `%APPDATA%\danqing\update-check-14uncle-danqing-log.json` 落盘。
-- [ ] b) 底栏「⚙ 设置」右上出现小圆点; 设置卡「关于」页见「有新版本 v1.0.1」行。
-- [ ] c) 零痕迹对照: 缓存手改 `UpToDate` → 圆点消失, 底栏与现状无异。
-- [ ] d) 点击照旧开设置卡; 「前往下载」跳 `https://github.com/14uncle/danqing-log/releases/latest`。
-- [ ] e) 圆点观感过目 (6px/accent 是拟态值, **位置**含「文字顶齐平」锚点 —— 偏小/偏色/偏位当场裁, 不预设翻案)。
+人工验收 —— **便携版** (用户实机, **开着 SteamTools = hosts 劫持态**; **2026-09-22 全部通过**):
+- [x] a) 启动后日志**无**「更新检查失败」; `%APPDATA%\danqing\update-check-14uncle-danqing-log.json` 落盘。
+- [x] b) 底栏「⚙ 设置」右上出现小圆点; 设置卡「关于」页见「有新版本」行 (实机植缓存出 v1.0.2, 观感反馈催生 SPEC-update-hint-ui)。
+- [x] c) 零痕迹对照: 缓存手改 `UpToDate` → 圆点消失, 底栏与现状无异。
+- [x] d) 点击照旧开设置卡; 「前往下载」跳 `https://github.com/14uncle/danqing-log/releases/latest`。
+- [x] e) 圆点观感过目 (6px/accent 是拟态值, **位置**含「文字顶齐平」锚点 —— 偏小/偏色/偏位当场裁, 不预设翻案)。
 
 人工验收 —— **商店轨** (侧载 MSIX 构建; StoreContext 运输侧载下不可全验, 如实分两截):
 - [ ] f) 侧载启动: 日志出现商店更新查询条目 (pomodoro 同款「商店更新查询: 待装更新 N 个」),
