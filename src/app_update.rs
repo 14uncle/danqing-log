@@ -19,6 +19,30 @@ use danqing::update::{UpdateHint, UpdateSpec, current_hint, spawn_check};
 /// 商店轨按钮文案: 框架只产 GitHub 轨的「前往下载」, 商店轨是应用内「更新」。
 const STORE_ACTION: &str = "更新";
 
+/// GitHub 轨发布页 URL —— **D2 不变量的编译期定锚** (远端 JSON 永不作定位符):
+/// `/releases/latest` 由 GitHub 302 到最新 release 详情页, tag 不拼进 URL。
+/// [`spec`] 与 [`action_target`] 共用这一份, 执行面与动作模型面同源。
+const GITHUB_RELEASES_PAGE: &str = "https://github.com/14uncle/danqing-log/releases/latest";
+
+/// 更新动作目标 (纯模型, 双臂锁死 —— 与 [`track_of`] 同族, 测试钉两臂):
+/// GitHub 臂 = 开发布页 (编译期常量 URL); 商店臂 = 拉系统更新对话框 (无 URL)。
+/// 把行为收敛成可枚举的模型, 「臂对调 / 臂体改开别的 URL」在测试里当场红。
+enum ActionTarget {
+    /// 开发布页 (URL 必须来自 [`GITHUB_RELEASES_PAGE`], 测试钉)。
+    ReleasesPage(&'static str),
+    /// 拉起系统商店更新对话框 (无 URL —— 商店轨不引站外, D5 理由②)。
+    StoreUpdate,
+}
+
+/// 动作目标**唯一模型** (纯函数): 按轨分派, 双臂 [`dispatch_polarity_is_never_inverted`]
+/// 锁极性、本模型锁目标 —— 合起来「点下去会发生什么」全在锁内。
+fn action_target(track: Track) -> ActionTarget {
+    match track {
+        Track::Store => ActionTarget::StoreUpdate,
+        Track::GitHub => ActionTarget::ReleasesPage(GITHUB_RELEASES_PAGE),
+    }
+}
+
 /// 更新轨道 (D6): 分轨判定的唯一模型。
 enum Track {
     /// GitHub 轨 (便携版): HTTP 查 `releases/latest`, 动作跳发布页。
@@ -58,7 +82,7 @@ fn spec() -> UpdateSpec {
     UpdateSpec {
         repo: "14uncle/danqing-log",
         user_agent: "danqing-log",
-        releases_page: "https://github.com/14uncle/danqing-log/releases/latest",
+        releases_page: GITHUB_RELEASES_PAGE,
         current_version: current_version(),
     }
 }
@@ -73,11 +97,26 @@ pub fn current_version() -> &'static str {
     }
 }
 
-/// 商店轨覆写按钮文案 (纯函数): 「前往下载」→「更新」; GitHub 轨原样。
-fn override_action(mut hint: UpdateHint, track: Track) -> UpdateHint {
-    if matches!(track, Track::Store) {
-        hint.action = STORE_ACTION;
+/// 动作按钮文案**单点** (按轨, 进程常量): GitHub「前往下载」/ 商店「更新」。
+/// [`override_action`] 与版本行按钮构造共用这一份, 防两处文案漂移。
+fn action_label_of(track: Track) -> &'static str {
+    match track {
+        Track::Store => STORE_ACTION,
+        // 框架原产文案是 GitHub 臂的真单点 (应用侧不另抄字面量; 测试钉「前往下载」防漂)。
+        Track::GitHub => danqing::update::update_action_text(),
     }
+}
+
+/// 当前轨道的动作按钮文案 (版本行 `Link` 构造时取; 轨是进程常量, 构造期定案)。
+pub fn action_label() -> &'static str {
+    action_label_of(track())
+}
+
+/// 动作按钮文案覆写 (纯函数): 两轨都从 [`action_label_of`] 单点取值 ——
+/// GitHub 臂覆写为同值 (与框架 `update_hint` 原产「前往下载」一致, 测试钉),
+/// 商店臂「前往下载」→「更新」。
+fn override_action(mut hint: UpdateHint, track: Track) -> UpdateHint {
+    hint.action = action_label_of(track);
     hint
 }
 
@@ -98,10 +137,16 @@ pub fn hint() -> Option<UpdateHint> {
 /// 执行更新动作 (设置卡「版本」行按钮; 行为按轨道分派)。
 ///
 /// 原名 `go_download` —— 那是 GitHub 轨语义; 双轨后名字随语义改。
+/// 分派走 [`action_target`] 纯模型 (目标与极性都在锁内), 臂体保持双保险。
 pub fn perform_action() {
-    match track() {
-        Track::Store => store::request_update(),
-        Track::GitHub => perform_action_github(),
+    match action_target(track()) {
+        ActionTarget::StoreUpdate => store::request_update(),
+        ActionTarget::ReleasesPage(url) => {
+            // 模型面 URL 是执行面的**指认** (打开仍走框架 `perform_action(&spec())`) ——
+            // 消费它做同源自证, 两面若漂移 debug 构建当场炸, 别等测试才发现。
+            debug_assert_eq!(url, GITHUB_RELEASES_PAGE, "动作模型与执行面 URL 漂移");
+            perform_action_github();
+        }
     }
 }
 
@@ -349,6 +394,31 @@ mod tests {
         );
     }
 
+    /// D2 双臂动作目标锁 (SPEC-update-hint-ui §5 的「动作分派双臂」在模型层兑现):
+    /// GitHub 臂 = 开**编译期常量**发布页 (URL 恒为 `/releases/latest`, 远端 tag 永不
+    /// 拼入 —— `releases_page: &'static str` 类型本身也拼不出动态串); 商店臂 = 拉系统
+    /// 更新对话框 (无 URL, 不引站外)。执行面同源: [`spec`] 与 [`action_target`] 共用
+    /// [`GITHUB_RELEASES_PAGE`] (三等式钉死, 臂体换 URL 源/臂对调须精确红)。
+    #[test]
+    fn action_target_dual_arm_never_splices_remote_tag() {
+        match action_target(Track::GitHub) {
+            ActionTarget::ReleasesPage(url) => assert_eq!(
+                url, "https://github.com/14uncle/danqing-log/releases/latest",
+                "GitHub 臂必须开编译期常量发布页 (D2)"
+            ),
+            ActionTarget::StoreUpdate => panic!("GitHub 臂不许走商店更新"),
+        }
+        assert!(
+            matches!(action_target(Track::Store), ActionTarget::StoreUpdate),
+            "商店臂必须拉系统更新对话框 (无 URL)"
+        );
+        assert_eq!(
+            spec().releases_page,
+            GITHUB_RELEASES_PAGE,
+            "UpdateSpec 与动作模型同源 (执行面/模型面不许各持一份 URL)"
+        );
+    }
+
     /// 商店轨按钮文案覆写为「更新」(框架只产「前往下载」); GitHub 轨保持原文案;
     /// `UpToDate` → None (「无新版零痕迹」的纯路径, SPEC §5 承诺的臂)。
     /// 纯函数形态两臂都测 (不碰全局 publish —— 全局静态测试并行互踩)。
@@ -364,7 +434,7 @@ mod tests {
         assert_eq!(hint.status, "有新版本", "商店轨拿不到新版号, 不显版本");
         assert_eq!(
             override_action(hint, Track::Store).action,
-            STORE_ACTION,
+            action_label_of(Track::Store),
             "商店轨按钮是应用内「更新」, 不是「前往下载」"
         );
 
@@ -376,7 +446,13 @@ mod tests {
         };
         let hint = update_hint("1.0.0", Some(&cache)).expect("应有提示");
         assert_eq!(hint.status, "有新版本 v9.9.9");
-        assert_eq!(override_action(hint, Track::GitHub).action, "前往下载");
+        // 文案单点: 覆写值取 action_label_of; GitHub 臂与框架 update_hint 原产
+        // 「前往下载」一致 (钉两处漂移)。
+        assert_eq!(
+            override_action(hint, Track::GitHub).action,
+            action_label_of(Track::GitHub)
+        );
+        assert_eq!(action_label_of(Track::GitHub), "前往下载");
 
         // UpToDate → None: 无新版零痕迹 (D3)。
         let cache = CheckCache {

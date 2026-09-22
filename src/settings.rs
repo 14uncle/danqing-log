@@ -64,7 +64,7 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseSettings)
 }
 
-/// 设置卡片：关闭行 + 页签 (常规 / 快捷键 / 关于)。
+/// 设置卡片：关闭行 + 页签 (常规 / 快捷键 / 许可 / 关于)。
 ///
 /// 卡面上**不再**另有关于区/版本行 —— 自 2026-09-13 起这两样各就其位在
 /// 「关于」页签里, 摆在页签外会与页签内容同屏重复 (用户指出)。
@@ -124,6 +124,13 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
                         // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
                         // 回归锁: `settings_card_tabs_follow_theme_switch`。
                         .bind_theme(|app: &LogApp| app.theme.theme())
+                        // 更新角标挂「关于」页签 (腿 A): 生产现查 hint() (与提示行
+                        // 同源); 测试经 update_hint_override 注入两态 (不碰全局 publish)。
+                        .bind_tab_badge(ABOUT_TAB_INDEX, |app: &LogApp| {
+                            app.update_hint_override
+                                .get()
+                                .unwrap_or_else(|| crate::app_update::hint().is_some())
+                        })
                         .on_change(Msg::SelectSettingsTab),
                 ),
         ))
@@ -133,6 +140,10 @@ fn settings_card(theme: config::AppTheme) -> impl Widget {
 /// 「许可」页签下标 —— 与 `.tab()` 链同文件相邻, 是唯一合法引用点 (T7 升级
 /// 提示的「去激活」要跳这页)。别处别抄数字 (2026-09-13 序号双抄漂过的教训)。
 pub(crate) const LICENSE_TAB_INDEX: usize = 2;
+
+/// 「关于」页签下标 —— 更新角标的挂载位 (SPEC-update-hint-ui 腿 A)。
+/// 同 [`LICENSE_TAB_INDEX`] 纪律: 唯一合法引用点, 别处别抄数字。
+pub(crate) const ABOUT_TAB_INDEX: usize = 3;
 
 /// 「常规」页签: 可配置项的家。
 ///
@@ -555,140 +566,125 @@ fn theme_dropdown() -> impl Widget {
 /// 抽成常量: `panel_contents_fit_fixed_height` 要拿它算关于页的最坏高度。
 const VERSION_ROW_H: f32 = 32.0;
 
-/// 版本行：有新版时显示提示 + 按钮; 无新版时空白。
+/// 版本行行内间距 (status 与动作按钮之间)。
+const VERSION_ROW_GAP: f32 = 12.0;
+
+/// 版本行：有新版时显示「有新版本 vX」+ link 形制动作按钮 (行内布局整体居中,
+/// SPEC-update-hint-ui 腿 B); 无新版时零高度零痕迹。
+///
+/// 动作按钮是真 [`Link`] 实例 (行内形) —— 形制/命中/主题刷新全部复用, 点击发
+/// [`Msg::PerformUpdateAction`] (双轨分派收敛在 `app_update::perform_action`)。
 struct VersionRow {
     hint_status: String,
-    hint_action: &'static str,
     has_hint: bool,
-    btn_hover: bool,
-    /// Cell 跨 paint/event 共享：paint 测量后写入，event 命中检测读取;
-    /// 依赖 paint 在 event 之前调用 (danqing 保证此顺序)。
-    btn_area: std::cell::Cell<Rect>,
+    action_link: Link,
     text_secondary: Color,
-    text_primary: Color,
+    /// 居中布局缓存 (layout 单点计算, paint/event 消费; 依赖 layout 先于
+    /// 两者调用 —— 与旧 `btn_area` 同一款帧序约定)。
+    status_x: std::cell::Cell<f32>,
+    link_area: std::cell::Cell<Rect>,
 }
 
 impl VersionRow {
     fn new() -> Self {
         Self {
             hint_status: String::new(),
-            hint_action: "",
             has_hint: false,
-            btn_hover: false,
-            btn_area: std::cell::Cell::new(Rect::default()),
+            action_link: Link::inline(crate::app_update::action_label(), || {
+                Msg::PerformUpdateAction
+            }),
             text_secondary: Color::rgb(0.40, 0.40, 0.42),
-            text_primary: Color::rgb(0.12, 0.12, 0.12),
+            status_x: std::cell::Cell::new(0.0),
+            link_area: std::cell::Cell::new(Rect::default()),
         }
+    }
+
+    /// link 的绝对命中矩形 (缓存相对坐标 + area 原点; paint/event 同源消费)。
+    fn link_abs(&self, area: Rect) -> Rect {
+        let link = self.link_area.get();
+        Rect::from_xywh(
+            area.origin.x + link.origin.x,
+            area.origin.y + link.origin.y,
+            link.size.width,
+            link.size.height,
+        )
     }
 }
 
 impl Widget for VersionRow {
     fn sync(&mut self, state: &dyn Any) {
+        self.action_link.sync(state);
         if let Some(app) = state.downcast_ref::<LogApp>() {
             let t = app.theme.theme();
             self.text_secondary = t.text_secondary();
-            self.text_primary = t.text_primary();
         }
         if let Some(hint) = crate::app_update::hint() {
             self.hint_status = hint.status;
-            self.hint_action = hint.action;
             self.has_hint = true;
         } else {
             self.has_hint = false;
         }
     }
 
-    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
-        if self.has_hint {
-            Size::new(constraints.max().width, VERSION_ROW_H)
-        } else {
-            Size::new(constraints.max().width, 0.0)
+    fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
+        let row_w = constraints.max().width;
+        if !self.has_hint {
+            return Size::new(row_w, 0.0);
         }
+        let status_w = texts.measure(&self.hint_status, BODY_SIZE);
+        let link_size = self
+            .action_link
+            .layout(Constraints::loose(Size::new(row_w, VERSION_ROW_H)), texts);
+        // 行内布局整体居中: [status, gap, link] (腿 B 乱源一的修法)。
+        let content_w = status_w + VERSION_ROW_GAP + link_size.width;
+        let start_x = ((row_w - content_w) / 2.0).max(0.0);
+        self.status_x.set(start_x);
+        self.link_area.set(Rect::from_xywh(
+            start_x + status_w + VERSION_ROW_GAP,
+            (VERSION_ROW_H - link_size.height) / 2.0,
+            link_size.width,
+            link_size.height,
+        ));
+        Size::new(row_w, VERSION_ROW_H)
     }
 
-    fn paint(&self, area: Rect, _rects: &mut RectBatch, texts: &mut TextBatch) {
+    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
         if !self.has_hint {
             return;
         }
         let baseline = area.origin.y
             + (VERSION_ROW_H - texts.line_height(f32::from(BODY_SIZE))) / 2.0
             + texts.ascent(f32::from(BODY_SIZE));
-        // 状态文案
         texts.push_text(
             &self.hint_status,
-            area.origin.x,
+            area.origin.x + self.status_x.get(),
             baseline,
             BODY_SIZE,
             self.text_secondary,
         );
-        // 按钮
-        let status_w = texts.measure(&self.hint_status, BODY_SIZE);
-        let btn_x = area.origin.x + status_w + 12.0;
-        let btn_w = texts.measure(self.hint_action, BODY_SIZE) + 16.0;
-        let btn_color = if self.btn_hover {
-            self.text_primary
-        } else {
-            self.text_secondary
-        };
-        texts.push_text(
-            self.hint_action,
-            btn_x + 8.0,
-            baseline,
-            BODY_SIZE,
-            btn_color,
-        );
-        self.btn_area
-            .set(Rect::from_xywh(btn_x, area.origin.y, btn_w, VERSION_ROW_H));
+        self.action_link.paint(self.link_abs(area), rects, texts);
     }
 
-    fn event(&mut self, event: &Event, area: Rect, _msgs: &mut MsgQueue) -> EventResult {
+    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
         if !self.has_hint {
             return EventResult::Ignored;
         }
-        let btn = self.btn_area.get();
-        match event {
-            Event::CursorMoved(p) => {
-                let abs_btn = Rect::from_xywh(
-                    btn.origin.x + area.origin.x,
-                    btn.origin.y + area.origin.y,
-                    btn.size.width,
-                    btn.size.height,
-                );
-                self.btn_hover = abs_btn.contains(*p);
-                EventResult::Ignored
-            }
-            Event::CursorLeft => {
-                self.btn_hover = false;
-                EventResult::Ignored
-            }
-            Event::MouseInput {
-                pressed: true,
-                position,
-                ..
-            } => {
-                let abs_btn = Rect::from_xywh(
-                    btn.origin.x + area.origin.x,
-                    btn.origin.y + area.origin.y,
-                    btn.size.width,
-                    btn.size.height,
-                );
-                if abs_btn.contains(*position) {
-                    crate::app_update::perform_action();
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
-                }
-            }
-            _ => EventResult::Ignored,
-        }
+        self.action_link.event(event, self.link_abs(area), msgs)
     }
 }
 
-/// 可点击链接行：整行宽幽灵按钮 —— 常显下划线 (裸小字链接发现性太差),
-/// hover 整行底色反馈，命中区整行 32px。
+/// 可点击链接：常显下划线 (裸小字链接发现性太差), hover 圆角底色反馈。
+///
+/// 两种形制共享同一套绘制 (hover 底 = area、文字居中、下划线随文字), 差只在
+/// layout: **整行形** [`Link::new`] 拉满约束宽 (「问题反馈」整行居中链接);
+/// **行内形** [`Link::inline`] 自然宽随文字块 (版本行动作按钮, SPEC-update-hint-ui
+/// 腿 B)。点击产出的消息可定制 —— 开 URL 与应用内动作共用同一形制语言。
 struct Link {
     text: String,
-    url: String,
+    /// 点击消息工厂 (整行形 = `Msg::OpenUrl`; 行内形 = 应用内动作)。
+    action: Box<dyn Fn() -> Msg>,
+    /// 行内形: layout 取自然宽, hover/下划线随文字块。
+    inline: bool,
     hovered: bool,
     area: Rect,
     hover_bg: Color,
@@ -696,10 +692,22 @@ struct Link {
 }
 
 impl Link {
+    /// 整行链接行 (「问题反馈」): 点击开 `url`, hover 整行底, 文本行内居中。
     fn new(text: &str, url: &str) -> Self {
+        let url = url.to_string();
+        Self::with_action(text, move || Msg::OpenUrl(url.clone()), false)
+    }
+
+    /// 行内 link 按钮 (版本行动作): 自然宽随文字块, 点击发自定义消息。
+    fn inline(text: &str, action: impl Fn() -> Msg + 'static) -> Self {
+        Self::with_action(text, action, true)
+    }
+
+    fn with_action(text: &str, action: impl Fn() -> Msg + 'static, inline: bool) -> Self {
         Self {
             text: text.to_string(),
-            url: url.to_string(),
+            action: Box::new(action),
+            inline,
             hovered: false,
             area: Rect::default(),
             hover_bg: Color::TRANSPARENT,
@@ -710,6 +718,8 @@ impl Link {
 
 /// 链接行高。
 const LINK_ROW_H: f32 = 32.0;
+/// 行内形左右 padding (hover 底/下划线随文字块两侧各留一档)。
+const LINK_INLINE_PAD: f32 = 8.0;
 
 impl Widget for Link {
     fn sync(&mut self, state: &dyn Any) {
@@ -719,8 +729,13 @@ impl Widget for Link {
             self.accent = t.accent();
         }
     }
-    fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
-        let size = constraints.constrain(Size::new(constraints.max().width, LINK_ROW_H));
+    fn layout(&mut self, constraints: Constraints, texts: &mut TextBatch) -> Size {
+        let w = if self.inline {
+            texts.measure(&self.text, BODY_SIZE) + LINK_INLINE_PAD * 2.0
+        } else {
+            constraints.max().width
+        };
+        let size = constraints.constrain(Size::new(w, LINK_ROW_H));
         self.area = Rect::new(Point::ZERO, size);
         size
     }
@@ -764,7 +779,7 @@ impl Widget for Link {
                 ..
             } => {
                 if area.contains(*position) {
-                    msgs.push(Box::new(Msg::OpenUrl(self.url.clone())));
+                    msgs.push(Box::new((self.action)()));
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored
@@ -793,7 +808,19 @@ pub(crate) fn handle_settings_key(key: &Key) -> Option<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use danqing::event::MouseButton;
     use danqing::srgb_to_linear;
+
+    /// 取 radius 3.0 正圆实例 (角标圆点形制; 与圆角面/指示线可辨)。
+    fn round_dots(rects: &RectBatch) -> Vec<Rect> {
+        rects
+            .instance_rects()
+            .into_iter()
+            .zip(rects.instance_radii())
+            .filter(|(_, rad)| *rad == [3.0; 4])
+            .map(|(r, _)| r)
+            .collect()
+    }
 
     /// 布局一个组件, 返回它**自报的自然高度**(不受固定高盒子影响)。
     fn natural_height(w: &mut impl Widget, c: Constraints, texts: &mut TextBatch) -> f32 {
@@ -874,6 +901,50 @@ mod tests {
         // tripwire (评审 Nit 修正自称): 这条只锁「改了常量没改测试」——
         // 它证不了常量与 .tab() 链的真一致, 只逼你重排链子时回来看一眼。
         assert_eq!(LICENSE_TAB_INDEX, 2, "「许可」是第三个页签 (0 起)");
+    }
+
+    /// 「关于」页签下标 tripwire (同 license 版弱锁, 自限照抄) —— 真一致的另一半在
+    /// [`about_tab_badge_sits_on_the_active_about_title`] 的几何锚里。
+    #[test]
+    fn about_tab_index_matches_tab_chain() {
+        assert_eq!(ABOUT_TAB_INDEX, 3, "「关于」是第四个页签 (0 起)");
+    }
+
+    /// 腿 A 真一致几何锁 (评审 Required #1): active 停在「关于」时, 选中指示线锚
+    /// 「关于」标题底 —— 角标圆点必须钉在**同一标题**的右缘外 2px。绑定错页签
+    /// (如误用 `LICENSE_TAB_INDEX`) 圆点与指示线脱钩 → 精确红。
+    /// 几何恒等式 (框架 paint): 指示线 = 标题宽两侧各伸 [`INDICATOR_PAD`=8],
+    /// 圆点 = 标题右缘外 2 → `dot.x == indicator.x + indicator.w − 6`。
+    /// A/B: 把绑定下标改 2 须精确红 (留痕见 plan Review 轮)。
+    #[test]
+    fn about_tab_badge_sits_on_the_active_about_title() {
+        let mut card = settings_card(AppTheme::Dark);
+        let mut app = crate::LogApp::new_empty();
+        app.update_hint_override.set(Some(true));
+        app.settings_tab = ABOUT_TAB_INDEX;
+        card.sync(&app);
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 600.0)), &mut texts);
+        card.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        let dots = round_dots(&rects);
+        let indicators: Vec<Rect> = rects
+            .instance_rects()
+            .into_iter()
+            .zip(rects.instance_radii())
+            .filter(|(r, rad)| *rad == [1.0; 4] && r.size.height == 2.0)
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(indicators.len(), 1, "恰一条选中指示线 (active=关于)");
+        assert_eq!(dots.len(), 1, "恰一个角标圆点");
+        let expected_x = indicators[0].origin.x + indicators[0].size.width - 6.0;
+        assert!(
+            (dots[0].origin.x - expected_x).abs() < 0.5,
+            "角标必须锚在指示线同页签的标题右缘: dot.x={} expected={}",
+            dots[0].origin.x,
+            expected_x
+        );
     }
 
     #[test]
@@ -1026,6 +1097,141 @@ mod tests {
         assert_eq!(
             left, 0,
             "切到浅色后卡里不该还剩暗色主题的 text_secondary —— 有 {left} 处即页签栏没挂 bind_theme"
+        );
+    }
+
+    /// 腿 A 接线锁: 「关于」页签角标随更新提示两态显隐 (SPEC-update-hint-ui)。
+    ///
+    /// 真画整卡 —— 绑定调用点在锁内 (helper 层锁不住「写死 false」)。
+    /// 两态对拍取**恰一之差**: 卡里可能有其他 radius-3 圆角面 (控件), 差值免疫同形干扰。
+    /// A/B: 把 `bind_tab_badge(ABOUT_TAB_INDEX, …)` 谓词写死 false 或删掉该行 → 精确红。
+    /// 绑错页签的防护 = [`ABOUT_TAB_INDEX`] 常量单点纪律 (LICENSE_TAB_INDEX 同款);
+    /// 角标几何本身由框架锁 `tab_badge_dot_sits_at_the_title_corner` 承担。
+    #[test]
+    fn about_tab_badge_follows_update_hint() {
+        fn badge_like_dots(has_hint: bool) -> Vec<Rect> {
+            let mut card = settings_card(AppTheme::Dark);
+            let app = crate::LogApp::new_empty();
+            app.update_hint_override.set(Some(has_hint));
+            card.sync(&app);
+            let mut texts = TextBatch::default();
+            let mut rects = RectBatch::new();
+            let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 600.0)), &mut texts);
+            card.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+            round_dots(&rects)
+        }
+        let on = badge_like_dots(true);
+        let off = badge_like_dots(false);
+        assert_eq!(
+            on.len(),
+            off.len() + 1,
+            "有提示恰添一个角标圆点 (on={} off={})",
+            on.len(),
+            off.len()
+        );
+    }
+
+    /// 腿 B 布局锁: 版本行 = 行内 [status, gap, 按钮] 整体居中 + link 形制常显下划线;
+    /// 无 hint 零高度 (零痕迹)。构造注入 has_hint (sync 后覆写字段 —— 全局 hint()
+    /// 测试里恒 None, 注入两态不碰 publish)。
+    #[test]
+    fn version_row_is_centered_with_link_action() {
+        let app = crate::LogApp::new_empty();
+
+        // 无 hint: 零高度。
+        let mut row = VersionRow::new();
+        row.sync(&app);
+        let mut texts = TextBatch::default();
+        let size = row.layout(Constraints::loose(Size::new(400.0, 60.0)), &mut texts);
+        assert_eq!(size.height, 0.0, "无 hint 零高度");
+
+        // 有 hint (注入): 居中 + 行内顺序 + Link 下划线形制。
+        let mut row = VersionRow::new();
+        row.sync(&app);
+        row.has_hint = true;
+        row.hint_status = "有新版本 v1.0.2".to_string();
+        let mut texts = TextBatch::default();
+        let size = row.layout(Constraints::loose(Size::new(400.0, 60.0)), &mut texts);
+        assert_eq!(size.height, VERSION_ROW_H);
+        let link = row.link_area.get();
+        let status_w = texts.measure(&row.hint_status, BODY_SIZE);
+        let left = row.status_x.get();
+        let right = 400.0 - (link.origin.x + link.size.width);
+        assert!(
+            (left - right).abs() < 0.5,
+            "行内布局应整体居中: left={left} right={right}"
+        );
+        assert!(
+            (link.origin.x - (left + status_w + VERSION_ROW_GAP)).abs() < 0.5,
+            "行内顺序: 按钮紧跟 status + gap"
+        );
+        let mut rects = RectBatch::new();
+        row.paint(
+            Rect::new(Point::new(10.0, 10.0), size),
+            &mut rects,
+            &mut texts,
+        );
+        let underlines = rects
+            .instance_rects()
+            .iter()
+            .zip(rects.instance_radii())
+            .filter(|(r, rad)| *rad == [0.0; 4] && r.size.height == 1.0)
+            .count();
+        assert_eq!(underlines, 1, "动作按钮应有 Link 同款常显下划线");
+    }
+
+    /// 腿 B 消息锁: 点击动作按钮产出 `Msg::PerformUpdateAction` (运输按轨收敛在
+    /// `app_update::perform_action`; 双臂目标锁在 app_update 的
+    /// `action_target_dual_arm_never_splices_remote_tag` —— 评审 Required #2 分工:
+    /// UI 层锁「发对消息」, 模型层锁「臂对目标」)。
+    #[test]
+    fn version_row_action_button_emits_perform_update_action() {
+        let app = crate::LogApp::new_empty();
+        let mut row = VersionRow::new();
+        row.sync(&app);
+        row.has_hint = true;
+        row.hint_status = "有新版本".to_string();
+        let mut texts = TextBatch::default();
+        let size = row.layout(Constraints::loose(Size::new(400.0, 60.0)), &mut texts);
+        let link = row.link_abs(Rect::new(Point::ZERO, size));
+        let mut msgs: MsgQueue = Vec::new();
+        let click = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(
+                link.origin.x + link.size.width / 2.0,
+                link.origin.y + link.size.height / 2.0,
+            ),
+        };
+        let _ = row.event(&click, Rect::new(Point::ZERO, size), &mut msgs);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::PerformUpdateAction))),
+            "点击应发 PerformUpdateAction"
+        );
+    }
+
+    /// Link 泛化回归锁: 旧调用点 (`Link::new(text, url)`, 「问题反馈」) 点击仍发
+    /// `Msg::OpenUrl` —— 消息面泛化不许改它的行为 (SPEC-update-hint-ui §5)。
+    #[test]
+    fn link_open_url_behavior_is_preserved() {
+        let mut link = Link::new("问题反馈", "https://example.invalid/x");
+        let mut texts = TextBatch::default();
+        let size = link.layout(Constraints::loose(Size::new(300.0, 32.0)), &mut texts);
+        let mut msgs: MsgQueue = Vec::new();
+        let click = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(size.width / 2.0, size.height / 2.0),
+        };
+        let r = link.event(&click, Rect::new(Point::ZERO, size), &mut msgs);
+        assert!(matches!(r, EventResult::Consumed));
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::OpenUrl(u)) if u == "https://example.invalid/x"
+            )),
+            "旧调用点点击仍发 OpenUrl"
         );
     }
 
