@@ -973,7 +973,7 @@ source = "git+https://github.com/14uncle/danqing-encoding#d86741caee0ab102cb8d6d
 
 [[package]]
 name = "danqing-log"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
