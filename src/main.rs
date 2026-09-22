@@ -283,6 +283,10 @@ pub(crate) struct LogApp {
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
     /// 留在应用状态里: 重开卡片停在上次那页。
     settings_tab: usize,
+    /// 更新角标谓词的测试注入位 (`Some` = 覆写; 生产恒 `None`, 闭包现查
+    /// `app_update::hint()`)。测试两态注入不碰全局 publish —— 构造注入惯例
+    /// 在「每帧查全局」场景下的形态 (SPEC-update-hint-ui 腿 A)。
+    update_hint_override: std::cell::Cell<Option<bool>>,
     /// 授权状态 (SPEC-v1x-licensing)。启动时判定一次 (D4: 失效不踢会话内的人),
     /// 激活动作即时翻转。免费层下全功能行为与 v1.0 逐点一致 (暗发)。
     entitlement: Entitlement,
@@ -381,6 +385,9 @@ pub(crate) enum Msg {
     CloseSettings,
     /// 打开 URL (反馈链接/发布页)。
     OpenUrl(String),
+    /// 更新动作 (版本行按钮): 按轨道分派 —— GitHub 开发布页 / 商店拉起系统更新
+    /// (语义收敛在 `app_update::perform_action`)。
+    PerformUpdateAction,
     /// 「许可」页 key 输入框内容变化 (镜像进应用状态, 激活按钮读它)。
     LicenseKeyInput(String),
     /// 「许可」页点「激活」按钮 (读输入镜像走激活)。
@@ -481,6 +488,7 @@ impl LogApp {
             theme: cfg.theme,
             histogram_visible: cfg.histogram,
             settings_tab: 0,
+            update_hint_override: std::cell::Cell::new(None),
             entitlement,
             license_pubkey: license::PRODUCT_PUBKEY,
             store_license_job: AsyncJob::new(),
@@ -1662,6 +1670,9 @@ impl App for LogApp {
                 if let Err(err) = open::that(&url) {
                     log::warn!("打开链接失败：{err}");
                 }
+            }
+            Msg::PerformUpdateAction => {
+                crate::app_update::perform_action();
             }
             Msg::LicenseKeyInput(s) => {
                 self.license_key_input = s;
