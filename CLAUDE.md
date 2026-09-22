@@ -4,6 +4,16 @@
 
 ## 状态
 
+- 2026-09-22 (**v1.0.2 GitHub 已发布; MS Store 余用户提交一步**): 更新提示两批
+  (update-badge 双轨更新检查 + update-hint-ui 角标/link 形按钮/版本行居中, 均
+  五段+人工验收+review+simplify 全闭, 含实机「角标 y 双加」返修)。**首个带更新
+  检查的版本** —— 此后更新链路打通。三方 exe 同哈希 `f32cddd2…`
+  (target/release = zip = msix); 便携 zip `e05db52c…` / MSIX 签名后 `0e25dbf9…`
+  (本机已侧载 1.0.2.0)。Release: `github.com/14uncle/danqing-log/releases/tag/v1.0.2`;
+  master `86c0a6d` + tag `v1.0.2`。**商店提交注意: 隐私政策双轨口径已更新
+  (update-badge 批), Partner Center 贴文本须换新版** (`docs/privacy-policy.md`);
+  商店上架后可验 update-badge 遗留 (i) 真商店更新流。review defer 六项在
+  `tasks/plan-update-hint-ui.md` Review 轮表备查。
 - 2026-09-19 (**v1.x 付费层开工 —— licensing 模块 build 完成, 待 review**): 用户四裁决
   (GitHub 轨 = License key + 代销 / 便携版无试用钟 / 首波 = 基建+腿二三四, 腿一第二波 /
   免费层协同欠账搭车) → 能力地图 `docs/specs/SPEC-v1x-map.md` (七模块+顺序, 已批准) →
