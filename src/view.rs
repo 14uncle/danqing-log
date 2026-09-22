@@ -68,6 +68,49 @@ const GLYPH_COLLAPSED: &str = "+";
 const GLYPH_EXPANDED: &str = "-";
 /// 底栏状态行高度。
 const STATUS_HEIGHT: f32 = 26.0;
+
+/// 更新角标直径 (逻辑像素; 圆点半径取直径之半)。SPEC-update-badge D1, 拟态值待验收 (e) 定档。
+const UPDATE_DOT_D: f32 = 6.0;
+/// 角标与「⚙ 设置」文字右缘的间隙。
+const UPDATE_DOT_GAP: f32 = 2.0;
+
+/// 角标几何 (纯函数): 挂「⚙ 设置」**文字**右上 —— X 在文字右缘外 [`UPDATE_DOT_GAP`],
+/// Y 与**文字顶**齐平 (锚在文字, 不锚状态行: 26px 行顶会把点浮到标签上方 —— 评审抓出
+/// 的 D1 偏差)。**不进布局**: 自绘路径绝对定位, 显隐零位移 (pomodoro 是 widget 树,
+/// 才需要「常占槽位、颜色显隐」的对策, 这里不需要)。命中矩形由 [`settings_hit_rect`] 常算吞并。
+fn update_dot_rect(text_right: f32, text_top: f32) -> Rect {
+    Rect::from_xywh(
+        text_right + UPDATE_DOT_GAP,
+        text_top,
+        UPDATE_DOT_D,
+        UPDATE_DOT_D,
+    )
+}
+
+/// 设置入口命中矩形 (纯函数): 文字 + 4px 内垫, **常算吞并角标** —— 角标显隐零位移,
+/// 且整个可见角标都点得到 (半个点不中 = D3「点击照旧开设置卡」的缺口, 评审抓出)。
+fn settings_hit_rect(settings_x: f32, settings_w: f32, text_top: f32, row_top: f32) -> Rect {
+    let dot = update_dot_rect(settings_x + settings_w, text_top);
+    let left = settings_x - 4.0;
+    let right = (settings_x + settings_w + 4.0).max(dot.origin.x + dot.size.width);
+    Rect::from_xywh(left, row_top, right - left, STATUS_HEIGHT)
+}
+
+/// 画更新角标 (D1): 有提示画 accent 圆点, 无提示**什么都不画** (零痕迹)。
+/// 几何与 [`update_dot_rect`] 同源; 断言走 `RectBatch` 实例内省, 不设返回值。
+fn paint_update_dot(
+    rects: &mut RectBatch,
+    text_right: f32,
+    text_top: f32,
+    has_hint: bool,
+    accent: Color,
+) {
+    if !has_hint {
+        return;
+    }
+    let dot = update_dot_rect(text_right, text_top);
+    rects.push_rect(dot, accent, UPDATE_DOT_D / 2.0);
+}
 /// 过滤栏高度 (表格模式)。
 const FILTER_BAR_H: f32 = 32.0;
 /// 表头高度 (表格模式)。
@@ -747,6 +790,9 @@ pub(crate) struct LogView {
     /// 未探索区域的宽度未知, 与编辑器「边走边长」同构)。
     max_seen: std::cell::Cell<f32>,
     // ---- 设置入口 (S2) ----
+    /// 设置按钮更新角标显隐 (D1): **sync 填充** (每帧从 `app_update::hint()` 读),
+    /// paint 只读字段 —— VersionRow 同款注入惯例, 测试可构造注入、不碰全局 publish。
+    has_update_hint: bool,
     /// 设置按钮 hover 态 (event 写, paint 读)。
     settings_hover: std::cell::Cell<bool>,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
@@ -805,6 +851,7 @@ impl LogView {
             hover_bar: std::cell::Cell::new(None),
             status: String::new(),
             status_error: false,
+            has_update_hint: false,
             notice: None,
             mode: ViewMode::Raw,
             schema: None,
@@ -1183,6 +1230,9 @@ impl Widget for LogView {
         let app = state
             .downcast_ref::<LogApp>()
             .expect("LogView 绑定状态类型不匹配");
+        // 更新角标显隐 (D1): sync 填充, paint 只读字段 (VersionRow 注入惯例 ——
+        // 测试可构造注入; 也免去 paint 每帧现查 hint() 的锁与字符串分配)。
+        self.has_update_hint = crate::app_update::hint().is_some();
         // 选区失效守卫: 显示行→内容映射变化 (换文件/过滤变化/切模式/展开折叠) 时
         // 旧选区的 (显示行, 偏移) 不再对应原文, 必须作废 (含潜伏按下);
         // 追加 tail 换入新 Arc 同样触发 —— 保守清除胜过复制出错行。
@@ -1805,8 +1855,8 @@ impl Widget for LogView {
         let settings_label = "⚙ 设置";
         let settings_w = texts.measure(settings_label, AUX_FONT_SIZE);
         let settings_x = area.origin.x + area.size.width - SCROLLBAR_W - 10.0 - settings_w;
-        let settings_rect =
-            Rect::from_xywh(settings_x - 4.0, status_y, settings_w + 8.0, STATUS_HEIGHT);
+        let text_top = sy - texts.ascent(f32::from(AUX_FONT_SIZE));
+        let settings_rect = settings_hit_rect(settings_x, settings_w, text_top, status_y);
         self.settings_btn_rect.set(settings_rect);
         let settings_color = if self.settings_hover.get() {
             th.text_primary()
@@ -1819,6 +1869,15 @@ impl Widget for LogView {
             sy,
             AUX_FONT_SIZE,
             settings_color,
+        );
+        // 更新角标 (SPEC-update-badge D1): 有新版时文字右上亮 6px accent 圆点, 无新版零痕迹。
+        // 两轨通用 —— 显隐读 sync 填充的字段 (注入惯例), 不在 paint 里现查 hint()。
+        paint_update_dot(
+            rects,
+            settings_x + settings_w,
+            text_top,
+            self.has_update_hint,
+            th.accent(),
         );
         // 位置计数: 设置入口左侧 (空态无意义, 不画)
         let pos = if !self.has_file {
@@ -4405,6 +4464,128 @@ mod tests {
             srgb_to_linear(c.b),
             c.a,
         ]
+    }
+
+    /// 更新角标显隐两态对拍 (SPEC-update-badge D1): 有提示恰画 1 个 accent 圆点,
+    /// 无提示**零痕迹** (批里一个实例都不许有)。
+    ///
+    /// 断言走 `RectBatch` 实例内省, 不走返回值 —— A/B: 摘掉 `paint_update_dot` 里的
+    /// `push_rect` 本锁精确红; 只断言返回值的话, 「算了几何但没画」会漏网
+    /// (P8/P10「有状态却没画」的原始形态)。
+    #[test]
+    fn settings_button_shows_update_dot_only_when_hint_exists() {
+        let accent = Color::from_srgb8(0, 120, 212);
+
+        let mut rects = RectBatch::new();
+        paint_update_dot(&mut rects, 100.0, 20.0, false, accent);
+        assert!(
+            rects.is_empty(),
+            "无提示必须零痕迹, 实际画了 {}",
+            rects.len()
+        );
+
+        let mut rects = RectBatch::new();
+        paint_update_dot(&mut rects, 100.0, 20.0, true, accent);
+        assert_eq!(rects.len(), 1, "有提示恰画一个圆点");
+        // 颜色按 token 传入色验 (linear 口径, 与 instance_colors 同源), 不钉绝对色号。
+        assert_eq!(
+            rects.instance_colors(),
+            vec![lin(accent)],
+            "圆点必须用 accent 色"
+        );
+        // 半径 = 直径之半 (正圆)。
+        assert_eq!(rects.instance_radii(), vec![[UPDATE_DOT_D / 2.0; 4]]);
+    }
+
+    /// 角标几何 (SPEC-update-badge D1): 6px, 挂**文字**右上 —— 不压文字 (X 在文字右缘外),
+    /// Y 与文字顶**齐平** (锚在文字, 不锚行顶); 且**整个角标落在设置入口命中矩形内**
+    /// (D3 点击面覆盖可见角标, 评审抓出「半个点不中」的缺口)。paint 与纯几何同源。
+    #[test]
+    fn update_dot_sits_at_the_label_corner_and_outside_layout() {
+        let (text_right, text_top, row_top) = (100.0, 20.0, 10.0);
+        let dot = update_dot_rect(text_right, text_top);
+        assert_eq!(
+            (dot.size.width, dot.size.height),
+            (UPDATE_DOT_D, UPDATE_DOT_D),
+            "圆点是 6px 正方 (D1)"
+        );
+        assert!(
+            dot.origin.x >= text_right,
+            "圆点不得压在文字上: x={} < 文字右缘 {}",
+            dot.origin.x,
+            text_right
+        );
+        assert_eq!(
+            dot.origin.y, text_top,
+            "圆点与**文字顶**齐平 —— 锚在文字, 不锚行顶 (行顶会把点浮到标签上方)"
+        );
+        // 命中矩形必须吞并角标 (与 paint 同一几何源)。
+        let hit = settings_hit_rect(text_right - 50.0, 50.0, text_top, row_top);
+        assert!(
+            hit.origin.x <= dot.origin.x
+                && dot.origin.x + dot.size.width <= hit.origin.x + hit.size.width,
+            "角标必须整个落在设置入口命中矩形内 (否则右半点不中)"
+        );
+        // paint 与纯几何同源: 画进批里的就是 `update_dot_rect` 算的那一个。
+        let mut rects = RectBatch::new();
+        paint_update_dot(&mut rects, text_right, text_top, true, Color::TRANSPARENT);
+        let got = &rects.instance_rects()[0];
+        assert_eq!(
+            (got.origin.x, got.origin.y, got.size.width, got.size.height),
+            (dot.origin.x, dot.origin.y, dot.size.width, dot.size.height),
+            "paint 画的必须与纯几何是同一个矩形 (同源)"
+        );
+    }
+
+    /// **接线锁** (评审 Required): `LogView::paint` 真把角标画出来 —— 只测
+    /// `paint_update_dot` 本体时, 把调用行删掉/写死 `false` 全套测试照样绿,
+    /// 角标永不显示 (P8/P10「有状态却没画」在接线层复活)。
+    /// 两态走**字段注入** (spec §5 惯例, 不碰全局 publish); 删调用行 → 添矩形数 0, 本锁红。
+    #[test]
+    fn log_view_paint_wires_the_update_dot() {
+        let (mut v, path) = cell_fixture("badge");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        v.has_update_hint = false;
+        let mut rects_plain = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects_plain, &mut texts);
+
+        v.has_update_hint = true;
+        let mut rects_dot = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects_dot, &mut texts);
+
+        let key = |r: &Rect| (r.origin.x, r.origin.y, r.size.width, r.size.height);
+        let plain: Vec<Rect> = rects_plain.instance_rects();
+        let with_dot: Vec<Rect> = rects_dot.instance_rects();
+        // f32 无 Eq/Hash (NaN 语义) —— 用 Vec::contains (PartialEq); 夹具矩形量级 O(n²) 无虞。
+        let plain_keys: Vec<_> = plain.iter().map(key).collect();
+        let added: Vec<_> = with_dot
+            .iter()
+            .filter(|r| !plain_keys.contains(&key(r)))
+            .map(key)
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "角标恰添一个矩形 (接线删了/写死 false 在此红): {added:?}"
+        );
+        assert_eq!(
+            (added[0].2, added[0].3),
+            (UPDATE_DOT_D, UPDATE_DOT_D),
+            "新增矩形是 6px 圆点"
+        );
+        // 颜色按**重数差**验: 新增的恰是 accent 色实例 (与 helper 锁同口径)。
+        let accent = lin(v.theme.theme().accent());
+        let count = |cs: Vec<[f32; 4]>| cs.iter().filter(|c| **c == accent).count();
+        assert_eq!(
+            count(rects_dot.instance_colors()),
+            count(rects_plain.instance_colors()) + 1,
+            "新增圆点必须是 accent 色"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// T6 回归锁 (2026-09-14 实机 M0 P10): 拖框选时**选中行不得消失**。

@@ -673,7 +673,7 @@ impl Widget for VersionRow {
                     btn.size.height,
                 );
                 if abs_btn.contains(*position) {
-                    crate::app_update::go_download();
+                    crate::app_update::perform_action();
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored
