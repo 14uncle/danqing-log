@@ -33,10 +33,11 @@
     spec §7 机器部分勾选
   - Verify: 两仓三件套 (验证落盘重定向取真退出码 + 读内容)
   - Files: plan/todo/spec 回填
-- [ ] T5: 联动落地 (**用户闸门 —— 未点头不动 git**)
+- [x] T5: 联动落地 (2026-09-22 用户「push」放行)
   - Acceptance: danqing commit+push → danqing-log 关 patch 复钉 → 两仓分别提交注明关联; lock 无 path 态
-  - Verify: 无 patch `cargo check --locked` 过
-  - Files: 两仓提交 + `danqing-log/Cargo.lock`
+  - Verify: 无 patch `cargo check --locked` 过 (实测 0); pinned `danqing#672241a` 下 265 全绿
+  - Files: danqing `672241a` / danqing-log `8456e80` + `8299858`; lock 钉 `danqing#672241a67b4e98e`,
+    logfile 原 rev `3f3cd03` 未动
 
 ## 人工验收 (build 后另行, spec §7) —— 2026-09-22 用户实机验收通过
 
