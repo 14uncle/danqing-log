@@ -24,9 +24,9 @@
   - Acceptance: 两仓 fmt/clippy/测试全绿; 基线对账 (253→258 / 617·646; 184/592 冻结旧值已订正); `danqing/docs/specs/SPEC-update-check.md:97` checkbox 勾上; 测试名 grep 确认真存在 (settings.rs:953 教训)
   - Verify: 两仓三件套
   - Files: `danqing/docs/specs/SPEC-update-check.md`
-- [ ] T6: 联动落地 (**用户闸门 —— 未点头不动 git**)
+- [x] T6: 联动落地 (用户 2026-09-22 说 push)
   - Acceptance: danqing commit+push → danqing-log 关 patch `cargo check` 驱动重解 → `cargo update -p danqing` 复钉 → 两仓分别提交注明关联; lock 无 path 态
-  - Verify: 无 patch `cargo check --locked` 过
+  - Verify: 无 patch `cargo check --locked` 过 (exit 0)。**插曲 (如实记)**: 首推 `f3211d9` 的 lock 带病 —— gpu-allocator 的 windows 宽边 (>=0.53,<=0.62) 粘在 0.61.3 而 wgpu-hal 30.x 硬要 0.62, wgpu-hal 编译内 10 处 E0277, **远端一度不可构建**; 管道假退出码 (`cargo test | grep | head` 恒 0) 掩过失败推送 (CLAUDE.md 既有陷阱再犯)。`a0d25ea` fix-forward: `cargo update -p gpu-allocator` 重解宽边 → windows 0.62.2 + wgpu 簇对齐 30.0.0, 258 绿 (真退出码 + 内容双验) 后复推
   - Files: 两仓提交 + `danqing-log/Cargo.lock`
 
 ## 人工验收 (build 后另行, spec §7)
