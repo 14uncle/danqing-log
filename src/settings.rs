@@ -52,7 +52,7 @@ fn content_width() -> f32 {
 /// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
 /// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
 /// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
-const PANEL_CONTENT_H: f32 = 180.0;
+const PANEL_CONTENT_H: f32 = 192.0;
 /// 正文字号。
 const BODY_SIZE: u16 = 14;
 
@@ -392,6 +392,81 @@ pub(crate) fn upgrade_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseUpgradePrompt)
 }
 
+/// 导出格式小菜单 (SPEC-v1x-export D7): 格式行**按模式收口** —— 不可用格式
+/// **不出现** (不灰置: 灰置要额外解释「为什么灰」, 不出现则无需解释)。
+/// 两卡互斥 (bind_open 谓词): JSONL (`schema.is_some()`) = 三项 / 明文 = 仅原始行。
+/// 注: 「JSONL 表格模式」判据取**文件是 JSONL** 而非当前 ViewMode —— Ctrl+T 切到
+/// 原始视图不改文件的可导性 (实现口径, 与 spec D1 的模式表同读)。
+pub(crate) fn export_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(
+        &t,
+        Center::new(export_menu_card(t.background(), false)).fill_max(),
+    )
+    .bind_open(|app: &LogApp| app.export_menu_open && app.schema.is_none())
+    .on_scrim_click(|| Msg::CloseExportMenu)
+}
+
+/// JSONL 卡: 原始行 / JSON 美化 / CSV 三项。
+pub(crate) fn export_menu_overlay_jsonl(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(
+        &t,
+        Center::new(export_menu_card(t.background(), true)).fill_max(),
+    )
+    .bind_open(|app: &LogApp| app.export_menu_open && app.schema.is_some())
+    .on_scrim_click(|| Msg::CloseExportMenu)
+}
+
+/// 卡体 (bg 取值传入 —— 传 `&T` 会被不透明返回类型捕获生命周期)。
+fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
+    let label = |s: &str| {
+        Text::new(s.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE)
+    };
+    let mut rows = Column::new()
+        .gap(12.0)
+        .cross_center()
+        .child(format_btn(label("原始行"), || {
+            Msg::ExportFormatChosen(0)
+        }));
+    if jsonl {
+        rows = rows
+            .child(format_btn(label("JSON 美化"), || {
+                Msg::ExportFormatChosen(1)
+            }))
+            .child(format_btn(label("CSV"), || Msg::ExportFormatChosen(2)));
+    }
+    UiBox::new(bg)
+        .bind_color(|app: &LogApp| app.theme.theme().background())
+        .radius(12.0)
+        .child(Padding::new(
+            Edges {
+                top: 24.0,
+                right: CARD_PAD_X,
+                bottom: 16.0,
+                left: CARD_PAD_X,
+            },
+            Column::new()
+                .gap(16.0)
+                .cross_center()
+                .child(
+                    Text::new("导出格式".to_string())
+                        .font_size(BODY_SIZE)
+                        .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+                )
+                .child(rows),
+        ))
+        .width(CARD_WIDTH)
+}
+
+fn format_btn(label: Text, on_click: fn() -> Msg) -> impl Widget {
+    Button::themed(&LightTheme, label)
+        .bind_color(|app: &LogApp| app.theme.theme().accent())
+        .on_click(on_click)
+}
+
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
 fn about_content(content_w: f32) -> impl Widget {
     Column::new()
@@ -475,13 +550,14 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 /// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
 /// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
-const SHORTCUT_KEYS: [(&str, &str); 8] = [
+const SHORTCUT_KEYS: [(&str, &str); 9] = [
     ("Ctrl+O", "打开文件"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+T", "表格 / 原始模式互切"),
     ("Ctrl+L", "级别侧栏 显示 / 收起"),
     ("Ctrl+B", "添加书签 / 去掉书签"),
     ("Ctrl+G", "跳下一书签"),
+    ("Ctrl+E", "导出…"),
     // P36 (2026-09-15): 单键两条。判据就是本表自己那句话 ——「只列**猜不出来**的」,
     // 不是新造标准: 方向键/翻页键不必教 (常识), 但 `/` 是 Vim 习惯、`f` 是本应用
     // 自造的词, 两个都猜不出来。它们原先只写在**仓外 README**, 而商店版用户没有
@@ -1053,6 +1129,20 @@ mod tests {
         assert!(
             action_of("Ctrl+G").contains("下一"),
             "Ctrl+G = 跳下一书签, 不是切换"
+        );
+    }
+
+    /// SPEC-v1x-export T5 一致性锁: `Ctrl+E` 落表且动词是「导出」(清单两处抄
+    /// 同一份会漂 —— 1041 行教训的同款锁)。
+    #[test]
+    fn shortcut_card_export_row_matches_dispatch() {
+        let row = SHORTCUT_KEYS.iter().find(|(k, _)| *k == "Ctrl+E");
+        let Some((_, action)) = row else {
+            panic!("快捷键卡缺 Ctrl+E 行");
+        };
+        assert!(
+            action.contains("导出"),
+            "Ctrl+E = 导出 (与 main 键分发同源)"
         );
     }
 

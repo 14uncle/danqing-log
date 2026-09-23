@@ -39,6 +39,7 @@ use danqing::{
 
 use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
+use danqing_log::export::{self, ExportEnd, ExportFormat, ExportJob, ExportSet};
 use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
 use danqing_log::license::{self, Entitlement, Feature, PaidSource};
@@ -307,6 +308,11 @@ pub(crate) struct LogApp {
     /// 在途时忽略再次发起; AsyncJob 代次语义下重复 launch 会让晚到的旧轮
     /// 覆盖新轮结果被丢弃 = 用户付了钱会话内无感知)。
     purchase_in_flight: bool,
+    /// 导出作业 (SPEC-v1x-export D2): 在途/进度/取消删半成品。单作业,
+    /// 进行中入口变取消。
+    export_job: ExportJob,
+    /// 导出格式小菜单 (D7): 格式行按模式收口 (JSONL 三项 / 明文仅原始行)。
+    export_menu_open: bool,
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
     ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
@@ -406,6 +412,13 @@ pub(crate) enum Msg {
     AnalyzeField(usize),
     /// 结果视图「← 换个字段」: 清结果回选择器。
     AnalysisBack,
+    /// 底栏「导出…」/ `Ctrl+E` (SPEC-v1x-export D7): 作业态点 = 取消;
+    /// 否则门控 (免费态弹升级提示, **保存对话框之前**) → 开格式菜单。
+    ExportEntryClicked,
+    /// 格式菜单选中 (0=原始行 / 1=JSON 美化 / 2=CSV)。
+    ExportFormatChosen(usize),
+    /// 关格式菜单 (scrim 点击 / Esc)。
+    CloseExportMenu,
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
@@ -497,6 +510,8 @@ impl LogApp {
             license_feedback: None,
             upgrade_prompt: None,
             purchase_in_flight: false,
+            export_job: ExportJob::new(),
+            export_menu_open: false,
             license_clear_rev: 0,
             analysis_job: AsyncJob::new(),
             analysis_result: None,
@@ -692,6 +707,113 @@ impl LogApp {
         self.analysis_job.launch(move || {
             danqing_log::analysis::analyze_field(&file, &field, rows.as_ref().map(|v| v.as_slice()))
         });
+    }
+
+    /// 导出入口 (SPEC-v1x-export D6/D7): 作业态点 = 取消 (单作业, 同一按钮);
+    /// 否则门控 —— 免费态弹统一升级提示, **保存对话框之前** (先让人选完路径再
+    /// 告诉他不能存是最坏的顺序)。付费态开格式小菜单。
+    fn export_entry_clicked(&mut self) {
+        if self.export_job.is_running() {
+            self.export_job.cancel();
+            self.set_notice("正在取消导出…".into(), NoticeKind::Info);
+            return;
+        }
+        if !self.has_file {
+            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
+            return;
+        }
+        if !self.entitlement.allows(Feature::Export) {
+            self.update(Msg::ShowUpgradePrompt(Feature::Export));
+            return;
+        }
+        self.export_menu_open = true;
+    }
+
+    /// 格式菜单选定 → 保存对话框 (D8) → 启动作业。
+    /// 明文非 JSONL 时美化/CSV **服务端同款守门** (菜单收口是 UI 层, 点到了也不放行)。
+    fn begin_export(&mut self, idx: usize) {
+        self.export_menu_open = false;
+        if idx != 0 && self.schema.is_none() {
+            self.set_notice("本文件非 JSONL, 仅可导出原始行".into(), NoticeKind::Info);
+            return;
+        }
+        let Some((stem, scope, ext)) = self.export_name_parts() else {
+            return;
+        };
+        let stamp = export::timestamp_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        let default_name = export::default_export_name(&stem, scope, &stamp, &ext);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("导出")
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return; // 对话框取消: 零副作用
+        };
+        self.launch_export(path, idx);
+    }
+
+    /// 文件名三段: stem / 行集 scope 中缀 (D8) / 扩展名 (原始行保源扩展名)。
+    fn export_name_parts(&self) -> Option<(String, &'static str, String)> {
+        let stem = self.path.file_stem()?.to_string_lossy().into_owned();
+        // scope 与行集口径 (D1) 同源: JSONL 看过滤, 明文看搜索
+        let scope = if self.schema.is_some() && self.filtered.is_some() {
+            "-filtered"
+        } else if self.schema.is_none() && self.search.is_some() {
+            "-searched"
+        } else {
+            ""
+        };
+        let ext = self
+            .path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "log".to_string());
+        Some((stem, scope, ext))
+    }
+
+    /// 行集快照 (spec D1): JSONL = 过滤命中集/全集; 明文 = 搜索命中行/全集。
+    /// 一律冻结 (`ExportSet` 构造即 clamp) —— live-tail 之后的增长不进本次导出。
+    fn export_line_set(&self) -> ExportSet {
+        let n = self.file.line_count();
+        if self.schema.is_some() {
+            match &self.filtered {
+                Some(hits) => ExportSet::from_lines(hits.as_ref().clone(), n),
+                None => ExportSet::all(n),
+            }
+        } else {
+            match &self.search {
+                Some(nav) => ExportSet::from_lines(nav.hits().as_ref().clone(), n),
+                None => ExportSet::all(n),
+            }
+        }
+    }
+
+    /// 启动作业 (D2): 冻结行集 + `Arc` 文件快照 (换文件由 `invalidate` 作废旧轮)。
+    fn launch_export(&mut self, path: std::path::PathBuf, idx: usize) {
+        let set = self.export_line_set();
+        let format = match idx {
+            1 => ExportFormat::Pretty,
+            2 => {
+                let columns = self
+                    .schema
+                    .as_ref()
+                    .map(|s| s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                ExportFormat::Csv { columns }
+            }
+            _ => ExportFormat::Raw,
+        };
+        if self
+            .export_job
+            .launch(Arc::clone(&self.file), set, format, path)
+        {
+            self.set_notice("导出中…".into(), NoticeKind::Info);
+        }
     }
 
     /// 商店授权查询回来了 (T5)。D4: **只许 Free → 其他** —— 会话内已激活的
@@ -973,6 +1095,8 @@ impl LogApp {
         // review C1: 旧文件上的在途 filter/search 结果不得贴到新文件
         self.filter_job.invalidate();
         self.search_job.invalidate();
+        // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
+        self.export_job.invalidate();
         let OpenOutcome {
             file: new_file,
             schema,
@@ -1705,6 +1829,9 @@ impl App for LogApp {
             Msg::AnalysisBack => {
                 self.analysis_result = None;
             }
+            Msg::ExportEntryClicked => self.export_entry_clicked(),
+            Msg::ExportFormatChosen(idx) => self.begin_export(idx),
+            Msg::CloseExportMenu => self.export_menu_open = false,
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
@@ -1757,7 +1884,9 @@ impl App for LogApp {
                         ),
                 )
                 .child(settings::settings_overlay(self.theme))
-                .child(settings::upgrade_overlay(self.theme)),
+                .child(settings::upgrade_overlay(self.theme))
+                .child(settings::export_menu_overlay(self.theme))
+                .child(settings::export_menu_overlay_jsonl(self.theme)),
         )
     }
 
@@ -1771,7 +1900,7 @@ impl App for LogApp {
         // `Consumed` 了, 能走到这里的本来就不是它。
         if let Event::MouseWheel { delta, .. } = event {
             // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
-            if !self.settings_open && self.has_file {
+            if !self.settings_open && !self.export_menu_open && self.has_file {
                 let rows = wheel_rows(delta.1);
                 if rows != 0.0 {
                     self.update(Msg::ScrollRows(rows));
@@ -1914,6 +2043,10 @@ impl App for LogApp {
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
+            // Esc 次序: 升级提示 > 设置卡 > **导出格式菜单** > 栏 (SPEC-v1x-export)
+            if self.export_menu_open {
+                return Some(Msg::CloseExportMenu);
+            }
         }
         let Event::Key {
             key,
@@ -1939,7 +2072,7 @@ impl App for LogApp {
         // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
         // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
         // (T7 扩展: 升级提示同享此守卫 —— 它是第二个模态层。)
-        if self.settings_open || self.upgrade_prompt.is_some() {
+        if self.settings_open || self.upgrade_prompt.is_some() || self.export_menu_open {
             // **剪辑组合键必须放行** (评审 Critical, 2026-09-19): 框架的剪贴板
             // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里, 这里吞掉 =
             // 许可页输入框没法 Ctrl+V 粘贴 key —— 而粘贴是 200+ 字符 key 的
@@ -1970,6 +2103,10 @@ impl App for LogApp {
             }
             return Some(Msg::Noop); // 取消：吞掉事件，不触发副作用
         }
+        // Ctrl+E 导出 (SPEC-v1x-export D7): 与底栏按钮同消息, 门控/取消在应用层
+        if s.eq_ignore_ascii_case("e") {
+            return Some(Msg::ExportEntryClicked);
+        }
         None
     }
 
@@ -1995,6 +2132,24 @@ impl App for LogApp {
         if let Some(a) = self.analysis_job.poll() {
             self.analysis_running = false;
             self.analysis_result = Some(a);
+        }
+        // 导出作业收尾 (SPEC-v1x-export D2): 完成/取消/失败一律给反馈
+        if let Some(r) = self.export_job.poll() {
+            match r.end {
+                ExportEnd::Done { lines, bad_lines } => {
+                    let mut msg = format!("导出完成 {lines} 行 → {}", r.path.display());
+                    if bad_lines > 0 {
+                        msg.push_str(&format!(" (含 {bad_lines} 行非 JSON, 已原样)"));
+                    }
+                    self.set_notice(msg, NoticeKind::Info);
+                }
+                ExportEnd::Cancelled { .. } => {
+                    self.set_notice("导出已取消, 半成品已删除".into(), NoticeKind::Info);
+                }
+                ExportEnd::Failed { error } => {
+                    self.set_notice(format!("导出失败: {error}"), NoticeKind::Warn);
+                }
+            }
         }
         if let Some(out) = self.filter_job.poll() {
             self.filter_pending = false;
@@ -2404,6 +2559,168 @@ mod tests {
             matches!(msg, Some(Msg::CloseUpgradePrompt)),
             "升级提示在最上层时 Esc 先关它"
         );
+    }
+
+    // ─── SPEC-v1x-export T5 (导出全链路 UI) ───
+
+    /// D6 判据: 免费态点导出 = 弹升级提示, **不开格式菜单** (保存对话框之前拦)。
+    /// 「零落盘」由构造保证: 该分支根本不走到 `launch_export`。
+    #[test]
+    fn export_entry_free_tier_prompts_upgrade_without_menu() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expgate")));
+        app.has_file = true;
+        app.update(Msg::ExportEntryClicked);
+        assert_eq!(app.upgrade_prompt, Some(Feature::Export));
+        assert!(!app.export_menu_open, "免费态不得开格式菜单");
+    }
+
+    /// 付费态开格式菜单; 作业态下同一入口 = 取消 (D2 单作业语义), 不再开菜单。
+    #[test]
+    fn export_entry_paid_opens_menu_and_running_entry_cancels() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("exppaid")));
+        app.has_file = true;
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.update(Msg::ExportEntryClicked);
+        assert!(app.export_menu_open, "付费态开格式菜单");
+        assert_eq!(app.upgrade_prompt, None);
+        // 作业态 (真作业压 running): 入口点 = 取消, 不是再开菜单
+        let p = temp_log(b"a\nb\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(p.clone(), out);
+        let dest = std::env::temp_dir().join(format!("dq-exp-cancel-{}.log", std::process::id()));
+        app.launch_export(dest.clone(), 0);
+        assert!(app.export_job.is_running());
+        app.export_menu_open = false; // 上一段菜单已用完, 复位再测作业态
+        app.update(Msg::ExportEntryClicked);
+        assert!(!app.export_menu_open, "作业态点入口 = 取消, 不开菜单");
+        // 收尾拾取 (取消或没赶上都是自洽收尾; 半成品语义由 export 单测锁)
+        for _ in 0..200 {
+            if app.export_job.poll().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&dest).ok();
+    }
+
+    /// `Ctrl+E` 与底栏按钮同消息; 格式菜单开着时 = 模态, 不得穿透 (T16 同纪律)。
+    #[test]
+    fn ctrl_e_dispatches_export_entry_and_menu_modal_eats_it() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expkey")));
+        let mk = |ch: &str| Event::Key {
+            key: Key::Character(ch.to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        assert!(
+            matches!(app.app_key_filter(&mk("e")), Some(Msg::ExportEntryClicked)),
+            "Ctrl+E 必须发导出入口消息"
+        );
+        app.export_menu_open = true;
+        assert!(
+            matches!(app.app_key_filter(&mk("e")), Some(Msg::Noop)),
+            "格式菜单开着 = 模态, Ctrl+E 不穿透"
+        );
+    }
+
+    /// Esc 次序: 升级提示 > 设置卡 > 导出格式菜单 > 栏。
+    #[test]
+    fn esc_closes_export_menu_after_higher_modals() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expesc")));
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        app.export_menu_open = true;
+        app.settings_open = true;
+        assert!(
+            matches!(app.app_key_filter(&esc), Some(Msg::CloseSettings)),
+            "设置卡在导出菜单之上"
+        );
+        app.settings_open = false;
+        assert!(
+            matches!(app.app_key_filter(&esc), Some(Msg::CloseExportMenu)),
+            "设置卡关后 Esc 关导出菜单"
+        );
+    }
+
+    /// 明文服务端守门: 菜单收口是 UI 层, 点到了也不放行 (测试不碰真对话框 ——
+    /// 该分支在弹框**之前**返回, 故可测)。
+    #[test]
+    fn begin_export_rejects_pretty_csv_on_plain_file() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expplain")));
+        let p = temp_log(b"plain line\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(p.clone(), out);
+        app.export_menu_open = true;
+        app.begin_export(1);
+        assert!(!app.export_job.is_running(), "非 JSONL 不得发起美化导出");
+        assert!(!app.export_menu_open, "菜单照常收起");
+        app.export_menu_open = true;
+        app.begin_export(2);
+        assert!(!app.export_job.is_running(), "非 JSONL 不得发起 CSV 导出");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 全链路 (D1 行集口径): JSONL + 过滤命中 → launch_export 写出恰是那两行。
+    /// 走 `launch_export` 而非 `begin_export` —— 后者会弹真保存对话框
+    /// (测试严禁真实桌面副作用)。
+    #[test]
+    fn launch_export_writes_filtered_line_set_end_to_end() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expe2e")));
+        let p = temp_log(b"{\"level\":\"ERROR\"}\n{\"level\":\"INFO\"}\n{\"level\":\"ERROR\"}\n");
+        let f = LogFile::open(&p).unwrap();
+        let out = OpenOutcome {
+            schema: jsonl::discover_schema(&f),
+            file: f,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: Some("level".into()),
+        };
+        app.apply_fresh(p.clone(), out);
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.filtered = Some(Arc::new(vec![0, 2]));
+        let dest = std::env::temp_dir().join(format!("dq-exp-e2e-{}.log", std::process::id()));
+        app.launch_export(dest.clone(), 0);
+        let mut result = None;
+        for _ in 0..200 {
+            if let Some(r) = app.export_job.poll() {
+                result = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let r = result.expect("导出作业应完成");
+        assert!(matches!(r.end, ExportEnd::Done { lines: 2, .. }));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"{\"level\":\"ERROR\"}\n{\"level\":\"ERROR\"}\n",
+            "行集 = 过滤命中 (0, 2), 字节保真"
+        );
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&dest).ok();
     }
 
     // ─── 评审修复 (2026-09-19) ───

@@ -8,6 +8,7 @@
 pub use danqing_logfile::{jsonl, logfile};
 pub mod analysis;
 pub mod expand;
+pub mod export;
 pub mod levels;
 pub mod license;
 pub mod open;

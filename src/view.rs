@@ -96,6 +96,12 @@ fn settings_hit_rect(settings_x: f32, settings_w: f32, text_top: f32, row_top: f
     Rect::from_xywh(left, row_top, right - left, STATUS_HEIGHT)
 }
 
+/// 导出入口命中矩形 (纯函数, SPEC-v1x-export D7): 文字 + 4px 内垫, 行高整条。
+/// 与 [`settings_hit_rect`] 同款垫法, 但**无角标可吞** —— 不共用免得耦合角标语义。
+fn export_hit_rect(export_x: f32, export_w: f32, row_top: f32) -> Rect {
+    Rect::from_xywh(export_x - 4.0, row_top, export_w + 8.0, STATUS_HEIGHT)
+}
+
 /// 画更新角标 (D1): 有提示画 accent 圆点, 无提示**什么都不画** (零痕迹)。
 /// 几何与 [`update_dot_rect`] 同源; 断言走 `RectBatch` 实例内省, 不设返回值。
 fn paint_update_dot(
@@ -795,6 +801,11 @@ pub(crate) struct LogView {
     has_update_hint: bool,
     /// 设置按钮 hover 态 (event 写, paint 读)。
     settings_hover: std::cell::Cell<bool>,
+    /// 导出入口 (SPEC-v1x-export D7): 标签随作业态切换 (「导出…」↔「取消导出 N%」),
+    /// 标签走 sync 注入 (与角标同款惯例); 显隐直接判 `has_file` (导出无对象不画)。
+    export_label: String,
+    export_hover: std::cell::Cell<bool>,
+    export_btn_rect: std::cell::Cell<Rect>,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
@@ -866,6 +877,9 @@ impl LogView {
             x_offset: std::cell::Cell::new(0.0),
             max_seen: std::cell::Cell::new(0.0),
             settings_hover: std::cell::Cell::new(false),
+            export_label: String::new(),
+            export_hover: std::cell::Cell::new(false),
+            export_btn_rect: std::cell::Cell::new(Rect::default()),
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
             hover_expand: std::cell::Cell::new(false),
@@ -1262,6 +1276,14 @@ impl Widget for LogView {
         self.status = app.status.clone();
         self.status_error = app.status_error;
         self.notice = app.notice.clone();
+        self.export_label = if app.export_job.is_running() {
+            let pct = (app.export_job.progress() * 100)
+                .checked_div(app.export_job.total())
+                .unwrap_or(0);
+            format!("取消导出 {pct}%")
+        } else {
+            "导出…".to_string()
+        };
         self.mode = app.mode;
         self.schema = app.schema.clone();
         self.filtered = app.filtered.clone();
@@ -1879,7 +1901,31 @@ impl Widget for LogView {
             self.has_update_hint,
             th.accent(),
         );
-        // 位置计数: 设置入口左侧 (空态无意义, 不画)
+        // 导出入口 (SPEC-v1x-export D7): 设置入口左侧; 作业态标签变「取消导出 N%」
+        // (同一按钮 = 取消, spec D2 单作业语义)。空态不画 (导出无对象)。
+        let export_anchor_x = if self.has_file {
+            let export_w = texts.measure(&self.export_label, AUX_FONT_SIZE);
+            let export_x = settings_x - 16.0 - export_w;
+            self.export_btn_rect
+                .set(export_hit_rect(export_x, export_w, status_y));
+            let export_color = if self.export_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(
+                &self.export_label,
+                export_x,
+                sy,
+                AUX_FONT_SIZE,
+                export_color,
+            );
+            export_x
+        } else {
+            self.export_btn_rect.set(Rect::default());
+            settings_x
+        };
+        // 位置计数: 导出入口 (无导出入口则设置入口) 左侧 (空态无意义, 不画)
         let pos = if !self.has_file {
             String::new()
         } else if count == 0 {
@@ -1888,7 +1934,7 @@ impl Widget for LogView {
             format!("行 {}/{count}", self.selected + 1)
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
-        let pos_x = settings_x - 16.0 - pos_w;
+        let pos_x = export_anchor_x - 16.0 - pos_w;
         texts.push_text(
             &pos,
             pos_x.max(area.origin.x + 10.0),
@@ -1906,6 +1952,8 @@ impl Widget for LogView {
             Event::CursorMoved(position) => {
                 self.settings_hover
                     .set(self.settings_btn_rect.get().contains(*position));
+                self.export_hover
+                    .set(self.export_btn_rect.get().contains(*position));
                 // T17: 拖拽跟手 —— 拇指顶 = 指针 − 抓握偏移, 再走逆运算得 top_row。
                 // 夹取在 `top_row_at` / `x_offset_at` 里 (验收 ②), 故拖出轨道也不越界。
                 //
@@ -1973,6 +2021,7 @@ impl Widget for LogView {
             }
             Event::CursorLeft => {
                 self.settings_hover.set(false);
+                self.export_hover.set(false);
                 self.hover_row.set(u64::MAX);
                 // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
                 // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
@@ -2035,6 +2084,12 @@ impl Widget for LogView {
                 // 设置按钮点击 (S2)
                 if self.settings_btn_rect.get().contains(*position) {
                     msgs.push(Box::new(Msg::OpenSettings));
+                    return EventResult::Consumed;
+                }
+                // 导出入口点击 (SPEC-v1x-export D7): 发入口消息 —— 门控/开格式菜单/
+                // 作业态变取消, 全在应用层 (Msg::ExportEntryClicked)。
+                if self.export_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::ExportEntryClicked));
                     return EventResult::Consumed;
                 }
                 // 滚动条按下 (T17)。在行命中**之前**: 条压在列表右缘/底缘之上,
@@ -3997,6 +4052,50 @@ mod tests {
             "左键仍须开设置卡"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 导出入口 (SPEC-v1x-export T5): 左键发 `ExportEntryClicked` (门控/菜单/取消
+    /// 全在应用层), 右/中键不冒充; 命中矩形在设置入口左侧不重叠。
+    #[test]
+    fn export_button_click_pushes_export_entry_and_sits_left_of_settings() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let (mut v, path) = cell_fixture("export-btn");
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let export = v.export_btn_rect.get();
+        let gear = v.settings_btn_rect.get();
+        assert!(export.size.width > 0.0, "有文件时导出入口必须在场");
+        assert!(
+            export.origin.x + export.size.width <= gear.origin.x,
+            "导出入口必须在设置入口左侧且不重叠"
+        );
+        let p = Point::new(export.origin.x + 2.0, export.origin.y + 2.0);
+        let right = press_at(&mut v, area, MouseButton::Right, p);
+        assert!(
+            !right
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ExportEntryClicked))),
+            "右键不得触发导出"
+        );
+        let left = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            left.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ExportEntryClicked))),
+            "左键必须发 ExportEntryClicked"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 空态零痕迹: 无文件不画导出入口 (导出无对象), 命中矩形塌缩。
+    #[test]
+    fn export_button_absent_without_file() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let v = LogView::new();
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        assert_eq!(v.export_btn_rect.get(), Rect::default());
     }
 
     #[test]

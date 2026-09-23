@@ -8,9 +8,11 @@
 //! --filter 走 JSONL 字段过滤 (前提②的引擎数字)。
 //! 输出即开枪前提的截图弹药, 数字可直接抄进意图文档与 Show HN 稿。
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use danqing_log::export::{self, ExportFormat, ExportSet, WriteOutcome};
 use danqing_log::jsonl;
 use danqing_log::levels;
 use danqing_log::logfile::LogFile;
@@ -37,12 +39,13 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next().map(PathBuf::from) else {
         eprintln!(
-            "用法: logbench <日志文件> [--filter \"level=ERROR status=50*\"] [--analyze <字段>] [正则...]"
+            "用法: logbench <日志文件> [--filter \"level=ERROR status=50*\"] [--analyze <字段>] [--export <raw|pretty|csv>] [正则...]"
         );
         std::process::exit(2);
     };
     let mut filter: Option<String> = None;
     let mut analyze: Option<String> = None;
+    let mut export_fmt: Option<String> = None;
     let mut patterns: Vec<String> = Vec::new();
     let mut it = args;
     while let Some(a) = it.next() {
@@ -50,6 +53,8 @@ fn main() {
             filter = it.next();
         } else if a == "--analyze" {
             analyze = it.next();
+        } else if a == "--export" {
+            export_fmt = it.next();
         } else {
             patterns.push(a);
         }
@@ -220,6 +225,76 @@ fn main() {
                 }
             }
         }
+    }
+
+    // 导出 (SPEC-v1x-export D9): 与 app 同源调导出核心 —— 数字与真实路径同一份代码。
+    // 行集跟随 --filter (同 --analyze 的作用域口径); 无过滤 = 全集。
+    if let Some(fmt) = &export_fmt {
+        println!("\n== 导出 (SPEC-v1x-export D9) ==");
+        let set = match &filtered_rows {
+            Some(hits) => ExportSet::from_lines(hits.clone(), file.line_count()),
+            None => ExportSet::all(file.line_count()),
+        };
+        let columns: Vec<String> = schema
+            .as_ref()
+            .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let (format, ext) = match fmt.as_str() {
+            "raw" => (ExportFormat::Raw, "log"),
+            "pretty" => (ExportFormat::Pretty, "json"),
+            "csv" => (ExportFormat::Csv { columns }, "csv"),
+            other => {
+                eprintln!("未知导出格式: {other} (raw|pretty|csv)");
+                std::process::exit(2);
+            }
+        };
+        let out_path = std::env::temp_dir().join(format!("logbench-export.{ext}"));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = std::sync::atomic::AtomicU64::new(0);
+        let t = Instant::now();
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&out_path).expect("建导出文件"));
+        let res = match &format {
+            ExportFormat::Raw => {
+                export::write_raw(&file, &set, &mut w, &cancel, &progress).map(|o| (o, 0))
+            }
+            ExportFormat::Pretty => export::write_pretty(&file, &set, &mut w, &cancel, &progress),
+            ExportFormat::Csv { columns } => {
+                export::write_csv(&file, &set, columns, &mut w, &cancel, &progress)
+            }
+        };
+        let (outcome, bad) = res.expect("导出写出");
+        w.flush().expect("flush");
+        let el = t.elapsed();
+        let bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        let secs = el.as_secs_f64();
+        let out_mib = bytes as f64 / (1024.0 * 1024.0);
+        let thr = if secs > 0.0 {
+            out_mib / secs
+        } else {
+            f64::INFINITY
+        };
+        let lines = match outcome {
+            WriteOutcome::Done { lines } => lines,
+            WriteOutcome::Cancelled { lines } => lines,
+        };
+        println!("格式           : {fmt}");
+        println!(
+            "行集           : {} 行 ({})",
+            set.len(),
+            if set.is_full() {
+                "全集"
+            } else {
+                "过滤命中"
+            }
+        );
+        println!(
+            "写出           : {lines} 行 / {out_mib:.1} MiB   {} ms ({thr:.0} MiB/s)",
+            el.as_millis()
+        );
+        if bad > 0 {
+            println!("非 JSON 原样   : {bad} 行");
+        }
+        println!("输出           : {}", out_path.display());
     }
 
     println!("\n== 全文搜索 ==");
