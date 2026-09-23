@@ -190,6 +190,11 @@ fn clamp_w(w: f32) -> f32 {
 /// per-文件条目 LRU 上限 (D4): 条目极小, 但配置文件不无限长。
 pub const FILE_CAP: usize = 64;
 
+/// per-文件书签上限 (SPEC-v1x-bookmark-persist D3): 正常使用永远碰不到, 刷屏有闸。
+/// 满员拒绝新增并提示 (「至少保留一列可见」同款守卫风格); 存量超限手造数据在
+/// 归一时截断保升序前 [`MAX_BOOKMARKS`]。
+pub const MAX_BOOKMARKS: usize = 256;
+
 /// 生产路径 (D4): config 目录下 `columns.json` (`license.key` 同目录独立文件先例)。
 pub fn default_path() -> std::path::PathBuf {
     dirs::config_dir()
@@ -202,20 +207,24 @@ pub fn default_path() -> std::path::PathBuf {
 /// 独立文件先例), per-**路径** key, LRU [`FILE_CAP`] 条。
 ///
 /// 磁盘形状 (serde_json::Value 手拼 —— serde derive 不在依赖, 零新依赖红线):
-/// `{ "files": [ { "path", "updated", "order", "hidden", "widths" } ] }`。
+/// `{ "files": [ { "path", "updated", "order", "hidden", "widths", "bookmarks" } ] }`。
 /// **损坏/缺失 → 空集合且不写回**（下次保存才写好, load 永不覆盖用户文件）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnFiles {
     pub entries: Vec<FileEntry>,
 }
 
-/// 一个文件的记忆摆法。
+/// 一个文件的记忆状态 (列摆法 + 书签, SPEC-v1x-bookmark-persist D1)。
+/// **腿四接缝** (评审 Optional): `workspace-sessions` 导出命名会话时须显式
+/// strip `bookmarks` (spec Out: 书签不随命名会话导出/切换), 别静默带进会话包。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEntry {
     /// 文件路径 (exact key)。
     pub path: String,
     /// 摆法。
     pub config: ColumnConfig,
+    /// 书签文件行号 (**升序去重**收编态, 见 [`normalize_bookmarks`])。
+    pub bookmarks: Vec<u64>,
     /// 最近使用时刻 (调用方给 epoch 秒), LRU 依据。
     pub updated: u64,
 }
@@ -246,40 +255,69 @@ impl ColumnFiles {
         files
     }
 
-    /// 写盘 (整文件覆盖写; 与 `config::Config::save_to` 同哲学: 同源一次写)。
+    /// 写盘 (整文件覆盖写, **temp + rename 原子落盘**; 同源一次写,
+    /// `config::Config::save_to` 同哲学)。评审 Critical: `fs::write` 直写
+    /// 中途被杀会留半截坏 JSON —— 再触发保存侧覆盖即抹掉其余全部记忆;
+    /// rename 没有半截窗口。
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
         let arr: Vec<serde_json::Value> = self.entries.iter().map(entry_to_value).collect();
         let v = serde_json::json!({ "files": arr });
         let bytes = serde_json::to_vec_pretty(&v).expect("Value 序列化不会失败");
-        std::fs::write(path, bytes)
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn get(&self, path: &str) -> Option<&ColumnConfig> {
-        self.entries
-            .iter()
-            .find(|e| e.path == path)
-            .map(|e| &e.config)
+        self.get_entry(path).map(|e| &e.config)
+    }
+
+    /// 整条目访问 (书签持久化后载入要拿列摆法**和**书签, 只给 config 不够)。
+    pub fn get_entry(&self, path: &str) -> Option<&FileEntry> {
+        self.entries.iter().find(|e| e.path == path)
     }
 
     /// 记入/更新一条并按 `updated` 保 LRU [`FILE_CAP`] (超限挤掉最旧)。
+    /// 书签入库前过 [`normalize_bookmarks`] (升序去重截断, 收编态见 D1)。
+    /// **淘汰保护** (评审 R2): 书签是用户内容不是偏好 —— 无书签条目先挤,
+    /// 带书签条目最后挤 (同级再按 `updated` 最旧); 全带书签才按纯 LRU。
+    /// 被挤条目**原样返回** (调用方可提示留痕)。
     /// 同秒并列时**本次条目**视为最新 (排序次键), 否则稳定排序把它排在同秒组尾、
     /// `truncate` 反而挤掉刚 put 的自己 (评审 C5)。
-    pub fn put(&mut self, path: String, config: ColumnConfig, updated: u64) {
+    pub fn put(&mut self, mut entry: FileEntry) -> Vec<FileEntry> {
+        entry.bookmarks = normalize_bookmarks(std::mem::take(&mut entry.bookmarks));
+        let path = entry.path.clone();
         self.entries.retain(|e| e.path != path);
-        self.entries.push(FileEntry {
-            path: path.clone(),
-            config,
-            updated,
+        self.entries.push(entry);
+        self.entries.sort_by_key(|e| {
+            (
+                e.bookmarks.is_empty(),
+                std::cmp::Reverse(e.updated),
+                e.path != path,
+            )
         });
-        self.entries
-            .sort_by_key(|e| (std::cmp::Reverse(e.updated), e.path != path));
-        self.entries.truncate(FILE_CAP);
+        if self.entries.len() > FILE_CAP {
+            self.entries.split_off(FILE_CAP)
+        } else {
+            Vec::new()
+        }
     }
+}
+
+/// 书签收编 (D1): 去重 + 升序 + 超 [`MAX_BOOKMARKS`] 截断保前 N。
+/// 磁盘形状的**唯一**归一入口 (`put` / `entry_from_value` 同用) —— 收编态进,
+/// 收编态出, roundtrip 全等好判。
+fn normalize_bookmarks(mut raw: Vec<u64>) -> Vec<u64> {
+    raw.sort_unstable();
+    raw.dedup();
+    raw.truncate(MAX_BOOKMARKS);
+    raw
 }
 
 /// 条目 → Value (手拼; 与 [`entry_from_value`] 互为往返)。
 /// `widths` 键**排序后写入** (评审 Nit: HashMap 迭代序随进程变, 不排的话
 /// 同一摆法两次落盘字节面就不同 —— 用户 diff/sync columns.json 徒增噪音)。
+/// `bookmarks` 恒写 (空 = 空数组, 不省略键 —— roundtrip 全等好判, D1)。
 fn entry_to_value(e: &FileEntry) -> serde_json::Value {
     let mut widths = serde_json::Map::new();
     let mut keys: Vec<&String> = e.config.widths.keys().collect();
@@ -294,6 +332,8 @@ fn entry_to_value(e: &FileEntry) -> serde_json::Value {
         "order": e.config.order,
         "hidden": e.config.hidden,
         "widths": widths,
+        "bookmarks": e.bookmarks,
+
     })
 }
 
@@ -333,6 +373,22 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
             }
         }
     }
+    // 书签 (D1): 可缺省 (空 = 无书签); 逐元素容错 (非 u64 元素丢弃),
+    // 坏形状**丢字段不丢条** (C6 同粒度); 收编走 normalize_bookmarks。
+    let mut bookmarks = Vec::new();
+    if let Some(b) = obj.get("bookmarks").and_then(|b| b.as_array()) {
+        for x in b {
+            // 收集硬顶 (评审 Optional): 手造天文数组不必全量进 Vec 再排 ——
+            // 超顶部分按收集序放弃 (极端手造数据的「升序前 256」近似, spec D3
+            // 存量手造数据本就是收编语义)。
+            if bookmarks.len() >= MAX_BOOKMARKS * 4 {
+                break;
+            }
+            if let Some(n) = x.as_u64() {
+                bookmarks.push(n);
+            }
+        }
+    }
     Some(FileEntry {
         path,
         config: ColumnConfig {
@@ -340,6 +396,7 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
             hidden,
             widths,
         },
+        bookmarks: normalize_bookmarks(bookmarks),
         updated,
     })
 }
@@ -524,11 +581,21 @@ mod tests {
         cfg
     }
 
+    /// 测试构造器: 无书签条目 (书签用例显式构造 `FileEntry`)。
+    fn entry(path: impl Into<String>, config: ColumnConfig, updated: u64) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            config,
+            bookmarks: Vec::new(),
+            updated,
+        }
+    }
+
     #[test]
     fn roundtrip_preserves_order_hidden_widths() {
         let p = temp_columns_path("roundtrip");
         let mut files = ColumnFiles::default();
-        files.put("C:\\logs\\a.jsonl".into(), sample_config(), 100);
+        files.put(entry("C:\\logs\\a.jsonl", sample_config(), 100));
         files.save_to(&p).unwrap();
         let loaded = ColumnFiles::load_from(&p);
         assert_eq!(loaded, files);
@@ -540,16 +607,16 @@ mod tests {
     fn lru_evicts_oldest_beyond_file_cap() {
         let mut files = ColumnFiles::default();
         for i in 0..FILE_CAP {
-            files.put(format!("p{i}"), ColumnConfig::default(), i as u64);
+            files.put(entry(format!("p{i}"), ColumnConfig::default(), i as u64));
         }
         assert_eq!(files.entries.len(), FILE_CAP);
         // 第 65 条: 挤掉最旧 (updated=0 的 p0)
-        files.put("newest".into(), ColumnConfig::default(), 999);
+        files.put(entry("newest", ColumnConfig::default(), 999));
         assert_eq!(files.entries.len(), FILE_CAP);
         assert!(files.get("p0").is_none());
         assert!(files.get("newest").is_some());
         // 更新既有条目不涨数
-        files.put("p1".into(), ColumnConfig::default(), 1000);
+        files.put(entry("p1", ColumnConfig::default(), 1000));
         assert_eq!(files.entries.len(), FILE_CAP);
     }
 
@@ -564,7 +631,7 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), before);
         // 下次保存才写好
         let mut files = files;
-        files.put("p".into(), sample_config(), 1);
+        files.put(entry("p", sample_config(), 1));
         files.save_to(&p).unwrap();
         assert_eq!(ColumnFiles::load_from(&p), files);
         std::fs::remove_file(&p).ok();
@@ -577,11 +644,7 @@ mod tests {
             ColumnFiles::default()
         );
         // 顶层可辨 + 一条坏条目 (缺 order) + 一条好条目: 坏跳好留
-        let good = entry_to_value(&FileEntry {
-            path: "ok".into(),
-            config: ColumnConfig::default(),
-            updated: 1,
-        });
+        let good = entry_to_value(&entry("ok", ColumnConfig::default(), 1));
         let mut bad = serde_json::Map::new();
         bad.insert("path".into(), serde_json::json!("bad"));
         bad.insert("updated".into(), serde_json::json!(2));
@@ -681,12 +744,161 @@ mod tests {
     fn lru_put_same_second_survives_truncation() {
         let mut files = ColumnFiles::default();
         for i in 0..FILE_CAP {
-            files.put(format!("p{i}"), ColumnConfig::default(), 7);
+            files.put(entry(format!("p{i}"), ColumnConfig::default(), 7));
         }
         assert_eq!(files.entries.len(), FILE_CAP);
         // 第 65 条与全部旧条目同秒 (updated=7): 刚 put 的必须存活
-        files.put("newest".into(), ColumnConfig::default(), 7);
+        files.put(entry("newest", ColumnConfig::default(), 7));
         assert_eq!(files.entries.len(), FILE_CAP);
         assert!(files.get("newest").is_some(), "同秒并列不得挤掉本次条目");
+    }
+
+    /// 评审 R2: 书签是用户内容不是偏好 —— LRU 淘汰**无书签条目先挤**,
+    /// 带书签条目最后挤; 全都带书签才按纯 LRU 丢最旧; 被挤者返回给调用方。
+    #[test]
+    fn lru_evicts_bookmarkless_before_bookmarked() {
+        let mut files = ColumnFiles::default();
+        // 1 条无书签最旧 + 63 条带书签 (满 64)
+        files.put(entry("plain", ColumnConfig::default(), 0));
+        for i in 0..FILE_CAP - 1 {
+            files.put(FileEntry {
+                path: format!("bm{i}"),
+                config: ColumnConfig::default(),
+                bookmarks: vec![1],
+                updated: (i + 1) as u64,
+            });
+        }
+        assert_eq!(files.entries.len(), FILE_CAP);
+        // 第 65 条: 无书签的 "plain" 先挤, 带书签全留
+        let evicted = files.put(entry("newest", ColumnConfig::default(), 999));
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, "plain", "无书签最旧先挤");
+        assert!(files.get_entry("bm0").is_some(), "带书签条目全留");
+        assert_eq!(files.entries.len(), FILE_CAP);
+        // 无书签条目**即使更新**也先挤 (此时 "newest" 无书签 updated=999)
+        let evicted = files.put(FileEntry {
+            path: "newest2".into(),
+            config: ColumnConfig::default(),
+            bookmarks: vec![2],
+            updated: 1000,
+        });
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, "newest", "无书签即使更新也先挤");
+        // 全带书签 → 纯 LRU: 最旧的带书签条目被挤并**原样返回**
+        let evicted = files.put(FileEntry {
+            path: "newest3".into(),
+            config: ColumnConfig::default(),
+            bookmarks: vec![3],
+            updated: 1001,
+        });
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].path, "bm0", "全都带书签 → 纯 LRU 丢最旧");
+        assert!(
+            !evicted[0].bookmarks.is_empty(),
+            "被挤条目原样返回 (调用方可提示)"
+        );
+    }
+
+    // ---- T1: 书签持久化磁盘模型 (SPEC-v1x-bookmark-persist D1) ----
+
+    /// roundtrip 全等 (三形态: 有书签/空/满 [`MAX_BOOKMARKS`]); `put` 收编
+    /// (乱序重复进 → 升序去重出); `get` 简写仍指列摆法, `get_entry` 拿整条。
+    /// 摘 `entry_to_value` 的 bookmarks 写出 → `loaded != files` 精确红 (A/B)。
+    #[test]
+    fn roundtrip_preserves_bookmarks_in_three_forms() {
+        let p = temp_columns_path("bm-roundtrip");
+        let mut files = ColumnFiles::default();
+        files.put(FileEntry {
+            path: "C:\\logs\\a.jsonl".into(),
+            config: ColumnConfig::default(),
+            bookmarks: vec![10, 5, 5, 3], // 乱序 + 重复 → 收编升序去重
+            updated: 100,
+        });
+        files.put(FileEntry {
+            path: "C:\\logs\\b.jsonl".into(),
+            config: ColumnConfig::default(),
+            bookmarks: Vec::new(),
+            updated: 99,
+        });
+        let full: Vec<u64> = (0..MAX_BOOKMARKS as u64).collect();
+        files.put(FileEntry {
+            path: "C:\\logs\\c.jsonl".into(),
+            config: ColumnConfig::default(),
+            bookmarks: full.clone(),
+            updated: 98,
+        });
+        files.save_to(&p).unwrap();
+        let loaded = ColumnFiles::load_from(&p);
+        assert_eq!(loaded, files, "roundtrip 全等");
+        assert_eq!(
+            loaded
+                .get_entry("C:\\logs\\a.jsonl")
+                .map(|e| e.bookmarks.as_slice()),
+            Some([3u64, 5, 10].as_slice()),
+            "put 归一: 去重升序"
+        );
+        assert_eq!(
+            loaded
+                .get_entry("C:\\logs\\b.jsonl")
+                .map(|e| e.bookmarks.len()),
+            Some(0),
+            "空书签原样"
+        );
+        assert_eq!(
+            loaded
+                .get_entry("C:\\logs\\c.jsonl")
+                .map(|e| e.bookmarks.as_slice()),
+            Some(full.as_slice()),
+            "满 MAX_BOOKMARKS 原样保留 (不截)"
+        );
+        // get 简写 = config 半边
+        assert_eq!(
+            loaded.get("C:\\logs\\b.jsonl"),
+            Some(&ColumnConfig::default())
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 载入归一 (D1/C6 同粒度): 逐元素容错 (非 u64 丢弃) / 去重 / 升序 /
+    /// 超 [`MAX_BOOKMARKS`] 截断保前 N / 坏形状**丢字段不丢条** / 可缺省。
+    #[test]
+    fn entry_from_json_normalizes_bookmarks_leniently() {
+        let mut shuffled: Vec<u64> = (0..(MAX_BOOKMARKS as u64 + 3)).collect();
+        shuffled.reverse(); // 乱序 259 条
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "files": [
+                {
+                    "path": "a", "updated": 1, "order": ["x"],
+                    "bookmarks": ["oops", 3.5, 7u64, 7u64, 2u64, -1]
+                },
+                {
+                    "path": "b", "updated": 2, "order": ["x"],
+                    "bookmarks": shuffled
+                },
+                {
+                    "path": "c", "updated": 3, "order": ["x"],
+                    "bookmarks": "not-a-list"
+                },
+                { "path": "d", "updated": 4, "order": ["x"] }
+            ]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.entries.len(), 4, "坏 bookmarks 不废条");
+        assert_eq!(
+            files.entries[0].bookmarks,
+            vec![2, 7],
+            "非数值/浮点/负数丢弃, 去重升序"
+        );
+        // 列摆法照留 (评审 R③: 只断言 bookmarks 空/条数会让「丢摆法留空壳」漏网)
+        assert_eq!(files.entries[0].config.order, names(&["x"]));
+        let b = &files.entries[1];
+        assert_eq!(b.bookmarks.len(), MAX_BOOKMARKS, "超限截断保升序前 256");
+        assert_eq!(b.bookmarks.first(), Some(&0));
+        assert_eq!(b.bookmarks.last(), Some(&((MAX_BOOKMARKS - 1) as u64)));
+        assert!(files.entries[2].bookmarks.is_empty(), "坏形状丢字段不丢条");
+        assert_eq!(files.entries[2].config.order, names(&["x"]), "摆法照留");
+        assert!(files.entries[3].bookmarks.is_empty(), "可缺省 = 空");
+        assert_eq!(files.entries[3].config.order, names(&["x"]));
     }
 }

@@ -238,7 +238,7 @@ pub(crate) struct LogApp {
     search_pattern: Option<String>,
     search_elapsed: Option<Duration>,
     search_job: AsyncJob<SearchOutcome>,
-    /// 书签：文件行号集合 (会话内有效，持久化归 v1.x 会话功能)。
+    /// 书签：文件行号集合 (per-路径持久化 + 越界剔除, SPEC-v1x-bookmark-persist D1/D2)。
     bookmarks: std::collections::BTreeSet<u64>,
     /// 展开态 (jsonl-table T4): 文件行号 → 子行数。
     expanded: ExpandMap,
@@ -670,13 +670,22 @@ impl LogApp {
         }
     }
 
-    /// 换文件载入该路径的列摆法 (D4): 记忆 → 对账; 无记忆 = 默认 (schema 首见序)。
-    fn load_columns_for_current_file(&mut self) {
+    /// 换文件载入该路径的记忆状态 (D2, SPEC-v1x-bookmark-persist): 列摆法 + 书签
+    /// **一次读盘同取**; 书签按当前行数越界剔除**不写回** (损坏零写回同哲学);
+    /// 无记忆 = 默认摆法 + 空书签 (替换语义 —— 旧文件的手势/书签不带进新文件)。
+    fn load_state_for_current_file(&mut self) {
         let files = danqing_log::columns::ColumnFiles::load_from(&self.columns_path());
-        self.columns = files
-            .get(self.path.to_string_lossy().as_ref())
-            .cloned()
-            .unwrap_or_default();
+        match files.get_entry(self.path.to_string_lossy().as_ref()) {
+            Some(e) => {
+                self.columns = e.config.clone();
+                let total = self.file.line_count();
+                self.bookmarks = e.bookmarks.iter().copied().filter(|&l| l < total).collect();
+            }
+            None => {
+                self.columns = danqing_log::columns::ColumnConfig::default();
+                self.bookmarks.clear();
+            }
+        }
         self.merge_columns();
     }
 
@@ -697,25 +706,77 @@ impl LogApp {
         }
     }
 
-    /// 列配置落盘 (D4): `columns.json` per-路径条目, 变更即写 (save_config 同哲学)。
-    /// 路径 key = `to_string_lossy` exact (已知局限: 同文件不同路径写法算两条)。
-    fn save_columns(&self) {
+    /// 损坏备份守卫 (评审 Critical, [`Self::save_state`] 前置): 文件存在且非空
+    /// 但解析为空账 (坏 JSON / 形状不可辨 / 条目全废) → 先 rename `.bak` 再开
+    /// 新账 —— 读改写覆盖不得把其余路径的记忆连同坏文件一起抹掉 (「下次保存
+    /// 才写好」不许做成「才写坏」)。返回**是否可继续落盘** (备份失败 = 拒绝覆盖)。
+    fn backup_if_corrupt(&mut self, path: &std::path::Path) -> bool {
+        let Ok(bytes) = std::fs::read(path) else {
+            return true;
+        };
+        if bytes.is_empty()
+            || !danqing_log::columns::ColumnFiles::from_json(&bytes)
+                .entries
+                .is_empty()
+        {
+            return true;
+        }
+        let bak = path.with_extension("json.bak");
+        if std::fs::rename(path, &bak).is_err() {
+            log::warn!("columns.json 已损坏且备份失败 —— 拒绝覆盖以免抹掉其余记忆");
+            return false;
+        }
+        self.set_notice(
+            "columns.json 已损坏, 原文件已备份为 columns.json.bak".into(),
+            NoticeKind::Warn,
+        );
+        true
+    }
+
+    /// 记忆状态落盘 (D2/D4): `columns.json` per-路径条目 (列摆法 + 书签), 变更即写
+    /// (save_config 同哲学)。路径 key = `to_string_lossy` exact (已知局限: 同文件
+    /// 不同路径写法算两条)。返回是否落盘成功 —— **toggle 据此不许说谎**
+    /// (评审 R①: 落盘失败还报「已添加」= 成功判据 1 静默违约)。
+    fn save_state(&mut self) -> bool {
         if !self.has_file {
-            return;
+            return true;
         }
         let path = self.columns_path();
+        if !self.backup_if_corrupt(&path) {
+            return false;
+        }
         let mut files = danqing_log::columns::ColumnFiles::load_from(&path);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        files.put(
-            self.path.to_string_lossy().into_owned(),
-            self.columns.clone(),
-            now,
-        );
-        if let Err(e) = files.save_to(&path) {
-            log::warn!("列配置落盘失败: {e}");
+        // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式, 脏行号不得出内存)
+        let evicted = files.put(danqing_log::columns::FileEntry {
+            path: self.path.to_string_lossy().into_owned(),
+            config: self.columns.clone(),
+            bookmarks: self
+                .bookmarks
+                .iter()
+                .copied()
+                .filter(|&l| l < self.file.line_count())
+                .collect(),
+            updated: now,
+        });
+        for e in evicted {
+            if !e.bookmarks.is_empty() {
+                log::warn!(
+                    "LRU 清理了久未打开文件的记忆 (含 {} 条书签): {}",
+                    e.bookmarks.len(),
+                    e.path
+                );
+            }
+        }
+        match files.save_to(&path) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("记忆状态落盘失败: {e}");
+                false
+            }
         }
     }
 
@@ -1250,7 +1311,7 @@ impl LogApp {
         self.mode = mode;
         self.schema = schema;
         // 列配置载入 (T5/D4): schema 就位后取该路径记忆摆法并对账 (先 schema 才能 merge)
-        self.load_columns_for_current_file();
+        self.load_state_for_current_file();
         self.adopt_level_column(level_column);
         self.launch_levels_job();
         self.top_row = 0.0;
@@ -1270,7 +1331,9 @@ impl LogApp {
         self.search_query.clear();
         self.search_pattern = None;
         self.search_elapsed = None;
-        self.bookmarks.clear();
+        // 书签不在这清: `load_state_for_current_file` 是**替换**语义 (D2) ——
+        // 记忆恢复或清空都在那一处发生; 这里再 clear 会把刚载入的记忆清掉
+        // (plan 核实⑤次序陷阱, 锁 `bookmarks_are_per_path_and_apply_fresh_replaces_with_memory`)。
         self.expanded = ExpandMap::new();
         self.sub_rows.clear();
         self.follow = false;
@@ -1752,17 +1815,46 @@ impl LogApp {
     /// `b` / Ctrl+B: 切换选中行书签 (按文件行号，过滤模式下语义不漂移)。
     /// 状态栏补动作反馈 —— 此前只有行号变金一个信号，用户按完不知道成没成;
     /// 计数由 `refresh_status` 的常驻「书签 N」段承担，这里只缀动作。
+    /// **幽灵行号守卫** (评审 R1): `line_at` 的 `unwrap_or((0,0))` 会把空文件/
+    /// 过滤 0 命中/越界选中塌成「行 0」—— 落盘即跨会话污染, 无有效显示行 =
+    /// 拒绝 + 说清 + 零变更。**上限守卫** (D3): 满
+    /// [`danqing_log::columns::MAX_BOOKMARKS`] 拒绝新增 + 说清 + 零变更
+    /// (删除照常 —— 守卫不得堵死腾位路径)。增删成功即落盘 (D2), 落盘失败
+    /// **不许说谎** (评审 R①)。
     fn toggle_bookmark(&mut self) {
-        let line = self.file_line_of(self.selected);
-        let added = self.bookmarks.insert(line);
-        if !added {
-            self.bookmarks.remove(&line);
-        }
-        self.refresh_status();
-        self.status.push_str(if added {
-            " · 已添加书签"
+        let Some((line, _)) = expand::file_line_at(self.selected, self.lines(), &self.expanded)
+        else {
+            self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Info);
+            return;
+        };
+        let added = if self.bookmarks.remove(&line) {
+            false
+        } else if self.bookmarks.len() >= danqing_log::columns::MAX_BOOKMARKS {
+            self.set_notice(
+                format!(
+                    "书签已达上限 {}, 先去掉一些",
+                    danqing_log::columns::MAX_BOOKMARKS
+                ),
+                NoticeKind::Warn,
+            );
+            return;
         } else {
-            " · 已去掉书签"
+            self.bookmarks.insert(line);
+            true
+        };
+        let saved = self.save_state();
+        // **次序陷阱**: `set_notice` 内含 `refresh_status` 会重建 status ——
+        // 必须先 notice 再 push 后缀, 否则「(未落盘)」被重建冲掉 (评审 R①锁伺候)。
+        if !saved {
+            self.set_notice("书签已改但落盘失败, 重启可能丢失".into(), NoticeKind::Warn);
+        } else {
+            self.refresh_status();
+        }
+        self.status.push_str(match (added, saved) {
+            (true, true) => " · 已添加书签",
+            (true, false) => " · 已添加书签 (未落盘)",
+            (false, true) => " · 已去掉书签",
+            (false, false) => " · 已去掉书签 (未落盘)",
         });
     }
 
@@ -1848,17 +1940,17 @@ impl App for LogApp {
             Msg::ColumnWidthSet(name, w) => {
                 self.merge_columns();
                 self.columns.set_width(&name, w);
-                self.save_columns();
+                self.save_state();
             }
             Msg::ColumnWidthClear(name) => {
                 self.merge_columns();
                 self.columns.widths.remove(&name);
-                self.save_columns();
+                self.save_state();
             }
             Msg::ColumnMoveBefore(name, before) => {
                 self.merge_columns();
                 self.columns.move_name_before(&name, before.as_deref());
-                self.save_columns();
+                self.save_state();
             }
             Msg::OpenColMenu => {
                 self.export_menu_open = false; // 互斥 (D3): 双 scrim 不叠
@@ -1874,7 +1966,7 @@ impl App for LogApp {
                     // D6: ≥1 可见列守卫 —— 关最后一可见列拒绝并提示 (零变更不写)
                     self.set_notice("至少保留一列可见".into(), NoticeKind::Warn);
                 } else {
-                    self.save_columns();
+                    self.save_state();
                 }
             }
             Msg::ResetColumns => {
@@ -1882,7 +1974,7 @@ impl App for LogApp {
                 if let Some(s) = &self.schema {
                     let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
                     self.columns.reset(&names);
-                    self.save_columns();
+                    self.save_state();
                 }
             }
             Msg::ScrollRows(d) => {
@@ -2792,6 +2884,319 @@ mod tests {
         assert!(app.notice.is_none(), "未知列零动作, 不得报守卫文案");
         std::fs::remove_file(cfg.with_extension("columns.json")).ok();
         std::fs::remove_file(&cfg).ok();
+    }
+
+    // ---- T2: 书签持久化全链路 (SPEC-v1x-bookmark-persist D1/D2/D3) ----
+
+    /// toggle 增删即落盘 + 重读 (`load_state_for_current_file`) 恢复 (T2①⑥)。
+    /// 摘 toggle 的 save_state / 摘载入的 bookmarks 读取 → 本锁红 (A/B)。
+    #[test]
+    fn toggle_bookmark_persists_and_reloads() {
+        let cfg = temp_cfg_path("bm-toggle");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\bm.log");
+        let p = temp_log(b"l0\nl1\nl2\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.selected = 1;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.contains(&1), "toggle 添加");
+        let cols = cfg.with_extension("columns.json");
+        let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert_eq!(
+            loaded
+                .get_entry("C:\\logs\\bm.log")
+                .map(|e| e.bookmarks.as_slice()),
+            Some([1u64].as_slice()),
+            "增即落盘"
+        );
+        // 内存清空后重读 = 恢复
+        app.bookmarks.clear();
+        app.load_state_for_current_file();
+        assert!(app.bookmarks.contains(&1), "重读恢复");
+        // 再点 = 去掉, 同步落盘
+        app.selected = 1;
+        app.toggle_bookmark();
+        assert!(!app.bookmarks.contains(&1), "toggle 去掉");
+        let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert!(
+            loaded
+                .get_entry("C:\\logs\\bm.log")
+                .is_some_and(|e| e.bookmarks.is_empty()),
+            "删即落盘"
+        );
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// per-路径隔离 (T2②) + apply_fresh 全链 (T2⑤, plan 核实⑤次序陷阱防漏锁):
+    /// 换文件 = 载入**替换**语义 —— A 的书签不带进 B, B 的记忆恢复
+    /// (若 `bookmarks.clear()` 留在载入之后, 这里会得到空集)。
+    #[test]
+    fn bookmarks_are_per_path_and_apply_fresh_replaces_with_memory() {
+        let cfg = temp_cfg_path("bm-path");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(b"x\ny\n"); // 2 行
+        let out = || OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        // 路径 A: 夹书签落盘
+        app.apply_fresh(std::path::PathBuf::from("A.log"), out());
+        app.selected = 0;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.contains(&0));
+        // 路径 B: 手造记忆 [1]
+        let cols = cfg.with_extension("columns.json");
+        let mut files = danqing_log::columns::ColumnFiles::load_from(&cols);
+        files.put(danqing_log::columns::FileEntry {
+            path: "B.log".into(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            bookmarks: vec![1],
+            updated: 999,
+        });
+        files.save_to(&cols).unwrap();
+        // 换 B: 无 A 残留 + B 记忆恢复
+        app.apply_fresh(std::path::PathBuf::from("B.log"), out());
+        assert_eq!(
+            app.bookmarks.iter().copied().collect::<Vec<_>>(),
+            vec![1],
+            "B 记忆恢复且 A 不跟过来 (载入替换 clear)"
+        );
+        // 回 A: 又在
+        app.apply_fresh(std::path::PathBuf::from("A.log"), out());
+        assert!(app.bookmarks.contains(&0), "A 记忆回来");
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 越界剔除 (T2③, 载入侧): 行号 ≥ line_count 消失、界内保留; **不写回**磁盘
+    /// (损坏零写回同哲学)。
+    #[test]
+    fn load_state_drops_out_of_bounds_bookmarks() {
+        let cfg = temp_cfg_path("bm-oob");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\oob.log");
+        let p = temp_log(b"l0\nl1\nl2\n"); // 3 行
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        let cols = cfg.with_extension("columns.json");
+        let mut files = danqing_log::columns::ColumnFiles::default();
+        files.put(danqing_log::columns::FileEntry {
+            path: "C:\\logs\\oob.log".into(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            bookmarks: vec![0, 5, 99],
+            updated: 1,
+        });
+        files.save_to(&cols).unwrap();
+        app.load_state_for_current_file();
+        assert_eq!(
+            app.bookmarks.iter().copied().collect::<Vec<_>>(),
+            vec![0],
+            "5/99 越界剔除, 0 保留"
+        );
+        let on_disk = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert_eq!(
+            on_disk
+                .get_entry("C:\\logs\\oob.log")
+                .map(|e| e.bookmarks.as_slice()),
+            Some([0u64, 5, 99].as_slice()),
+            "剔除不写回"
+        );
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 上限守卫 (T2④, D3): 满 `MAX_BOOKMARKS` 拒绝新增 + 说清为什么 + 零变更;
+    /// **删除照常**（满员时 toggle 已有书签仍须能删 —— 评审 R②: 别让守卫顺序
+    /// 把「腾空位」的唯一路径堵死）; 去掉一个又能加。全走 toggle 行为, 不直改集合。
+    #[test]
+    fn toggle_bookmark_refuses_at_cap_with_notice() {
+        let cfg = temp_cfg_path("bm-cap");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\cap.log");
+        // 257 行真夹具 (行号 0..=256): 前 256 行全夹满, 第 257 行是空位行
+        let content: String = (0..257).map(|i| format!("l{i}\n")).collect();
+        let p = temp_log(content.as_bytes());
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        for row in 0..danqing_log::columns::MAX_BOOKMARKS as u64 {
+            app.selected = row;
+            app.toggle_bookmark();
+        }
+        assert_eq!(app.bookmarks.len(), danqing_log::columns::MAX_BOOKMARKS);
+        // 满员: 新增拒绝零变更
+        app.selected = 256;
+        app.toggle_bookmark();
+        assert_eq!(
+            app.bookmarks.len(),
+            danqing_log::columns::MAX_BOOKMARKS,
+            "满员拒绝零变更"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, k)| t.contains("上限") && matches!(k, crate::NoticeKind::Warn)),
+            "拒绝须说清为什么"
+        );
+        // **删除照常**: 满员时 toggle 已有书签 → 移除成功 (守卫不得堵死腾位路径)
+        app.selected = 5;
+        app.toggle_bookmark();
+        assert!(
+            !app.bookmarks.contains(&5),
+            "满员时删除已有书签照常 (评审 R②)"
+        );
+        assert_eq!(app.bookmarks.len(), danqing_log::columns::MAX_BOOKMARKS - 1);
+        // 有空位 → 又能加
+        app.selected = 256;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.contains(&256), "有空位即恢复可加");
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// rebuild 越界剔除既有行为回归锁 (T2③另一半): 轮转后 `retain(l < line_count)`。
+    #[test]
+    fn apply_rebuild_keeps_bounds_valid_bookmarks() {
+        let cfg = temp_cfg_path("bm-rebuild");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\rb.log");
+        app.bookmarks = [0u64, 5, 99].into_iter().collect();
+        let p = temp_log(b"a\nb\n"); // 轮转后 2 行
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: true,
+            level_column: None,
+        };
+        app.apply_rebuild(std::path::Path::new("C:\\logs\\rb.log"), out);
+        assert_eq!(
+            app.bookmarks.iter().copied().collect::<Vec<_>>(),
+            vec![0],
+            "rebuild 越界剔除"
+        );
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ---- 评审修复锁 (2026-09-23 双路评审并账) ----
+
+    /// 评审 Critical: 坏 `columns.json` 后变更不得**覆盖抹掉全部记忆** ——
+    /// 先备份 `.bak` (原字节原样), 再开新账。
+    #[test]
+    fn corrupt_state_file_is_backed_up_not_clobbered() {
+        let cfg = temp_cfg_path("bm-corrupt-save");
+        let cols = cfg.with_extension("columns.json");
+        let bak = cfg.with_extension("columns.json.bak");
+        // 先造一份 64 条真实记忆, 再把文件打成坏 JSON (字节里仍含全部路径)
+        let mut files = danqing_log::columns::ColumnFiles::default();
+        for i in 0..danqing_log::columns::FILE_CAP {
+            files.put(danqing_log::columns::FileEntry {
+                path: format!("C:\\logs\\p{i}.log"),
+                config: danqing_log::columns::ColumnConfig::default(),
+                bookmarks: vec![1],
+                updated: i as u64,
+            });
+        }
+        files.save_to(&cols).unwrap();
+        let garbage = b"{ this was a good file, now it is not json".to_vec();
+        std::fs::write(&cols, &garbage).unwrap();
+        // 任意变更触发 save_state
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\fresh.log");
+        let p = temp_log(b"x\ny\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.selected = 0;
+        app.toggle_bookmark();
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            garbage,
+            "坏文件原字节进 .bak (记忆可捞回)"
+        );
+        let after = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert_eq!(after.entries.len(), 1, "新账只含本次条目");
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&bak).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 R1: 无有效显示行 (空文件 / 过滤 0 命中 / selected 越界) 不得把
+    /// 「行 0」幽灵书签落盘 —— 拒绝 + 说清 + 零变更。
+    #[test]
+    fn toggle_bookmark_rejects_ghost_rows() {
+        let cfg = temp_cfg_path("bm-ghost");
+        let cols = cfg.with_extension("columns.json");
+        // 空文件 (0 行)
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\empty.log");
+        let p = temp_log(b"");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.selected = 0;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.is_empty(), "空文件不夹幽灵行 0");
+        // 过滤 0 命中: 3 行文件全被滤掉
+        let p2 = temp_log(b"a\nb\nc\n");
+        app.file = Arc::new(LogFile::open(&p2).unwrap());
+        app.filtered = Some(Arc::new(Vec::new()));
+        app.selected = 0;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.is_empty(), "过滤 0 命中不夹行 0");
+        // selected 越界 (3 行文件选中第 99 行)
+        app.filtered = None;
+        app.selected = 99;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.is_empty(), "越界选中不夹行 0");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("无有效行") || t.contains("无行")),
+            "拒绝须说清为什么"
+        );
+        assert!(!cols.exists(), "零变更不落盘");
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    /// 评审 R1 (五轴 R①): 落盘失败不得谎报「已添加/已去掉」—— 内存照改、
+    /// 状态说「未落盘」+ 提示。
+    #[test]
+    fn toggle_says_truth_when_save_fails() {
+        let cfg = temp_cfg_path("bm-savefail");
+        let cols = cfg.with_extension("columns.json");
+        std::fs::create_dir(&cols).unwrap(); // 非空目录占住落盘路径 → rename 必败
+        std::fs::write(cols.join("sentinel"), b"x").unwrap();
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\sf.log");
+        let p = temp_log(b"l0\nl1\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.selected = 0;
+        app.toggle_bookmark();
+        assert!(app.bookmarks.contains(&0), "内存照改");
+        assert!(app.status.contains("未落盘"), "状态不许说谎");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(_, k)| matches!(k, crate::NoticeKind::Warn)),
+            "落盘失败须提示"
+        );
+        std::fs::remove_dir(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
