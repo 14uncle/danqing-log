@@ -2,7 +2,8 @@
 
 - @author 十四叔
 - @date 2026/09/23
-- 状态: **已批准**（2026-09-23 用户「go」；四项口径见 D1/D5/D2/D6，Open Q① 同批确认不做）—— 进 plan 阶段
+- 状态: **build + 双路评审修复收口**（2026-09-23 一日: 批准 → plan → T1–T7 → 双路
+  review REQUEST CHANGES → 全部修复, 312 测试绿）—— 待人工验收 → code-simplify
 - 所属: 能力地图 `SPEC-v1x-map.md` 模块 `export`（构建顺序第 3 位，接 `field-analytics` 之后；依赖 `licensing` 的门控机制）
 
 ## Objective
@@ -107,6 +108,9 @@ ROADMAP §二腿三的三格式字面：**过滤结果导出、JSON 美化导出
   单行 JSON（`{"a":1}`，与单元格显示同口径）。
 - **源非 UTF-8**（GBK JSONL 罕见但存在）：解码走 `danqing-encoding`，输出一律
   UTF-8——CSV 是交付文本，统一编码；原始行格式负责字节保真那条路。
+- **公式注入中和**（2026-09-23 评审追加）：单元格首字符 `=`/`@`/Tab/CR 恒加 `'`
+  前缀，`+`/`-` 仅**非纯数字**时加（负数列保数值语义）——CSV 的目标就是 Excel，
+  而日志内容不可信，RFC4180 引号挡不住公式执行。
 - 仅 JSONL 模式可用（裁定②）。
 
 ### D6: 门控点位 = 导出入口（保存对话框之前）
@@ -180,6 +184,13 @@ ROADMAP §二腿三的三格式字面：**过滤结果导出、JSON 美化导出
   **转码后**的行/字节, 不是源文件的 UTF-16 字节; 「逐字节保真」对 UTF-8/GBK 成立
 - 默认文件名时间戳 = **UTC**（零依赖手写 civil-from-days; 时间戳只用于唯一名,
   不承担叙事; 要本地时间再议）
+- **同路径覆写**会透过 Windows 共享映射窜进在途快照（mmap 与写句柄同页）——
+  冻结语义对 live-tail 的 **append** 增长成立（映射定长）, 对「覆写同名文件再导」
+  不设防; 不属产品增长形态, 实机撞到再议
+- **行尾探测**取前 8 个行尾多数票——「头样板与正文方向相反」的文件会统一错
+  （比混排更隐蔽的采样偏差）; 属已知局限, 实机撞到再补引擎 `line_with_ending(i)`
+- **0 命中导出**（过滤结果空）= 合法空交付（raw 0 字节 / CSV 仅 BOM+表头）,
+  完成提示如实报「0 行」—— 不加确认弹窗
 - 离线 key 是君子协定（licensing 既定，不重复展开）
 
 ## Boundaries
@@ -188,8 +199,9 @@ ROADMAP §二腿三的三格式字面：**过滤结果导出、JSON 美化导出
 - 零新依赖（rfd / serde_json / danqing-encoding 全是既有）；CSV 转义手写
 - 五段流水线：spec 批准 → plan → build → review → code-simplify，spec 后不立即编码
 - 未获用户指示不 commit/push
-- 引擎缺口当场修进 `danqing-logfile`（本模块预计**零引擎改动**——取行/切行/
-  过滤全是既有原语，唯一消费方是写出管道）
+- 引擎缺口当场修进 `danqing-logfile`（~~预计零引擎改动~~ **实况修正**: 为全集
+  整拷补了 `LogFile::bytes()` 访问器, `danqing-logfile@a81dcac` —— `line()` 剥行尾,
+  字节保真需要存储字节快照, 8 行零拷贝）
 
 ## Open Questions
 
@@ -220,13 +232,69 @@ ROADMAP §二腿三的三格式字面：**过滤结果导出、JSON 美化导出
 - 机器判据 1–8 全过 (测试 298 绿); 三处 **A/B 精确红**记录在
   `tasks/todo-v1x-export.md` Checkpoint A (摘行尾策略 / 摘 CSV 转义 / 摘 pretty 空行)。
 
-## 评审记
+## 评审记（2026-09-23, 双路独立评审: 均 REQUEST CHANGES → 修复闭环, 312 测试绿）
 
-（review 阶段回填）
+两路（五轴全量 / 并发·保真·行集深潜）互不知情, 独立提出。合并去重后修复清单:
 
-## 简化记
+**Critical ×2（全修）**:
+1. **覆盖写+取消/失败吃掉用户旧文件** (A) —— `File::create(目标)` 先截断。修: 写
+   `<path>.partial` 成功后 rename 原子替换; 取消/失败/panic 只删 partial, 目标原样。
+   锁: `cancel_keeps_existing_target_intact` (修前精确红 = 旧文件被删)。
+2. **invalidate + 立刻再 launch = 会话级导出报废** (B) —— 跨代次共享 cancel Arc
+   (新 launch 重置撤销旧 worker 的取消) + `AsyncJob` 单槽被旧轮覆写 (新结果永久
+   丢失 → running 卡死)。修三件套: 每轮新建 Arc 对 / `AsyncJob` 按代次拒旧覆盖
+   (search.rs, 全作业族受益) / 语义不变的 poll 链。锁: `invalidate_then_relaunch_
+   keeps_new_job_alive` + `late_stale_result_does_not_overwrite_newer` (search.rs)。
 
-（code-simplify 阶段回填）
+**Required ×7（全修）**: ①默认扩展名按格式分派 (R1/B-R4, 锁 `default_export_ext_
+follows_format`) ②D1 四态+冻结上锁 (R2, 锁 `export_line_set_covers_d1_four_states`
++ `export_writes_frozen_snapshot_not_appended_growth`) ③CSV 公式注入中和 (R3, 锁
+`csv_neutralizes_excel_formulas_but_keeps_numbers`) ④apply_fresh 关格式菜单 (R4,
+锁 `apply_fresh_closes_export_menu`) ⑤worker panic → catch_unwind 收 Failed
+(R5, 免 in-flight 卡死) ⑥搜索命中 100 万封顶**拒绝导出**不静默截断 (B-R1, 锁
+`capped_search_hits_refuse_export`, 闸在入口) ⑦稀疏末行无行尾不补 + BOM 对齐全集
+(B-R2, 锁 `sparse_keeps_bare_last_line_without_added_ending` + `sparse_preserves_
+utf8_bom_like_full_copy`) ⑧UTF-8 源直 parse 原字节, lossy 不得把失败行洗成合法
+JSON (B-R3, 锁 `invalid_utf8_line_stays_raw_bad_not_washed` + `parse_source_...`)。
+
+**Optional 裁决**: 进度 u128 溢出修 / 取消前先 poll (双态拧巴) 修 / 过滤在途闸修
+(锁 `pending_filter_blocks_export_entry`) / pretty 连续失败行**同样**空行分隔
+(口径写死进实现记) / 0 命中=合法空交付 (文档记录) / `export_line_set` 等 110 行
+迁 export.rs **留给 code-simplify** / 行尾采样偏差与覆写透映射入已知局限 /
+settings 两卡壳重复不动 (卡体已共享) / visit_rows 全集不收束 line_count 不动 (契约注)。
+
+**Nits 修**: idx 魔法数 → `ExportPick` 枚举 / pretty `expect` → 失败行兜底 /
+`drop(w)` 先于 rename/remove / launch 撞单作业不再静默。
+
+**评审过程事故（自报）**: 修复中把在途闸从 `begin_export` 挪到入口后, `capped_
+search_hits` 测试仍直调 `begin_export` —— **穿到真保存对话框** (套件 34s), 违反
+「测试严禁真实桌面副作用」家法。当轮改正为走入口消息, 测试注释写明此坑。
+
+**A/B 精确红记录**: 取消保旧文件 (修前红 = 旧文件消失) / search.rs 代次拒覆盖
+(修前红 = 新结果丢) / 稀疏末行 (修前红 = 多出 CRLF) / 公式中和 (修前红 = 裸
+`=HYPERLINK`) / UTF-8 坏字节 (修前红 = U+FFFD 洗过且 bad=0)。夹具教训: 坏字节
+必须藏在编码检测采样窗 (64 KiB) 之后, 否则检出为 GBK 测不到目标路径。
+
+## 简化记（2026-09-23 code-simplify, 行为零变化, 314 绿不破 —— 既有测试零改动）
+
+1. **`outcome_of`** —— raw/pretty/csv 三处同一份「completed→Done/Cancelled」收尾
+   判定收成一函数（概念命名, 三处 5 行 if-else 各消失）。
+2. **`ExportFormat::write`** —— 格式分派的三臂 match 曾在作业体与 logbench
+   **各抄一份**; 收成方法后两边只剩一行调用（消灭第二条构造线, 与 D9「数字与
+   真实路径同一份代码」同哲学）。
+3. **`export::now_stamp`** —— `SystemTime` 取值移进 export（UTC 决策归 D8 所有者）,
+   main 调用点 8 行 → 1 行。
+4. **评审 defer 落地: D1/命名件迁 `export.rs`** —— `line_set_of` / `scope_suffix` /
+   `ext_for` 自 main 迁入; **原 main 的同形双分支 match（JSONL/明文）折叠成一处**
+   「模式取源」（重复条件=缺模型的信号, 折叠后可读性反升）; main 只剩备料三行。
+   补纯函数锁 `line_set_of_picks_source_by_mode` + `scope_and_ext_follow_d1_d8_matrix`
+   （取源优先级/命名矩阵边角）; main 既有四态/扩展名测试**原样保留**作适配层人证。
+
+**通读后判定不动**（不为动而动）: `ExportJob` 状态机（评审刚加固, 概念数已最低）/
+`csv_escape`·`neutralize_formula`·`detect_line_end`·`civil_from_days`（纯函数已对拍）/
+`write_full` 的 `projected` 闭包（u128 注释即意图）/ view 底栏绘制块（自绘几何家法）/
+settings 两卡壳（卡体已共享, 4 行包装不值得再抽）/ `WriteOutcome` vs `ExportEnd`
+两枚举（writer 层与作业层职责真不同）。
 
 ## 人工验收
 

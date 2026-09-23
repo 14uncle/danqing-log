@@ -105,7 +105,17 @@
 - [ ] **人工验收（用户实机, spec 四条）**: ①免费态升级提示无保存框 ②付费态三格式
   真文件（CSV **Excel** 开中文不乱码列对齐 / 美化缩进 / 原始行 diff 对应行一致）
   ③demo-1gb 导出期间 UI 可响应、取消半成品消失 ④明文菜单收口 + live-tail 快照语义
-- [ ] 进 review 阶段（`/agent-skills:code-review-and-quality`）→ code-simplify
+- [x] 进 review 阶段（`/agent-skills:code-review-and-quality`）—— 2026-09-23 双路
+      独立评审 (五轴全量 + 并发/保真/行集深潜) 均 REQUEST CHANGES → **修复闭环**:
+      Critical ×2 (覆盖写吃旧文件 → .partial+rename; invalidate+relaunch 会话级
+      卡死 → Arc 分代 + AsyncJob 代次拒覆盖) + Required ×7 全修 + Optional 4 修
+      3 记录 + Nits 全修; 修复锁 +14 (298→**312**); 详见 spec 评审记
+      (含过程事故自报: 测试穿到真保存对话框, 当轮改正)
+- [x] 进 code-simplify 阶段 —— 2026-09-23 完成, **五阶段全闭**。4 处简化
+      (outcome_of 三处收尾统一 / ExportFormat::write 双份三臂 match 收一 /
+      now_stamp 取值归 export / 评审 defer 落地: line_set_of·scope_suffix·ext_for
+      迁 export.rs + main 双分支 match 折叠), 行为零变化 (既有测试零改动, 314 绿);
+      通读后判定不动清单见 spec 简化记。补纯函数锁 +2。
 
 ## 遗留 / 待用户动作
 

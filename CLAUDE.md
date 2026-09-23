@@ -23,6 +23,16 @@
   轮转不作废在途导出 / UTC 时间戳 / UTF-16 转码副本局限)。
   **待: 人工验收 (spec 四条) → review → code-simplify; 之后地图顺序 =
   table-column-config (免费层欠账三连)**。
+  **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
+  write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
+  main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 全修)**: Critical ×2
+  (覆盖写吃用户旧文件 → `.partial`+rename 目标保护; invalidate+relaunch 跨代
+  共享 Arc + AsyncJob 单槽覆写 → 会话级卡死, 修在 search.rs 代次拒覆盖全作业族
+  受益) + Required ×7 (扩展名分派 / D1 四态上锁 / CSV 公式注入中和 / apply_fresh
+  关菜单 / panic catch_unwind / 搜索 100 万封顶拒绝导出 / 稀疏末行不补+BOM 对齐
+  +UTF-8 直 parse) 全修, 修复锁 +14 → **312 绿**。教训一笔: 修复中测试直调
+  begin_export 穿到真保存对话框 (家法违规, 当轮改正, 评审记有案)。
 - 2026-09-22 (**v1.0.2 GitHub 已发布; MS Store 余用户提交一步**): 更新提示两批
   (update-badge 双轨更新检查 + update-hint-ui 角标/link 形按钮/版本行居中, 均
   五段+人工验收+review+simplify 全闭, 含实机「角标 y 双加」返修)。**首个带更新
