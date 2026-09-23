@@ -44,8 +44,9 @@
   **同日 code-simplify 收口 → 五段全闭**: Nit×5 清零 (move_column 边界 /
   `HeaderHit::None`→`Miss` / `last_is_move`→`msg_count` / widths 键排序落盘 /
   「排尾」doc 补全) + 消重复形状 (`header_gesture_active` / `abandon_header_gesture`
-  各收 3 处), 365 绿行为零变化。**人工验收五条用户闸门** (免费层无门控, 任意
-  JSONL 可验; 含新验点: 表头右键开弹层 / 截断列边缘拖宽)。
+  各收 3 处), 365 绿行为零变化。**人工验收全部记账** (2026-09-23 用户裁定) ——
+  跨模块总清单 `tasks/acceptance-pending.md` (A 组列配置六条含评审验点 /
+  B 组 export 四条需付费态 / C 组商店更新流一条)。
   **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
   write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
   main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。
