@@ -83,6 +83,41 @@ impl ExportSet {
     }
 }
 
+/// D1 行集口径的唯一真身 (2026-09-23 评审 defer, 自 main 迁入):
+/// 行集来源**按模式取一** —— JSONL 看过滤, 明文看搜索; 另一模式的活动项
+/// **不改口径** (JSONL 搜索是高亮导航, 明文无过滤通路)。都无 = 全集。
+pub fn line_set_of(
+    line_count: u64,
+    is_jsonl: bool,
+    filtered: Option<&[u64]>,
+    search_hits: Option<&[u64]>,
+) -> ExportSet {
+    match if is_jsonl { filtered } else { search_hits } {
+        Some(hits) => ExportSet::from_lines(hits.to_vec(), line_count),
+        None => ExportSet::all(line_count),
+    }
+}
+
+/// 默认名 scope 中缀 (spec D8, 与 D1 口径同源): JSONL 看过滤, 明文看搜索。
+pub fn scope_suffix(is_jsonl: bool, has_filtered: bool, has_search: bool) -> &'static str {
+    match (is_jsonl, has_filtered, has_search) {
+        (true, true, _) => "-filtered",
+        (false, _, true) => "-searched",
+        _ => "",
+    }
+}
+
+/// 扩展名按格式分派 (spec D8 / 评审 R1): 原始行保源扩展名, 美化 `.json`, CSV `.csv`。
+pub fn ext_for(pick: ExportPick, source_ext: Option<&str>) -> String {
+    match pick {
+        ExportPick::Raw => source_ext
+            .map(str::to_string)
+            .unwrap_or_else(|| "log".to_string()),
+        ExportPick::Pretty => "json".to_string(),
+        ExportPick::Csv => "csv".to_string(),
+    }
+}
+
 /// 行尾策略 (plan 衍生设计): 文件级探测, 统一写出。
 ///
 /// 为什么文件级不是逐行: `LogFile::line()` 剥行尾 (`\n`/`\r` 都不含), 逐行精确
@@ -136,6 +171,15 @@ pub enum WriteOutcome {
     Cancelled { lines: u64 },
 }
 
+/// 写出收尾统一形 (raw/pretty/csv 三处 writer 共用同一判定)。
+fn outcome_of(completed: bool, lines: u64) -> WriteOutcome {
+    if completed {
+        WriteOutcome::Done { lines }
+    } else {
+        WriteOutcome::Cancelled { lines }
+    }
+}
+
 /// 原始行导出 (spec D3): 全集 = 存储字节整拷; 稀疏 = 行内容 + 文件级行尾。
 ///
 /// - GBK/Latin-1: 数据是 mmap 原字节, 稀疏路径逐行保真 (行尾统一除外), 整拷逐字节相等。
@@ -168,21 +212,22 @@ fn write_full<W: Write>(
     let data = file.bytes();
     let total = data.len();
     let line_count = file.line_count();
+    // 进度按字节比例折行数, 乘法走 u128 (review Optional: done×line_count 在
+    // 40GiB+/大行数下 u64 溢出 —— debug panic 会连带卡死 in-flight 态)。
+    let projected = |done: usize| -> u64 {
+        ((done as u128 * line_count as u128) / total.max(1) as u128) as u64
+    };
     let mut done = 0usize;
     while done < total {
         if cancel.load(Ordering::Relaxed) {
-            let lines = (done as u64 * line_count)
-                .checked_div(total as u64)
-                .unwrap_or(0);
+            let lines = projected(done);
             progress.store(lines, Ordering::Relaxed);
             return Ok(WriteOutcome::Cancelled { lines });
         }
         let end = (done + CHUNK).min(total);
         out.write_all(&data[done..end])?;
         done = end;
-        let lines = (done as u64 * line_count)
-            .checked_div(total as u64)
-            .unwrap_or(0);
+        let lines = projected(done);
         progress.store(lines, Ordering::Relaxed);
     }
     progress.store(line_count, Ordering::Relaxed);
@@ -197,31 +242,40 @@ fn write_sparse<W: Write>(
     cancel: &AtomicBool,
     progress: &AtomicU64,
 ) -> io::Result<WriteOutcome> {
-    let end = detect_line_end(file.bytes()).as_bytes();
+    let data = file.bytes();
+    let end = detect_line_end(data).as_bytes();
+    // 末行无行尾 (review B-R2): 源不以 `\n` 收尾时最后一行**不补**行尾 ——
+    // D3「与源文件对应行逐字节相同」含行尾维度; 全集/稀疏对同一行集输出必须一致。
+    let last_line = file.line_count().saturating_sub(1);
+    let last_bare = !data.is_empty() && data.last() != Some(&b'\n');
+    // BOM 对齐全集 (review B): 引擎 line(0) 剥 BOM (`logfile.rs:620`), 不补则稀疏
+    // 与全集整拷首行不一致 —— 这里按源补回。
+    if data.starts_with(UTF8_BOM) {
+        out.write_all(UTF8_BOM)?;
+    }
     let mut written = 0u64;
-    let completed = visit_rows(file, set, cancel, progress, |line| {
+    let completed = visit_rows(file, set, cancel, progress, |i, line| {
         out.write_all(line)?;
-        out.write_all(end)?;
+        if !(last_bare && i == last_line) {
+            out.write_all(end)?;
+        }
         written += 1;
         Ok(())
     })?;
-    Ok(if completed {
-        WriteOutcome::Done { lines: written }
-    } else {
-        WriteOutcome::Cancelled { lines: written }
-    })
+    Ok(outcome_of(completed, written))
 }
 
 /// 行遍历骨架 (csv/pretty 共用): `lines()` 单遍 + 行集游标, 每命中一行回调一次。
 ///
 /// 取消语义: 命中行回调前查 [`AtomicBool`], 置位即停 —— 回调**不**再执行。
-/// 返回值 = 是否走完全部行集 (false = 中途取消)。
+/// 返回值 = 是否走完全部行集 (false = 中途取消)。回调携带**文件行号** (稀疏
+/// raw 的末行无行尾判定要用)。
 fn visit_rows(
     file: &LogFile,
     set: &ExportSet,
     cancel: &AtomicBool,
     progress: &AtomicU64,
-    mut f: impl FnMut(&[u8]) -> io::Result<()>,
+    mut f: impl FnMut(u64, &[u8]) -> io::Result<()>,
 ) -> io::Result<bool> {
     let want = set.lines();
     let mut cursor = 0usize;
@@ -240,7 +294,7 @@ fn visit_rows(
         if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        f(line)?;
+        f(i, line)?;
         visited += 1;
         progress.store(visited, Ordering::Relaxed);
     }
@@ -249,8 +303,8 @@ fn visit_rows(
 
 // ---------------- CSV (spec D5) ----------------
 
-/// UTF-8 BOM (Excel 中文不乱码的唯一可靠手段, 只在 CSV 写)。
-const CSV_BOM: &[u8] = b"\xEF\xBB\xBF";
+/// UTF-8 BOM (Excel 中文不乱码的唯一可靠手段; CSV 写出 + 稀疏 raw 对齐全集)。
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// RFC4180 字段转义: 含逗号/引号/换行 → 整体加引号, 内部 `"` → `""`。行尾 CRLF 由调用方拼。
 fn csv_escape(field: &str, out: &mut Vec<u8>) {
@@ -271,6 +325,39 @@ fn csv_escape(field: &str, out: &mut Vec<u8>) {
     out.push(b'"');
 }
 
+/// Excel 公式注入中和 (review A-R3): CSV 的目标就是 Excel, 而日志内容不可信 ——
+/// `=HYPERLINK(...)` 这类单元格经 RFC4180 引号后**仍会被 Excel 当公式执行**。
+/// 首字符 `=`/`@`/Tab/CR 恒加 `'` 前缀; `+`/`-` 仅在**非纯数字**时加
+/// (负数/正数列保数值语义, 不被文本化)。
+fn neutralize_formula(field: &str) -> std::borrow::Cow<'_, str> {
+    let risky = match field.as_bytes().first() {
+        Some(b'=' | b'@' | b'\t' | b'\r') => true,
+        Some(b'+' | b'-') => field.parse::<f64>().is_err(),
+        _ => false,
+    };
+    if risky {
+        std::borrow::Cow::Owned(format!("'{field}"))
+    } else {
+        std::borrow::Cow::Borrowed(field)
+    }
+}
+
+/// 取本行的 parse 源字节 (review B-R3): UTF-8 存储 (含 UTF-16 转码副本) **直接
+/// 按原字节** parse —— 先 `decode_line` 的 lossy 会把非法字节洗成 U+FFFD,
+/// 可能把本该「失败行原样」的行洗成合法 JSON (交付物被静默改写)。
+/// 仅非 UTF-8 存储 (GBK/Latin-1) 才解码后 parse。
+fn parse_source<'a>(
+    enc: danqing::encoding::Encoding,
+    line: &'a [u8],
+    decoded: &'a str,
+) -> &'a [u8] {
+    if matches!(enc, danqing::encoding::Encoding::Utf8) {
+        line
+    } else {
+        decoded.as_bytes()
+    }
+}
+
 /// CSV 导出 (spec D5): BOM + 表头 (schema 首见序) + 数据行, 行尾 CRLF。
 ///
 /// 口径 (实现中修正 plan 原案「不逐行 parse」): 单元格值走 `parse_line` +
@@ -288,7 +375,7 @@ pub fn write_csv<W: Write>(
     cancel: &AtomicBool,
     progress: &AtomicU64,
 ) -> io::Result<(WriteOutcome, u64)> {
-    out.write_all(CSV_BOM)?;
+    out.write_all(UTF8_BOM)?;
     // 表头 (列名同样走转义 —— 列名含逗号并非不可能)
     let mut head = Vec::new();
     for (ci, col) in columns.iter().enumerate() {
@@ -303,10 +390,10 @@ pub fn write_csv<W: Write>(
     let mut bad = 0u64;
     let mut written = 0u64;
     let enc = file.encoding();
-    let completed = visit_rows(file, set, cancel, progress, |line| {
+    let completed = visit_rows(file, set, cancel, progress, |_i, line| {
         let decoded = decode_line(enc, line);
         let mut row = Vec::new();
-        match jsonl::parse_line(decoded.as_bytes()) {
+        match jsonl::parse_line(parse_source(enc, line, &decoded)) {
             Some(value) => {
                 for (ci, col) in columns.iter().enumerate() {
                     if ci > 0 {
@@ -316,11 +403,12 @@ pub fn write_csv<W: Write>(
                         .get(col.as_str())
                         .map(jsonl::cell_display)
                         .unwrap_or_default();
-                    csv_escape(&cell, &mut row);
+                    csv_escape(&neutralize_formula(&cell), &mut row);
                 }
             }
             None => {
-                // 非 JSON 行: 整行进第一列, 其余空 —— 不丢行。
+                // 非 JSON 行: 整行文本进第一列 (文本输出对 UTF-8 坏字节只能 lossy),
+                // 其余空 —— 不丢行。
                 bad += 1;
                 csv_escape(&decoded, &mut row);
                 row.extend(std::iter::repeat_n(b',', columns.len().saturating_sub(1)));
@@ -331,12 +419,7 @@ pub fn write_csv<W: Write>(
         written += 1;
         Ok(())
     })?;
-    let outcome = if completed {
-        WriteOutcome::Done { lines: written }
-    } else {
-        WriteOutcome::Cancelled { lines: written }
-    };
-    Ok((outcome, bad))
+    Ok((outcome_of(completed, written), bad))
 }
 
 // ---------------- JSON 美化 (spec D4) ----------------
@@ -357,19 +440,26 @@ pub fn write_pretty<W: Write>(
     let mut written = 0u64;
     let mut first = true;
     let enc = file.encoding();
-    let completed = visit_rows(file, set, cancel, progress, |line| {
+    let completed = visit_rows(file, set, cancel, progress, |_i, line| {
         if !first {
-            out.write_all(b"\n")?; // 记录间空一行 (空行 = 记录分隔符, 首记录前无)
+            out.write_all(b"\n")?; // 记录间空一行 (空行 = 记录分隔符, 首记录前无;
+            // 连续失败行**同样**以空行分隔 —— 口径: 记录分隔对成败行一视同仁)
         }
         first = false;
         let decoded = decode_line(enc, line);
-        match jsonl::parse_line(decoded.as_bytes()) {
-            Some(value) => {
-                let pretty = serde_json::to_string_pretty(&value)
-                    .expect("to_string_pretty 对合法 Value 不失败");
-                out.write_all(pretty.as_bytes())?;
-                out.write_all(b"\n")?;
-            }
+        match jsonl::parse_line(parse_source(enc, line, &decoded)) {
+            Some(value) => match serde_json::to_string_pretty(&value) {
+                Ok(pretty) => {
+                    out.write_all(pretty.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Err(_) => {
+                    // 序列化失败视同失败行 (不 expect —— worker panic 会卡死 in-flight 态)
+                    bad += 1;
+                    out.write_all(line)?;
+                    out.write_all(b"\n")?;
+                }
+            },
             None => {
                 bad += 1;
                 out.write_all(line)?; // 原样字节 (spec D4: 保持字节)
@@ -379,15 +469,20 @@ pub fn write_pretty<W: Write>(
         written += 1;
         Ok(())
     })?;
-    let outcome = if completed {
-        WriteOutcome::Done { lines: written }
-    } else {
-        WriteOutcome::Cancelled { lines: written }
-    };
-    Ok((outcome, bad))
+    Ok((outcome_of(completed, written), bad))
 }
 
 // ---------------- 默认文件名 (T5, spec D8) ----------------
+
+/// 当前时刻戳 (系统时钟 → [`timestamp_stamp`])。调用方不碰 `SystemTime`。
+pub fn now_stamp() -> String {
+    timestamp_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+}
 
 /// epoch 秒 → `yyyyMMdd-HHmmss` (**UTC**)。纯函数手写 civil-from-days
 /// (Howard Hinnant 算法), 零新依赖 (Cargo 无 time/chrono, 不为此引)。
@@ -423,6 +518,14 @@ pub fn default_export_name(stem: &str, scope: &str, stamp: &str, ext: &str) -> S
 
 // ---------------- 导出作业 (T4: 语义层) ----------------
 
+/// 格式选择 (菜单/消息载荷; 评审 Nit: 杀 idx 魔法数)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExportPick {
+    Raw,
+    Pretty,
+    Csv,
+}
+
 /// 导出格式 (spec 范围三格式)。
 pub enum ExportFormat {
     /// 原始行 (两模式可用, spec D3)。
@@ -431,6 +534,25 @@ pub enum ExportFormat {
     Pretty,
     /// CSV (仅 JSONL, spec D5; 列 = schema 首见序)。
     Csv { columns: Vec<String> },
+}
+
+impl ExportFormat {
+    /// 按格式分派写出 (作业体 / logbench 共用同一分派 —— 不留第二份三臂 match)。
+    /// 返回 `(写出结果, 解析失败行数)` (raw 恒 0)。
+    pub fn write<W: Write>(
+        &self,
+        log: &LogFile,
+        set: &ExportSet,
+        out: &mut W,
+        cancel: &AtomicBool,
+        progress: &AtomicU64,
+    ) -> io::Result<(WriteOutcome, u64)> {
+        match self {
+            ExportFormat::Raw => write_raw(log, set, out, cancel, progress).map(|o| (o, 0)),
+            ExportFormat::Pretty => write_pretty(log, set, out, cancel, progress),
+            ExportFormat::Csv { columns } => write_csv(log, set, columns, out, cancel, progress),
+        }
+    }
 }
 
 /// 作业收尾态。Cancelled / Failed 时**半成品已删** (spec D2: 内容不完整的
@@ -502,8 +624,11 @@ impl ExportJob {
         if self.running {
             return false;
         }
-        self.cancel.store(false, Ordering::Relaxed);
-        self.progress.store(0, Ordering::Relaxed);
+        // 每轮**新建** Arc 对 (review B-Critical): 跨代次共享 cancel/progress 会让
+        // 新 launch 的重置**撤销旧 worker 的取消** —— invalidate 后立刻再 launch
+        // 时两代同写一对 Arc, 旧作业「以为已取消」却继续写盘。各代各持各的。
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.progress = Arc::new(AtomicU64::new(0));
         self.total = set.len();
         self.running = true;
         let cancel = Arc::clone(&self.cancel);
@@ -535,10 +660,50 @@ impl ExportJob {
     }
 }
 
-/// 作业体 (worker 线程内同步执行): 建文件 → 流式写出 → 按结果收尾。
+/// 半成品路径: 目标旁 `<name>.partial`。
+fn partial_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".partial");
+    PathBuf::from(os)
+}
+
+/// 删半成品; 删除失败降级为在错误尾注带上路径 (spec D2: 「删除失败降级提示路径」)。
+fn remove_partial(partial: &Path, error: &mut String) {
+    if let Err(del) = std::fs::remove_file(partial) {
+        if del.kind() != io::ErrorKind::NotFound {
+            error.push_str(&format!(
+                "; 半成品删除失败 (残留在 {}): {del}",
+                partial.display()
+            ));
+        }
+    }
+}
+
+/// 写出到 `.partial` (建文件 → 流式写出 → flush → **先关句柄**)。
+fn write_partial(
+    log: &LogFile,
+    set: &ExportSet,
+    format: &ExportFormat,
+    partial: &Path,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<(WriteOutcome, u64)> {
+    let fs_file = std::fs::File::create(partial)?;
+    let mut w = io::BufWriter::new(fs_file);
+    let r = format.write(log, set, &mut w, cancel, progress)?;
+    w.flush()?;
+    drop(w); // 关句柄再 rename/remove (Windows 语义友好; 评审 Nit)
+    Ok(r)
+}
+
+/// 作业体 (worker 线程内同步执行): 写 `.partial` → 成功 rename 原子替换目标。
 ///
-/// 半成品纪律: 取消/写出错 → `remove_file`; 建文件本身失败 → 无文件可删, 只报错。
-/// 删除失败降级为在 error 尾注带上路径 (spec D2: 「删除失败降级提示路径」)。
+/// **目标保护** (review A-Critical): 直接 `File::create(目标)` 会**先截断目标** ——
+/// 覆盖导出后取消/失败 = 吃掉用户原先的完整文件。故全程只动 `.partial`:
+/// Done → rename 替换 (Windows MoveFileEx 语义: 目标存在即替换);
+/// Cancelled / Failed / panic → 只删 `.partial`, 目标原样。
+/// panic 收口 (review A-R5): worker 炸掉而 AsyncJob 不交结果 = in-flight 卡死,
+/// 导出按钮变死键 —— catch_unwind 收成 Failed。
 fn run_export_job(
     log: &LogFile,
     set: &ExportSet,
@@ -548,47 +713,36 @@ fn run_export_job(
     progress: &AtomicU64,
 ) -> ExportResult {
     let path_buf = path.to_path_buf();
-    let fs_file = match std::fs::File::create(path) {
-        Ok(f) => f,
-        Err(e) => {
-            return ExportResult {
-                path: path_buf,
-                end: ExportEnd::Failed {
-                    error: e.to_string(),
-                },
-            };
-        }
-    };
-    let mut w = io::BufWriter::new(fs_file);
-    let result = match format {
-        ExportFormat::Raw => write_raw(log, set, &mut w, cancel, progress).map(|o| (o, 0)),
-        ExportFormat::Pretty => write_pretty(log, set, &mut w, cancel, progress),
-        ExportFormat::Csv { columns } => write_csv(log, set, columns, &mut w, cancel, progress),
-    }
-    .and_then(|r| {
-        w.flush()?;
-        Ok(r)
-    });
-    let end = match result {
-        Ok((WriteOutcome::Done { lines }, bad)) => ExportEnd::Done {
-            lines,
-            bad_lines: bad,
-        },
-        Ok((WriteOutcome::Cancelled { lines }, _)) => {
-            let _ = std::fs::remove_file(path); // 半成品必删; 删失败按 path 提示 (UI 层)
-            ExportEnd::Cancelled { lines }
-        }
-        Err(e) => {
-            let mut error = e.to_string();
-            if let Err(del) = std::fs::remove_file(path) {
-                if del.kind() != io::ErrorKind::NotFound {
-                    error.push_str(&format!(
-                        "; 半成品删除失败 (残留在 {}): {del}",
-                        path.display()
-                    ));
-                }
-            }
+    let partial = partial_path(path);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_partial(log, set, format, &partial, cancel, progress)
+    }));
+    let end = match outcome {
+        Err(_) => {
+            let mut error = "导出线程意外崩溃 (panic)".to_string();
+            remove_partial(&partial, &mut error);
             ExportEnd::Failed { error }
+        }
+        Ok(Err(e)) => {
+            let mut error = e.to_string();
+            remove_partial(&partial, &mut error);
+            ExportEnd::Failed { error }
+        }
+        Ok(Ok((WriteOutcome::Done { lines }, bad))) => match std::fs::rename(&partial, path) {
+            Ok(()) => ExportEnd::Done {
+                lines,
+                bad_lines: bad,
+            },
+            Err(e) => {
+                let mut error = format!("写出完成但替换目标失败: {e}");
+                remove_partial(&partial, &mut error);
+                ExportEnd::Failed { error }
+            }
+        },
+        Ok(Ok((WriteOutcome::Cancelled { lines }, _))) => {
+            let mut error = String::new();
+            remove_partial(&partial, &mut error);
+            ExportEnd::Cancelled { lines }
         }
     };
     ExportResult {
@@ -928,6 +1082,30 @@ mod tests {
 
     // ---------------- 默认文件名 (T5 判据) ----------------
 
+    /// D1 折叠后的取源优先级 (评审 defer 迁入): 模式决定看哪份活动项, 另一份不改口径。
+    #[test]
+    fn line_set_of_picks_source_by_mode() {
+        // JSONL: 过滤是唯一来源, 搜索命中 (即便有) 不改口径
+        let s = line_set_of(10, true, Some(&[2, 1]), Some(&[9]));
+        assert_eq!(s.lines(), &[1, 2]);
+        // 明文: 搜索是唯一来源
+        let s = line_set_of(10, false, Some(&[0]), Some(&[3]));
+        assert_eq!(s.lines(), &[3]);
+    }
+
+    /// D8 命名矩阵: scope 随模式/活动项, 扩展名随格式 (评审 R1)。
+    #[test]
+    fn scope_and_ext_follow_d1_d8_matrix() {
+        assert_eq!(scope_suffix(true, true, true), "-filtered");
+        assert_eq!(scope_suffix(true, false, true), "", "JSONL 搜索不给 scope");
+        assert_eq!(scope_suffix(false, true, true), "-searched");
+        assert_eq!(scope_suffix(false, false, false), "");
+        assert_eq!(ext_for(ExportPick::Raw, Some("jsonl")), "jsonl");
+        assert_eq!(ext_for(ExportPick::Raw, None), "log");
+        assert_eq!(ext_for(ExportPick::Pretty, Some("jsonl")), "json");
+        assert_eq!(ext_for(ExportPick::Csv, Some("jsonl")), "csv");
+    }
+
     #[test]
     fn timestamp_stamp_handles_epoch_leap_and_day_boundaries() {
         assert_eq!(timestamp_stamp(0), "19700101-000000");
@@ -1019,7 +1197,37 @@ mod tests {
         );
         assert!(matches!(r.end, ExportEnd::Cancelled { .. }));
         assert!(!dest.exists(), "半成品必须删除");
+        assert!(!partial_path(&dest).exists(), ".partial 也必须清干净");
         let _ = std::fs::remove_file(src);
+    }
+
+    /// review A-Critical 回归锁: 目标已有完整文件时, 取消导出**不得动它**。
+    /// 修前: `File::create(目标)` 先截断, 取消时 `remove_file` 把用户的旧文件
+    /// 整个吃掉 (覆盖导出上周的 results.csv 后取消 → 旧文件消失)。
+    #[test]
+    fn cancel_keeps_existing_target_intact() {
+        let (src, file) = fixture("job-cancel-keep", b"x\ny\n");
+        let dest = out_path("job-cancel-keep");
+        std::fs::write(&dest, b"last week result").unwrap();
+        let cancel = AtomicBool::new(true);
+        let progress = AtomicU64::new(0);
+        let r = run_export_job(
+            &file,
+            &ExportSet::all(file.line_count()),
+            &ExportFormat::Raw,
+            &dest,
+            &cancel,
+            &progress,
+        );
+        assert!(matches!(r.end, ExportEnd::Cancelled { .. }));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"last week result",
+            "取消导出不得碰已存在的目标文件"
+        );
+        assert!(!partial_path(&dest).exists(), ".partial 必须清干净");
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(dest);
     }
 
     /// 中途取消的不变式: **Cancelled ⟹ 半成品已删** (Done = 取消没赶上, 成品完整自洽)。
@@ -1127,8 +1335,9 @@ mod tests {
         let content = b"a\n";
         let (src, file) = fixture("job-fail", content);
         let file = Arc::new(file);
-        // 输出路径指向已存在目录 → File::create 必败
-        let dir = std::env::temp_dir().join(format!("dq-export-dir-{}", std::process::id()));
+        // 输出路径指向已存在目录 → rename(partial → 目录) 必败 (半成品旁路设计下
+        // File::create 只动 `.partial`, 失败点在替换目标那一步)
+        let dir = std::env::temp_dir().join(format!("dq-export-dir-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut job = ExportJob::new();
         assert!(job.launch(
@@ -1140,7 +1349,183 @@ mod tests {
         let r = wait_poll(&mut job);
         assert!(matches!(r.end, ExportEnd::Failed { .. }));
         assert!(dir.is_dir(), "只删导出文件, 不碰目录");
+        assert!(!partial_path(&dir).exists(), "失败收尾必须清掉 .partial");
         let _ = std::fs::remove_file(src);
         let _ = std::fs::remove_dir(dir);
+    }
+
+    /// review B-Critical 回归锁: invalidate 后**立刻**再 launch, 旧 worker 晚到
+    /// 不得吞掉新作业 —— 修前两条缺陷叠加: ①跨代次共享 cancel Arc (新 launch 的
+    /// 重置撤销旧 worker 的取消) ②AsyncJob 单槽被旧轮覆写 (新结果永久丢失 →
+    /// running 卡死)。锁: 最终 poll 必须交付**新作业** (path B) 且 running 复位。
+    #[test]
+    fn invalidate_then_relaunch_keeps_new_job_alive() {
+        let mut content = Vec::new();
+        for i in 0..200_000u64 {
+            content.extend_from_slice(format!("line {i}\n").as_bytes());
+        }
+        let (src, file) = fixture("job-relaunch", &content);
+        let file = Arc::new(file);
+        let dest_a = out_path("job-relaunch-a");
+        let dest_b = out_path("job-relaunch-b");
+        let mut job = ExportJob::new();
+        assert!(job.launch(
+            Arc::clone(&file),
+            ExportSet::all(file.line_count()),
+            ExportFormat::Raw,
+            dest_a.clone(),
+        ));
+        job.invalidate(); // 模拟 apply_fresh 换文件
+        let (src2, file2) = fixture("job-relaunch-small", b"tiny\n");
+        let file2 = Arc::new(file2);
+        assert!(job.launch(
+            Arc::clone(&file2),
+            ExportSet::all(file2.line_count()),
+            ExportFormat::Raw,
+            dest_b.clone(),
+        ));
+        // 等旧 worker 真越过它的收尾 (大文件 + 取消协作), 新作业结果必须是唯一交付
+        let mut result = None;
+        for _ in 0..500 {
+            if let Some(r) = job.poll() {
+                result = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let r = result.expect("新作业结果必须交付 (修前: 被旧轮覆写永久吞掉)");
+        assert_eq!(r.path, dest_b, "交付的必须是新作业");
+        assert!(matches!(r.end, ExportEnd::Done { lines: 1, .. }));
+        assert!(!job.is_running(), "running 必须复位, 否则导出按钮变死键");
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(src2);
+        let _ = std::fs::remove_file(dest_b);
+    }
+
+    // ---------------- 评审回归锁 (2026-09-23 双路评审) ----------------
+
+    /// review B-R2: 源末行**无行尾**时, 稀疏导出不得无中生有补行尾 ——
+    /// D3「对应行逐字节相同」含行尾维度 (全集/稀疏对同一行集必须一致)。
+    #[test]
+    fn sparse_keeps_bare_last_line_without_added_ending() {
+        let content = b"aa\r\nbb\r\ncc"; // 末行无行尾
+        let (path, file) = fixture("sparse-bare-last", content);
+        let n = file.line_count();
+        let (out, _, _) = run(
+            &file,
+            &ExportSet::from_lines(vec![2], n),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(out, b"cc", "末行无行尾: 原样, 不补 CRLF");
+        let (out, _, _) = run(
+            &file,
+            &ExportSet::from_lines(vec![0, 2], n),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(out, b"aa\r\ncc", "非末行照常带行尾");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// review B: 源带 UTF-8 BOM 时稀疏导出补回 BOM —— 引擎 line(0) 剥 BOM,
+    /// 不补则与全集整拷首行不一致。
+    #[test]
+    fn sparse_preserves_utf8_bom_like_full_copy() {
+        let content = b"\xEF\xBB\xBFaa\nbb\n";
+        let (path, file) = fixture("sparse-bom", content);
+        let n = file.line_count();
+        let (out, _, _) = run(
+            &file,
+            &ExportSet::from_lines(vec![0], n),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(out, b"\xEF\xBB\xBFaa\n", "BOM 必须补回");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// review A-R3: Excel 公式注入中和 —— `=`/`@` 恒加 `'` 前缀; `+`/`-` 非纯数字
+    /// 才加 (负数列保数值)。
+    #[test]
+    fn csv_neutralizes_excel_formulas_but_keeps_numbers() {
+        let content =
+            b"{\"m\":\"=HYPERLINK(1)\",\"n\":-5,\"p\":\"+3\",\"q\":\"-1+1\",\"r\":\"@x\"}\n";
+        let (path, file) = fixture("csv-formula", content);
+        let set = ExportSet::all(file.line_count());
+        let (out, _, _) = csv_run(&file, &set, &["m", "n", "p", "q", "r"]);
+        assert_eq!(
+            &out[3..],
+            "m,n,p,q,r\r\n'=HYPERLINK(1),-5,+3,'-1+1,'@x\r\n".as_bytes(),
+            "公式中和: =@恒加引号撇, +-仅非数字加, 数值原样"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// review B-R3: UTF-8 源的非法字节行**不得**被 lossy 解码洗成合法 JSON。
+    /// 夹具口径: 坏字节必须藏在编码检测采样窗 (`danqing-encoding::SAMPLE` =
+    /// 头 64 KiB) **之后**, 文件才会被检出为 UTF-8 —— 坏字节在窗内会被检出成
+    /// GBK, 测不到这条路径 (前两版夹具都踩了这个)。
+    #[test]
+    fn invalid_utf8_line_stays_raw_bad_not_washed() {
+        let mut content = Vec::new();
+        // 先铺 >64 KiB 的合法 UTF-8, 把坏字节挤出采样窗
+        while content.len() <= 64 * 1024 {
+            content.extend_from_slice(b"{\"a\":1,\"pad\":\"012345678901234567890123456789\"}\n");
+        }
+        content.extend_from_slice(b"{\"m\":\"\xFF\"}\n"); // 采样窗外的非法字节
+        let (path, file) = fixture("bad-utf8", &content);
+        assert!(
+            matches!(file.encoding(), danqing::encoding::Encoding::Utf8),
+            "探针: 夹具必须检出为 UTF-8, 否则测的不是这条路径"
+        );
+        let set = ExportSet::all(file.line_count());
+        let (out, _, bad) = pretty_run(&file, &set);
+        assert_eq!(bad, 1, "非法字节行必须计为失败行");
+        assert!(
+            out.ends_with(b"\n\n{\"m\":\"\xFF\"}\n"),
+            "末条 = 非法行原样字节 (修前被 U+FFFD 洗成合法 JSON 且 bad 不计)"
+        );
+        assert!(out.contains(&0xFF), "pretty 输出必须保留原始坏字节");
+        let (_, _, bad) = csv_run(&file, &set, &["a", "m"]);
+        assert_eq!(bad, 1, "CSV 同口径: 非法行计数");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// parse_source 口径探针 (review B-R3): UTF-8 源按**原字节** parse,
+    /// 非 UTF-8 源才走解码副本 —— lossy 会改字节是探针前提。
+    #[test]
+    fn parse_source_uses_raw_bytes_for_utf8_storage() {
+        let line = b"{\"m\":\"\xFF\"}";
+        let decoded = decode_line(danqing::encoding::Encoding::Utf8, line);
+        assert_ne!(decoded.as_bytes(), line, "探针: lossy 必然改字节");
+        assert_eq!(
+            parse_source(danqing::encoding::Encoding::Utf8, line, &decoded),
+            line,
+            "UTF-8 存储必须按原字节 parse"
+        );
+        assert_eq!(
+            parse_source(danqing::encoding::Encoding::Gbk, line, &decoded),
+            decoded.as_bytes(),
+            "非 UTF-8 存储才用解码副本"
+        );
+    }
+
+    /// 冻结快照语义 (spec D1): 作业持有的 `Arc<LogFile>` 是启动时刻的映射 ——
+    /// live-tail 的增长形态是 **append** (映射定长, 新字节在映射外), 导出仍是
+    /// 冻结那一刻的内容。注: 同路径**覆写**会透过共享映射窜进快照 (Windows
+    /// mmap 语义), 不属产品增长形态 —— 已知边界, 记入评审记。
+    #[test]
+    fn export_writes_frozen_snapshot_not_appended_growth() {
+        let content = b"one\ntwo\n";
+        let (path, file) = fixture("frozen", content);
+        // append (live-tail 真实增长形态)
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"three\n").unwrap();
+        drop(f);
+        let set = ExportSet::all(file.line_count());
+        let (out, _, _) = run(&file, &set, &AtomicBool::new(false));
+        assert_eq!(out, content, "导出必须是冻结快照, 不含其后 append 的增长");
+        let _ = std::fs::remove_file(path);
     }
 }

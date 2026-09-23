@@ -22,6 +22,7 @@ use danqing::{
 use crate::LogApp;
 use crate::Msg;
 use crate::config::{self, AppTheme};
+use danqing_log::export::ExportPick;
 use danqing_log::license::{self, Entitlement, PaidSource};
 
 /// 卡片宽度。
@@ -429,14 +430,16 @@ fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
         .gap(12.0)
         .cross_center()
         .child(format_btn(label("原始行"), || {
-            Msg::ExportFormatChosen(0)
+            Msg::ExportFormatChosen(ExportPick::Raw)
         }));
     if jsonl {
         rows = rows
             .child(format_btn(label("JSON 美化"), || {
-                Msg::ExportFormatChosen(1)
+                Msg::ExportFormatChosen(ExportPick::Pretty)
             }))
-            .child(format_btn(label("CSV"), || Msg::ExportFormatChosen(2)));
+            .child(format_btn(label("CSV"), || {
+                Msg::ExportFormatChosen(ExportPick::Csv)
+            }));
     }
     UiBox::new(bg)
         .bind_color(|app: &LogApp| app.theme.theme().background())

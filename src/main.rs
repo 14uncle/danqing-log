@@ -39,7 +39,7 @@ use danqing::{
 
 use danqing::encoding::{self, Encoding, bytes_as_literal_regex};
 use danqing_log::expand::{self, ExpandMap};
-use danqing_log::export::{self, ExportEnd, ExportFormat, ExportJob, ExportSet};
+use danqing_log::export::{self, ExportEnd, ExportFormat, ExportJob, ExportPick, ExportSet};
 use danqing_log::jsonl::{self, Schema, SubRow};
 use danqing_log::levels::{self, Level, LevelCounts, LevelQueries};
 use danqing_log::license::{self, Entitlement, Feature, PaidSource};
@@ -415,8 +415,8 @@ pub(crate) enum Msg {
     /// 底栏「导出…」/ `Ctrl+E` (SPEC-v1x-export D7): 作业态点 = 取消;
     /// 否则门控 (免费态弹升级提示, **保存对话框之前**) → 开格式菜单。
     ExportEntryClicked,
-    /// 格式菜单选中 (0=原始行 / 1=JSON 美化 / 2=CSV)。
-    ExportFormatChosen(usize),
+    /// 格式菜单选中。
+    ExportFormatChosen(ExportPick),
     /// 关格式菜单 (scrim 点击 / Esc)。
     CloseExportMenu,
     /// Ctrl+O / 拖拽文件：打开新文件。
@@ -714,9 +714,31 @@ impl LogApp {
     /// 告诉他不能存是最坏的顺序)。付费态开格式小菜单。
     fn export_entry_clicked(&mut self) {
         if self.export_job.is_running() {
+            // worker 可能已收尾、只是 tick 还没拾取 (review Optional): 先拾取 ——
+            // 否则用户先看到「正在取消」下一帧又弹「导出完成」, 双态拧巴。
+            if let Some(r) = self.export_job.poll() {
+                self.handle_export_result(r);
+                return;
+            }
             self.export_job.cancel();
             self.set_notice("正在取消导出…".into(), NoticeKind::Info);
             return;
+        }
+        // 两道在途闸开在**入口** (review B-R1/Optional; 与 D6「门控点位 = 入口」同点位):
+        // 过滤计算中导出 = 静默拿到上一份行集 (首筛在途 = 全文件);
+        // 搜索命中被导航表封顶 = 静默截断交付物 (对账事故) —— 都挡在格式菜单之前。
+        if self.filter_pending {
+            self.set_notice("过滤计算中, 请稍候再导出".into(), NoticeKind::Info);
+            return;
+        }
+        if let Some(nav) = &self.search {
+            if (nav.hits().len() as u64) < nav.total() {
+                self.set_notice(
+                    "搜索命中超过 100 万, 导航表已封顶 —— 请收窄搜索后再导出".into(),
+                    NoticeKind::Warn,
+                );
+                return;
+            }
         }
         if !self.has_file {
             self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
@@ -731,21 +753,16 @@ impl LogApp {
 
     /// 格式菜单选定 → 保存对话框 (D8) → 启动作业。
     /// 明文非 JSONL 时美化/CSV **服务端同款守门** (菜单收口是 UI 层, 点到了也不放行)。
-    fn begin_export(&mut self, idx: usize) {
+    fn begin_export(&mut self, pick: ExportPick) {
         self.export_menu_open = false;
-        if idx != 0 && self.schema.is_none() {
+        if pick != ExportPick::Raw && self.schema.is_none() {
             self.set_notice("本文件非 JSONL, 仅可导出原始行".into(), NoticeKind::Info);
             return;
         }
-        let Some((stem, scope, ext)) = self.export_name_parts() else {
+        let Some((stem, scope, ext)) = self.export_name_parts(pick) else {
             return;
         };
-        let stamp = export::timestamp_stamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-        );
+        let stamp = export::now_stamp();
         let default_name = export::default_export_name(&stem, scope, &stamp, &ext);
         let Some(path) = rfd::FileDialog::new()
             .set_title("导出")
@@ -754,51 +771,40 @@ impl LogApp {
         else {
             return; // 对话框取消: 零副作用
         };
-        self.launch_export(path, idx);
+        self.launch_export(path, pick);
     }
 
-    /// 文件名三段: stem / 行集 scope 中缀 (D8) / 扩展名 (原始行保源扩展名)。
-    fn export_name_parts(&self) -> Option<(String, &'static str, String)> {
+    /// 文件名三段: stem / scope 中缀 / 扩展名 —— 口径真身在
+    /// [`export::scope_suffix`] / [`export::ext_for`], 这里只备料。
+    fn export_name_parts(&self, pick: ExportPick) -> Option<(String, &'static str, String)> {
         let stem = self.path.file_stem()?.to_string_lossy().into_owned();
-        // scope 与行集口径 (D1) 同源: JSONL 看过滤, 明文看搜索
-        let scope = if self.schema.is_some() && self.filtered.is_some() {
-            "-filtered"
-        } else if self.schema.is_none() && self.search.is_some() {
-            "-searched"
-        } else {
-            ""
-        };
-        let ext = self
-            .path
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "log".to_string());
+        let scope = export::scope_suffix(
+            self.schema.is_some(),
+            self.filtered.is_some(),
+            self.search.is_some(),
+        );
+        let src_ext = self.path.extension().map(|e| e.to_string_lossy());
+        let ext = export::ext_for(pick, src_ext.as_deref());
         Some((stem, scope, ext))
     }
 
-    /// 行集快照 (spec D1): JSONL = 过滤命中集/全集; 明文 = 搜索命中行/全集。
-    /// 一律冻结 (`ExportSet` 构造即 clamp) —— live-tail 之后的增长不进本次导出。
+    /// 行集快照 (spec D1): 口径真身在 [`export::line_set_of`] —— 这里只备料。
     fn export_line_set(&self) -> ExportSet {
-        let n = self.file.line_count();
-        if self.schema.is_some() {
-            match &self.filtered {
-                Some(hits) => ExportSet::from_lines(hits.as_ref().clone(), n),
-                None => ExportSet::all(n),
-            }
-        } else {
-            match &self.search {
-                Some(nav) => ExportSet::from_lines(nav.hits().as_ref().clone(), n),
-                None => ExportSet::all(n),
-            }
-        }
+        export::line_set_of(
+            self.file.line_count(),
+            self.schema.is_some(),
+            self.filtered.as_ref().map(|h| h.as_slice()),
+            self.search.as_ref().map(|n| n.hits().as_slice()),
+        )
     }
 
     /// 启动作业 (D2): 冻结行集 + `Arc` 文件快照 (换文件由 `invalidate` 作废旧轮)。
-    fn launch_export(&mut self, path: std::path::PathBuf, idx: usize) {
+    fn launch_export(&mut self, path: std::path::PathBuf, pick: ExportPick) {
         let set = self.export_line_set();
-        let format = match idx {
-            1 => ExportFormat::Pretty,
-            2 => {
+        let format = match pick {
+            ExportPick::Raw => ExportFormat::Raw,
+            ExportPick::Pretty => ExportFormat::Pretty,
+            ExportPick::Csv => {
                 let columns = self
                     .schema
                     .as_ref()
@@ -806,13 +812,34 @@ impl LogApp {
                     .unwrap_or_default();
                 ExportFormat::Csv { columns }
             }
-            _ => ExportFormat::Raw,
         };
         if self
             .export_job
             .launch(Arc::clone(&self.file), set, format, path)
         {
             self.set_notice("导出中…".into(), NoticeKind::Info);
+        } else {
+            // 单作业语义下 UI 不应撞到; 撞到也不能「点了保存什么都没发生」(评审 Nit)
+            self.set_notice("已有导出进行中".into(), NoticeKind::Warn);
+        }
+    }
+
+    /// 导出收尾反馈 (完成/取消/失败一律如实报)。
+    fn handle_export_result(&mut self, r: export::ExportResult) {
+        match r.end {
+            ExportEnd::Done { lines, bad_lines } => {
+                let mut msg = format!("导出完成 {lines} 行 → {}", r.path.display());
+                if bad_lines > 0 {
+                    msg.push_str(&format!(" (含 {bad_lines} 行非 JSON, 已原样)"));
+                }
+                self.set_notice(msg, NoticeKind::Info);
+            }
+            ExportEnd::Cancelled { .. } => {
+                self.set_notice("导出已取消, 半成品已删除".into(), NoticeKind::Info);
+            }
+            ExportEnd::Failed { error } => {
+                self.set_notice(format!("导出失败: {error}"), NoticeKind::Warn);
+            }
         }
     }
 
@@ -1097,6 +1124,9 @@ impl LogApp {
         self.search_job.invalidate();
         // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
         self.export_job.invalidate();
+        // 格式菜单同灭 (review R4): async-open 在途开着菜单, 落地后点格式
+        // 会导出的是**新**文件 —— 菜单是旧文件语境的, 一起作废。
+        self.export_menu_open = false;
         let OpenOutcome {
             file: new_file,
             schema,
@@ -1830,7 +1860,7 @@ impl App for LogApp {
                 self.analysis_result = None;
             }
             Msg::ExportEntryClicked => self.export_entry_clicked(),
-            Msg::ExportFormatChosen(idx) => self.begin_export(idx),
+            Msg::ExportFormatChosen(pick) => self.begin_export(pick),
             Msg::CloseExportMenu => self.export_menu_open = false,
             Msg::OpenFile(path) => {
                 self.reload_file(path);
@@ -2135,21 +2165,7 @@ impl App for LogApp {
         }
         // 导出作业收尾 (SPEC-v1x-export D2): 完成/取消/失败一律给反馈
         if let Some(r) = self.export_job.poll() {
-            match r.end {
-                ExportEnd::Done { lines, bad_lines } => {
-                    let mut msg = format!("导出完成 {lines} 行 → {}", r.path.display());
-                    if bad_lines > 0 {
-                        msg.push_str(&format!(" (含 {bad_lines} 行非 JSON, 已原样)"));
-                    }
-                    self.set_notice(msg, NoticeKind::Info);
-                }
-                ExportEnd::Cancelled { .. } => {
-                    self.set_notice("导出已取消, 半成品已删除".into(), NoticeKind::Info);
-                }
-                ExportEnd::Failed { error } => {
-                    self.set_notice(format!("导出失败: {error}"), NoticeKind::Warn);
-                }
-            }
+            self.handle_export_result(r);
         }
         if let Some(out) = self.filter_job.poll() {
             self.filter_pending = false;
@@ -2596,7 +2612,7 @@ mod tests {
         };
         app.apply_fresh(p.clone(), out);
         let dest = std::env::temp_dir().join(format!("dq-exp-cancel-{}.log", std::process::id()));
-        app.launch_export(dest.clone(), 0);
+        app.launch_export(dest.clone(), ExportPick::Raw);
         assert!(app.export_job.is_running());
         app.export_menu_open = false; // 上一段菜单已用完, 复位再测作业态
         app.update(Msg::ExportEntryClicked);
@@ -2673,11 +2689,11 @@ mod tests {
         };
         app.apply_fresh(p.clone(), out);
         app.export_menu_open = true;
-        app.begin_export(1);
+        app.begin_export(ExportPick::Pretty);
         assert!(!app.export_job.is_running(), "非 JSONL 不得发起美化导出");
         assert!(!app.export_menu_open, "菜单照常收起");
         app.export_menu_open = true;
-        app.begin_export(2);
+        app.begin_export(ExportPick::Csv);
         assert!(!app.export_job.is_running(), "非 JSONL 不得发起 CSV 导出");
         std::fs::remove_file(&p).ok();
     }
@@ -2703,7 +2719,7 @@ mod tests {
         };
         app.filtered = Some(Arc::new(vec![0, 2]));
         let dest = std::env::temp_dir().join(format!("dq-exp-e2e-{}.log", std::process::id()));
-        app.launch_export(dest.clone(), 0);
+        app.launch_export(dest.clone(), ExportPick::Raw);
         let mut result = None;
         for _ in 0..200 {
             if let Some(r) = app.export_job.poll() {
@@ -2721,6 +2737,133 @@ mod tests {
         );
         std::fs::remove_file(&p).ok();
         std::fs::remove_file(&dest).ok();
+    }
+
+    /// 成功判据 4 (review R2): D1 行集口径表**四态逐格上锁** —— 修前只测了
+    /// 「JSONL+过滤」一格, 分支写反/冻结失效仍全绿。
+    #[test]
+    fn export_line_set_covers_d1_four_states() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("d1a")));
+        // 真文件 (行集要 clamp 到 line_count —— 空 LogApp 的 0 行会把命中全夹没)
+        let p = temp_log(b"0\n1\n2\n3\n4\n5\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        // ① JSONL + 过滤生效 → 过滤命中集
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![jsonl::Column {
+                name: "a".into(),
+                width_chars: 1,
+            }],
+        }));
+        app.filtered = Some(Arc::new(vec![3, 1]));
+        let set = app.export_line_set();
+        assert!(!set.is_full(), "① JSONL+过滤 = 稀疏命中");
+        assert_eq!(set.lines(), &[1, 3], "① 升序去重");
+
+        // ② JSONL 无过滤 → 全集 (搜索**不改**行集 —— 即便搜索在途)
+        app.filtered = None;
+        app.search = Some(SearchNav::new(Arc::new(vec![0]), 1));
+        let set = app.export_line_set();
+        assert!(set.is_full(), "② JSONL 无过滤 = 全集, 搜索不改口径");
+
+        // ③ 明文 + 搜索生效 → 含命中的行
+        app.schema = None;
+        app.search = Some(SearchNav::new(Arc::new(vec![5, 2]), 2));
+        let set = app.export_line_set();
+        assert!(!set.is_full(), "③ 明文+搜索 = 命中行集");
+        assert_eq!(set.lines(), &[2, 5]);
+
+        // ④ 明文 无搜索 → 全集
+        app.search = None;
+        let set = app.export_line_set();
+        assert!(set.is_full(), "④ 明文无搜索 = 全集");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// review R1 回归锁: 默认扩展名按格式分派 (原始行保源 / 美化 .json / CSV .csv) ——
+    /// 修前恒取源扩展名, `server.jsonl` 导 CSV 默认名还是 `.jsonl`。
+    #[test]
+    fn default_export_ext_follows_format() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("d8ext")));
+        app.path = std::path::PathBuf::from("server.jsonl");
+        assert_eq!(
+            app.export_name_parts(ExportPick::Raw).unwrap().2,
+            "jsonl",
+            "原始行保源扩展名"
+        );
+        assert_eq!(
+            app.export_name_parts(ExportPick::Pretty).unwrap().2,
+            "json",
+            "美化 = .json"
+        );
+        assert_eq!(
+            app.export_name_parts(ExportPick::Csv).unwrap().2,
+            "csv",
+            "CSV = .csv"
+        );
+    }
+
+    /// review B-R1 回归锁: 搜索命中被导航表封顶 (100 万) 时**拒绝导出** ——
+    /// 静默截断交付物是对账事故 (修前: 导出前 100 万行且报「完成 N 行」)。
+    /// 走**入口消息** (闸在入口, D6 同点位) —— 别直接调 begin_export:
+    /// 那会穿到真保存对话框 (测试严禁真实桌面副作用; 本测试第一版就踩了这个)。
+    #[test]
+    fn capped_search_hits_refuse_export() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("cap")));
+        let p = temp_log(b"a\nb\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(p.clone(), out);
+        // total=200 万 > hits 表 2 条 = 被封顶的形态
+        app.search = Some(SearchNav::new(Arc::new(vec![0, 1]), 2_000_000));
+        app.update(Msg::ExportEntryClicked);
+        assert!(!app.export_job.is_running(), "封顶命中不得静默截断导出");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("收窄搜索")),
+            "必须明说原因"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// review R4 回归锁: 换文件 (apply_fresh) 必须关掉格式菜单 ——
+    /// 修前菜单残留, 落地后点格式导出的是**新**文件 (旧文件语境的菜单)。
+    #[test]
+    fn apply_fresh_closes_export_menu() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshmenu")));
+        app.export_menu_open = true;
+        let p = temp_log(b"x\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: None,
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(p.clone(), out);
+        assert!(!app.export_menu_open, "换文件必须作废格式菜单");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// review Optional: 过滤在途闸 —— Enter 后立刻导出不得静默拿到上一份行集。
+    #[test]
+    fn pending_filter_blocks_export_entry() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("pending")));
+        app.has_file = true;
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.filter_pending = true;
+        app.update(Msg::ExportEntryClicked);
+        assert!(
+            !app.export_menu_open,
+            "过滤计算中不开菜单 (开了就会静默导出上一份行集)"
+        );
     }
 
     // ─── 评审修复 (2026-09-19) ───

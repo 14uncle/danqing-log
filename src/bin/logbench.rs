@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use danqing_log::export::{self, ExportFormat, ExportSet, WriteOutcome};
+use danqing_log::export::{ExportFormat, ExportSet, WriteOutcome};
 use danqing_log::jsonl;
 use danqing_log::levels;
 use danqing_log::logfile::LogFile;
@@ -253,15 +253,7 @@ fn main() {
         let progress = std::sync::atomic::AtomicU64::new(0);
         let t = Instant::now();
         let mut w = std::io::BufWriter::new(std::fs::File::create(&out_path).expect("建导出文件"));
-        let res = match &format {
-            ExportFormat::Raw => {
-                export::write_raw(&file, &set, &mut w, &cancel, &progress).map(|o| (o, 0))
-            }
-            ExportFormat::Pretty => export::write_pretty(&file, &set, &mut w, &cancel, &progress),
-            ExportFormat::Csv { columns } => {
-                export::write_csv(&file, &set, columns, &mut w, &cancel, &progress)
-            }
-        };
+        let res = format.write(&file, &set, &mut w, &cancel, &progress);
         let (outcome, bad) = res.expect("导出写出");
         w.flush().expect("flush");
         let el = t.elapsed();
