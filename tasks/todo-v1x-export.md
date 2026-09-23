@@ -3,7 +3,7 @@
 - @author 十四叔
 - @date 2026/09/23
 - Spec: `docs/specs/SPEC-v1x-export.md` · Plan: `tasks/plan-v1x-export.md`
-- 状态: **plan 完成待用户过目** → build（零 commit 惯例）
+- 状态: **五阶段全闭**（2026-09-23: spec→plan→build→review→code-simplify, 314 测试绿）—— **人工验收记账延后**（2026-09-23 用户裁定「先记账」, 见 Checkpoint C 末项）
 - 测试基线: **262**（2026-09-22 实测; T1 三件套复核回填）
 
 ## Phase 1: 纯逻辑核心（`src/export.rs`, 零 UI）
@@ -102,7 +102,8 @@
       raw 全集 **608ms**/1684MiB/s (目标 ≤8s ✅) · raw 稀疏 36k 行 129ms ·
       pretty **18.1s** · CSV **20.7s** (目标 ≤30s 量级 ✅); 产物机检: BOM/CRLF/表头/
       缩进分隔全对）
-- [ ] **人工验收（用户实机, spec 四条）**: ①免费态升级提示无保存框 ②付费态三格式
+- [ ] **人工验收（用户实机, spec 四条; 2026-09-23 记账延后——用户裁定「先记账」）**:
+      ①免费态升级提示无保存框 ②付费态三格式
   真文件（CSV **Excel** 开中文不乱码列对齐 / 美化缩进 / 原始行 diff 对应行一致）
   ③demo-1gb 导出期间 UI 可响应、取消半成品消失 ④明文菜单收口 + live-tail 快照语义
 - [x] 进 review 阶段（`/agent-skills:code-review-and-quality`）—— 2026-09-23 双路
