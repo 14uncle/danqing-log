@@ -7,6 +7,8 @@
 - 范围: danqing-log 全部**待**实机验收项。已验收通过的不再列（licensing /
   field-analytics 09-20 三轮过; async-open / text-selection / jsonl-table /
   live-tail / settings / update-hint-ui 均已过）
+- 组别: A 列配置六条 / B export 四条（需付费态）/ C 商店更新流一条 /
+  **D 书签持久化五条**
 
 ## 前置准备
 
@@ -41,10 +43,20 @@
 |---|---|---|---|---|
 | C1 | 真商店更新流（`SPEC-update-badge` 遗留 (i)） | 商店发布新版后: 旧版看到角标/更新提示 → 点「更新」→ 系统对话框装完 | 端到端更新链路通（需商店侧先有 > 当前版 的更新可装） | [ ] |
 
+## D. bookmark-persist 书签持久化（五条, 免费层; 2026-09-23 记账）
+
+| # | 验收项 | 步骤 | 预期 | ✓ |
+|---|---|---|---|---|
+| D1 | 夹/去书签重启还在 | `b` 夹几处书签 → 重启应用 | 书签全在; 位次/计数显示如常 | [ ] |
+| D2 | 换文件各记各的 | 文件 A 夹书签 → 开文件 B 夹几处 → 回 A | 各记各的, 互不串 | [ ] |
+| D3 | 越界书签消失其余照旧 | 大文件夹书签 → 删行/轮转后重开 | 越界的安静消失, 界内照旧 | [ ] |
+| D4 | 手坏 columns.json 如常 | 手坏 `columns.json`（含 bookmarks 字段）再启动 | app 如常（书签回默认, 不炸） | [ ] |
+| D5 | 上限有闸 | 夹满 256 条 → 再夹; 去掉一个再夹 | 满员有提示; 去掉又能加 | [ ] |
+
 ## 回填规则
 
 1. 实机验一项勾一项; **同步回填所属 spec 人工验收节**（A→
    `SPEC-v1x-table-column-config.md` / B→`SPEC-v1x-export.md` / C→
-   `SPEC-update-badge.md`）
+   `SPEC-update-badge.md` / D→`SPEC-v1x-bookmark-persist.md`）
 2. 发现缺陷: 复现测试先行（Prove-It）→ 修 → 补锁 → 再验
 3. 全部打勾后本清单状态改「**已全部验收 \<日期\>**」——文件不删, 账目留痕

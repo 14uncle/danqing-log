@@ -47,6 +47,22 @@
   各收 3 处), 365 绿行为零变化。**人工验收全部记账** (2026-09-23 用户裁定) ——
   跨模块总清单 `tasks/acceptance-pending.md` (A 组列配置六条含评审验点 /
   B 组 export 四条需付费态 / C 组商店更新流一条)。
+  **同日下一棒 bookmark-persist build T1–T2 全闭** (「go」三项全按推荐: 并入
+  columns.json FileEntry.bookmarks / 上限 256 / 行号越界剔除; plan 核实⑤次序
+  陷阱 = apply_fresh 载入后的 `bookmarks.clear()` 已拆, 替换语义收在
+  load_state 一处): `columns.rs` 加 bookmarks 字段 + normalize_bookmarks 收编
+  (升序去重截断, 坏字段丢字段不丢条) + `put(FileEntry)`/`get_entry`;
+  main `load_state_for_current_file`/`save_state` 改名同取两态 + toggle 上限
+  守卫落盘。**A/B 三红** (摘写出/摘载入读取/摘 toggle 落盘) 在案; **372 绿**
+  (365+7), 零 view/框架/引擎改动。人工验收五条记账总清单 D 组。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (坏 columns.json 后 save_state 读改写覆盖成单条抹掉其余全部记忆 —— 修 =
+  save_to temp+rename 原子落盘 + 损坏备份守卫 rename .bak) + Required ×6
+  (幽灵行号塌 0 落盘 / LRU 静默丢真书签→无书签先挤淘汰保护 / 落盘失败谎报
+  「已添加」→bool+「(未落盘)」+ **set_notice 内含 refresh_status 的次序陷阱**
+  / 两锁补半边 / 旧注释勘误) 全修, +4 锁 → **376 绿**。
+  **同日 code-simplify 收口 → 五段全闭**: 抽 `backup_if_corrupt` (save_state
+  守卫策略块命名化), 不动清单见 spec 简化记, 376 绿行为零变化。
   **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
   write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
   main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。
