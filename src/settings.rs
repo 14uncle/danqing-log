@@ -464,10 +464,94 @@ fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
         .width(CARD_WIDTH)
 }
 
-fn format_btn(label: Text, on_click: fn() -> Msg) -> impl Widget {
+fn format_btn(label: Text, on_click: impl Fn() -> Msg + 'static) -> impl Widget {
     Button::themed(&LightTheme, label)
         .bind_color(|app: &LogApp| app.theme.theme().accent())
         .on_click(on_click)
+}
+
+/// 列管理弹层 (SPEC-v1x-table-column-config D3, 裁定①): 表头「列…」按钮/右键入口,
+/// 卡体 = 每列一行开关 (`[x]`/`[ ]` ASCII 勾选, GB2312 字体约束) + 「恢复默认」。
+/// 复用 export 菜单四件套范式; 与导出菜单**互斥** (开一个先关另一个, 防双 scrim 叠)。
+pub(crate) fn col_menu_overlay(
+    theme: config::AppTheme,
+    schema: Option<danqing_log::jsonl::Schema>,
+    columns: danqing_log::columns::ColumnConfig,
+) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(
+        &t,
+        Center::new(col_menu_card(t.background(), schema, columns)).fill_max(),
+    )
+    .bind_open(|app: &LogApp| app.col_menu_open)
+    .on_scrim_click(|| Msg::CloseColMenu)
+}
+
+/// 弹层行序 = 列配置**显示序** (评审 Optional: 与表格同序, 摆到哪画到哪);
+/// 空配置回退 schema 首见序 (未对账快照防御), 只保留 schema 内的列名。
+fn col_menu_row_names(
+    schema: &Option<danqing_log::jsonl::Schema>,
+    columns: &danqing_log::columns::ColumnConfig,
+) -> Vec<String> {
+    let Some(s) = schema else {
+        return Vec::new();
+    };
+    if columns.order.is_empty() {
+        return s.columns.iter().map(|c| c.name.clone()).collect();
+    }
+    columns
+        .order
+        .iter()
+        .filter(|n| s.columns.iter().any(|c| c.name == **n))
+        .cloned()
+        .collect()
+}
+
+/// 卡体 (bg 与数据全**取值**传入 —— 引用会被 'static widget 捕获,
+/// `export_menu_card` 的生命周期理由同款)。
+fn col_menu_card(
+    bg: Color,
+    schema: Option<danqing_log::jsonl::Schema>,
+    columns: danqing_log::columns::ColumnConfig,
+) -> impl Widget {
+    let label = |s: String| Text::new(s).font_size(BODY_SIZE).color(Color::WHITE);
+    let mut rows = Column::new().gap(12.0).cross_center();
+    for name in col_menu_row_names(&schema, &columns) {
+        let mark = if columns.is_hidden(&name) {
+            "[ ]"
+        } else {
+            "[x]"
+        };
+        let display = format!("{mark} {name}");
+        let toggle_name = name.clone();
+        rows = rows.child(format_btn(label(display), move || {
+            Msg::ToggleColumn(toggle_name.clone())
+        }));
+    }
+    let rows = rows.child(format_btn(label("恢复默认".to_string()), || {
+        Msg::ResetColumns
+    }));
+    UiBox::new(bg)
+        .bind_color(|app: &LogApp| app.theme.theme().background())
+        .radius(12.0)
+        .child(Padding::new(
+            Edges {
+                top: 24.0,
+                right: CARD_PAD_X,
+                bottom: 16.0,
+                left: CARD_PAD_X,
+            },
+            Column::new()
+                .gap(16.0)
+                .cross_center()
+                .child(
+                    Text::new("显示列".to_string())
+                        .font_size(BODY_SIZE)
+                        .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+                )
+                .child(rows),
+        ))
+        .width(CARD_WIDTH)
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -1397,5 +1481,42 @@ mod tests {
             !painted_border,
             "设置卡不应画边框 —— 区分交给 scrim (见 settings_card 的注释)"
         );
+    }
+
+    /// 评审 Optional (五轴⑤): 列管理弹层行序 = 列配置显示序 (与表格同序);
+    /// 空配置回退 schema 首见序; 无 schema 空表。
+    #[test]
+    fn col_menu_rows_follow_column_config_order() {
+        let schema = Some(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "c".into(),
+                    width_chars: 4,
+                },
+            ],
+        });
+        let mut cfg = danqing_log::columns::ColumnConfig::from_schema(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]);
+        assert!(cfg.move_column(2, 0)); // c a b
+        assert!(cfg.set_hidden("a", true));
+        assert_eq!(col_menu_row_names(&schema, &cfg), vec!["c", "a", "b"]);
+        // 空配置回退 schema 首见序
+        assert_eq!(
+            col_menu_row_names(&schema, &danqing_log::columns::ColumnConfig::default()),
+            vec!["a", "b", "c"]
+        );
+        // 无 schema = 空表 (弹层本就不该开)
+        assert!(col_menu_row_names(&None, &cfg).is_empty());
     }
 }

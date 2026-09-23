@@ -181,6 +181,9 @@ pub(crate) struct LogApp {
     mode: ViewMode,
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
+    /// 列配置真身 (SPEC-v1x-table-column-config D1): 用户列宽/显隐/列序,
+    /// 换文件 (`apply_fresh`) 载入该路径记忆, 变更即落 `columns.json` (D4)。
+    columns: danqing_log::columns::ColumnConfig,
     /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
     /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
     level_counts: Arc<LevelCounts>,
@@ -313,6 +316,8 @@ pub(crate) struct LogApp {
     export_job: ExportJob,
     /// 导出格式小菜单 (D7): 格式行按模式收口 (JSONL 三项 / 明文仅原始行)。
     export_menu_open: bool,
+    /// 列管理弹层开合 (SPEC-v1x-table-column-config D3; 与 export_menu 互斥)。
+    col_menu_open: bool,
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
     ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
@@ -419,6 +424,22 @@ pub(crate) enum Msg {
     ExportFormatChosen(ExportPick),
     /// 关格式菜单 (scrim 点击 / Esc)。
     CloseExportMenu,
+    // ---- 列配置三件套 (SPEC-v1x-table-column-config T4) ----
+    /// 列宽拖拽提交 (抬起落账): 手动宽覆盖, 落 `columns.json` (D1/D4)。
+    ColumnWidthSet(String, f32),
+    /// 双击手柄恢复采样宽: 删手动宽覆盖。
+    ColumnWidthClear(String),
+    /// 表头拖拽换位落点: `name` 移到 `before` 之前 (`None` = 排尾;
+    /// `before == name` = 落点即原位无操作)。
+    ColumnMoveBefore(String, Option<String>),
+    /// 表头「列…」按钮 / 表头右键: 开列管理弹层 (与导出菜单互斥, D3)。
+    OpenColMenu,
+    /// 关列管理弹层 (scrim 点击 / Esc)。
+    CloseColMenu,
+    /// 列管理开关行: 切换该列显隐 (≥1 可见守卫在应用层, D6)。
+    ToggleColumn(String),
+    /// 「恢复默认」: 列摆法回首见序 + 全显 + 采样宽 (D3)。
+    ResetColumns,
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
@@ -465,6 +486,7 @@ impl LogApp {
             status_error: false,
             mode: ViewMode::Raw,
             schema: None,
+            columns: danqing_log::columns::ColumnConfig::default(),
             level_counts: Arc::new(LevelCounts::default()),
             level_column: None,
             level_queries: levels::no_level_queries(),
@@ -512,6 +534,7 @@ impl LogApp {
             purchase_in_flight: false,
             export_job: ExportJob::new(),
             export_menu_open: false,
+            col_menu_open: false,
             license_clear_rev: 0,
             analysis_job: AsyncJob::new(),
             analysis_result: None,
@@ -632,6 +655,70 @@ impl LogApp {
         }
     }
 
+    /// columns.json 路径: 生产 = config 目录独立文件 (license.key 同目录先例, D4);
+    /// 测试 = 注入配置路径的邻居 + 无注入 panic (与 cfg_path/license_path 同规:
+    /// 「测试不得写真实配置」家法的封法)。
+    fn columns_path(&self) -> std::path::PathBuf {
+        match &self.cfg_path {
+            Some(p) => p.with_extension("columns.json"),
+            None => {
+                #[cfg(test)]
+                panic!("测试不得读写真实 columns.json —— 请用 LogApp::new_empty_at(临时路径)");
+                #[cfg(not(test))]
+                danqing_log::columns::default_path()
+            }
+        }
+    }
+
+    /// 换文件载入该路径的列摆法 (D4): 记忆 → 对账; 无记忆 = 默认 (schema 首见序)。
+    fn load_columns_for_current_file(&mut self) {
+        let files = danqing_log::columns::ColumnFiles::load_from(&self.columns_path());
+        self.columns = files
+            .get(self.path.to_string_lossy().as_ref())
+            .cloned()
+            .unwrap_or_default();
+        self.merge_columns();
+    }
+
+    /// CSV 列序列集 (export D5): **schema 首见序全列** —— 显示配置不影响交付物
+    /// (SPEC-v1x-table-column-config D5): 摆列/隐藏/拖宽都不改变导出列。
+    fn export_csv_columns(&self) -> Vec<String> {
+        self.schema
+            .as_ref()
+            .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// 保证列配置与当前 schema 对账 (幂等, ≤16 列): 提交/落盘的前置 (D4)。
+    fn merge_columns(&mut self) {
+        if let Some(s) = &self.schema {
+            let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
+            self.columns.merge_with_schema(&names);
+        }
+    }
+
+    /// 列配置落盘 (D4): `columns.json` per-路径条目, 变更即写 (save_config 同哲学)。
+    /// 路径 key = `to_string_lossy` exact (已知局限: 同文件不同路径写法算两条)。
+    fn save_columns(&self) {
+        if !self.has_file {
+            return;
+        }
+        let path = self.columns_path();
+        let mut files = danqing_log::columns::ColumnFiles::load_from(&path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        files.put(
+            self.path.to_string_lossy().into_owned(),
+            self.columns.clone(),
+            now,
+        );
+        if let Err(e) = files.save_to(&path) {
+            log::warn!("列配置落盘失败: {e}");
+        }
+    }
+
     /// 激活付费层 (SPEC-v1x-licensing D4): 校验通过即**即时**翻转授权状态,
     /// 不要求重启; 落盘失败时状态照样翻转、只警示「重启后需重新激活」。
     /// 反馈落在「许可」页内 (`license_feedback`) —— 底栏 notice 会被模态卡遮住。
@@ -749,6 +836,7 @@ impl LogApp {
             return;
         }
         self.export_menu_open = true;
+        self.col_menu_open = false; // 互斥 (D3)
     }
 
     /// 格式菜单选定 → 保存对话框 (D8) → 启动作业。
@@ -805,12 +893,10 @@ impl LogApp {
             ExportPick::Raw => ExportFormat::Raw,
             ExportPick::Pretty => ExportFormat::Pretty,
             ExportPick::Csv => {
-                let columns = self
-                    .schema
-                    .as_ref()
-                    .map(|s| s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                ExportFormat::Csv { columns }
+                // export D5: schema 首见序全列 —— 显示配置不影响交付物 (T5 回归锁)
+                ExportFormat::Csv {
+                    columns: self.export_csv_columns(),
+                }
             }
         };
         if self
@@ -1086,6 +1172,9 @@ impl LogApp {
         } else {
             ViewMode::Raw
         };
+        // 列配置对账 (评审 C4, apply_fresh 同纪律): 同路径不重读盘, 但 schema 可能
+        // 换了列集 —— merge 收敛失配序/隐/宽 + ≥1 可见兜底 (C2 在 merge 内收口)。
+        self.merge_columns();
         self.base_status = base_status;
         self.bookmarks.retain(|&l| l < new_count);
         self.filtered = None;
@@ -1125,8 +1214,9 @@ impl LogApp {
         // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
         self.export_job.invalidate();
         // 格式菜单同灭 (review R4): async-open 在途开着菜单, 落地后点格式
-        // 会导出的是**新**文件 —— 菜单是旧文件语境的, 一起作废。
+        // 会导出的是**新**文件 —— 菜单是旧文件语境的, 一起作废。列管理同灭。
         self.export_menu_open = false;
+        self.col_menu_open = false;
         let OpenOutcome {
             file: new_file,
             schema,
@@ -1159,6 +1249,8 @@ impl LogApp {
         self.base_status = base_status;
         self.mode = mode;
         self.schema = schema;
+        // 列配置载入 (T5/D4): schema 就位后取该路径记忆摆法并对账 (先 schema 才能 merge)
+        self.load_columns_for_current_file();
         self.adopt_level_column(level_column);
         self.launch_levels_job();
         self.top_row = 0.0;
@@ -1752,6 +1844,47 @@ impl App for LogApp {
 
     fn update(&mut self, msg: Msg) {
         match msg {
+            // ---- 列配置三件套 (SPEC-v1x-table-column-config T4): 变更即落盘 ----
+            Msg::ColumnWidthSet(name, w) => {
+                self.merge_columns();
+                self.columns.set_width(&name, w);
+                self.save_columns();
+            }
+            Msg::ColumnWidthClear(name) => {
+                self.merge_columns();
+                self.columns.widths.remove(&name);
+                self.save_columns();
+            }
+            Msg::ColumnMoveBefore(name, before) => {
+                self.merge_columns();
+                self.columns.move_name_before(&name, before.as_deref());
+                self.save_columns();
+            }
+            Msg::OpenColMenu => {
+                self.export_menu_open = false; // 互斥 (D3): 双 scrim 不叠
+                self.col_menu_open = true;
+            }
+            Msg::CloseColMenu => self.col_menu_open = false,
+            Msg::ToggleColumn(name) => {
+                self.merge_columns();
+                if !self.columns.order.contains(&name) {
+                    return; // 未知列 (陈旧弹层快照): 零动作零提示, 不误报守卫文案
+                }
+                if !self.columns.toggle_hidden(&name) {
+                    // D6: ≥1 可见列守卫 —— 关最后一可见列拒绝并提示 (零变更不写)
+                    self.set_notice("至少保留一列可见".into(), NoticeKind::Warn);
+                } else {
+                    self.save_columns();
+                }
+            }
+            Msg::ResetColumns => {
+                self.merge_columns();
+                if let Some(s) = &self.schema {
+                    let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
+                    self.columns.reset(&names);
+                    self.save_columns();
+                }
+            }
             Msg::ScrollRows(d) => {
                 // 用户向上滚动 → 脱离跟随 (不打扰阅读)
                 if d < 0.0 && self.follow {
@@ -1916,7 +2049,12 @@ impl App for LogApp {
                 .child(settings::settings_overlay(self.theme))
                 .child(settings::upgrade_overlay(self.theme))
                 .child(settings::export_menu_overlay(self.theme))
-                .child(settings::export_menu_overlay_jsonl(self.theme)),
+                .child(settings::export_menu_overlay_jsonl(self.theme))
+                .child(settings::col_menu_overlay(
+                    self.theme,
+                    self.schema.as_deref().cloned(),
+                    self.columns.clone(),
+                )),
         )
     }
 
@@ -1930,7 +2068,8 @@ impl App for LogApp {
         // `Consumed` 了, 能走到这里的本来就不是它。
         if let Event::MouseWheel { delta, .. } = event {
             // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
-            if !self.settings_open && !self.export_menu_open && self.has_file {
+            if !self.settings_open && !self.export_menu_open && !self.col_menu_open && self.has_file
+            {
                 let rows = wheel_rows(delta.1);
                 if rows != 0.0 {
                     self.update(Msg::ScrollRows(rows));
@@ -2073,6 +2212,11 @@ impl App for LogApp {
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
+            // Esc 次序: 升级提示 > 设置卡 > **列管理** > 导出格式菜单 > 栏
+            // (SPEC-v1x-table-column-config D3 插层)
+            if self.col_menu_open {
+                return Some(Msg::CloseColMenu);
+            }
             // Esc 次序: 升级提示 > 设置卡 > **导出格式菜单** > 栏 (SPEC-v1x-export)
             if self.export_menu_open {
                 return Some(Msg::CloseExportMenu);
@@ -2102,7 +2246,11 @@ impl App for LogApp {
         // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
         // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
         // (T7 扩展: 升级提示同享此守卫 —— 它是第二个模态层。)
-        if self.settings_open || self.upgrade_prompt.is_some() || self.export_menu_open {
+        if self.settings_open
+            || self.upgrade_prompt.is_some()
+            || self.export_menu_open
+            || self.col_menu_open
+        {
             // **剪辑组合键必须放行** (评审 Critical, 2026-09-19): 框架的剪贴板
             // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里, 这里吞掉 =
             // 许可页输入框没法 Ctrl+V 粘贴 key —— 而粘贴是 200+ 字符 key 的
@@ -2336,6 +2484,314 @@ mod tests {
             "danqing-log-app-lic-{}-{tag}.toml",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn column_msgs_mutate_and_persist_columns_json() {
+        let cfg = temp_cfg_path("cols-msg");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\a.jsonl");
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![
+                jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        app.update(Msg::ColumnWidthSet("a".into(), 120.0));
+        app.update(Msg::ColumnMoveBefore("b".into(), Some("a".into())));
+        assert_eq!(app.columns.widths.get("a"), Some(&120.0));
+        assert_eq!(
+            app.columns.order,
+            vec!["b".to_string(), "a".to_string()],
+            "换位落点生效"
+        );
+        // 落盘 = columns.json 邻居 (license.key 注入同规), 重启读得回
+        let cols = cfg.with_extension("columns.json");
+        let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert_eq!(
+            loaded.get("C:\\logs\\a.jsonl").map(|c| &c.order),
+            Some(&vec!["b".to_string(), "a".to_string()])
+        );
+        // 双击恢复 = 删手动宽覆盖
+        app.update(Msg::ColumnWidthClear("a".into()));
+        assert!(app.columns.widths.is_empty());
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T5: 列管理开关/恢复默认/≥1 可见守卫 + 落盘; 与导出菜单互斥。
+    #[test]
+    fn col_menu_toggle_reset_guard_and_persist() {
+        let cfg = temp_cfg_path("cols-menu");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\m.jsonl");
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![
+                jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        // 互斥: 开列管理关导出菜单, 反之亦然
+        app.export_menu_open = true;
+        app.update(Msg::OpenColMenu);
+        assert!(app.col_menu_open && !app.export_menu_open);
+        app.update(Msg::ToggleColumn("a".into()));
+        assert!(app.columns.is_hidden("a"));
+        // ≥1 可见守卫 (D6): 关最后一可见列拒绝 + 提示 + 零变更
+        app.update(Msg::ToggleColumn("b".into()));
+        assert!(!app.columns.is_hidden("b"), "最后一可见列不可藏");
+        assert!(
+            app.notice.as_ref().is_some_and(
+                |(t, k)| t.contains("至少保留一列") && matches!(k, crate::NoticeKind::Warn)
+            ),
+            "拒绝须说清为什么"
+        );
+        // 恢复默认 (D3)
+        app.update(Msg::ResetColumns);
+        assert_eq!(app.columns.order, vec!["a".to_string(), "b".to_string()]);
+        assert!(app.columns.hidden.is_empty());
+        // 落盘读回 (D4)
+        let cols = cfg.with_extension("columns.json");
+        let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
+        assert!(loaded.get("C:\\logs\\m.jsonl").is_some());
+        std::fs::remove_file(&cols).ok();
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T5: 换文件载入 per-路径记忆 (D4) + 关列管理菜单 (R4 先例同款)。
+    #[test]
+    fn apply_fresh_loads_per_path_memory_and_closes_col_menu() {
+        let cfg = temp_cfg_path("cols-fresh");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let schema = || {
+            Some(jsonl::Schema {
+                columns: vec![
+                    jsonl::Column {
+                        name: "a".into(),
+                        width_chars: 4,
+                    },
+                    jsonl::Column {
+                        name: "b".into(),
+                        width_chars: 4,
+                    },
+                ],
+            })
+        };
+        let p = temp_log(b"x\n");
+        // 路径 A: 摆一列手动宽
+        let out_a = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: schema(),
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(std::path::PathBuf::from("A.jsonl"), out_a);
+        app.update(Msg::ColumnWidthSet("a".into(), 222.0));
+        app.col_menu_open = true;
+        // 换文件 B: 菜单关 + 摠法回默认 (B 无记忆)
+        let out_b = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: schema(),
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(std::path::PathBuf::from("B.jsonl"), out_b);
+        assert!(!app.col_menu_open, "换文件关列管理菜单");
+        assert!(app.columns.widths.is_empty(), "B 无记忆 = 默认摆法");
+        // 回 A: 记忆回来
+        let out_a2 = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: schema(),
+            incremental_hits: None,
+            rebuilt: false,
+            level_column: None,
+        };
+        app.apply_fresh(std::path::PathBuf::from("A.jsonl"), out_a2);
+        assert_eq!(
+            app.columns.widths.get("a"),
+            Some(&222.0),
+            "per-路径记忆读回"
+        );
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// T5: Esc 次序 —— 列管理先于导出格式菜单 (D3 插层)。
+    #[test]
+    fn esc_prefers_col_menu_over_export_menu() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("cols-esc")));
+        app.col_menu_open = true;
+        app.export_menu_open = true;
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        assert!(matches!(app.app_key_filter(&esc), Some(Msg::CloseColMenu)));
+        std::fs::remove_file(temp_cfg_path("cols-esc")).ok();
+    }
+
+    /// T5: 模态守卫 —— 列管理开着时全局 Ctrl 键不穿到菜单后 (P32 同纪律)。
+    /// 探针取 Ctrl+L (侧栏); **绝不碰 Ctrl+O** (会弹真文件对话框 —— 测试严禁真实桌面副作用)。
+    #[test]
+    fn modal_guard_blocks_globals_while_col_menu_open() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("cols-modal")));
+        let ctrl_l = Event::Key {
+            key: Key::Character("l".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        assert!(matches!(
+            app.app_key_filter(&ctrl_l),
+            Some(Msg::ToggleHistogram)
+        ));
+        app.col_menu_open = true;
+        assert!(matches!(app.app_key_filter(&ctrl_l), Some(Msg::Noop)));
+        // 剪辑键放行 (评审 Critical 先例)
+        let ctrl_v = Event::Key {
+            key: Key::Character("v".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        assert!(app.app_key_filter(&ctrl_v).is_none());
+        std::fs::remove_file(temp_cfg_path("cols-modal")).ok();
+    }
+
+    /// T5/D5 回归锁: **显示配置不影响交付物** —— 摆列/隐藏后 CSV 列仍 schema 首见序全列。
+    #[test]
+    fn csv_columns_ignore_column_config() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("cols-csv")));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\c.jsonl");
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![
+                jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        app.update(Msg::ColumnMoveBefore("b".into(), Some("a".into())));
+        app.update(Msg::ToggleColumn("a".into()));
+        assert_eq!(
+            app.export_csv_columns(),
+            vec!["a".to_string(), "b".to_string()],
+            "摆列不改变导出列 (export D5)"
+        );
+        std::fs::remove_file(temp_cfg_path("cols-csv").with_extension("columns.json")).ok();
+        std::fs::remove_file(temp_cfg_path("cols-csv")).ok();
+    }
+
+    // ---- 评审修复锁 (2026-09-23 双路评审并账) ----
+
+    /// 评审 C4: `apply_rebuild` 也须对账列配置 —— 轮转/截断后 schema 可能整体换,
+    /// 旧摆法不 merge 会残留失配序 (含 C2 的 0 列面); 与 `apply_fresh` 同纪律。
+    #[test]
+    fn apply_rebuild_merges_column_config_with_new_schema() {
+        let cfg = temp_cfg_path("cols-rebuild");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\r.jsonl");
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![
+                jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+                jsonl::Column {
+                    name: "c".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        // 摆法: 藏 a、b, 只留 c 可见 (落盘形态同款的脏态)
+        app.update(Msg::ToggleColumn("a".into()));
+        app.update(Msg::ToggleColumn("b".into()));
+        assert_eq!(app.columns.visible_names().collect::<Vec<_>>(), vec!["c"]);
+        // 轮转 rebuild: 新 schema 只剩 a,b (c 没了)
+        let p = temp_log(b"x\n");
+        let out = OpenOutcome {
+            file: LogFile::open(&p).unwrap(),
+            schema: Some(jsonl::Schema {
+                columns: vec![
+                    jsonl::Column {
+                        name: "a".into(),
+                        width_chars: 4,
+                    },
+                    jsonl::Column {
+                        name: "b".into(),
+                        width_chars: 4,
+                    },
+                ],
+            }),
+            incremental_hits: None,
+            rebuilt: true,
+            level_column: None,
+        };
+        app.apply_rebuild(std::path::PathBuf::from("C:\\logs\\r.jsonl").as_path(), out);
+        assert_eq!(
+            app.columns.order,
+            vec!["a".to_string(), "b".to_string()],
+            "rebuild 后列配置须对账新 schema"
+        );
+        assert_eq!(
+            app.columns.visible_names().collect::<Vec<_>>(),
+            vec!["a"],
+            "唯一可见列被剔除后 merge 兜底 (≥1 可见)"
+        );
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 Optional (五轴⑥): 未知列名的 Toggle 不得误报「至少保留一列可见」守卫文案。
+    #[test]
+    fn toggle_unknown_column_reports_nothing() {
+        let cfg = temp_cfg_path("cols-ghost");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\g.jsonl");
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![jsonl::Column {
+                name: "a".into(),
+                width_chars: 4,
+            }],
+        }));
+        app.update(Msg::ToggleColumn("ghost".into()));
+        assert!(app.notice.is_none(), "未知列零动作, 不得报守卫文案");
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
     }
 
     #[test]
@@ -3434,7 +3890,8 @@ mod tests {
     /// (不得拿空子句表去点); ③ 作业交付后计数等于全量重算。
     #[test]
     fn apply_fresh_does_not_block_on_level_counting() {
-        let mut app = LogApp::new_empty();
+        // 注入配置路径: apply_fresh 现会读 columns.json (T5), 无注入 panic 封死会拦
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("lvlcnt")));
         let p = temp_log(
             "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
         );
@@ -3489,7 +3946,7 @@ mod tests {
     /// 过滤栏里打字的用户当场拽走 (焦点一挪, 接下来敲的字就不进栏了)。
     #[test]
     fn fresh_open_hands_focus_to_the_list_but_append_does_not() {
-        let mut app = LogApp::new_empty();
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshfocus")));
         let p = temp_log("2026-09-05 12:00:01 ERROR one\n".as_bytes());
         let out = OpenOutcome {
             file: LogFile::open(&p).unwrap(),
@@ -3583,7 +4040,7 @@ mod tests {
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
         // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
         // 不得贴上 (worker 用通道闸门控制交付时序, 无运气成分)
-        let mut app = LogApp::new_empty();
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshinv")));
         let (f_tx, f_rx) = std::sync::mpsc::channel::<()>();
         app.filter_job.launch(move || {
             f_rx.recv().ok();
