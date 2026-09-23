@@ -52,7 +52,7 @@
 |---|---|---|
 | `licensing` | `SPEC-v1x-licensing.md` | **五段全收口**（2026-09-19: review 修复 + simplify, 250 测试绿）; 待人工验收（需真公钥回填） |
 | `field-analytics` | `SPEC-v1x-field-analytics.md` | **五段全收口**（2026-09-19: review 6 Required 全修 + simplify, 250+68 绿）; 待人工验收 |
-| `export` | `SPEC-v1x-export.md` | 未开工 |
+| `export` | `SPEC-v1x-export.md` | **build 完成**（2026-09-23 /build auto T1–T7 零 commit, 298 测试绿, 性能四路达标; 待人工验收 + review） |
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | 未开工 |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | 未开工 |
 | `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | 未开工 |

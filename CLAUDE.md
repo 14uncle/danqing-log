@@ -4,6 +4,25 @@
 
 ## 状态
 
+- 2026-09-23 (**v1.0.2 MSIX 用户已提交; 腿三 export 一日全链: spec→plan→build T1–T7**):
+  商店侧余认证 (v1.0.0 同款节奏, 认证通过后照 `docs/ms-store-copy.md`「v1.x 上架时
+  必须改什么」清单核隐私政策双轨口径贴的是新版)。export: 四项口径 interview 裁定
+  (行集=当前结果全集 / 明文只出原始行 / 流式+可取消+实测定档 / 导出整体付费) →
+  `docs/specs/SPEC-v1x-export.md` (D1–D9) 「go」批准 (Open Q① 分析结果导出不做) →
+  plan/todo → **/build auto T1–T7 全绿零 commit**。产出: `src/export.rs`
+  (ExportSet 行集冻结 + raw 全集 `bytes()` 整拷/稀疏行尾探测 + CSV BOM+CRLF+RFC4180
+  手写转义 + pretty 失败行原样 + ExportJob 删半成品/在途拒绝/invalidate) /
+  底栏「导出…」+ `Ctrl+E` + 格式菜单两卡收口 (明文仅原始行) + 门控点位=入口
+  (对话框前) / `logbench --export` / **PANEL_CONTENT_H 180→192** (快捷键页加行越界)。
+  **实测 (release 热缓存)**: raw 全集 **608ms**/1684MiB/s · 稀疏 129ms · pretty
+  **18.1s** · CSV **20.7s** —— D9 目标全过, 已进 PERFORMANCE_REPORT。
+  测试 **298 绿** (基线实测 265→298; plan 记 262 为 09-22 旧值); 三处 A/B 精确红
+  (行尾策略/CSV 转义/pretty 空行)。**联动**: `danqing-logfile` 新增 `LogFile::bytes()`
+  (**未 commit 未 push**, patch 开着, lock path 态 —— 待用户闸门走 push+复钉)。
+  实现口径分叉已回写 spec 实现记 (T2 逐行 parse 修正 / schema.is_some() 判据 /
+  轮转不作废在途导出 / UTC 时间戳 / UTF-16 转码副本局限)。
+  **待: 人工验收 (spec 四条) → review → code-simplify; 之后地图顺序 =
+  table-column-config (免费层欠账三连)**。
 - 2026-09-22 (**v1.0.2 GitHub 已发布; MS Store 余用户提交一步**): 更新提示两批
   (update-badge 双轨更新检查 + update-hint-ui 角标/link 形按钮/版本行居中, 均
   五段+人工验收+review+simplify 全闭, 含实机「角标 y 双加」返修)。**首个带更新
