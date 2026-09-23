@@ -41,7 +41,7 @@ JSONL 自动检测+列发现+字段过滤迷你语法+嵌套展开 / 编码检�
 
 | 项 | 性质 | 出处 |
 |---|---|---|
-| 列宽拖拽 / 列显隐 / 列重排 | v1 欠账 | `SPEC-jsonl-table.md:30` |
+| ~~列宽拖拽 / 列显隐 / 列重排~~ | ~~v1 欠账~~ **已补**（2026-09-23, `SPEC-v1x-table-column-config` 免费层白送: 手柄拖宽/表头拖拽换位/「列…」显隐 + per-文件记忆） | `SPEC-jsonl-table.md:30` |
 | 书签持久化 | v1 欠账（**2026-09-12 由 v1.x 改判至此**） | `SPEC-core-viewer.md:29` |
 | 时间戳列类型系统 | 打磨 | `SPEC-jsonl-table.md:31` |
 | 免语法字段查询 UI（列发现采样结果做成下拉点选） | 缺口，**提议待裁** | — |
@@ -96,7 +96,7 @@ Error 43,464 / **Fatal 4,760**，一眼知道该看哪行），也是排障的�
 
 | 项 | 内容 | 出处 |
 |---|---|---|
-| 导出 | 过滤结果导出、JSON 美化导出、CSV —— **已建成**（2026-09-23, `SPEC-v1x-export` 五段推进中; 1 GiB 全集 raw 608ms / pretty 18.1s / CSV 20.7s, 见 PERFORMANCE_REPORT） | `SPEC-jsonl-table.md:31` |
+| 导出 | 过滤结果导出、JSON 美化导出、CSV —— **已建成**（2026-09-23, `SPEC-v1x-export` 五段全闭; 1 GiB 全集 raw 608ms / pretty 18.1s / CSV 20.7s, 见 PERFORMANCE_REPORT） | `SPEC-jsonl-table.md:31` |
 | 工作台会话持久化 | 命名会话（过滤器组合 + 搜索历史 + 列配置 + 展开态）跨会话保存/切换 | `SPEC-core-viewer.md:29`、intent:52 |
 
 单独看都不构成购买理由，但它们是腿一/腿二的收尾：用户分析完，总得能把结果交出去、

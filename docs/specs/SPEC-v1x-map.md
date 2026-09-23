@@ -50,10 +50,10 @@
 
 | 模块 | spec 文件 | 状态 |
 |---|---|---|
-| `licensing` | `SPEC-v1x-licensing.md` | **五段全收口**（2026-09-19: review 修复 + simplify, 250 测试绿）; 待人工验收（需真公钥回填） |
-| `field-analytics` | `SPEC-v1x-field-analytics.md` | **五段全收口**（2026-09-19: review 6 Required 全修 + simplify, 250+68 绿）; 待人工验收 |
-| `export` | `SPEC-v1x-export.md` | **五阶段全闭**（2026-09-23 spec→plan→build→review→code-simplify 一日走完, 314 测试绿; 仅余人工验收用户闸门） |
-| `table-column-config` | `SPEC-v1x-table-column-config.md` | 未开工 |
+| `licensing` | `SPEC-v1x-licensing.md` | **五段全收口 + 人工验收过**（09-19 收口; 09-20 三轮实机过, 真公钥已回填） |
+| `field-analytics` | `SPEC-v1x-field-analytics.md` | **五段全收口 + 人工验收过**（09-19 收口; 09-20 三轮实机过） |
+| `export` | `SPEC-v1x-export.md` | **五阶段全闭**（2026-09-23 一日走完, 314 测试绿; 人工验收**记账延后** 2026-09-23 用户裁定, 待实机回填） |
+| `table-column-config` | `SPEC-v1x-table-column-config.md` | **五段全闭**（2026-09-23 一日走完: 365 测试绿, 双路评审 Critical×1+Required×6 全修 + Nit×5 清零, 零框架/引擎改动）; 人工验收**记账**（`tasks/acceptance-pending.md` A 组） |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | 未开工 |
 | `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | 未开工 |
 | `workspace-sessions` | `SPEC-v1x-workspace-sessions.md` | 未开工 |

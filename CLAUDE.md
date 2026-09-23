@@ -18,11 +18,34 @@
   **18.1s** · CSV **20.7s** —— D9 目标全过, 已进 PERFORMANCE_REPORT。
   测试 **298 绿** (基线实测 265→298; plan 记 262 为 09-22 旧值); 三处 A/B 精确红
   (行尾策略/CSV 转义/pretty 空行)。**联动**: `danqing-logfile` 新增 `LogFile::bytes()`
-  (**未 commit 未 push**, patch 开着, lock path 态 —— 待用户闸门走 push+复钉)。
+  (**已 push**: logfile `a81dcac`, lock 钉 `a81dcac2`; 本仓三笔 `688ce4e`(search 代次
+  拒覆盖)/`1e669db`(评审修复+简化)/`0ad53ae`(文档) 同日已推 `dev`)。
   实现口径分叉已回写 spec 实现记 (T2 逐行 parse 修正 / schema.is_some() 判据 /
   轮转不作废在途导出 / UTC 时间戳 / UTF-16 转码副本局限)。
-  **待: 人工验收 (spec 四条) → review → code-simplify; 之后地图顺序 =
-  table-column-config (免费层欠账三连)**。
+  **人工验收 (spec 四条) 记账延后** (2026-09-23 用户裁定「人工验收先记账」,
+  待实机回填 —— CSV 记得在 Excel 开验); review+simplify 同日已收口 (见下) ——
+  **五阶段全闭**。地图下一棒 = table-column-config (免费层欠账三连), 同日 spec 已起
+  (三项口径裁定全按推荐: 表头「列管理」弹层 / 表头拖拽换位 / 自带轻持久化
+  免费 columns.json; 调研: 拖拽基建零框架改动, event 无 TextBatch 列几何须 paint
+  同源) → 「go」批准 → plan/todo (Open Q①② 裁定: 光标首版零联动 / 弹层上移下移不进
+  首版) → **/build auto T1–T6 全绿零 commit** (348 测试绿, 314→348): `src/columns.rs`
+  (模型+对账+columns.json Value 手拼 LRU64) / view (表头几何缓存+手柄拖宽预览+拖拽
+  换位+hover) / settings (「列管理」弹层, format_btn 泛化收 impl Fn) / main (Msg 链+
+  per-路径记忆载入+变更即落盘+Esc 插层+模态互斥)。**panic 封死当场抓 3 条既有测试**
+  (apply_fresh 读 columns.json 无注入 → 补 temp 注入, 守卫按 save_config 先例起效);
+  A/B 三红: 对账 (摘补尾/retain) / 持久化 (摘 widths 写出) / paint 预览 (摘预览分支)。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (表头右键开列管理是死代码 —— 左键筛选提前返回吞掉右键分支, D3 第二入口从未接通)
+  + Required ×6 (零位移单击误冻结采样宽 / 换文件·rebuild·Ctrl+T 打断手势不清态→
+  抬起写错文件错列 / columns.json 外部数据三连: hidden 重复 usize 下溢破 D6 +
+  order 重复画两列 + inf 宽入库 / merge 后可 0 列 / 「列…」按钮盖末列手柄 /
+  右缘截断列手柄热区在屏外) 全修 + Optional 修 8·预防锁 1·文档化 1, 修复锁 +17 →
+  **365 绿** (348→365)。
+  **同日 code-simplify 收口 → 五段全闭**: Nit×5 清零 (move_column 边界 /
+  `HeaderHit::None`→`Miss` / `last_is_move`→`msg_count` / widths 键排序落盘 /
+  「排尾」doc 补全) + 消重复形状 (`header_gesture_active` / `abandon_header_gesture`
+  各收 3 处), 365 绿行为零变化。**人工验收五条用户闸门** (免费层无门控, 任意
+  JSONL 可验; 含新验点: 表头右键开弹层 / 截断列边缘拖宽)。
   **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
   write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
   main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。
