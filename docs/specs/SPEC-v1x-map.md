@@ -54,7 +54,7 @@
 | `field-analytics` | `SPEC-v1x-field-analytics.md` | **五段全收口 + 人工验收过**（09-19 收口; 09-20 三轮实机过） |
 | `export` | `SPEC-v1x-export.md` | **五阶段全闭**（2026-09-23 一日走完, 314 测试绿; 人工验收**记账延后** 2026-09-23 用户裁定, 待实机回填） |
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | **五段全闭**（2026-09-23 一日走完: 365 测试绿, 双路评审 Critical×1+Required×6 全修 + Nit×5 清零, 零框架/引擎改动）; 人工验收**记账**（`tasks/acceptance-pending.md` A 组） |
-| `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | **spec 草案待批准**（2026-09-23 起草: 范围三项推荐随「go」裁定） |
+| `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | **已批准 + plan 待过目**（2026-09-23「go」三项全按推荐; plan/todo 已出） |
 | `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | 未开工 |
 | `workspace-sessions` | `SPEC-v1x-workspace-sessions.md` | 未开工 |
 
