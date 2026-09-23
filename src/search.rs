@@ -48,7 +48,17 @@ impl<T: Send + 'static> AsyncJob<T> {
         let rev = Arc::clone(&self.rev);
         std::thread::spawn(move || {
             let out = work();
-            *done.lock().unwrap() = Some((generation, out));
+            {
+                let mut slot = done.lock().unwrap();
+                // 代次拒旧覆盖 (export review B-Critical): 完成顺序颠倒时, 旧轮
+                // 晚到**不得**覆写新轮结果 —— 单槽被旧轮覆写后 poll 只 take 一次,
+                // 新轮结果会永久丢失 (invalidate 后立刻再 launch 的交错可复现)。
+                // 槽里已有更高代次时本结果直接丢弃。
+                let stale = matches!(&*slot, Some((g, _)) if *g >= generation);
+                if !stale {
+                    *slot = Some((generation, out));
+                }
+            }
             rev.fetch_add(1, Ordering::Release);
         });
     }
@@ -241,5 +251,32 @@ mod tests {
             !re.is_match("\u{D6}\u{D0}".as_bytes()),
             "不匹配码点 UTF-8 展开"
         );
+    }
+
+    /// 代次拒旧覆盖 (export review B-Critical 回归锁): invalidate 后立刻再 launch,
+    /// 完成顺序颠倒 (旧轮晚到) 时**新轮结果不得丢失**。
+    /// 修前行为: 旧轮覆写单槽 → poll take 到旧代次丢弃 → 新结果永久蒸发。
+    #[test]
+    fn late_stale_result_does_not_overwrite_newer() {
+        let mut job: AsyncJob<&'static str> = AsyncJob::new();
+        job.launch(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            "old"
+        });
+        job.invalidate(); // 旧轮作废
+        job.launch(|| "new"); // 新轮先完成
+        // 自旋等新轮结果 (上限 5s); 旧轮 200ms 后才到, 到达时必须被拒收
+        let mut got = None;
+        for _ in 0..500 {
+            if let Some(v) = job.poll() {
+                got = Some(v);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(got, Some("new"), "新轮结果必须交付, 不得被旧轮覆写吞掉");
+        // 等旧轮真到达 (越过 200ms) 再确认它没有借尸还魂
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(job.poll(), None, "旧轮晚到结果不得再被交付");
     }
 }
