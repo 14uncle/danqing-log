@@ -70,6 +70,8 @@ const GLYPH_COLLAPSED: &str = "+";
 const GLYPH_EXPANDED: &str = "-";
 /// 底栏状态行高度。
 const STATUS_HEIGHT: f32 = 26.0;
+/// 命名会话入口标签 (SPEC-v1x-workspace-sessions D5)。
+const SESSIONS_BTN_LABEL: &str = "会话";
 
 /// 更新角标直径 (逻辑像素; 圆点半径取直径之半)。SPEC-update-badge D1, 拟态值待验收 (e) 定档。
 const UPDATE_DOT_D: f32 = 6.0;
@@ -854,6 +856,9 @@ pub(crate) struct LogView {
     export_label: String,
     export_hover: std::cell::Cell<bool>,
     export_btn_rect: std::cell::Cell<Rect>,
+    /// 「会话」入口 (D5): hover + hit rect, export 同规。
+    sessions_hover: std::cell::Cell<bool>,
+    sessions_btn_rect: std::cell::Cell<Rect>,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
@@ -944,6 +949,8 @@ impl LogView {
             export_label: String::new(),
             export_hover: std::cell::Cell::new(false),
             export_btn_rect: std::cell::Cell::new(Rect::default()),
+            sessions_hover: std::cell::Cell::new(false),
+            sessions_btn_rect: std::cell::Cell::new(Rect::default()),
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
             hover_expand: std::cell::Cell::new(false),
@@ -2201,7 +2208,25 @@ impl Widget for LogView {
             self.export_btn_rect.set(Rect::default());
             settings_x
         };
-        // 位置计数: 导出入口 (无导出入口则设置入口) 左侧 (空态无意义, 不画)
+        // 命名会话入口 (SPEC-v1x-workspace-sessions D5): 导出入口左侧;
+        // 空态不画 (Open Q3: 无文件不出入口)。
+        let sessions_anchor_x = if self.has_file {
+            let sw = texts.measure(SESSIONS_BTN_LABEL, AUX_FONT_SIZE);
+            let sx = export_anchor_x - 16.0 - sw;
+            self.sessions_btn_rect
+                .set(export_hit_rect(sx, sw, status_y));
+            let sessions_color = if self.sessions_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(SESSIONS_BTN_LABEL, sx, sy, AUX_FONT_SIZE, sessions_color);
+            sx
+        } else {
+            self.sessions_btn_rect.set(Rect::default());
+            export_anchor_x
+        };
+        // 位置计数: 会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画)
         let pos = if !self.has_file {
             String::new()
         } else if count == 0 {
@@ -2210,7 +2235,7 @@ impl Widget for LogView {
             format!("行 {}/{count}", self.selected + 1)
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
-        let pos_x = export_anchor_x - 16.0 - pos_w;
+        let pos_x = sessions_anchor_x - 16.0 - pos_w;
         texts.push_text(
             &pos,
             pos_x.max(area.origin.x + 10.0),
@@ -2230,6 +2255,8 @@ impl Widget for LogView {
                     .set(self.settings_btn_rect.get().contains(*position));
                 self.export_hover
                     .set(self.export_btn_rect.get().contains(*position));
+                self.sessions_hover
+                    .set(self.sessions_btn_rect.get().contains(*position));
                 // T3: 表头 hover (手柄/「列…」) —— 命中几何来自 paint 缓存 (D2)
                 let hhit = self.header_hit_at(area, *position);
                 self.hover_cols_btn
@@ -2312,6 +2339,7 @@ impl Widget for LogView {
             Event::CursorLeft => {
                 self.settings_hover.set(false);
                 self.export_hover.set(false);
+                self.sessions_hover.set(false);
                 self.hover_row.set(u64::MAX);
                 // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
                 // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
@@ -2396,6 +2424,10 @@ impl Widget for LogView {
                 // 作业态变取消, 全在应用层 (Msg::ExportEntryClicked)。
                 if self.export_btn_rect.get().contains(*position) {
                     msgs.push(Box::new(Msg::ExportEntryClicked));
+                }
+                // 命名会话入口 (D5): 门控/互斥全在应用层 (Msg::OpenSessionMenu)
+                if self.sessions_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::OpenSessionMenu));
                     return EventResult::Consumed;
                 }
                 // 表头命中 (T3/T4, SPEC-v1x-table-column-config): 表头行内一律收口,
@@ -4529,6 +4561,42 @@ mod tests {
             "左键必须发 ExportEntryClicked"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 命名会话入口 (SPEC-v1x-workspace-sessions D5): 左键发 `OpenSessionMenu`
+    /// (门控在应用层), 坐落导出入口左侧; 空态不出 (Open Q3)。
+    #[test]
+    fn sessions_button_click_pushes_open_and_sits_left_of_export() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let (mut v, path) = cell_fixture("sess-btn");
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let sess = v.sessions_btn_rect.get();
+        let export = v.export_btn_rect.get();
+        assert!(sess.size.width > 0.0, "有文件时会话入口必须在场");
+        assert!(
+            sess.origin.x + sess.size.width <= export.origin.x,
+            "会话入口必须在导出入口左侧且不重叠"
+        );
+        let p = Point::new(sess.origin.x + 2.0, sess.origin.y + 2.0);
+        let left = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            left.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenSessionMenu))),
+            "左键必须发 OpenSessionMenu"
+        );
+        // 空态不出 (无文件)
+        let (mut v2, path2) = cell_fixture("sess-btn-empty");
+        v2.has_file = false;
+        v2.paint(area, &mut rects, &mut texts);
+        assert_eq!(
+            v2.sessions_btn_rect.get(),
+            Rect::default(),
+            "无文件不出「会话」"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path2).ok();
     }
 
     /// 空态零痕迹: 无文件不画导出入口 (导出无对象), 命中矩形塌缩。

@@ -183,7 +183,7 @@ pub(crate) struct LogApp {
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
     /// 列配置真身 (SPEC-v1x-table-column-config D1): 用户列宽/显隐/列序,
-    /// 换文件 (`apply_fresh`) 载入该路径记忆, 变更即落 `columns.json` (D4)。
+    /// 换文件 (`apply_fresh`) 载入该路径记忆, 变更即落 `state.json` (D4)。
     columns: danqing_log::columns::ColumnConfig,
     /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
     /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
@@ -327,6 +327,15 @@ pub(crate) struct LogApp {
     picker_op: jsonl::Op,
     /// 值输入框清空代次 (框架 `TextInput::bind_clear` 消费): 提交/关弹层时 +1。
     picker_clear_rev: u64,
+    /// 当前路径的命名会话 (SPEC-v1x-workspace-sessions T2): 随
+    /// `load_state_for_current_file` 换路径整片替换, 变更即落 `state.json`。
+    sessions: Vec<danqing_log::columns::SessionEntry>,
+    /// 会话弹层最近点选名 (「删除」指针, T3; 应用即记选中)。换文件清。
+    session_selected: Option<String>,
+    /// 命名会话弹层开合 (D5; 与三弹层互斥并入 `close_popovers`/`popover_open`)。
+    session_menu_open: bool,
+    /// 命名输入清空代次 (`bind_clear` 消费): 开/关/保存/应用时 +1。
+    session_clear_rev: u64,
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
     ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
@@ -434,7 +443,7 @@ pub(crate) enum Msg {
     /// 关格式菜单 (scrim 点击 / Esc)。
     CloseExportMenu,
     // ---- 列配置三件套 (SPEC-v1x-table-column-config T4) ----
-    /// 列宽拖拽提交 (抬起落账): 手动宽覆盖, 落 `columns.json` (D1/D4)。
+    /// 列宽拖拽提交 (抬起落账): 手动宽覆盖, 落 `state.json` (D1/D4)。
     ColumnWidthSet(String, f32),
     /// 双击手柄恢复采样宽: 删手动宽覆盖。
     ColumnWidthClear(String),
@@ -457,6 +466,16 @@ pub(crate) enum Msg {
     PickPickerField(String),
     /// 点算符行: 记选中算符 (六钮常显, Open Q①)。
     PickPickerOp(jsonl::Op),
+    /// 保存/覆盖命名会话 (命名输入 Enter /「保存当前」同路, T2)。
+    SaveSession(String),
+    /// 应用命名会话 (点行 = 应用并记选中, T2/T3)。
+    ApplySession(String),
+    /// 删除**选中**会话 (「删除」钮; 无确认, Open Q4; 无选中 = 提示)。
+    DeleteSelectedSession,
+    /// 开命名会话弹层 (状态栏「会话」入口; D4 门控点位 = 入口)。
+    OpenSessionMenu,
+    /// 关命名会话弹层 (Esc/scrim)。
+    CloseSessionMenu,
     /// 表单提交 (值输入 Enter / 「过滤」钮, `PickerInput` 持有者内同路):
     /// 值随信 (评审 R3: 不设镜像, 镜像有 set_text/clear 不回 on_change 的脱钩窗),
     /// 拼子句 → 空格追加 → `apply_filter` (D1/D3)。
@@ -560,6 +579,10 @@ impl LogApp {
             picker_field: None,
             picker_op: jsonl::Op::Eq,
             picker_clear_rev: 0,
+            sessions: Vec::new(),
+            session_selected: None,
+            session_menu_open: false,
+            session_clear_rev: 0,
             license_clear_rev: 0,
             analysis_job: AsyncJob::new(),
             analysis_result: None,
@@ -680,26 +703,54 @@ impl LogApp {
         }
     }
 
-    /// columns.json 路径: 生产 = config 目录独立文件 (license.key 同目录先例, D4);
-    /// 测试 = 注入配置路径的邻居 + 无注入 panic (与 cfg_path/license_path 同规:
-    /// 「测试不得写真实配置」家法的封法)。
-    fn columns_path(&self) -> std::path::PathBuf {
+    /// 状态账本路径 (`state.json`): 生产 = config 目录独立文件 (license.key 同目录
+    /// 先例, D4); 测试 = 注入配置路径的邻居 + 无注入 panic (与 cfg_path/license_path
+    /// 同规: 「测试不得写真实配置」家法的封法)。2026-09-24 随账本改名一次到位
+    /// (bookmark-persist 既定裁定)。
+    fn state_path(&self) -> std::path::PathBuf {
         match &self.cfg_path {
-            Some(p) => p.with_extension("columns.json"),
+            Some(p) => p.with_extension("state.json"),
             None => {
                 #[cfg(test)]
-                panic!("测试不得读写真实 columns.json —— 请用 LogApp::new_empty_at(临时路径)");
+                panic!("测试不得读写真实 state.json —— 请用 LogApp::new_empty_at(临时路径)");
                 #[cfg(not(test))]
                 danqing_log::columns::default_path()
             }
         }
     }
 
+    /// 旧名账本路径 (只读迁移源, SPEC-v1x-workspace-sessions D3): 与
+    /// [`Self::state_path`] **同分支派生** —— 测试注入是 `with_extension` 邻居派生
+    /// (`x.state.json` ↔ `x.columns.json`), 生产是整名兄弟 (`state.json` ↔
+    /// `columns.json`), 两种方案没有统一表达式, 分支配对是唯一不歪的写法。
+    fn legacy_state_path(&self) -> std::path::PathBuf {
+        match &self.cfg_path {
+            Some(p) => p.with_extension("columns.json"),
+            None => {
+                #[cfg(test)]
+                panic!("测试不得读写真实 columns.json —— 请用 LogApp::new_empty_at(临时路径)");
+                #[cfg(not(test))]
+                danqing_log::columns::default_path().with_file_name("columns.json")
+            }
+        }
+    }
+
+    /// 载入状态账本 (**读旧写新迁移**, SPEC-v1x-workspace-sessions D3): 新名
+    /// `state.json` 在 → 新名优先; 仅旧名 `columns.json` 在 → 读旧; 落盘只写新名
+    /// (`save_state` 全走 [`Self::state_path`])。缺失/坏账一律空集合且**零写盘**。
+    fn load_state_account(&self) -> danqing_log::columns::ColumnFiles {
+        let new_p = self.state_path();
+        if new_p.exists() {
+            return danqing_log::columns::ColumnFiles::load_from(&new_p);
+        }
+        danqing_log::columns::ColumnFiles::load_from(&self.legacy_state_path())
+    }
+
     /// 换文件载入该路径的记忆状态 (D2, SPEC-v1x-bookmark-persist): 列摆法 + 书签
     /// **一次读盘同取**; 书签按当前行数越界剔除**不写回** (损坏零写回同哲学);
     /// 无记忆 = 默认摆法 + 空书签 (替换语义 —— 旧文件的手势/书签不带进新文件)。
     fn load_state_for_current_file(&mut self) {
-        let files = danqing_log::columns::ColumnFiles::load_from(&self.columns_path());
+        let files = self.load_state_account();
         match files.get_entry(self.path.to_string_lossy().as_ref()) {
             Some(e) => {
                 self.columns = e.config.clone();
@@ -711,7 +762,120 @@ impl LogApp {
                 self.bookmarks.clear();
             }
         }
+        // 命名会话 (T2): 该路径切片整片替换 + 选中清
+        // (Open Q3: 「会话」列表只显本路径, 换文件不带旧选中)。
+        self.sessions = files.sessions_for_path(self.path.to_string_lossy().as_ref());
+        self.session_selected = None;
         self.merge_columns();
+    }
+
+    /// 保存/覆盖命名会话 (D1/D2/D6): 快照四样 = 过滤查询串 + 搜索查询串 +
+    /// 列摆法 + 展开行号表 (**应用时重建真相**, 不存行集)。同名覆盖 +「已更新」;
+    /// 空名 / 满 [`MAX_SESSIONS_PER_PATH`] (新名才计数) 拒绝并说清。
+    /// **书签零触碰** (Open Q1)。
+    fn save_session(&mut self, name: &str) {
+        use danqing_log::columns::{MAX_SESSIONS_PER_PATH, SessionEntry};
+        let name = name.trim();
+        if name.is_empty() {
+            self.set_notice("先命名再保存会话".into(), NoticeKind::Warn);
+            return;
+        }
+        let exists = self.sessions.iter().any(|s| s.name == name);
+        if !exists && self.sessions.len() >= MAX_SESSIONS_PER_PATH {
+            self.set_notice(
+                format!("会话已满 ({MAX_SESSIONS_PER_PATH} 个), 先删再存"),
+                NoticeKind::Warn,
+            );
+            return;
+        }
+        let updated = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = SessionEntry {
+            path: self.path.to_string_lossy().into_owned(),
+            name: name.to_string(),
+            filter: self.filter_applied.clone(),
+            search: self.search_query.clone(),
+            config: self.columns.clone(),
+            expands: self.expanded.lines(),
+            updated,
+        };
+        if let Some(slot) = self.sessions.iter_mut().find(|s| s.name == name) {
+            *slot = entry;
+        } else {
+            self.sessions.push(entry);
+        }
+        let ok = self.save_state();
+        let verb = if exists { "已更新" } else { "已保存" };
+        let tail = if ok { "" } else { " (未落盘)" };
+        self.set_notice(format!("会话「{name}」{verb}{tail}"), NoticeKind::Info);
+    }
+
+    /// 应用命名会话 (D1/D2): ①列换入**写穿** per-file 条目 ②过滤/搜索走既有
+    /// 全链重跑 (查询串 = 真相重建) ③展开重建 (越界/不可展开剔除) ④回顶。
+    /// 应用即记选中 (「删除」指针, T3)。**书签零触碰** (Open Q1)。
+    /// 返回是否找到 (未知名不动账, 留弹层重选)。
+    fn apply_session(&mut self, name: &str) -> bool {
+        let Some(s) = self.sessions.iter().find(|s| s.name == name).cloned() else {
+            self.set_notice("会话不存在".into(), NoticeKind::Warn);
+            return false;
+        };
+        self.columns = s.config.clone();
+        self.merge_columns();
+        self.save_state(); // 写穿 (接缝定案: 会话应用 = 写穿 per-file 条目)
+        self.apply_filter(s.filter.clone());
+        if s.search.is_empty() {
+            self.clear_search();
+        } else {
+            self.apply_search(s.search.clone());
+        }
+        self.rebuild_expands(&s.expands);
+        self.top_row = 0.0;
+        self.selected = 0;
+        self.session_selected = Some(s.name);
+        true
+    }
+
+    /// 删除命名会话 (Open Q4: 无确认, 说清即走 —— 快照非唯一记忆, 重存即可)。
+    fn delete_session(&mut self, name: &str) {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.name != name);
+        if self.sessions.len() == before {
+            self.set_notice("会话不存在".into(), NoticeKind::Warn);
+            return;
+        }
+        if self.session_selected.as_deref() == Some(name) {
+            self.session_selected = None;
+        }
+        let ok = self.save_state();
+        let tail = if ok { "" } else { " (未落盘)" };
+        self.set_notice(format!("会话已删除{tail}"), NoticeKind::Info);
+    }
+
+    /// 展开态整体换入 (D2/D6): 会话行号表逐行现算子行 —— 越界 / 不可展开
+    /// **静默剔除** (书签越界剔除同哲学); `expand_rev` 保守 +1 作废旧选区
+    /// (整体换入不逐次判「有无真变化」)。
+    fn rebuild_expands(&mut self, lines: &[u64]) {
+        self.expanded = ExpandMap::new();
+        self.sub_rows.clear();
+        let total = self.file.line_count();
+        for &line in lines {
+            if line >= total {
+                continue;
+            }
+            let raw = self.file.line(line);
+            let Some(parsed) = jsonl::parse_line(raw) else {
+                continue;
+            };
+            let rows = jsonl::flatten(&parsed);
+            if rows.is_empty() {
+                continue;
+            }
+            self.expanded.expand(line, rows.len());
+            self.sub_rows.insert(line, rows);
+        }
+        self.expand_rev += 1;
     }
 
     /// CSV 列序列集 (export D5): **schema 首见序全列** —— 显示配置不影响交付物
@@ -739,19 +903,30 @@ impl LogApp {
         self.picker_clear_rev += 1;
     }
 
-    /// 关尽三弹层 (列管理 / 导出格式 / 字段查询) —— 互斥「开一关二」、换文件/
-    /// 重建、开设置/升级去激活同纪律的**单一收口** (各处各写一份漏过项:
+    /// 关尽弹层族 (列管理 / 导出格式 / 字段查询 / 命名会话) —— 互斥「开一关二」、
+    /// 换文件/重建、开设置/升级去激活同纪律的**单一收口** (各处各写一份漏过项:
     /// 评审 R5 双开劫 Enter / R6 门禁漏 picker)。
     fn close_popovers(&mut self) {
         self.col_menu_open = false;
         self.export_menu_open = false;
         self.picker_open = false;
+        self.session_menu_open = false;
     }
 
-    /// 三弹层任一开着 —— 模态清单的共同判据 (滚轮/键盘门禁与 Ctrl 守卫**同源**,
+    /// 弹层族任一开着 —— 模态清单的共同判据 (滚轮/键盘门禁与 Ctrl 守卫**同源**,
     /// 评审 R6: 各列一份就漏一项)。
     fn popover_open(&self) -> bool {
-        self.col_menu_open || self.export_menu_open || self.picker_open
+        self.col_menu_open || self.export_menu_open || self.picker_open || self.session_menu_open
+    }
+
+    /// 会话动作门 (两道闸第二道, D4): 免费态弹统一升级提示并拦下动作。
+    /// **数据永在**: 账本读写不走这道门 (降级锁动作不毁数据)。
+    fn session_gate(&mut self) -> bool {
+        if self.entitlement.allows(Feature::WorkspaceSessions) {
+            return true;
+        }
+        self.update(Msg::ShowUpgradePrompt(Feature::WorkspaceSessions));
+        false
     }
 
     /// 损坏备份守卫 (评审 Critical, [`Self::save_state`] 前置): 文件存在且非空
@@ -771,17 +946,17 @@ impl LogApp {
         }
         let bak = path.with_extension("json.bak");
         if std::fs::rename(path, &bak).is_err() {
-            log::warn!("columns.json 已损坏且备份失败 —— 拒绝覆盖以免抹掉其余记忆");
+            log::warn!("state.json 已损坏且备份失败 —— 拒绝覆盖以免抹掉其余记忆");
             return false;
         }
         self.set_notice(
-            "columns.json 已损坏, 原文件已备份为 columns.json.bak".into(),
+            "state.json 已损坏, 原文件已备份为 state.json.bak".into(),
             NoticeKind::Warn,
         );
         true
     }
 
-    /// 记忆状态落盘 (D2/D4): `columns.json` per-路径条目 (列摆法 + 书签), 变更即写
+    /// 记忆状态落盘 (D2/D4): `state.json` per-路径条目 (列摆法 + 书签 + 命名会话), 变更即写
     /// (save_config 同哲学)。路径 key = `to_string_lossy` exact (已知局限: 同文件
     /// 不同路径写法算两条)。返回是否落盘成功 —— **toggle 据此不许说谎**
     /// (评审 R①: 落盘失败还报「已添加」= 成功判据 1 静默违约)。
@@ -789,11 +964,12 @@ impl LogApp {
         if !self.has_file {
             return true;
         }
-        let path = self.columns_path();
+        let path = self.state_path();
         if !self.backup_if_corrupt(&path) {
             return false;
         }
-        let mut files = danqing_log::columns::ColumnFiles::load_from(&path);
+        // 读改写 (含旧名迁移读): sessions 段随 from_json/save_to 恒写自动保真
+        let mut files = self.load_state_account();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -819,6 +995,9 @@ impl LogApp {
                 );
             }
         }
+        // 命名会话整片写穿 (T2): 只动本路径切片 —— 保存不抹别处会话
+        // (bookmark-persist Critical「读改写覆盖抹全记忆」同族面的会话版封口)。
+        files.put_sessions_for_path(self.path.to_string_lossy().as_ref(), self.sessions.clone());
         match files.save_to(&path) {
             Ok(()) => true,
             Err(e) => {
@@ -2101,6 +2280,44 @@ impl App for LogApp {
                 self.reset_picker_draft();
                 self.apply_filter(q);
             }
+            // ---- 命名工作台会话 (SPEC-v1x-workspace-sessions) ----
+            Msg::OpenSessionMenu => {
+                // 门控 (D4, 两道闸第一道): 免费态入口 → 升级提示, 弹层不开
+                if !self.session_gate() {
+                    return;
+                }
+                self.close_popovers();
+                self.settings_open = false;
+                self.session_menu_open = true;
+                self.session_clear_rev += 1;
+                // 开弹层直接打字命名 (评审 R8 同纪律: 送焦值框)
+                self.focus_target = Some("session-name");
+            }
+            Msg::CloseSessionMenu => {
+                self.session_menu_open = false;
+                self.session_clear_rev += 1;
+            }
+            Msg::SaveSession(name) => {
+                if self.session_gate() {
+                    self.save_session(&name);
+                    self.session_clear_rev += 1;
+                }
+            }
+            Msg::ApplySession(name) => {
+                // 应用成功即关弹层清草稿 (picker 提交先例); 未知名留着重选
+                if self.session_gate() && self.apply_session(&name) {
+                    self.session_menu_open = false;
+                    self.session_clear_rev += 1;
+                }
+            }
+            Msg::DeleteSelectedSession => {
+                if self.session_gate() {
+                    match self.session_selected.clone() {
+                        Some(n) => self.delete_session(&n),
+                        None => self.set_notice("先点选会话再删".into(), NoticeKind::Info),
+                    }
+                }
+            }
             Msg::ToggleColumn(name) => {
                 self.merge_columns();
                 if !self.columns.order.contains(&name) {
@@ -2291,7 +2508,8 @@ impl App for LogApp {
                 .child(settings::export_menu_overlay(self.theme))
                 .child(settings::export_menu_overlay_jsonl(self.theme))
                 .child(settings::col_menu_overlay(self.theme))
-                .child(settings::picker_overlay(self.theme)),
+                .child(settings::picker_overlay(self.theme))
+                .child(settings::session_menu_overlay(self.theme)),
         )
     }
 
@@ -2454,6 +2672,11 @@ impl App for LogApp {
                 // 时按 Esc 也走这条路径：整卡通关，而非先收下拉。与「设置卡
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
+            }
+            // Esc 次序: 升级提示 > 设置卡 > **命名会话** > 字段查询 > 列管理 >
+            // 导出格式菜单 > 栏 (SPEC-v1x-workspace-sessions 插层)
+            if self.session_menu_open {
+                return Some(Msg::CloseSessionMenu);
             }
             // Esc 次序: 升级提示 > 设置卡 > **字段查询** > 列管理 > 导出格式菜单 > 栏
             // (SPEC-v1x-field-picker-ui D1 插层)
@@ -2733,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn column_msgs_mutate_and_persist_columns_json() {
+    fn column_msgs_mutate_and_persist_state_account() {
         let cfg = temp_cfg_path("cols-msg");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
         app.has_file = true;
@@ -2758,8 +2981,8 @@ mod tests {
             vec!["b".to_string(), "a".to_string()],
             "换位落点生效"
         );
-        // 落盘 = columns.json 邻居 (license.key 注入同规), 重启读得回
-        let cols = cfg.with_extension("columns.json");
+        // 落盘 = state.json 邻居 (license.key 注入同规), 重启读得回
+        let cols = cfg.with_extension("state.json");
         let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
         assert_eq!(
             loaded.get("C:\\logs\\a.jsonl").map(|c| &c.order),
@@ -2770,6 +2993,354 @@ mod tests {
         assert!(app.columns.widths.is_empty());
         std::fs::remove_file(&cols).ok();
         std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T1 迁移 (SPEC-v1x-workspace-sessions D3): 旧 `columns.json` 在且新名无 →
+    /// 读旧零丢失; 落盘只写新名; 新名在则新名优先 (旧名残留不再被读)。
+    #[test]
+    fn state_account_migrates_from_legacy_columns_json() {
+        let cfg = temp_cfg_path("migrate");
+        let legacy = cfg.with_extension("columns.json");
+        let newp = cfg.with_extension("state.json");
+        let p = temp_log(b"{\"level\":\"ERROR\"}\n{\"level\":\"WARN\"}\n{\"level\":\"INFO\"}\n{\"level\":\"DEBUG\"}\n{\"level\":\"TRACE\"}\n{\"level\":\"FATAL\"}\n");
+        let path_str = "C:\\logs\\m.log";
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": [ {
+                    "path": path_str, "updated": 1, "order": ["a", "b"],
+                    "hidden": ["b"], "widths": {"a": 90.0}, "bookmarks": [5, 2]
+                } ],
+                "sessions": [ {
+                    "path": path_str, "name": "旧台", "filter": "a=1", "search": "x",
+                    "order": ["a"], "expands": [1], "updated": 2
+                } ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from(path_str);
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.load_state_for_current_file();
+        assert_eq!(app.columns.order, vec!["a".to_string(), "b".to_string()]);
+        assert!(app.columns.is_hidden("b"));
+        assert_eq!(app.columns.widths.get("a"), Some(&90.0));
+        assert_eq!(
+            app.bookmarks.iter().copied().collect::<Vec<_>>(),
+            vec![2, 5],
+            "旧账本读入零丢失"
+        );
+        // 落盘只写新名 (sessions 段随读改写保真)
+        assert!(app.save_state());
+        assert!(newp.exists(), "落盘写新名");
+        let saved = danqing_log::columns::ColumnFiles::load_from(&newp);
+        assert_eq!(
+            saved.sessions_for_path(path_str).len(),
+            1,
+            "sessions 迁移保真"
+        );
+        // 新名在 → 新名优先: 旧名再动不进视野
+        std::fs::write(&legacy, b"{ not json").unwrap();
+        app.load_state_for_current_file();
+        assert_eq!(app.columns.order, vec!["a".to_string(), "b".to_string()]);
+        std::fs::remove_file(&legacy).ok();
+        std::fs::remove_file(&newp).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 家法随迁 (panic 封死): 测试构建无注入路径不得读写真实状态账本。
+    #[test]
+    #[should_panic(expected = "测试不得读写真实")]
+    fn state_path_without_injection_panics_in_tests() {
+        let mut app = LogApp::new_empty_at(None);
+        app.has_file = true;
+        let _ = app.save_state();
+    }
+
+    // ---- T2: 会话 save/apply/delete 状态链 (SPEC-v1x-workspace-sessions) ----
+
+    /// 四样载荷 save→apply roundtrip (含写穿实证) + **书签零触碰** (Open Q1) +
+    /// 换路径切片替换清选中。
+    #[test]
+    fn session_save_apply_roundtrips_four_parts_and_touches_no_bookmarks() {
+        let cfg = temp_cfg_path("sess-sa");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        let p = temp_log(
+            b"{\"a\":{\"b\":1},\"level\":\"ERROR\"}\nplain line\n{\"a\":{\"c\":2},\"level\":\"WARN\"}\n",
+        );
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\s.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.schema = Some(Arc::new(jsonl::Schema {
+            columns: vec![jsonl::Column {
+                name: "level".into(),
+                width_chars: 8,
+            }],
+        }));
+        app.load_state_for_current_file();
+        // 调好工作台: 摆列 + 过滤/搜索串 + 展开 0 号行; 书签在场 (零触碰判据)
+        app.update(Msg::ColumnWidthSet("level".into(), 200.0));
+        app.filter_applied = "level=ERROR".into();
+        app.search_query = "plain".into();
+        app.toggle_expand(0);
+        app.bookmarks.insert(2);
+        let bookmarks_before = app.bookmarks.clone();
+        app.update(Msg::SaveSession("排障A".into()));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].name, "排障A");
+        assert_eq!(app.sessions[0].expands, vec![0], "快照 = 展开行号表");
+        // 破坏现场后应用 = 四样回来
+        app.update(Msg::ColumnWidthClear("level".into()));
+        app.filter_applied.clear();
+        app.search_query.clear();
+        app.toggle_expand(0);
+        app.update(Msg::ApplySession("排障A".into()));
+        assert_eq!(app.filter_applied, "level=ERROR", "过滤串回来");
+        assert_eq!(app.search_query, "plain", "搜索串回来");
+        assert_eq!(app.columns.widths.get("level"), Some(&200.0), "列摆法回来");
+        assert!(app.expanded.is_expanded(0), "展开重建");
+        assert_eq!(app.session_selected.as_deref(), Some("排障A"), "应用记选中");
+        assert_eq!(app.bookmarks, bookmarks_before, "书签零触碰 (Open Q1)");
+        // 写穿实证 (摘写穿 = 本断言红): files 段条目 = 会话列摆法
+        let saved = danqing_log::columns::ColumnFiles::load_from(&cfg.with_extension("state.json"));
+        assert_eq!(
+            saved
+                .get_entry("C:\\logs\\s.log")
+                .and_then(|e| e.config.widths.get("level")),
+            Some(&200.0),
+            "应用写穿 per-file 条目"
+        );
+        // 换路径 = 切片替换 + 清选中 (他路径列表只显自己的, Open Q3)
+        app.path = std::path::PathBuf::from("C:\\logs\\other.log");
+        app.load_state_for_current_file();
+        assert!(app.sessions.is_empty(), "换路径 = 该路径的会话");
+        assert!(app.session_selected.is_none());
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 展开重建剔除 (D6): 越界行号 / 不可展开行**静默剔除** (书签越界剔除同哲学)。
+    #[test]
+    fn session_apply_prunes_invalid_expands() {
+        let cfg = temp_cfg_path("sess-prune");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        let p = temp_log(b"{\"a\":{\"b\":1}}\nplain\n");
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\p.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.load_state_for_current_file();
+        app.sessions.push(danqing_log::columns::SessionEntry {
+            path: "C:\\logs\\p.log".into(),
+            name: "越界台".into(),
+            filter: String::new(),
+            search: String::new(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: vec![0, 1, 99],
+            updated: 1,
+        });
+        app.update(Msg::ApplySession("越界台".into()));
+        assert!(app.expanded.is_expanded(0), "合法行重建");
+        assert!(!app.expanded.is_expanded(1), "不可展开行剔除 (parse 失败)");
+        assert!(!app.expanded.is_expanded(99), "越界行号剔除");
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// D6 守卫: 空名拒绝 / 满 32 拒绝 (新名才计数) / 同名覆盖不算新增 /
+    /// 删除后再存; 未知名三动作说清不动账。
+    #[test]
+    fn session_save_rejects_empty_and_full_cap_and_overwrites() {
+        let cfg = temp_cfg_path("sess-cap");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        let p = temp_log(b"{\"a\":{\"b\":1}}\n");
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\c.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.load_state_for_current_file();
+        app.update(Msg::SaveSession("   ".into()));
+        assert!(app.sessions.is_empty(), "空名拒绝");
+        assert!(app.notice.is_some(), "拒绝说清");
+        for i in 0..danqing_log::columns::MAX_SESSIONS_PER_PATH {
+            app.update(Msg::SaveSession(format!("s{i:02}")));
+        }
+        assert_eq!(
+            app.sessions.len(),
+            danqing_log::columns::MAX_SESSIONS_PER_PATH
+        );
+        app.update(Msg::SaveSession("s99".into()));
+        assert_eq!(
+            app.sessions.len(),
+            danqing_log::columns::MAX_SESSIONS_PER_PATH,
+            "满员拒绝"
+        );
+        // 同名覆盖不算新增 + 快照更新
+        app.filter_applied = "x=1".into();
+        app.update(Msg::SaveSession("s00".into()));
+        assert_eq!(
+            app.sessions.len(),
+            danqing_log::columns::MAX_SESSIONS_PER_PATH
+        );
+        assert_eq!(
+            app.sessions
+                .iter()
+                .find(|s| s.name == "s00")
+                .map(|s| s.filter.as_str()),
+            Some("x=1"),
+            "同名覆盖生效"
+        );
+        // 删除选中后再存 + 删除落盘 + 未知名说清不动账
+        app.session_selected = Some("s00".into());
+        app.update(Msg::DeleteSelectedSession);
+        assert_eq!(
+            app.sessions.len(),
+            danqing_log::columns::MAX_SESSIONS_PER_PATH - 1
+        );
+        assert!(app.session_selected.is_none(), "删选中 = 清指针");
+        let saved = danqing_log::columns::ColumnFiles::load_from(&cfg.with_extension("state.json"));
+        assert!(
+            saved
+                .sessions_for_path("C:\\logs\\c.log")
+                .iter()
+                .all(|s| s.name != "s00"),
+            "删除落盘"
+        );
+        app.update(Msg::SaveSession("s99".into()));
+        assert_eq!(
+            app.sessions.len(),
+            danqing_log::columns::MAX_SESSIONS_PER_PATH
+        );
+        let before = app.sessions.len();
+        app.session_selected = Some("ghost".into());
+        app.update(Msg::DeleteSelectedSession);
+        app.update(Msg::ApplySession("ghost".into()));
+        assert_eq!(app.sessions.len(), before, "未知名不动账");
+        assert!(app.notice.is_some(), "未知名说清");
+        // 无选中点删除 = 提示不动账
+        app.session_selected = None;
+        app.update(Msg::DeleteSelectedSession);
+        assert_eq!(app.sessions.len(), before, "无选中不动账");
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// D4 门控两态 (两道闸): 免费态入口/三动作全拦 (升级提示 + 账本零变化);
+    /// 付费态放行且**永不触发升级提示**。
+    #[test]
+    fn session_gate_blocks_free_tier_and_never_prompts_paid() {
+        let cfg = temp_cfg_path("sess-gate");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(b"{\"a\":{\"b\":1}}\n");
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\g.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        // 免费态: 入口被拦, 弹层不开
+        app.update(Msg::OpenSessionMenu);
+        assert_eq!(
+            app.upgrade_prompt,
+            Some(Feature::WorkspaceSessions),
+            "免费态入口 = 升级提示"
+        );
+        assert!(!app.session_menu_open, "免费态不得开弹层");
+        // 免费态: 三动作兜底闸全拦 (账本零变化)
+        app.update(Msg::SaveSession("s".into()));
+        app.update(Msg::ApplySession("s".into()));
+        app.update(Msg::DeleteSelectedSession);
+        assert!(app.sessions.is_empty(), "免费态动作零落账");
+        assert!(!cfg.with_extension("state.json").exists(), "免费态零落盘");
+        // 付费态: 放行; 全程永不触发升级提示 (两道闸锁)
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.upgrade_prompt = None;
+        app.update(Msg::OpenSessionMenu);
+        assert!(app.session_menu_open, "付费态开弹层");
+        assert!(app.upgrade_prompt.is_none(), "付费态永不误弹");
+        app.update(Msg::SaveSession("s".into()));
+        app.update(Msg::ApplySession("s".into()));
+        app.session_selected = Some("s".into());
+        app.update(Msg::DeleteSelectedSession);
+        assert!(app.sessions.is_empty(), "付费态动作放行");
+        assert!(app.upgrade_prompt.is_none(), "付费态动作也不误弹");
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 弹层族第四员全套: Esc 次序首插 / 与三弹层互斥 / 模态门禁 (导航键+滚轮
+    /// 不穿) / 关弹层清草稿 (session_clear_rev)。
+    #[test]
+    fn session_menu_esc_mutex_modal_and_draft_clear() {
+        let cfg = temp_cfg_path("sess-wire");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        let p = temp_log(b"{\"a\":{\"b\":1}}\nplain\n");
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\w.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        // Esc 次序: 会话先于 picker/col (D5 插层)
+        app.session_menu_open = true;
+        app.picker_open = true;
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        assert!(matches!(
+            app.app_key_filter(&esc),
+            Some(Msg::CloseSessionMenu)
+        ));
+        // 互斥: 开 picker 关会话; 开会话关三弹层
+        app.session_menu_open = false;
+        app.picker_open = true;
+        app.col_menu_open = true;
+        let rev = app.session_clear_rev;
+        app.update(Msg::OpenSessionMenu);
+        assert!(app.session_menu_open && !app.picker_open && !app.col_menu_open);
+        assert!(app.session_clear_rev > rev, "开弹层清命名草稿");
+        // 模态门禁: 会话开时 ↓/滚轮不穿到日志
+        app.top_row = 0.0;
+        app.event(&Event::Key {
+            key: Key::Named(NamedKey::ArrowDown),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(app.top_row, 0.0, "会话开着 ↓ 不穿");
+        app.event(&Event::MouseWheel {
+            delta: (0.0, 3.0),
+            position: danqing::Point::new(400.0, 300.0),
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(app.top_row, 0.0, "会话开着滚轮不穿");
+        // 关弹层清草稿
+        let rev = app.session_clear_rev;
+        app.update(Msg::CloseSessionMenu);
+        assert!(!app.session_menu_open);
+        assert!(app.session_clear_rev > rev, "关弹层清命名草稿");
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
     }
 
     /// T5: 列管理开关/恢复默认/≥1 可见守卫 + 落盘; 与导出菜单互斥。
@@ -2811,7 +3382,7 @@ mod tests {
         assert_eq!(app.columns.order, vec!["a".to_string(), "b".to_string()]);
         assert!(app.columns.hidden.is_empty());
         // 落盘读回 (D4)
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
         assert!(loaded.get("C:\\logs\\m.jsonl").is_some());
         std::fs::remove_file(&cols).ok();
@@ -2874,7 +3445,7 @@ mod tests {
             Some(&222.0),
             "per-路径记忆读回"
         );
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
@@ -2951,7 +3522,7 @@ mod tests {
             vec!["a".to_string(), "b".to_string()],
             "摆列不改变导出列 (export D5)"
         );
-        std::fs::remove_file(temp_cfg_path("cols-csv").with_extension("columns.json")).ok();
+        std::fs::remove_file(temp_cfg_path("cols-csv").with_extension("state.json")).ok();
         std::fs::remove_file(temp_cfg_path("cols-csv")).ok();
     }
 
@@ -3016,7 +3587,7 @@ mod tests {
             vec!["a"],
             "唯一可见列被剔除后 merge 兜底 (≥1 可见)"
         );
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
@@ -3036,7 +3607,7 @@ mod tests {
         }));
         app.update(Msg::ToggleColumn("ghost".into()));
         assert!(app.notice.is_none(), "未知列零动作, 不得报守卫文案");
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
     }
 
@@ -3055,7 +3626,7 @@ mod tests {
         app.selected = 1;
         app.toggle_bookmark();
         assert!(app.bookmarks.contains(&1), "toggle 添加");
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         let loaded = danqing_log::columns::ColumnFiles::load_from(&cols);
         assert_eq!(
             loaded
@@ -3105,7 +3676,7 @@ mod tests {
         app.toggle_bookmark();
         assert!(app.bookmarks.contains(&0));
         // 路径 B: 手造记忆 [1]
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         let mut files = danqing_log::columns::ColumnFiles::load_from(&cols);
         files.put(danqing_log::columns::FileEntry {
             path: "B.log".into(),
@@ -3139,7 +3710,7 @@ mod tests {
         app.path = std::path::PathBuf::from("C:\\logs\\oob.log");
         let p = temp_log(b"l0\nl1\nl2\n"); // 3 行
         app.file = Arc::new(LogFile::open(&p).unwrap());
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         let mut files = danqing_log::columns::ColumnFiles::default();
         files.put(danqing_log::columns::FileEntry {
             path: "C:\\logs\\oob.log".into(),
@@ -3211,7 +3782,7 @@ mod tests {
         app.selected = 256;
         app.toggle_bookmark();
         assert!(app.bookmarks.contains(&256), "有空位即恢复可加");
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
@@ -3238,20 +3809,20 @@ mod tests {
             vec![0],
             "rebuild 越界剔除"
         );
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
 
     // ---- 评审修复锁 (2026-09-23 双路评审并账) ----
 
-    /// 评审 Critical: 坏 `columns.json` 后变更不得**覆盖抹掉全部记忆** ——
+    /// 评审 Critical: 坏 `state.json` 后变更不得**覆盖抹掉全部记忆** ——
     /// 先备份 `.bak` (原字节原样), 再开新账。
     #[test]
     fn corrupt_state_file_is_backed_up_not_clobbered() {
         let cfg = temp_cfg_path("bm-corrupt-save");
-        let cols = cfg.with_extension("columns.json");
-        let bak = cfg.with_extension("columns.json.bak");
+        let cols = cfg.with_extension("state.json");
+        let bak = cfg.with_extension("state.json.bak");
         // 先造一份 64 条真实记忆, 再把文件打成坏 JSON (字节里仍含全部路径)
         let mut files = danqing_log::columns::ColumnFiles::default();
         for i in 0..danqing_log::columns::FILE_CAP {
@@ -3291,7 +3862,7 @@ mod tests {
     #[test]
     fn toggle_bookmark_rejects_ghost_rows() {
         let cfg = temp_cfg_path("bm-ghost");
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         // 空文件 (0 行)
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
         app.has_file = true;
@@ -3330,7 +3901,7 @@ mod tests {
     #[test]
     fn toggle_says_truth_when_save_fails() {
         let cfg = temp_cfg_path("bm-savefail");
-        let cols = cfg.with_extension("columns.json");
+        let cols = cfg.with_extension("state.json");
         std::fs::create_dir(&cols).unwrap(); // 非空目录占住落盘路径 → rename 必败
         std::fs::write(cols.join("sentinel"), b"x").unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
@@ -3491,7 +4062,7 @@ mod tests {
         app.update(Msg::PickerSubmit("".into()));
         assert_eq!(app.filter_applied, "level=ERROR level=ER*", "空值不动查询");
         assert!(app.picker_open, "拒绝不关弹层");
-        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
@@ -4736,7 +5307,7 @@ mod tests {
     /// (不得拿空子句表去点); ③ 作业交付后计数等于全量重算。
     #[test]
     fn apply_fresh_does_not_block_on_level_counting() {
-        // 注入配置路径: apply_fresh 现会读 columns.json (T5), 无注入 panic 封死会拦
+        // 注入配置路径: apply_fresh 现会读 state.json (T5), 无注入 panic 封死会拦
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("lvlcnt")));
         let p = temp_log(
             "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),

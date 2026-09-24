@@ -585,52 +585,70 @@ fn op_btn(label: &str, op: danqing_log::jsonl::Op) -> impl Widget {
     .on_click(move || Msg::PickPickerOp(op))
 }
 
-/// 值输入框宽度。
-const PICKER_INPUT_W: f32 = 200.0;
-/// 「过滤」钮标签 (query 卡提交钮, Enter 同路)。
-const PICKER_SUBMIT_LABEL: &str = "过滤";
+/// 提交钮 + 值输入复合件的输入宽。
+const SUBMIT_INPUT_W: f32 = 200.0;
 
-/// 值输入薄复合件 (Bar 同构; 评审 R3/R7/R8 三缺陷一次消解):
+/// 值输入 + 提交钮薄复合件 (Bar 同构; 评审 R3/R7/R8 三缺陷一次消解的持有者
+/// 收口; 泛化自 picker 专用件, 行为零变化 —— picker 锁全程护航):
 /// - **提交时读 `ti.value()` 随信** —— 值不设镜像 (镜像有 `set_text`/`clear`
 ///   不回 `on_change` 的脱钩窗, 评审 R3: 空框提交出脏子句);
-/// - Enter 只在本件持焦时拦截 (算符钮的 Enter 归按钮自己, 评审 R7);
-/// - 焦点代理 `focus_id = "picker-value"` (`OpenPicker` 送焦, 开弹层直接
-///   打字进值框, 评审 R8)。
+/// - Enter 只在本件持焦时拦截 (兄弟钮的 Enter 归按钮自己, 评审 R7);
+/// - 焦点代理 `focus_id` (`Open*` 送焦, 开弹层直接打字, 评审 R8)。
 ///
-/// 「过滤」钮 paint 侧 (hit 同源缓存) —— 兄弟节点读不到输入缓冲, 提交收口
-/// 必须在持有者内 (plan 核实②的「不许绕」回到原点, 镜像偏差撤销)。
-struct PickerInput {
+/// 提交钮 paint 侧 (hit 同源缓存) —— 兄弟节点读不到输入缓冲, 提交收口必须在
+/// 持有者内 (plan 核实②的「不许绕」)。两处消费: picker 值框 (`PickerSubmit`)
+/// 与会话命名框 (`SaveSession`) —— 提交钮标签/预留宽/焦点 id/清空代次/提交
+/// Msg 全部构造注入。
+struct SubmitInput {
     ti: TextInput,
     submit_rect: std::cell::Cell<Rect>,
     submit_hover: std::cell::Cell<bool>,
     /// 钮色 (sync 每帧从主题取 —— 构造值烘死会「浅色启动切暗色钮字发灰」)。
     submit_accent: Color,
     submit_idle: Color,
+    /// 提交钮标签。
+    submit_label: &'static str,
+    /// 提交钮预留宽 (layout 定宽; 命中宽 paint 实测, picker 56 = 行为不变)。
+    submit_w: f32,
+    focus_id: &'static str,
+    /// 提交 = 值 → Msg (Enter 与钮同路)。
+    submit_fn: Box<dyn Fn(String) -> Msg>,
 }
 
-impl PickerInput {
-    fn new() -> Self {
+impl SubmitInput {
+    fn new(
+        placeholder: &str,
+        submit_label: &'static str,
+        submit_w: f32,
+        focus_id: &'static str,
+        clear_rev: impl Fn(&LogApp) -> u64 + 'static,
+        submit_fn: impl Fn(String) -> Msg + 'static,
+    ) -> Self {
         Self {
             ti: TextInput::themed(&LightTheme)
                 .bind_theme(|app: &LogApp| app.theme.theme())
-                .bind_clear(|app: &LogApp| app.picker_clear_rev)
+                .bind_clear(move |app: &LogApp| clear_rev(app))
                 .font_size(BODY_SIZE)
-                .placeholder("值 (如 ERROR / 42)", Color::rgb(0.45, 0.45, 0.48)),
+                .placeholder(placeholder, Color::rgb(0.45, 0.45, 0.48)),
             submit_rect: std::cell::Cell::new(Rect::default()),
             submit_hover: std::cell::Cell::new(false),
             submit_accent: Color::rgb(0.18, 0.35, 0.60),
             submit_idle: Color::rgb(0.4, 0.4, 0.42),
+            submit_label,
+            submit_w,
+            focus_id,
+            submit_fn: Box::new(submit_fn),
         }
     }
 
-    /// 提交 = 值随信 (Enter 与「过滤」钮同路)。
+    /// 提交 = 值随信 (Enter 与提交钮同路)。
     fn submit(&self, msgs: &mut MsgQueue) -> EventResult {
-        msgs.push(Box::new(Msg::PickerSubmit(self.ti.value().to_owned())));
+        msgs.push(Box::new((self.submit_fn)(self.ti.value().to_owned())));
         EventResult::Consumed
     }
 }
 
-impl Widget for PickerInput {
+impl Widget for SubmitInput {
     fn sync(&mut self, state: &dyn Any) {
         // TextInput 是**字段**非子节点, 框架不替它传播 sync (Bar 同因)。
         self.ti.sync(state);
@@ -644,8 +662,8 @@ impl Widget for PickerInput {
     fn layout(&mut self, _constraints: Constraints, texts: &mut TextBatch) -> Size {
         let ti = self
             .ti
-            .layout(Constraints::loose(Size::new(PICKER_INPUT_W, 999.0)), texts);
-        Size::new(PICKER_INPUT_W + 8.0 + 56.0, ti.height.max(28.0))
+            .layout(Constraints::loose(Size::new(SUBMIT_INPUT_W, 999.0)), texts);
+        Size::new(SUBMIT_INPUT_W + 8.0 + self.submit_w, ti.height.max(28.0))
     }
 
     fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
@@ -653,14 +671,14 @@ impl Widget for PickerInput {
             Rect::from_xywh(
                 area.origin.x,
                 area.origin.y,
-                PICKER_INPUT_W,
+                SUBMIT_INPUT_W,
                 area.size.height,
             ),
             rects,
             texts,
         );
-        let w = texts.measure(PICKER_SUBMIT_LABEL, BODY_SIZE);
-        let bx = area.origin.x + PICKER_INPUT_W + 8.0;
+        let w = texts.measure(self.submit_label, BODY_SIZE);
+        let bx = area.origin.x + SUBMIT_INPUT_W + 8.0;
         let line_h = texts.line_height(f32::from(BODY_SIZE));
         let base =
             area.origin.y + (area.size.height - line_h) / 2.0 + texts.ascent(f32::from(BODY_SIZE));
@@ -670,7 +688,7 @@ impl Widget for PickerInput {
         } else {
             self.submit_idle
         };
-        texts.push_text(PICKER_SUBMIT_LABEL, bx, base, BODY_SIZE, color);
+        texts.push_text(self.submit_label, bx, base, BODY_SIZE, color);
         self.submit_rect.set(Rect::from_xywh(
             bx - 4.0,
             area.origin.y,
@@ -705,7 +723,7 @@ impl Widget for PickerInput {
     }
 
     fn focus_id(&self) -> Option<&'static str> {
-        Some("picker-value")
+        Some(self.focus_id)
     }
 
     fn wants_ime(&self) -> bool {
@@ -729,6 +747,32 @@ impl Widget for PickerInput {
     }
 }
 
+/// picker 值框 (SPEC-v1x-field-picker-ui): 提交 = `PickerSubmit` (值随信);
+/// 56 预留宽 = 泛化前原值 (行为零变化)。
+fn picker_input() -> SubmitInput {
+    SubmitInput::new(
+        "值 (如 ERROR / 42)",
+        "过滤",
+        56.0,
+        "picker-value",
+        |app: &LogApp| app.picker_clear_rev,
+        Msg::PickerSubmit,
+    )
+}
+
+/// 会话命名框 (SPEC-v1x-workspace-sessions D5): 提交 = `SaveSession`
+/// (Enter 与「保存当前」同路)。
+fn session_name_input() -> SubmitInput {
+    SubmitInput::new(
+        "会话名",
+        "保存当前",
+        64.0,
+        "session-name",
+        |app: &LogApp| app.session_clear_rev,
+        Msg::SaveSession,
+    )
+}
+
 /// 卡体 (壳见 [`card_shell`]): 标题「查询字段」+ 字段行 + 算符六钮 + 值输入。
 fn picker_card(bg: Color) -> impl Widget {
     card_shell(
@@ -747,7 +791,52 @@ fn picker_card(bg: Color) -> impl Widget {
                     .child(op_btn(">", danqing_log::jsonl::Op::Gt))
                     .child(op_btn("<", danqing_log::jsonl::Op::Lt)),
             )
-            .child(PickerInput::new()),
+            .child(picker_input()),
+    )
+}
+
+/// 命名会话弹层 (SPEC-v1x-workspace-sessions D5): 状态栏「会话」入口,
+/// 卡体 = 会话行 (RowList 第三消费者 —— 评审留档「五闭包等第三消费者」在此
+/// 落地, 契约零变化) + 命名框 (Enter/「保存当前」同路) + 「删除」
+/// (作用选中, 无确认)。
+pub(crate) fn session_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(sessions_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.session_menu_open)
+        .on_scrim_click(|| Msg::CloseSessionMenu)
+}
+
+/// 会话行 (RowList): 行 = 会话名 (载荷 = 名), 点行 = **应用并记选中**
+/// (热路径一击直达; 高亮 = 最近点选名 = 「删除」指针, Open Q3 只显本路径)。
+fn session_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            app.sessions
+                .iter()
+                .map(|s| (s.name.clone(), s.name.clone()))
+                .collect()
+        },
+        |app: &LogApp| app.session_selected.clone(),
+        |payload: &str| Msg::ApplySession(payload.to_string()),
+        |n| format!("… 还有 {n} 个"),
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「工作台会话」+ 会话行 + 命名框 + 「删除」。
+fn sessions_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("工作台会话"))
+            .child(session_rows())
+            .child(session_name_input())
+            .child(format_btn(
+                Text::new("删除".to_string())
+                    .font_size(BODY_SIZE)
+                    .color(Color::WHITE),
+                || Msg::DeleteSelectedSession,
+            )),
     )
 }
 
@@ -1815,7 +1904,7 @@ mod tests {
             "danqing-log-settings-pin-{}.toml",
             std::process::id()
         ));
-        let mut input = PickerInput::new();
+        let mut input = picker_input();
         let app = LogApp::new_empty_at(Some(cfg.clone()));
         input.sync(&app);
         input.ti.set_text("ERROR");
@@ -1915,6 +2004,114 @@ mod tests {
             rows.layout(Constraints::loose(Size::new(200.0, 900.0)), &mut texts)
                 .height,
             2.0 * crate::pick_list::ROW_H
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 会话命名框与 picker 同构锁 (R3 持有者收口, SubmitInput 泛化零回退面):
+    /// Enter 与「保存当前」同路, 值随信 `SaveSession`。
+    #[test]
+    fn session_name_input_enter_and_button_carry_value() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-sni-{}.toml",
+            std::process::id()
+        ));
+        let mut input = session_name_input();
+        let app = LogApp::new_empty_at(Some(cfg.clone()));
+        input.sync(&app);
+        input.ti.set_text("排障A");
+        let area = Rect::from_xywh(0.0, 0.0, 320.0, 32.0);
+        let mut texts = TextBatch::new();
+        let size = input.layout(Constraints::loose(Size::new(320.0, 32.0)), &mut texts);
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::SaveSession(v)) if v == "排障A"
+            )),
+            "Enter 提交带出框内值"
+        );
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        input.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+        input.ti.set_text("排障B");
+        let r = input.submit_rect.get();
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, 16.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::SaveSession(v)) if v == "排障B"
+            )),
+            "「保存当前」与 Enter 同路"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 真 paint 锁 (非零平移原点): 会话卡字形产出 + 行数跟随本路径会话
+    /// (第三消费面接线锁; RowList 判罪面在通用锁)。
+    #[test]
+    fn sessions_card_paints_names_and_rows_follow() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-sess-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.session_menu_open = true;
+        app.sessions = vec![danqing_log::columns::SessionEntry {
+            path: "p".into(),
+            name: "排障A".into(),
+            filter: String::new(),
+            search: String::new(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: Vec::new(),
+            updated: 1,
+        }];
+        app.session_selected = Some("排障A".into());
+        let mut card = sessions_card(Color::rgb(0.1, 0.1, 0.1));
+        card.sync(&app);
+        let mut texts = TextBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 900.0)), &mut texts);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        card.paint(
+            Rect::new(Point::new(137.0, 89.0), size),
+            &mut rects,
+            &mut texts,
+        );
+        assert!(
+            texts.glyph_clips().count() > 0,
+            "会话卡须产出字形 (标题/行/钮)"
+        );
+        let mut rows = session_rows();
+        rows.sync(&app);
+        assert_eq!(
+            rows.layout(Constraints::loose(Size::new(200.0, 900.0)), &mut texts)
+                .height,
+            1.0 * crate::pick_list::ROW_H,
+            "行数跟随本路径会话"
         );
         std::fs::remove_file(&cfg).ok();
     }

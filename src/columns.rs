@@ -195,28 +195,49 @@ pub const FILE_CAP: usize = 64;
 /// 归一时截断保升序前 [`MAX_BOOKMARKS`]。
 pub const MAX_BOOKMARKS: usize = 256;
 
-/// 生产路径 (D4): config 目录下 `columns.json` (`license.key` 同目录独立文件先例)。
+/// per-路径命名会话上限 (SPEC-v1x-workspace-sessions D6): 同款「碰不到、有闸」;
+/// 新增满员拒绝由调用方提示, 存量超限手造数据归一时截断保前 N。
+pub const MAX_SESSIONS_PER_PATH: usize = 32;
+
+/// 会话展开行号上限 (收编截断保前 N; 防手造天文数组, 书签同哲学)。
+/// 正常使用 (逐个点开子行) 永远碰不到。
+pub const MAX_EXPANDS: usize = 1024;
+
+/// sessions 数组收集硬顶 (防手造天文数组, 书签先例: 超顶按收集序放弃)。
+const SESSIONS_HARD_CAP: usize = MAX_SESSIONS_PER_PATH * FILE_CAP * 4;
+
+/// 生产路径: config 目录下 `state.json` (`license.key` 同目录独立文件先例)。
+/// **2026-09-24 改名一次到位**（bookmark-persist 既定裁定: 腿四扩多套会话时
+/// 统一改名）——账本自此 = 列摆法 + 书签 + 命名会话, 旧名 `columns.json` 只
+/// 读不写（迁移见 `LogApp::load_state_account`）。
 pub fn default_path() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_default()
         .join("danqing-log")
-        .join("columns.json")
+        .join("state.json")
 }
 
-/// per-文件列摆法的持久化集合 (D4): `columns.json` 独立文件 (`license.key` 同目录
-/// 独立文件先例), per-**路径** key, LRU [`FILE_CAP`] 条。
+/// per-文件记忆的持久化集合 (D4 + SPEC-v1x-workspace-sessions D3): 独立账本
+/// `state.json`, per-**路径** key, files 段 LRU [`FILE_CAP`] 条 + sessions 段
+/// 命名会话 (用户自管, 不吃 LRU)。
 ///
 /// 磁盘形状 (serde_json::Value 手拼 —— serde derive 不在依赖, 零新依赖红线):
-/// `{ "files": [ { "path", "updated", "order", "hidden", "widths", "bookmarks" } ] }`。
+/// `{ "files": [ { "path", "updated", "order", "hidden", "widths", "bookmarks" } ],
+///    "sessions": [ { "path", "name", "filter", "search", "order", "hidden",
+///                    "widths", "expands", "updated" } ] }`。
+/// 两段**恒写** (空 = 空数组, roundtrip 全等好判)。
 /// **损坏/缺失 → 空集合且不写回**（下次保存才写好, load 永不覆盖用户文件）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnFiles {
     pub entries: Vec<FileEntry>,
+    /// 命名工作台会话 (平铺含 `path`; 收编态见 [`normalize_sessions`])。
+    pub sessions: Vec<SessionEntry>,
 }
 
 /// 一个文件的记忆状态 (列摆法 + 书签, SPEC-v1x-bookmark-persist D1)。
-/// **腿四接缝** (评审 Optional): `workspace-sessions` 导出命名会话时须显式
-/// strip `bookmarks` (spec Out: 书签不随命名会话导出/切换), 别静默带进会话包。
+/// **腿四接缝已兑现** (2026-09-24): 命名会话由 [`SessionEntry`] 承载, 其结构
+/// **无** `bookmarks` 字段 —— 书签不随会话导出/切换 (Open Q1) 是结构保证,
+/// 不靠运行时 strip。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileEntry {
     /// 文件路径 (exact key)。
@@ -229,6 +250,27 @@ pub struct FileEntry {
     pub updated: u64,
 }
 
+/// 命名工作台会话 (SPEC-v1x-workspace-sessions D1/D2): per-路径命名快照,
+/// 载荷四样 = 过滤查询串 + 搜索查询串 + 列摆法 + 展开行号表 (**应用时重建真相**,
+/// 不存行集/子行内容)。**无书签字段** —— 见 [`FileEntry`] 腿四接缝注。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEntry {
+    /// 文件路径 (exact key, 与 [`FileEntry`] 同粒度; `put_sessions_for_path` 归参)。
+    pub path: String,
+    /// 会话名 (路径内唯一; 收编同名保首见)。
+    pub name: String,
+    /// 过滤查询串 (`filter_applied` 口径; 应用时走全链重跑)。
+    pub filter: String,
+    /// 搜索查询串 (Open Q2: 当前查询, 无多条历史)。
+    pub search: String,
+    /// 列摆法快照 (复用 [`ColumnConfig`]; 应用 = 写穿 per-file 条目)。
+    pub config: ColumnConfig,
+    /// 已展开的**文件行号** (**升序去重**收编态, 见 [`normalize_expands`])。
+    pub expands: Vec<u64>,
+    /// 保存时刻 (调用方给 epoch 秒)。
+    pub updated: u64,
+}
+
 impl ColumnFiles {
     /// 读盘: 缺失/坏 JSON/坏形状一律回空集合, **零写盘**。
     pub fn load_from(path: &std::path::Path) -> Self {
@@ -238,19 +280,30 @@ impl ColumnFiles {
         Self::from_json(&bytes)
     }
 
-    /// 解析 bytes; 顶层或 `files` 不可辨 → 空; 坏条目**静默跳过** (D4 失配同哲学)。
+    /// 解析 bytes; 顶层不可辨 → 空; 段/条目坏 → **丢段丢条不丢账**
+    /// (D4 失配同哲学: `files`/`sessions` 互不牵连)。
     pub fn from_json(bytes: &[u8]) -> Self {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return Self::default();
         };
-        let Some(arr) = v.get("files").and_then(|f| f.as_array()) else {
-            return Self::default();
-        };
         let mut files = Self::default();
-        for item in arr {
-            if let Some(entry) = entry_from_value(item) {
-                files.entries.push(entry);
+        if let Some(arr) = v.get("files").and_then(|f| f.as_array()) {
+            for item in arr {
+                if let Some(entry) = entry_from_value(item) {
+                    files.entries.push(entry);
+                }
             }
+        }
+        if let Some(arr) = v.get("sessions").and_then(|s| s.as_array()) {
+            for (i, item) in arr.iter().enumerate() {
+                if i >= SESSIONS_HARD_CAP {
+                    break; // 超顶按收集序放弃 (书签先例)
+                }
+                if let Some(s) = session_from_value(item) {
+                    files.sessions.push(s);
+                }
+            }
+            files.sessions = normalize_sessions(std::mem::take(&mut files.sessions));
         }
         files
     }
@@ -261,7 +314,8 @@ impl ColumnFiles {
     /// rename 没有半截窗口。
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
         let arr: Vec<serde_json::Value> = self.entries.iter().map(entry_to_value).collect();
-        let v = serde_json::json!({ "files": arr });
+        let sess: Vec<serde_json::Value> = self.sessions.iter().map(session_to_value).collect();
+        let v = serde_json::json!({ "files": arr, "sessions": sess });
         let bytes = serde_json::to_vec_pretty(&v).expect("Value 序列化不会失败");
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, bytes)?;
@@ -302,6 +356,27 @@ impl ColumnFiles {
             Vec::new()
         }
     }
+
+    /// 该路径的命名会话 (载入收编态原样返回副本)。
+    pub fn sessions_for_path(&self, path: &str) -> Vec<SessionEntry> {
+        self.sessions
+            .iter()
+            .filter(|s| s.path == path)
+            .cloned()
+            .collect()
+    }
+
+    /// 替换**该路径**的命名会话切片 (他路径不动 —— 保存会话不许抹掉别处会话,
+    /// bookmark-persist Critical「读改写覆盖抹全记忆」同族面的会话版封口)。
+    /// 条目 `path` 归本参数; 入库过 [`normalize_sessions`] (收编态进收编态出)。
+    pub fn put_sessions_for_path(&mut self, path: &str, sessions: Vec<SessionEntry>) {
+        self.sessions.retain(|s| s.path != path);
+        for mut s in sessions {
+            s.path = path.to_string();
+            self.sessions.push(s);
+        }
+        self.sessions = normalize_sessions(std::mem::take(&mut self.sessions));
+    }
 }
 
 /// 书签收编 (D1): 去重 + 升序 + 超 [`MAX_BOOKMARKS`] 截断保前 N。
@@ -312,6 +387,35 @@ fn normalize_bookmarks(mut raw: Vec<u64>) -> Vec<u64> {
     raw.dedup();
     raw.truncate(MAX_BOOKMARKS);
     raw
+}
+
+/// 展开行号收编 (D2): 升序去重 + 超 [`MAX_EXPANDS`] 截断保前 N (书签同哲学)。
+fn normalize_expands(mut raw: Vec<u64>) -> Vec<u64> {
+    raw.sort_unstable();
+    raw.dedup();
+    raw.truncate(MAX_EXPANDS);
+    raw
+}
+
+/// 会话收编 (D6, 磁盘形状唯一归一入口): 空名丢条; (path, name) 去重保首见;
+/// 每路径超 [`MAX_SESSIONS_PER_PATH`] 截断保前 N (存量手造超限 = 收编语义);
+/// 行号走 [`normalize_expands`]。收编态进收编态出。
+fn normalize_sessions(raw: Vec<SessionEntry>) -> Vec<SessionEntry> {
+    let mut out: Vec<SessionEntry> = Vec::new();
+    for mut s in raw {
+        if s.name.is_empty() {
+            continue;
+        }
+        if out.iter().any(|o| o.path == s.path && o.name == s.name) {
+            continue;
+        }
+        if out.iter().filter(|o| o.path == s.path).count() >= MAX_SESSIONS_PER_PATH {
+            continue;
+        }
+        s.expands = normalize_expands(std::mem::take(&mut s.expands));
+        out.push(s);
+    }
+    out
 }
 
 /// 条目 → Value (手拼; 与 [`entry_from_value`] 互为往返)。
@@ -397,6 +501,104 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
             widths,
         },
         bookmarks: normalize_bookmarks(bookmarks),
+        updated,
+    })
+}
+
+/// 会话条目 → Value (手拼; 与 [`session_from_value`] 互为往返)。
+/// 列三字段与 [`entry_to_value`] 同形状同排序 (widths 键排序写入);
+/// **无 `bookmarks` 键** (Open Q1: 书签不随会话 = 结构保证)。
+fn session_to_value(s: &SessionEntry) -> serde_json::Value {
+    let mut widths = serde_json::Map::new();
+    let mut keys: Vec<&String> = s.config.widths.keys().collect();
+    keys.sort();
+    for k in keys {
+        widths.insert(k.clone(), serde_json::json!(s.config.widths[k] as f64));
+    }
+    serde_json::json!({
+        "path": s.path,
+        "name": s.name,
+        "filter": s.filter,
+        "search": s.search,
+        "order": s.config.order,
+        "hidden": s.config.hidden,
+        "widths": widths,
+        "expands": s.expands,
+        "updated": s.updated,
+    })
+}
+
+/// Value → 会话条目; 坏条 (缺/空 name、缺 path/updated、形状不可辨) → None 条废。
+/// filter/search/order/hidden/widths/expands **容缺省** —— 坏字段丢字段不丢条
+/// (C6 同粒度; order 坏形状 = 空表, 应用时 merge 兜底)。
+fn session_from_value(v: &serde_json::Value) -> Option<SessionEntry> {
+    let obj = v.as_object()?;
+    let path = obj.get("path")?.as_str()?.to_string();
+    let name = obj.get("name")?.as_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let updated = obj.get("updated")?.as_u64()?;
+    let filter = obj
+        .get("filter")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let search = obj
+        .get("search")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut order: Vec<String> = Vec::new();
+    if let Some(list) = obj.get("order").and_then(str_list) {
+        for n in list {
+            if !order.contains(&n) {
+                order.push(n);
+            }
+        }
+    }
+    let mut hidden: Vec<String> = Vec::new();
+    if let Some(list) = obj.get("hidden").and_then(str_list) {
+        for n in list {
+            if order.contains(&n) && !hidden.contains(&n) {
+                hidden.push(n);
+            }
+        }
+    }
+    let mut widths = HashMap::new();
+    if let Some(w) = obj.get("widths").and_then(|w| w.as_object()) {
+        for (k, num) in w {
+            let Some(w) = num.as_f64().map(|f| f as f32).filter(|f| f.is_finite()) else {
+                continue;
+            };
+            if order.contains(k) {
+                widths.insert(k.clone(), w);
+            }
+        }
+    }
+    let mut expands = Vec::new();
+    if let Some(e) = obj.get("expands").and_then(|e| e.as_array()) {
+        for x in e {
+            // 收集硬顶 (书签先例: 天文数组不必全量进 Vec 再排)
+            if expands.len() >= MAX_EXPANDS * 4 {
+                break;
+            }
+            if let Some(n) = x.as_u64() {
+                expands.push(n);
+            }
+        }
+    }
+    Some(SessionEntry {
+        path,
+        name,
+        filter,
+        search,
+        config: ColumnConfig {
+            order,
+            hidden,
+            widths,
+        },
+        expands: normalize_expands(expands),
         updated,
     })
 }
@@ -900,5 +1102,129 @@ mod tests {
         assert_eq!(files.entries[2].config.order, names(&["x"]), "摆法照留");
         assert!(files.entries[3].bookmarks.is_empty(), "可缺省 = 空");
         assert_eq!(files.entries[3].config.order, names(&["x"]));
+    }
+
+    // ---- T1: sessions 段 (SPEC-v1x-workspace-sessions) ----
+
+    fn session(path: &str, name: &str) -> SessionEntry {
+        SessionEntry {
+            path: path.into(),
+            name: name.into(),
+            filter: "level=ERROR status>=500".into(),
+            search: "timeout".into(),
+            config: sample_config(),
+            expands: vec![7, 3, 3, 11], // 乱序 + 重复 → 收编升序去重
+            updated: 42,
+        }
+    }
+
+    /// 四样载荷 roundtrip 全等; `sessions` **恒写** (空也写键); 序列化面**无**
+    /// `bookmarks` 键 (Open Q1: 书签不随会话 = 结构保证); files 段同账不互扰。
+    #[test]
+    fn session_roundtrip_preserves_four_parts_and_has_no_bookmarks_key() {
+        let p = temp_columns_path("sess-rt");
+        let mut files = ColumnFiles::default();
+        files.put(entry("a", sample_config(), 1));
+        files.put_sessions_for_path("a", vec![session("ignored", "排障A")]);
+        files.put_sessions_for_path("b", vec![session("ignored2", "排障B")]);
+        files.save_to(&p).unwrap();
+        let loaded = ColumnFiles::load_from(&p);
+        assert_eq!(loaded, files, "roundtrip 全等 (files + sessions 同账)");
+        let sa = loaded.sessions_for_path("a");
+        assert_eq!(sa.len(), 1);
+        assert_eq!(sa[0].name, "排障A");
+        assert_eq!(sa[0].path, "a", "path 归 put 参数定");
+        assert_eq!(
+            (sa[0].filter.as_str(), sa[0].search.as_str()),
+            ("level=ERROR status>=500", "timeout")
+        );
+        assert_eq!(sa[0].config, sample_config());
+        assert_eq!(sa[0].expands, vec![3, 7, 11], "乱序重复收编升序去重");
+        // 恒写: 空 sessions 也写键 (roundtrip 全等好判, D1 同哲学)
+        ColumnFiles::default().save_to(&p).unwrap();
+        let txt = String::from_utf8(std::fs::read(&p).unwrap()).unwrap();
+        assert!(txt.contains("\"sessions\""), "sessions 恒写");
+        // Open Q1 结构 strip: 会话序列化面根本没有 bookmarks 键
+        assert!(
+            session_to_value(&session("a", "n"))
+                .get("bookmarks")
+                .is_none()
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 坏条丢条不丢账 (表驱动): 缺/空/错型 name、缺 path/updated → 条废;
+    /// 同 (path,name) 去重保首见; filter/search/order/hidden/widths/expands
+    /// 容缺省丢字段不丢条; expands 逐元素容错收编。
+    #[test]
+    fn session_from_json_drops_bad_keeps_good() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sessions": [
+                { "path": "a", "name": "好", "filter": "f", "search": "s",
+                  "order": ["x", "x", "y"], "hidden": ["x", "ghost"],
+                  "widths": {"x": 100.0, "ghost": 50.0, "y": "oops"},
+                  "expands": ["oops", 5, 5, 2], "updated": 1 },
+                { "path": "a", "name": "好", "filter": "dup", "updated": 2 },
+                { "path": "a", "filter": "缺名", "updated": 3 },
+                { "path": "a", "name": "", "updated": 4 },
+                { "path": "a", "name": 5, "updated": 5 },
+                { "name": "缺path", "updated": 6 },
+                { "path": "b", "name": "缺updated" },
+                { "path": "b", "name": "宽容", "order": "not-a-list", "updated": 9 }
+            ]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.sessions.len(), 2, "坏条丢条不丢账");
+        let good = &files.sessions[0];
+        assert_eq!((good.name.as_str(), good.filter.as_str()), ("好", "f"));
+        assert_eq!(good.expands, vec![2, 5], "逐元素容错 + 收编");
+        assert_eq!(good.config.order, names(&["x", "y"]), "order 去重保首见");
+        assert_eq!(good.config.hidden, names(&["x"]), "hidden ⊆ order 归一");
+        assert_eq!(good.config.widths.len(), 1, "失配/坏宽丢键不丢条");
+        assert_eq!(good.config.widths["x"], 100.0);
+        let lenient = &files.sessions[1];
+        assert_eq!(lenient.name, "宽容");
+        assert_eq!(
+            (lenient.filter.as_str(), lenient.search.as_str()),
+            ("", ""),
+            "可缺省 = 空"
+        );
+        assert!(lenient.config.order.is_empty(), "坏形状丢字段不丢条");
+    }
+
+    /// `put_sessions_for_path` 只替换本路径切片 (他路径不动); 满
+    /// [`MAX_SESSIONS_PER_PATH`] 收编截断保前 N (手造超限 = 收编语义)。
+    #[test]
+    fn put_sessions_replaces_only_that_path_slice() {
+        let mut files = ColumnFiles::default();
+        files.put_sessions_for_path("a", vec![session("x", "a1"), session("x", "a2")]);
+        files.put_sessions_for_path("b", vec![session("x", "b1")]);
+        files.put_sessions_for_path("a", vec![session("x", "a3")]);
+        let sa = files.sessions_for_path("a");
+        let sb = files.sessions_for_path("b");
+        let a: Vec<&str> = sa.iter().map(|s| s.name.as_str()).collect();
+        let b: Vec<&str> = sb.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(a, vec!["a3"], "本路径整片替换");
+        assert_eq!(b, vec!["b1"], "他路径不动");
+        let many: Vec<SessionEntry> = (0..40).map(|i| session("x", &format!("s{i:02}"))).collect();
+        files.put_sessions_for_path("c", many);
+        assert_eq!(
+            files.sessions_for_path("c").len(),
+            MAX_SESSIONS_PER_PATH,
+            "满员截断保前 32"
+        );
+    }
+
+    /// 收集硬顶 (防手造天文数组, 书签先例: 超顶按收集序放弃)。
+    #[test]
+    fn session_collect_hard_cap_defends_astronomical_arrays() {
+        let big = SESSIONS_HARD_CAP + 10;
+        let arr: Vec<serde_json::Value> = (0..big)
+            .map(|i| serde_json::json!({ "path": format!("p{i}"), "name": "n", "updated": i }))
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({ "sessions": arr })).unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.sessions.len(), SESSIONS_HARD_CAP, "超顶按收集序放弃");
     }
 }
