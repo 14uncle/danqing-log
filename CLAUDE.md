@@ -4,7 +4,7 @@
 
 ## 状态
 
-- 2026-09-24 (**field-picker-ui code-simplify 收口 → 五段全闭**): 8 项行为零变化
+- 2026-09-24 (**field-picker-ui simplify 收口 → 五段全闭; workspace-sessions build 全闭**): 8 项行为零变化
   简化 (**393 测试零修改全绿**): 拒收说清单一收口 `clause_reject_notice` (判据+
   文案同一函数, PickerSubmit 22 行分类链→4 行; 修程: `?` 极性写反被表驱动锁当场
   红) / `close_popovers`+`popover_open` 三弹层开合与三门禁同源 (评审 R6 落实为
@@ -16,6 +16,22 @@
   它方向正确 (同 crate 无环), 不为一 const 开新家; 真害 = 同值分家已钉。留档:
   许可页镜像 R3 同族窗实机再收 / RowList 五闭包等第三消费者。余人工验收 E 组
   五条记账待实机。
+  **同日下一棒 workspace-sessions build T1–T4 全闭**（「go」批 spec+plan 全按
+  推荐 → /build auto）: ①账本**改名 `state.json` 一次到位**（bookmark-persist
+  既定裁定兑现; `legacy_state_path` **分支配对**读旧写新迁移 —— 测试
+  `with_extension` 邻居派生 vs 生产整名兄弟无统一表达式; panic 封死家法随迁
+  should_panic 锁）②`SessionEntry` 四样载荷（查询串×2+`ColumnConfig`+展开
+  行号表; **结构无 `bookmarks` 键** = Open Q1 strip 落类型面）+ sessions 段
+  恒写/坏条丢条/`put_sessions_for_path` 只动本路径切片 ③save/apply/delete 链
+  （写穿 per-file 接缝兑现 / `rebuild_expands` 越界·不可展开静默剔除 / 书签
+  零触碰锁 / **`DeleteSelectedSession` 指针语义** —— plan 偏差: 无状态钮读不到
+  选中名, TextInput 无 set API 不绕镜像）④`PickerInput`→`SubmitInput` 零行为
+  变化泛化 + `sessions_card`（**RowList 第三消费者契约零变化**, 评审留档了结）
+  + 状态栏「会话」钮（空态不出）+ 门控两道闸 `session_gate`（数据永在）+
+  弹层族第四员（Esc 首插/互斥扩员/模态同源）。A/B 三红（摘恒写/摘写穿/摘
+  剔除）; **407 绿**（393+14）零 commit; 人工验收 F 组五条记账（**需付费态**）;
+  三处前账兑现注记（bookmark-persist 改名 / col-config 写穿 / columns.rs
+  strip）。待 review。
 - 2026-09-23 (**v1.0.2 MSIX 用户已提交; 腿三 export 一日全链: spec→plan→build T1–T7**):
   商店侧余认证 (v1.0.0 同款节奏, 认证通过后照 `docs/ms-store-copy.md`「v1.x 上架时
   必须改什么」清单核隐私政策双轨口径贴的是新版)。export: 四项口径 interview 裁定

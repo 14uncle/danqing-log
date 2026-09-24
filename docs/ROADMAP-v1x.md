@@ -97,7 +97,7 @@ Error 43,464 / **Fatal 4,760**，一眼知道该看哪行），也是排障的�
 | 项 | 内容 | 出处 |
 |---|---|---|
 | 导出 | 过滤结果导出、JSON 美化导出、CSV —— **已建成**（2026-09-23, `SPEC-v1x-export` 五段全闭; 1 GiB 全集 raw 608ms / pretty 18.1s / CSV 20.7s, 见 PERFORMANCE_REPORT） | `SPEC-jsonl-table.md:31` |
-| 工作台会话持久化 | 命名会话（过滤器组合 + 搜索历史 + 列配置 + 展开态）跨会话保存/切换 | `SPEC-core-viewer.md:29`、intent:52 |
+| 工作台会话持久化 | 命名会话（过滤器组合 + 搜索历史 + 列配置 + 展开态）跨会话保存/切换 —— **已建成**（2026-09-24, `SPEC-v1x-workspace-sessions` build 全闭; per-路径命名快照 + `state.json` 账本改名一次到位） | `SPEC-core-viewer.md:29`、intent:52 |
 
 单独看都不构成购买理由，但它们是腿一/腿二的收尾：用户分析完，总得能把结果交出去、
 把自己搭起来的工作台留下来。

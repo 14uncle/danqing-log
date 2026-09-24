@@ -144,7 +144,8 @@ clamp [4,32] 字符），长消息列挤、短 id 列宽，用户却动不了它
   「测试不得写真实配置」）。
 - 与腿四的接缝：`ColumnConfig` 模型 + 读写函数即「共用状态持久化基建」本体，
   `workspace-sessions` 将来存命名会话时**复用此模型**（会话应用=写穿 per-file 条目），
-  不再另造第二套。
+  不再另造第二套。**已兑现（2026-09-24 workspace-sessions T1/T2）**: `SessionEntry.config`
+  就是 `ColumnConfig`, 应用 = 换入 + `merge_columns` + `save_state` 写穿。
 
 ### D5: 作用面 = 表格渲染；显示配置不影响交付物
 
