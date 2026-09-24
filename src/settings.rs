@@ -812,8 +812,11 @@ fn session_rows() -> crate::pick_list::RowList {
     crate::pick_list::RowList::new(
         POPOVER_ROWS_MAX,
         |app: &LogApp| {
-            app.sessions
-                .iter()
+            // 展示序 = updated **降序** (评审 M3): 新存的永远在顶 —— 「存完
+            // 即见」, 不许 push 队尾存完即从列表消失。
+            let mut v: Vec<&danqing_log::columns::SessionEntry> = app.sessions.iter().collect();
+            v.sort_by_key(|s| std::cmp::Reverse(s.updated));
+            v.into_iter()
                 .map(|s| (s.name.clone(), s.name.clone()))
                 .collect()
         },
@@ -2112,6 +2115,69 @@ mod tests {
                 .height,
             1.0 * crate::pick_list::ROW_H,
             "行数跟随本路径会话"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 评审 M3: 上限与可视封顶取齐 (12 = 12) —— 满员时全部可达 (无「还有 N」
+    /// 尾行死角); 展示序 = updated **降序**, 新存的永远在第一行 (点行锁)。
+    #[test]
+    fn session_rows_show_all_up_to_cap_newest_first() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-srows-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        for i in 0..danqing_log::columns::MAX_SESSIONS_PER_PATH {
+            app.sessions.push(danqing_log::columns::SessionEntry {
+                path: "p".into(),
+                name: format!("s{i:02}"),
+                filter: String::new(),
+                search: String::new(),
+                config: danqing_log::columns::ColumnConfig::default(),
+                expands: Vec::new(),
+                updated: i as u64,
+            });
+        }
+        let mut rows = session_rows();
+        rows.sync(&app);
+        let mut texts = TextBatch::new();
+        let h = rows
+            .layout(Constraints::loose(Size::new(300.0, 900.0)), &mut texts)
+            .height;
+        assert_eq!(
+            h,
+            danqing_log::columns::MAX_SESSIONS_PER_PATH as f32 * crate::pick_list::ROW_H,
+            "上限即可视: 满员 12 条全画, 无尾行死角"
+        );
+        // 降序: updated 最大 (最后存) 的在第一行 —— 点第一行 = 应用它
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 500.0);
+        let mut msgs = MsgQueue::new();
+        rows.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(20.0, 4.0),
+            },
+            area,
+            &mut msgs,
+        );
+        rows.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(20.0, 4.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ApplySession(n)) if n == "s11"
+            )),
+            "降序: 最新会话 (updated 最大) 在第一行"
         );
         std::fs::remove_file(&cfg).ok();
     }

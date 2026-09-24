@@ -332,7 +332,7 @@ pub(crate) struct LogApp {
     sessions: Vec<danqing_log::columns::SessionEntry>,
     /// 会话弹层最近点选名 (「删除」指针, T3; 应用即记选中)。换文件清。
     session_selected: Option<String>,
-    /// 命名会话弹层开合 (D5; 与三弹层互斥并入 `close_popovers`/`popover_open`)。
+    /// 命名会话弹层开合 (D5; 与弹层族互斥并入 `close_popovers`/`popover_open`)。
     session_menu_open: bool,
     /// 命名输入清空代次 (`bind_clear` 消费): 开/关/保存/应用时 +1。
     session_clear_rev: u64,
@@ -736,12 +736,15 @@ impl LogApp {
     }
 
     /// 载入状态账本 (**读旧写新迁移**, SPEC-v1x-workspace-sessions D3): 新名
-    /// `state.json` 在 → 新名优先; 仅旧名 `columns.json` 在 → 读旧; 落盘只写新名
-    /// (`save_state` 全走 [`Self::state_path`])。缺失/坏账一律空集合且**零写盘**。
+    /// `state.json` **可辨**才新名优先; 新名缺失/空/坏/全废 → 回落旧名
+    /// `columns.json`（与 [`Self::backup_if_corrupt`] 同一「可辨」谓词——评审
+    /// M2: 读/备判据不对称会让坏新名 + 旧名有货时, save_state 先挪新名、再读
+    /// 旧名、再拿空内存覆盖旧名本路径切片 = 家族 Critical 复发）。落盘只写新名,
+    /// 成功后旧名退役（一次性, 见 [`Self::save_state`]）。
     fn load_state_account(&self) -> danqing_log::columns::ColumnFiles {
-        let new_p = self.state_path();
-        if new_p.exists() {
-            return danqing_log::columns::ColumnFiles::load_from(&new_p);
+        let new_acc = danqing_log::columns::ColumnFiles::load_from(&self.state_path());
+        if new_acc.is_recognizable() {
+            return new_acc;
         }
         danqing_log::columns::ColumnFiles::load_from(&self.legacy_state_path())
     }
@@ -775,7 +778,7 @@ impl LogApp {
     /// **书签零触碰** (Open Q1)。
     fn save_session(&mut self, name: &str) {
         use danqing_log::columns::{MAX_SESSIONS_PER_PATH, SessionEntry};
-        let name = name.trim();
+        let name = danqing_log::columns::clean_session_name(name);
         if name.is_empty() {
             self.set_notice("先命名再保存会话".into(), NoticeKind::Warn);
             return;
@@ -788,10 +791,7 @@ impl LogApp {
             );
             return;
         }
-        let updated = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let updated = now_secs();
         let entry = SessionEntry {
             path: self.path.to_string_lossy().into_owned(),
             name: name.to_string(),
@@ -825,10 +825,19 @@ impl LogApp {
         self.merge_columns();
         self.save_state(); // 写穿 (接缝定案: 会话应用 = 写穿 per-file 条目)
         self.apply_filter(s.filter.clone());
-        if s.search.is_empty() {
-            self.clear_search();
-        } else {
+        // 搜索串先验正则 (评审 M8): 跨编码/手造会话的搜索串可能在当前文件上
+        // 正则无效 (如 GBK 下合法的 `(` 到 UTF-8 是残括号) —— 失败则**显式清空**
+        // 并说清, 四样必须「已应用或已显式清空」, 不许 3/4 写穿后谎称成功。
+        let search_usable = s.search.is_empty()
+            || regex::bytes::Regex::new(&build_search_pattern(self.file.encoding(), &s.search))
+                .is_ok();
+        if search_usable && !s.search.is_empty() {
             self.apply_search(s.search.clone());
+        } else {
+            self.clear_search();
+            if !s.search.is_empty() {
+                self.set_notice("会话搜索串正则无效, 已清空搜索".into(), NoticeKind::Warn);
+            }
         }
         self.rebuild_expands(&s.expands);
         self.top_row = 0.0;
@@ -839,14 +848,16 @@ impl LogApp {
 
     /// 删除命名会话 (Open Q4: 无确认, 说清即走 —— 快照非唯一记忆, 重存即可)。
     fn delete_session(&mut self, name: &str) {
+        // 指针随名清 (评审 M9): 名不存在 (外部改账/收编丢条) 也清 —— 免得
+        // 「删除」一直对着幽灵名反复「会话不存在」。
+        if self.session_selected.as_deref() == Some(name) {
+            self.session_selected = None;
+        }
         let before = self.sessions.len();
         self.sessions.retain(|s| s.name != name);
         if self.sessions.len() == before {
             self.set_notice("会话不存在".into(), NoticeKind::Warn);
             return;
-        }
-        if self.session_selected.as_deref() == Some(name) {
-            self.session_selected = None;
         }
         let ok = self.save_state();
         let tail = if ok { "" } else { " (未落盘)" };
@@ -910,7 +921,12 @@ impl LogApp {
         self.col_menu_open = false;
         self.export_menu_open = false;
         self.picker_open = false;
-        self.session_menu_open = false;
+        if self.session_menu_open {
+            self.session_menu_open = false;
+            // 关清草稿随关走 (评审 M12): 换文件/重建/互斥全在这收口, 不靠下次
+            // 开弹层兜 —— 「关弹层清草稿」纪律对齐 CloseSessionMenu 臂。
+            self.session_clear_rev += 1;
+        }
     }
 
     /// 弹层族任一开着 —— 模态清单的共同判据 (滚轮/键盘门禁与 Ctrl 守卫**同源**,
@@ -937,10 +953,12 @@ impl LogApp {
         let Ok(bytes) = std::fs::read(path) else {
             return true;
         };
+        // 损坏 = 非空文件却给不出**可辨**账本 (评审 M1: 判据必须认 sessions 段 ——
+        // 「files 坏条 + sessions 完好」是丢段不丢账的合法容错, 不许整账判损
+        // 把他会话 rename 进 .bak 丢出活跃账本)。判据与 `load_state_account`
+        // 回落同源 (`is_recognizable`)。
         if bytes.is_empty()
-            || !danqing_log::columns::ColumnFiles::from_json(&bytes)
-                .entries
-                .is_empty()
+            || danqing_log::columns::ColumnFiles::from_json(&bytes).is_recognizable()
         {
             return true;
         }
@@ -970,10 +988,7 @@ impl LogApp {
         }
         // 读改写 (含旧名迁移读): sessions 段随 from_json/save_to 恒写自动保真
         let mut files = self.load_state_account();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = now_secs();
         // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式, 脏行号不得出内存)
         let evicted = files.put(danqing_log::columns::FileEntry {
             path: self.path.to_string_lossy().into_owned(),
@@ -999,7 +1014,19 @@ impl LogApp {
         // (bookmark-persist Critical「读改写覆盖抹全记忆」同族面的会话版封口)。
         files.put_sessions_for_path(self.path.to_string_lossy().as_ref(), self.sessions.clone());
         match files.save_to(&path) {
-            Ok(()) => true,
+            Ok(()) => {
+                // 迁移**一次性** (D3, 评审 M2): 新账落成后旧名退役 —— rename
+                // 不删 (数据不毁), 但从此读侧只可能命中可辨新账, 双名稳态
+                // 消灭 (双名并存 + 新名再坏 = 会把陈旧旧账当恢复源)。
+                let legacy = self.legacy_state_path();
+                if legacy.exists() {
+                    let retired = legacy.with_extension("json.migrated");
+                    if let Err(e) = std::fs::rename(&legacy, &retired) {
+                        log::warn!("旧账本退役失败 (不影响本次落盘): {e}");
+                    }
+                }
+                true
+            }
             Err(e) => {
                 log::warn!("记忆状态落盘失败: {e}");
                 false
@@ -1503,7 +1530,7 @@ impl LogApp {
         self.search_job.invalidate();
         // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
         self.export_job.invalidate();
-        // 三弹层同灭 (review R4 + D1): 弹层是旧文件语境的 —— async-open 在途
+        // 弹层族同灭 (review R4 + D1): 弹层是旧文件语境的 —— async-open 在途
         // 开着菜单, 落地后点格式会导出的是**新**文件, 一起作废。
         self.close_popovers();
         let OpenOutcome {
@@ -1984,6 +2011,10 @@ impl LogApp {
 
     /// Esc (搜索): 清搜索态，栏保持可见 (搜索栏始终显示，不可隐藏)。
     fn clear_search(&mut self) {
+        // 在途搜索一并作废 (`clear_filter` 同规, 评审 M7): 不作废的话, 清空/
+        // 应用空搜索会话后旧搜索结果会经 tick 拾取复活 —— spec「代次拒旧护在途」
+        // 的搜索侧半边。
+        self.search_job.invalidate();
         self.search_clear_rev += 1;
         self.search = None;
         self.search_query.clear();
@@ -2215,6 +2246,15 @@ const WHEEL_MAX_ROWS: f64 = 12.0;
 /// 底栏提示的停留时长 (见 `LogApp::set_notice`)。**待实机核对**。
 const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// 当前 epoch 秒 (记忆状态落账时间戳; 系统时钟取不到按 0 —— 落账不因钟坏拒写)。
+/// `save_state`/`save_session` 同用。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl App for LogApp {
     type Msg = Msg;
 
@@ -2398,7 +2438,7 @@ impl App for LogApp {
             }
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
-                // 互斥 (评审 R5): 托盘等入口无模态屏障, 开设置先关三弹层 ——
+                // 互斥 (评审 R5): 托盘等入口无模态屏障, 开设置先关弹层族 ——
                 // 双开时 Enter 会被劫到 PickerSubmit (原「互斥保证」前提不成立)
                 self.close_popovers();
                 self.settings_open = true;
@@ -2523,7 +2563,7 @@ impl App for LogApp {
         // `Consumed` 了, 能走到这里的本来就不是它。
         if let Event::MouseWheel { delta, .. } = event {
             // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
-            // (判据与键盘门禁同源: settings + 三弹层, [`Self::popover_open`])。
+            // (判据与键盘门禁同源: settings + 弹层族, [`Self::popover_open`])。
             if !self.settings_open && !self.popover_open() && self.has_file {
                 let rows = wheel_rows(delta.1);
                 if rows != 0.0 {
@@ -2552,7 +2592,7 @@ impl App for LogApp {
             }
             return;
         }
-        // 弹层模态 (评审 R6, 与滚轮守卫同源): 三弹层开着时, 无人认领的导航键
+        // 弹层模态 (评审 R6, 与滚轮守卫同源): 弹层族开着时, 无人认领的导航键
         // (↑↓/Space/Home/End/Page*) 不许穿到弹层后滚日志 —— 2026-09-14 设置卡
         // 同款漏洞的守卫扩展面。卡内控件经焦点路由自行消费。
         if self.popover_open() {
@@ -3233,6 +3273,10 @@ mod tests {
         app.session_selected = None;
         app.update(Msg::DeleteSelectedSession);
         assert_eq!(app.sessions.len(), before, "无选中不动账");
+        // 幽灵名删除 = 说清 + 指针随名清 (评审 M9)
+        app.session_selected = Some("ghost".into());
+        app.update(Msg::DeleteSelectedSession);
+        assert!(app.session_selected.is_none(), "幽灵名删除也清指针");
         std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
@@ -3281,7 +3325,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 弹层族第四员全套: Esc 次序首插 / 与三弹层互斥 / 模态门禁 (导航键+滚轮
+    /// 弹层族第四员全套: Esc 次序首插 / 与弹层族互斥 / 模态门禁 (导航键+滚轮
     /// 不穿) / 关弹层清草稿 (session_clear_rev)。
     #[test]
     fn session_menu_esc_mutex_modal_and_draft_clear() {
@@ -3308,7 +3352,7 @@ mod tests {
             app.app_key_filter(&esc),
             Some(Msg::CloseSessionMenu)
         ));
-        // 互斥: 开 picker 关会话; 开会话关三弹层
+        // 互斥: 开 picker 关会话; 开会话关弹层族
         app.session_menu_open = false;
         app.picker_open = true;
         app.col_menu_open = true;
@@ -3316,8 +3360,9 @@ mod tests {
         app.update(Msg::OpenSessionMenu);
         assert!(app.session_menu_open && !app.picker_open && !app.col_menu_open);
         assert!(app.session_clear_rev > rev, "开弹层清命名草稿");
-        // 模态门禁: 会话开时 ↓/滚轮不穿到日志
-        app.top_row = 0.0;
+        // 模态门禁: 会话开时 ↓/滚轮不穿到日志 (滚轮用**可动**位: top_row=0 时
+        // 向上滚会被钳回 0 —— 家族⑥假绿, 评审 M5 抓出后改真锁)
+        app.top_row = 5.0;
         app.event(&Event::Key {
             key: Key::Named(NamedKey::ArrowDown),
             pressed: true,
@@ -3325,22 +3370,179 @@ mod tests {
             ctrl: false,
             alt: false,
         });
-        assert_eq!(app.top_row, 0.0, "会话开着 ↓ 不穿");
+        assert_eq!(app.top_row, 5.0, "会话开着 ↓ 不穿");
+        let before = app.top_row;
         app.event(&Event::MouseWheel {
-            delta: (0.0, 3.0),
+            delta: (0.0, -1.0),
             position: danqing::Point::new(400.0, 300.0),
             shift: false,
             ctrl: false,
             alt: false,
         });
-        assert_eq!(app.top_row, 0.0, "会话开着滚轮不穿");
+        assert_eq!(app.top_row, before, "会话开着滚轮不穿");
         // 关弹层清草稿
         let rev = app.session_clear_rev;
         app.update(Msg::CloseSessionMenu);
         assert!(!app.session_menu_open);
         assert!(app.session_clear_rev > rev, "关弹层清命名草稿");
+        // 互斥关也清草稿 (评审 M12: close_popovers 随关走, 不靠下次开兜)
+        app.update(Msg::OpenSessionMenu);
+        let rev = app.session_clear_rev;
+        app.update(Msg::OpenPicker);
+        assert!(!app.session_menu_open && app.picker_open);
+        assert!(app.session_clear_rev > rev, "互斥关会话也清草稿");
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 M1/M2: 损坏判据认 sessions 段 (sessions-only = 可辨, 不备份不丢他会话);
+    /// 空/坏新名回落旧名 (读备判据同源); 保存后旧记忆写回 + 旧名**退役一次性**。
+    #[test]
+    fn state_account_recognizes_sessions_and_falls_back_then_retires_legacy() {
+        let cfg = temp_cfg_path("m12");
+        let legacy = cfg.with_extension("columns.json");
+        let newp = cfg.with_extension("state.json");
+        let bak = cfg.with_extension("state.json.bak");
+        let retired = cfg.with_extension("columns.json.migrated");
+        let p = temp_log(b"{\"a\":{\"b\":1}}\n");
+        let path_str = "C:\\logs\\m12.log";
+        // M1: files 全废 + sessions 完好 = 丢段不丢账的合法容错 → 不算损坏
+        std::fs::write(
+            &newp,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": [ { "path": 1 }, { "order": ["a"] } ],
+                "sessions": [
+                    { "path": "C:\\logs\\z.log", "name": "他路径台", "updated": 1, "order": ["x"] }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from(path_str);
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        assert!(app.save_state());
+        assert!(!bak.exists(), "sessions-only 不算损坏 (M1)");
+        let acc = danqing_log::columns::ColumnFiles::load_from(&newp);
+        assert_eq!(
+            acc.sessions_for_path("C:\\logs\\z.log").len(),
+            1,
+            "他路径会话不丢"
+        );
+        std::fs::remove_file(&newp).ok();
+        // M2: 旧名有货 + 新名空 → 回落旧名; 保存后记忆写回新名, 旧名退役
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": [ {
+                    "path": path_str, "updated": 1, "order": ["a"],
+                    "hidden": ["a"], "widths": {}, "bookmarks": [0]
+                } ],
+                "sessions": [
+                    { "path": path_str, "name": "旧台", "updated": 2, "order": ["a"] }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&newp, b"").unwrap(); // 空新名: 不许挡死迁移 (M2)
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from(path_str);
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.load_state_for_current_file();
+        assert!(app.columns.is_hidden("a"), "空新名回落旧名");
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.save_state());
+        let acc = danqing_log::columns::ColumnFiles::load_from(&newp);
+        assert!(
+            acc.get_entry(path_str).unwrap().config.is_hidden("a"),
+            "旧记忆写回新账, 不被空内存覆盖"
+        );
+        assert_eq!(acc.sessions_for_path(path_str).len(), 1, "旧会话写回");
+        assert!(retired.exists() && !legacy.exists(), "迁移一次性: 旧名退役");
+        std::fs::remove_file(&legacy).ok();
+        std::fs::remove_file(&newp).ok();
+        std::fs::remove_file(&bak).ok();
+        std::fs::remove_file(&retired).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 M7: `clear_search` 作废在途搜索 (`clear_filter` 同规) —— 清空/
+    /// 空搜索会话应用后, 旧搜索不得经 tick 拾取复活。
+    #[test]
+    fn clear_search_kills_pending_search_job() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("sclr")));
+        app.has_file = true;
+        let p = temp_log(b"timeout\nplain\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.apply_search("timeout".to_string());
+        app.clear_search();
+        assert!(app.search_query.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut resurrected = false;
+        for _ in 0..50 {
+            if app.search_job.poll().is_some() {
+                resurrected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!resurrected, "invalidate 后在途搜索结果必须被丢弃");
+        assert!(app.search.is_none() && app.search_query.is_empty());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 M8: 会话搜索串正则无效 (跨编码/手造) → **显式清空** + 说清,
+    /// 其余三样照常应用 —— 四样必须「已应用或已显式清空」, 不许 3/4 谎报成功。
+    #[test]
+    fn apply_session_with_invalid_search_explicitly_clears() {
+        let cfg = temp_cfg_path("sess-regex");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        let p = temp_log(b"{\"level\":\"ERROR\"}\nplain\n");
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\r.log");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.load_state_for_current_file();
+        app.search_query = "旧搜索".into();
+        app.sessions.push(danqing_log::columns::SessionEntry {
+            path: "C:\\logs\\r.log".into(),
+            name: "坏正则台".into(),
+            filter: "level=ERROR".into(),
+            search: "(".into(), // UTF-8 下 `(?i)(` 正则无效
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: Vec::new(),
+            updated: 1,
+        });
+        app.update(Msg::ApplySession("坏正则台".into()));
+        assert!(app.search_query.is_empty(), "无效搜索串 = 显式清空");
+        assert!(app.notice.is_some(), "说清为什么清");
+        assert_eq!(app.filter_applied, "level=ERROR", "其余三样照常应用");
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 评审 M6: 弹层互斥**双向** —— 他弹层开会话必关 (漏进 close_popovers 就红)。
+    #[test]
+    fn session_menu_mutex_is_bidirectional() {
+        let cfg = temp_cfg_path("sess-mutex");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        for opener in [Msg::OpenPicker, Msg::OpenColMenu, Msg::OpenSettings] {
+            app.update(Msg::OpenSessionMenu);
+            assert!(app.session_menu_open);
+            app.update(opener);
+            assert!(!app.session_menu_open, "开他弹层/设置必关会话");
+        }
+        std::fs::remove_file(&cfg).ok();
     }
 
     /// T5: 列管理开关/恢复默认/≥1 可见守卫 + 落盘; 与导出菜单互斥。
@@ -4144,7 +4346,7 @@ mod tests {
         std::fs::remove_file(temp_cfg_path("picker-wire")).ok();
     }
 
-    /// 评审 R5: `OpenSettings` 与三弹层互斥 (托盘无模态屏障) ——
+    /// 评审 R5: `OpenSettings` 与弹层族互斥 (托盘无模态屏障) ——
     /// 双开会让 Enter 被劫到提交; 开设置先关尽。
     #[test]
     fn open_settings_closes_transient_popovers() {
@@ -4156,7 +4358,7 @@ mod tests {
         assert!(app.settings_open);
         assert!(
             !app.picker_open && !app.col_menu_open && !app.export_menu_open,
-            "开设置关三弹层"
+            "开设置关弹层族"
         );
         // UpgradeGotoActivate 同规
         app.picker_open = true;

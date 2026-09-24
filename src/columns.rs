@@ -197,7 +197,9 @@ pub const MAX_BOOKMARKS: usize = 256;
 
 /// per-路径命名会话上限 (SPEC-v1x-workspace-sessions D6): 同款「碰不到、有闸」;
 /// 新增满员拒绝由调用方提示, 存量超限手造数据归一时截断保前 N。
-pub const MAX_SESSIONS_PER_PATH: usize = 32;
+/// **取 12 = 与弹层可视封顶 `POPOVER_ROWS_MAX` 取齐**（评审 M3: 上限 > 可视
+/// 会让超出部分静默不可达 —— 可达集恒等于允许集, 才配叫「有闸」）。
+pub const MAX_SESSIONS_PER_PATH: usize = 12;
 
 /// 会话展开行号上限 (收编截断保前 N; 防手造天文数组, 书签同哲学)。
 /// 正常使用 (逐个点开子行) 永远碰不到。
@@ -366,6 +368,15 @@ impl ColumnFiles {
             .collect()
     }
 
+    /// **可辨账本**谓词 (评审 M1/M2 单一收口): 两段至少一段有有效条目。
+    /// 「files 坏条 + sessions 完好」是合法容错结果 (丢段不丢账) —— 不算损坏;
+    /// 损坏备份与迁移回落**共用本判据**, 不许各算一份。
+    /// 已知残留: 合法空账 `{"files":[],"sessions":[]}` 会被误判不可辨 ——
+    /// 备份侧零数据损失 (顶多多一个 .bak), 回落侧会被旧名接住 (正是迁移语义)。
+    pub fn is_recognizable(&self) -> bool {
+        !self.entries.is_empty() || !self.sessions.is_empty()
+    }
+
     /// 替换**该路径**的命名会话切片 (他路径不动 —— 保存会话不许抹掉别处会话,
     /// bookmark-persist Critical「读改写覆盖抹全记忆」同族面的会话版封口)。
     /// 条目 `path` 归本参数; 入库过 [`normalize_sessions`] (收编态进收编态出)。
@@ -397,21 +408,40 @@ fn normalize_expands(mut raw: Vec<u64>) -> Vec<u64> {
     raw
 }
 
-/// 会话收编 (D6, 磁盘形状唯一归一入口): 空名丢条; (path, name) 去重保首见;
-/// 每路径超 [`MAX_SESSIONS_PER_PATH`] 截断保前 N (存量手造超限 = 收编语义);
-/// 行号走 [`normalize_expands`]。收编态进收编态出。
+/// 会话名长度上限 (正常使用碰不到; 超长截断 = 收编语义)。
+pub const MAX_SESSION_NAME_LEN: usize = 64;
+
+/// 会话名归一 (评审 M10, 保存/载入同式): trim + 剔 ASCII 控制字符（换行会打进
+/// 底栏 notice / 列表行）+ 截 [`MAX_SESSION_NAME_LEN`] 字符（Unicode 安全）。
+/// 空结果 = 不可用名（调用方丢条/拒绝）。
+pub fn clean_session_name(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_SESSION_NAME_LEN)
+        .collect()
+}
+
+/// 会话收编 (D6, 磁盘形状唯一归一入口): 名归一后空名丢条; (path, name) 去重
+/// 保首见; 每路径超 [`MAX_SESSIONS_PER_PATH`] 截断保前 N (存量手造超限 =
+/// 收编语义); 行号走 [`normalize_expands`]。收编态进收编态出。
 fn normalize_sessions(raw: Vec<SessionEntry>) -> Vec<SessionEntry> {
+    let mut seen: HashMap<(String, String), ()> = HashMap::new();
+    let mut per_path: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<SessionEntry> = Vec::new();
     for mut s in raw {
+        s.name = clean_session_name(&s.name);
         if s.name.is_empty() {
             continue;
         }
-        if out.iter().any(|o| o.path == s.path && o.name == s.name) {
+        if seen.insert((s.path.clone(), s.name.clone()), ()).is_some() {
             continue;
         }
-        if out.iter().filter(|o| o.path == s.path).count() >= MAX_SESSIONS_PER_PATH {
+        let count = per_path.entry(s.path.clone()).or_insert(0);
+        if *count >= MAX_SESSIONS_PER_PATH {
             continue;
         }
+        *count += 1;
         s.expands = normalize_expands(std::mem::take(&mut s.expands));
         out.push(s);
     }
@@ -422,22 +452,47 @@ fn normalize_sessions(raw: Vec<SessionEntry>) -> Vec<SessionEntry> {
 /// `widths` 键**排序后写入** (评审 Nit: HashMap 迭代序随进程变, 不排的话
 /// 同一摆法两次落盘字节面就不同 —— 用户 diff/sync columns.json 徒增噪音)。
 /// `bookmarks` 恒写 (空 = 空数组, 不省略键 —— roundtrip 全等好判, D1)。
-fn entry_to_value(e: &FileEntry) -> serde_json::Value {
-    let mut widths = serde_json::Map::new();
-    let mut keys: Vec<&String> = e.config.widths.keys().collect();
+/// widths → Value (键**排序后写入** —— HashMap 迭代序随进程变, 不排则同摆法
+/// 两次落盘字节面就不同, 评审 Nit 先例)。`entry_to_value`/`session_to_value`
+/// 同用 (列三字段同模型)。
+fn widths_to_value(widths: &HashMap<String, f32>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let mut keys: Vec<&String> = widths.keys().collect();
     keys.sort();
     for k in keys {
-        let w = e.config.widths[k];
-        widths.insert(k.clone(), serde_json::json!(w as f64));
+        map.insert(k.clone(), serde_json::json!(widths[k] as f64));
     }
+    serde_json::Value::Object(map)
+}
+
+/// Value → widths (逐键容错: 非数值 / 非有限 (如 1e308 → f32 inf) / 失配键 →
+/// **丢键不丢条**, 评审 C1 先例)。`entry_from_value`/`session_from_value` 同用。
+fn widths_from_value(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    order: &[String],
+) -> HashMap<String, f32> {
+    let mut widths = HashMap::new();
+    if let Some(w) = obj.get("widths").and_then(|w| w.as_object()) {
+        for (k, num) in w {
+            let Some(w) = num.as_f64().map(|f| f as f32).filter(|f| f.is_finite()) else {
+                continue;
+            };
+            if order.contains(k) {
+                widths.insert(k.clone(), w);
+            }
+        }
+    }
+    widths
+}
+
+fn entry_to_value(e: &FileEntry) -> serde_json::Value {
     serde_json::json!({
         "path": e.path,
         "updated": e.updated,
         "order": e.config.order,
         "hidden": e.config.hidden,
-        "widths": widths,
+        "widths": widths_to_value(&e.config.widths),
         "bookmarks": e.bookmarks,
-
     })
 }
 
@@ -465,18 +520,7 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
             }
         }
     }
-    let mut widths = HashMap::new();
-    if let Some(w) = obj.get("widths").and_then(|w| w.as_object()) {
-        for (k, num) in w {
-            // 逐键容错: 非数值 / 非有限 (如 1e308 → f32 inf) / 失配键 → 丢键
-            let Some(w) = num.as_f64().map(|f| f as f32).filter(|f| f.is_finite()) else {
-                continue;
-            };
-            if order.contains(k) {
-                widths.insert(k.clone(), w);
-            }
-        }
-    }
+    let widths = widths_from_value(obj, &order);
     // 书签 (D1): 可缺省 (空 = 无书签); 逐元素容错 (非 u64 元素丢弃),
     // 坏形状**丢字段不丢条** (C6 同粒度); 收编走 normalize_bookmarks。
     let mut bookmarks = Vec::new();
@@ -509,12 +553,6 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
 /// 列三字段与 [`entry_to_value`] 同形状同排序 (widths 键排序写入);
 /// **无 `bookmarks` 键** (Open Q1: 书签不随会话 = 结构保证)。
 fn session_to_value(s: &SessionEntry) -> serde_json::Value {
-    let mut widths = serde_json::Map::new();
-    let mut keys: Vec<&String> = s.config.widths.keys().collect();
-    keys.sort();
-    for k in keys {
-        widths.insert(k.clone(), serde_json::json!(s.config.widths[k] as f64));
-    }
     serde_json::json!({
         "path": s.path,
         "name": s.name,
@@ -522,7 +560,7 @@ fn session_to_value(s: &SessionEntry) -> serde_json::Value {
         "search": s.search,
         "order": s.config.order,
         "hidden": s.config.hidden,
-        "widths": widths,
+        "widths": widths_to_value(&s.config.widths),
         "expands": s.expands,
         "updated": s.updated,
     })
@@ -565,17 +603,7 @@ fn session_from_value(v: &serde_json::Value) -> Option<SessionEntry> {
             }
         }
     }
-    let mut widths = HashMap::new();
-    if let Some(w) = obj.get("widths").and_then(|w| w.as_object()) {
-        for (k, num) in w {
-            let Some(w) = num.as_f64().map(|f| f as f32).filter(|f| f.is_finite()) else {
-                continue;
-            };
-            if order.contains(k) {
-                widths.insert(k.clone(), w);
-            }
-        }
-    }
+    let widths = widths_from_value(obj, &order);
     let mut expands = Vec::new();
     if let Some(e) = obj.get("expands").and_then(|e| e.as_array()) {
         for x in e {
@@ -1214,6 +1242,36 @@ mod tests {
             MAX_SESSIONS_PER_PATH,
             "满员截断保前 32"
         );
+    }
+
+    /// 评审 M10: 名归一 (trim / 剔控制字符 / 截 64) 保存载入同式;
+    /// 归一后为空 = 丢条。
+    #[test]
+    fn clean_session_name_trims_strips_controls_and_clamps() {
+        assert_eq!(clean_session_name("  排障 A  "), "排障 A");
+        assert_eq!(
+            clean_session_name("A\nB\tC"),
+            "ABC",
+            "换行/制表打进 notice 的面"
+        );
+        assert_eq!(clean_session_name("   "), "");
+        let long = "x".repeat(100);
+        assert_eq!(
+            clean_session_name(&long).chars().count(),
+            MAX_SESSION_NAME_LEN
+        );
+        // 载入侧同式: 纯空白/纯控制名丢条, 好名 trim
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sessions": [
+                { "path": "a", "name": "   ", "updated": 1 },
+                { "path": "a", "name": "\n\t", "updated": 2 },
+                { "path": "a", "name": " 好 ", "updated": 3 }
+            ]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.sessions.len(), 1, "坏名丢条不丢账");
+        assert_eq!(files.sessions[0].name, "好");
     }
 
     /// 收集硬顶 (防手造天文数组, 书签先例: 超顶按收集序放弃)。

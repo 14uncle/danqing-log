@@ -2226,7 +2226,10 @@ impl Widget for LogView {
             self.sessions_btn_rect.set(Rect::default());
             export_anchor_x
         };
-        // 位置计数: 会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画)
+        // 位置计数: 会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画);
+        // **放不下就不画** (评审 M11, Bar hint 家规): 窄窗下左缘钳制会把 pos 推
+        // 进「会话」钮带 —— 画序后画的 pos 压钮字 = 看得见行号点出会话, 与钮
+        // hit 带重叠即整条不画。
         let pos = if !self.has_file {
             String::new()
         } else if count == 0 {
@@ -2236,13 +2239,15 @@ impl Widget for LogView {
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
         let pos_x = sessions_anchor_x - 16.0 - pos_w;
-        texts.push_text(
-            &pos,
-            pos_x.max(area.origin.x + 10.0),
-            sy,
-            AUX_FONT_SIZE,
-            th.text_secondary(),
-        );
+        if pos.is_empty() || pos_x >= area.origin.x + 10.0 {
+            texts.push_text(
+                &pos,
+                pos_x.max(area.origin.x + 10.0),
+                sy,
+                AUX_FONT_SIZE,
+                th.text_secondary(),
+            );
+        }
     }
 
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
@@ -2424,6 +2429,9 @@ impl Widget for LogView {
                 // 作业态变取消, 全在应用层 (Msg::ExportEntryClicked)。
                 if self.export_btn_rect.get().contains(*position) {
                     msgs.push(Box::new(Msg::ExportEntryClicked));
+                    // 点穿防护 (评审 M4): 不 return 会落入「此处无行」, 后到的
+                    // Notice 覆盖守卫文案 (家族⑤次序陷阱) 且事件不被认领。
+                    return EventResult::Consumed;
                 }
                 // 命名会话入口 (D5): 门控/互斥全在应用层 (Msg::OpenSessionMenu)
                 if self.sessions_btn_rect.get().contains(*position) {
@@ -4560,6 +4568,27 @@ mod tests {
                 .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ExportEntryClicked))),
             "左键必须发 ExportEntryClicked"
         );
+        // 点穿防护 (评审 M4): 事件须被认领, 且**恰一条** ExportEntryClicked ——
+        // 落入「此处无行」分支会追尾 Notice 覆盖守卫文案 (家族⑤次序陷阱)。
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let r = v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            matches!(r, EventResult::Consumed),
+            "导出钮点击须 Consumed (不落列表分支)"
+        );
+        assert_eq!(msgs.len(), 1, "只许一条, 不许 Notice 追尾");
+        assert!(matches!(
+            msgs.first().unwrap().downcast_ref::<Msg>(),
+            Some(Msg::ExportEntryClicked)
+        ));
         std::fs::remove_file(&path).ok();
     }
 
