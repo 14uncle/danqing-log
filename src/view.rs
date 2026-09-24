@@ -45,7 +45,8 @@ const COPY_MAX_LINES: u64 = 100_000;
 /// 行高 (逻辑像素)。24 = 可读性底线: 14px 正文上下仍留呼吸, 终端感消失。
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// 正文字号 (实机验收定档 14: 像素吸附落地后用户拍板; 行高 24 容得下)。
-const FONT_SIZE: u16 = 14;
+/// 全应用唯一定义: 弹层 (`settings::BODY_SIZE` 同源别名) 与 RowList 行文同号。
+pub(crate) const FONT_SIZE: u16 = 14;
 /// 行号/状态栏字号 (12: 竞品基准的可读底线, 11 在白底上偏吃力)。
 const AUX_FONT_SIZE: u16 = 12;
 /// 行号槽最小宽度。
@@ -128,6 +129,8 @@ const COL_PAD: f32 = 16.0;
 const HANDLE_HALF: f32 = 4.0;
 /// 表头「列…」按钮标签 (D3): ASCII + GB2312 「列」+ 省略号 (与「导出…」同款)。
 const COLS_BTN_LABEL: &str = "列…";
+/// 过滤栏「字段…」按钮标签 (SPEC-v1x-field-picker-ui D1): 免语法查询弹层入口。
+const FIELDS_BTN_LABEL: &str = "字段…";
 
 /// 表头列区间 (T3, paint 写 event 读): 显示序可见列的 (x0, x1, schema 下标,
 /// 显示序位), 绝对窗口 x (含 `x_offset` 平移) —— 与 [`LogView::col_spans`] 同口径
@@ -2852,6 +2855,14 @@ pub(crate) struct Bar {
     hint_reserved: std::cell::Cell<f32>,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
+    /// 有 schema (表格语境) —— 「字段…」按钮显示判据 (T2; `.log` 不出)。
+    has_schema: bool,
+    /// 「字段…」按钮 hit rect (paint 写 event 读, `cols_btn_rect` 同规)。
+    fields_btn_rect: std::cell::Cell<Rect>,
+    /// 「字段…」hover (自绘变色, D8 同款发现性)。
+    fields_hover: std::cell::Cell<bool>,
+    /// 「字段…」让位宽 (paint 先测后存; `hint_reserved` 同纪律)。
+    fields_reserved: std::cell::Cell<f32>,
 }
 
 impl Bar {
@@ -2871,6 +2882,10 @@ impl Bar {
             label_width: std::cell::Cell::new(0.0),
             hint_reserved: std::cell::Cell::new(0.0),
             theme: crate::config::AppTheme::Light,
+            has_schema: false,
+            fields_btn_rect: std::cell::Cell::new(Rect::default()),
+            fields_hover: std::cell::Cell::new(false),
+            fields_reserved: std::cell::Cell::new(0.0),
         }
     }
 
@@ -2954,9 +2969,14 @@ impl Bar {
     fn input_area(&self, area: Rect, label_w: f32) -> Rect {
         let text_x = area.origin.x + BAR_PAD_X + label_w + BAR_LABEL_GAP;
         // 持焦时右侧让出键义提示的位置 (hint_reserved 由 paint 测量后写入;
-        // 未持焦 / 放不下时为 0)。**单点收口**: paint 与 event 转发都走这里。
-        let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X - self.hint_reserved.get())
-            .max(1.0);
+        // 未持焦 / 放不下时为 0); 「字段…」常让位 (fields_reserved 同纪律)。
+        // **单点收口**: paint 与 event 转发都走这里。
+        let w = (area.size.width
+            - (text_x - area.origin.x)
+            - BAR_PAD_X
+            - self.hint_reserved.get()
+            - self.fields_reserved.get())
+        .max(1.0);
         Rect::from_xywh(text_x, area.origin.y, w, area.size.height)
     }
 
@@ -3016,6 +3036,7 @@ impl Widget for Bar {
             ActiveBar::Search
         };
         self.theme = app.theme;
+        self.has_schema = app.schema.is_some();
 
         // 两个输入框是**字段**而非子节点, 框架不会替它们传播 sync ——
         // 挂在 `TextInput` 上的 `bind_theme` 不手动踢一脚就不生效。
@@ -3109,14 +3130,27 @@ impl Widget for Bar {
         // 持焦态两条反馈 (P33 键义提示 / P6 焦点线)。提示宽度**先测后存**,
         // `input_area` 才好在同一帧内让位 —— 顺序反了就会压字一帧。
         //
-        // 提示只在**输入框为空**时出现。这不是省事, 是被框架逼出来的:
-        // `TextInput::paint` **既不裁剪也不横向滚动** (源码是整串一次性
-        // `push_text`, 没有任何 scroll offset), 所以「让位」保护得了命中测试,
-        // 保护不了字形 —— 有字时长查询照旧会画进提示的地盘。空态下要避的只剩
-        // 占位文案, 那是**可测**的, 于是能给出真正的「放不下就不画」判据。
+        // 提示只在**输入框为空**时出现 (P33)。原由是框架逼的 —— 当年
+        // `TextInput::paint` 既不裁剪也不横向滚动, 有字时长查询会画进提示的
+        // 地盘; 2026-09-20 起框架裁剪进边框 (长查询被裁断, 不再外溢), 但空态
+        // 才画的规矩留了下来: 「放不下就不画」的宽度判据只对占位文案成立
+        // (量得出来), 且裁断边紧贴提示会误读成查询的延续。
         let focused = self.input_focused();
+        // 「字段…」按钮 (T2/D1): 过滤行 + schema 在手才出 (`.log` 不出 —— 判据 6);
+        // 宽度**先测后存**, input_area 同帧让位 (hint 同纪律)。
+        let fields_w = if self.active == ActiveBar::Filter && self.has_schema {
+            let w = texts.measure(FIELDS_BTN_LABEL, FONT_SIZE);
+            self.fields_reserved.set(w + BAR_LABEL_GAP);
+            w
+        } else {
+            self.fields_reserved.set(0.0);
+            0.0
+        };
         let hint_w = if focused && self.active_input().is_some_and(|t| t.value().is_empty()) {
-            let room = area.size.width - (BAR_PAD_X + label_w + BAR_LABEL_GAP) - BAR_PAD_X;
+            let room = area.size.width
+                - (BAR_PAD_X + label_w + BAR_LABEL_GAP)
+                - BAR_PAD_X
+                - self.fields_reserved.get();
             let w = texts.measure(BAR_KEY_HINT, FONT_SIZE);
             let ph_w = texts.measure(&self.active_placeholder(), FONT_SIZE);
             if room >= ph_w + BAR_HINT_GAP + BAR_LABEL_GAP + w {
@@ -3140,11 +3174,35 @@ impl Widget for Bar {
             ActiveBar::Hidden => {}
         }
 
+        if fields_w > 0.0 {
+            // 右对齐: 尾端贴栏右内边距 (与让位同源); hover 换 accent (发现性)。
+            let bx = area.origin.x + area.size.width - BAR_PAD_X - fields_w;
+            texts.push_text(
+                FIELDS_BTN_LABEL,
+                bx,
+                baseline,
+                FONT_SIZE,
+                if self.fields_hover.get() {
+                    th.accent()
+                } else {
+                    th.text_secondary()
+                },
+            );
+            self.fields_btn_rect.set(Rect::from_xywh(
+                bx - 4.0,
+                area.origin.y,
+                fields_w + 8.0,
+                FILTER_BAR_H,
+            ));
+        } else {
+            self.fields_btn_rect.set(Rect::default());
+        }
         if hint_w > 0.0 {
-            // 右对齐推 x: 提示尾端贴栏的右内边距, 与输入区让出的宽度同源。
+            // 右对齐推 x: 提示尾端贴「字段…」左缘 (无按钮则贴栏右内边距),
+            // 与输入区让出的宽度同源。
             texts.push_text(
                 BAR_KEY_HINT,
-                area.origin.x + area.size.width - BAR_PAD_X - hint_w,
+                area.origin.x + area.size.width - BAR_PAD_X - self.fields_reserved.get() - hint_w,
                 baseline,
                 FONT_SIZE,
                 th.text_secondary(),
@@ -3168,6 +3226,27 @@ impl Widget for Bar {
         let active = self.active;
         if active == ActiveBar::Hidden {
             return EventResult::Ignored;
+        }
+        // 「字段…」按钮 (T2/D1): 命中优先于输入转发, 只认左键 (P29);
+        // hover 经 CursorMoved 缓存 (自绘变色), 离窗不粘 (评审 Nit)。
+        if let Event::CursorMoved(p) = event {
+            self.fields_hover
+                .set(self.fields_btn_rect.get().contains(*p));
+        }
+        if let Event::CursorLeft = event {
+            self.fields_hover.set(false);
+        }
+        if let Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position,
+            ..
+        } = event
+        {
+            if self.fields_btn_rect.get().contains(*position) {
+                msgs.push(Box::new(Msg::OpenPicker));
+                return EventResult::Consumed;
+            }
         }
         // 拦截 Enter/Esc/PageUp/PageDown: Enter=应用, Esc=关闭/清除, Page=滚动 (栏聚焦时导航仍可用)。
         if let Event::Key {
@@ -3381,9 +3460,9 @@ mod tests {
         );
     }
 
-    /// P33 边界: **框里有字就不画提示** —— 框架的 `TextInput::paint` 既不裁剪也不
-    /// 横向滚动 (整串一次性 `push_text`), 「让位」保护得了命中测试、保护不了字形,
-    /// 长查询会直接画进提示的地盘。故只在空框时画, 那时要避的只剩占位文案。
+    /// P33 边界: **框里有字就不画提示** —— 原为框架不裁剪、长查询会画进提示的
+    /// 地盘; 2026-09-20 裁剪落地后规矩保留 (宽度判据只对占位文案可测, 裁断边
+    /// 紧贴提示会误读成查询的延续)。
     ///
     /// 但**焦点线不跟着消失**: 「焦点在哪」与「键义怎么说」是两件事。
     #[test]
@@ -7009,5 +7088,79 @@ mod tests {
         assert!(v.press.is_none(), "右键不产潜伏锚点");
         assert_eq!(v.last_click, lc, "右键不污染双击判定");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- T2: 「字段…」按钮 (SPEC-v1x-field-picker-ui D1) ----
+
+    /// 「字段…」按钮显示判据 (真 paint, 判据 6): schema 在手才画 (`.log` 不出);
+    /// hit rect 同源 (paint 写 event 读), 点击发 `OpenPicker`; 右键不冒充 (P29)。
+    #[test]
+    fn fields_btn_shows_only_with_schema_and_opens_picker() {
+        use crate::view::Bar;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-bar-fields-{}.toml",
+            std::process::id()
+        ));
+        let mut bar = Bar::new();
+        let mut app = crate::LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        // `.log` (Raw/无 schema) → 不出按钮
+        app.mode = ViewMode::Raw;
+        bar.sync(&app);
+        let area = Rect::from_xywh(0.0, 0.0, 600.0, FILTER_BAR_H);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.layout(
+            Constraints::loose(Size::new(600.0, FILTER_BAR_H)),
+            &mut texts,
+        );
+        bar.paint(area, &mut rects, &mut texts);
+        assert!(
+            bar.fields_btn_rect.get().size.width <= 0.0,
+            ".log 不出「字段…」"
+        );
+        // JSONL 表格 (有 schema) → 出按钮
+        app.mode = ViewMode::Table;
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        bar.sync(&app);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+        let r = bar.fields_btn_rect.get();
+        assert!(r.size.width > 0.0, "表格语境出「字段…」");
+        // 点击 → OpenPicker; 命中矩形与绘制同源
+        let mut msgs = MsgQueue::new();
+        bar.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, FILTER_BAR_H / 2.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenPicker))),
+            "点「字段…」发 OpenPicker"
+        );
+        // 右键不冒充
+        let mut msgs = MsgQueue::new();
+        bar.event(
+            &Event::MouseInput {
+                button: MouseButton::Right,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, FILTER_BAR_H / 2.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(msgs.is_empty(), "右键不冒充左键");
+        std::fs::remove_file(&cfg).ok();
     }
 }

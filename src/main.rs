@@ -20,6 +20,7 @@ mod analysis_panel;
 mod app_update;
 mod config;
 mod histogram;
+mod pick_list;
 mod settings;
 mod sidebar;
 mod store_license;
@@ -318,6 +319,14 @@ pub(crate) struct LogApp {
     export_menu_open: bool,
     /// 列管理弹层开合 (SPEC-v1x-table-column-config D3; 与 export_menu 互斥)。
     col_menu_open: bool,
+    /// 字段查询弹层开合 (SPEC-v1x-field-picker-ui D1; 与 col_menu/export_menu 互斥)。
+    picker_open: bool,
+    /// 表单已点选的字段名 (None = 还没点字段; 提交/开弹层时复位)。
+    picker_field: Option<String>,
+    /// 表单已点选的算符 (默认 `=`; 开弹层时复位)。
+    picker_op: jsonl::Op,
+    /// 值输入框清空代次 (框架 `TextInput::bind_clear` 消费): 提交/关弹层时 +1。
+    picker_clear_rev: u64,
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
     ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
@@ -440,6 +449,18 @@ pub(crate) enum Msg {
     ToggleColumn(String),
     /// 「恢复默认」: 列摆法回首见序 + 全显 + 采样宽 (D3)。
     ResetColumns,
+    /// 「字段…」按钮: 开字段查询弹层 (与 col_menu/export_menu 互斥, D1)。
+    OpenPicker,
+    /// 关字段查询弹层 (scrim 点击 / Esc; 不提交)。
+    ClosePicker,
+    /// 点字段行: 记选中字段 (RowList 载荷 = 列名)。
+    PickPickerField(String),
+    /// 点算符行: 记选中算符 (六钮常显, Open Q①)。
+    PickPickerOp(jsonl::Op),
+    /// 表单提交 (值输入 Enter / 「过滤」钮, `PickerInput` 持有者内同路):
+    /// 值随信 (评审 R3: 不设镜像, 镜像有 set_text/clear 不回 on_change 的脱钩窗),
+    /// 拼子句 → 空格追加 → `apply_filter` (D1/D3)。
+    PickerSubmit(String),
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
@@ -535,6 +556,10 @@ impl LogApp {
             export_job: ExportJob::new(),
             export_menu_open: false,
             col_menu_open: false,
+            picker_open: false,
+            picker_field: None,
+            picker_op: jsonl::Op::Eq,
+            picker_clear_rev: 0,
             license_clear_rev: 0,
             analysis_job: AsyncJob::new(),
             analysis_result: None,
@@ -704,6 +729,29 @@ impl LogApp {
             let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
             self.columns.merge_with_schema(&names);
         }
+    }
+
+    /// 字段查询弹层草稿三态复位 (评审 Optional: 开/关/提交成功共用一处收口,
+    /// 免得第三条路径漏复位)。
+    fn reset_picker_draft(&mut self) {
+        self.picker_field = None;
+        self.picker_op = jsonl::Op::Eq;
+        self.picker_clear_rev += 1;
+    }
+
+    /// 关尽三弹层 (列管理 / 导出格式 / 字段查询) —— 互斥「开一关二」、换文件/
+    /// 重建、开设置/升级去激活同纪律的**单一收口** (各处各写一份漏过项:
+    /// 评审 R5 双开劫 Enter / R6 门禁漏 picker)。
+    fn close_popovers(&mut self) {
+        self.col_menu_open = false;
+        self.export_menu_open = false;
+        self.picker_open = false;
+    }
+
+    /// 三弹层任一开着 —— 模态清单的共同判据 (滚轮/键盘门禁与 Ctrl 守卫**同源**,
+    /// 评审 R6: 各列一份就漏一项)。
+    fn popover_open(&self) -> bool {
+        self.col_menu_open || self.export_menu_open || self.picker_open
     }
 
     /// 损坏备份守卫 (评审 Critical, [`Self::save_state`] 前置): 文件存在且非空
@@ -896,8 +944,8 @@ impl LogApp {
             self.update(Msg::ShowUpgradePrompt(Feature::Export));
             return;
         }
+        self.close_popovers(); // 互斥 (D3/D1): 开一关二, 双 scrim 不叠
         self.export_menu_open = true;
-        self.col_menu_open = false; // 互斥 (D3)
     }
 
     /// 格式菜单选定 → 保存对话框 (D8) → 启动作业。
@@ -1233,6 +1281,8 @@ impl LogApp {
         } else {
             ViewMode::Raw
         };
+        // 弹层是旧内容语境 (评审 R4: 列集可能整体换) —— 与 apply_fresh 同纪律关尽
+        self.close_popovers();
         // 列配置对账 (评审 C4, apply_fresh 同纪律): 同路径不重读盘, 但 schema 可能
         // 换了列集 —— merge 收敛失配序/隐/宽 + ≥1 可见兜底 (C2 在 merge 内收口)。
         self.merge_columns();
@@ -1274,10 +1324,9 @@ impl LogApp {
         self.search_job.invalidate();
         // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
         self.export_job.invalidate();
-        // 格式菜单同灭 (review R4): async-open 在途开着菜单, 落地后点格式
-        // 会导出的是**新**文件 —— 菜单是旧文件语境的, 一起作废。列管理同灭。
-        self.export_menu_open = false;
-        self.col_menu_open = false;
+        // 三弹层同灭 (review R4 + D1): 弹层是旧文件语境的 —— async-open 在途
+        // 开着菜单, 落地后点格式会导出的是**新**文件, 一起作废。
+        self.close_popovers();
         let OpenOutcome {
             file: new_file,
             schema,
@@ -1874,6 +1923,62 @@ impl LogApp {
     }
 }
 
+/// 拼查询子句 (SPEC-v1x-field-picker-ui D1): 字段+算符+值 → 语法串 ——
+/// `parse_query` 的逆向壳, **不造新语法** (前缀 = `=` + 值尾 `*`, `jsonl::
+/// parse_clause` 现语义)。拒收面见 [`clause_reject_notice`] (判据同源)。
+fn build_clause(field: &str, op: jsonl::Op, value: &str) -> Option<String> {
+    if clause_reject_notice(field, op, value).is_some() {
+        return None;
+    }
+    Some(match op {
+        jsonl::Op::Eq => format!("{field}={value}"),
+        jsonl::Op::Prefix => format!("{field}={value}*"),
+        jsonl::Op::Gt => format!("{field}>{value}"),
+        jsonl::Op::GtEq => format!("{field}>={value}"),
+        jsonl::Op::Lt => format!("{field}<{value}"),
+        jsonl::Op::LtEq => format!("{field}<={value}"),
+    })
+}
+
+/// 拒收判据 + 说清文案 (**单一事实源**, 评审 Critical): `Some(文案)` = 拒收并
+/// 说清为什么; `None` = 可拼。拼装方 [`build_clause`] 与提交方的提示**只许**经
+/// 本函数判 —— 各算一份会漂 (判据变了文案没跟上 = 说错原因)。
+///
+/// **拒收面必须盖住 parse 破坏面** (评审 Critical, 双路并账): `parse_query` =
+/// 空白分 token + `split_operator` 长算符首次出现切分 + Eq 值尾 `*` 改写 Prefix ——
+/// 凡会被它**改写语义**的输入一律拒收, 不静默拼出另一条查询:
+/// - 字段: 空 / 含空白 / 含 `.` (扁平键被拆嵌套 = 0 命中面) / 含 `=< >` (算符逃逸)
+/// - 值: 空 / 含空白 / 含 `<` `>` (算符切分逃逸, 泛型/比较片段常见) /
+///   **前导 `=`** (与 `>`/`<` 算符拼出双字符算符) / Eq 尾 `*` (被偷换前缀) /
+///   Prefix 含 `*` (双重编码)
+fn clause_reject_notice(field: &str, op: jsonl::Op, value: &str) -> Option<&'static str> {
+    let field_reserved = field
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '=' | '<' | '>' | '.'));
+    let value_reserved = value
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '<' | '>'))
+        || value.starts_with('=');
+    let star_abuse = match op {
+        jsonl::Op::Eq => value.ends_with('*'),
+        jsonl::Op::Prefix => value.contains('*'),
+        _ => false,
+    };
+    if !field_reserved && !value_reserved && !star_abuse && !field.is_empty() && !value.is_empty() {
+        return None;
+    }
+    // 文案分类 (优先级 = 最可能的用户本意在前; 判据不变, 只管说哪句)
+    Some(if field_reserved {
+        "该列名含保留字符 (空格 . = < >), 暂不支持点选查询"
+    } else if op == jsonl::Op::Eq && value.ends_with('*') {
+        "精确匹配不接受结尾 *, 前缀查询请点 * 钮"
+    } else if op == jsonl::Op::Prefix && value.contains('*') {
+        "前缀值不能再含 *"
+    } else {
+        "值不能为空, 且不能含空格 / < / > 或以 = 开头"
+    })
+}
+
 /// 下一书签：严格大于 current 的最小书签，无则环绕到最小书签。空集 None。
 pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64) -> Option<u64> {
     set.range(current.saturating_add(1)..)
@@ -1953,10 +2058,49 @@ impl App for LogApp {
                 self.save_state();
             }
             Msg::OpenColMenu => {
-                self.export_menu_open = false; // 互斥 (D3): 双 scrim 不叠
+                self.close_popovers(); // 互斥 (D3): 双 scrim 不叠, 开一关二
                 self.col_menu_open = true;
             }
             Msg::CloseColMenu => self.col_menu_open = false,
+            Msg::OpenPicker => {
+                // 互斥 (D1): 「开一关二」+ 关 settings (评审 R5: 托盘双开会让
+                // Enter 被劫到提交)。
+                self.close_popovers();
+                self.settings_open = false;
+                self.picker_open = true;
+                self.reset_picker_draft();
+                // 开弹层直接打字进值框 (评审 R8: 点按钮会清焦, 送回值框)
+                self.focus_target = Some("picker-value");
+            }
+            Msg::ClosePicker => {
+                self.picker_open = false;
+                self.reset_picker_draft();
+            }
+            Msg::PickPickerField(name) => self.picker_field = Some(name),
+            Msg::PickPickerOp(op) => self.picker_op = op,
+            Msg::PickerSubmit(value) => {
+                let Some(field) = self.picker_field.clone() else {
+                    self.set_notice("先点选字段".into(), NoticeKind::Info);
+                    return;
+                };
+                let Some(clause) = build_clause(&field, self.picker_op, &value) else {
+                    // 拒收说清 (评审 Critical): 文案与判据同一函数 (单一事实源)
+                    let why = clause_reject_notice(&field, self.picker_op, &value)
+                        .expect("build_clause 拒收 ⇒ clause_reject_notice 必有文案");
+                    self.set_notice(why.into(), NoticeKind::Warn);
+                    return;
+                };
+                // 追加 AND (D3): 空查询 = 就是它; 有查询 = 空格连接
+                // (parse_query = split_whitespace, 多子句 AND)。提交即关弹层清草稿。
+                let q = if self.filter_applied.is_empty() {
+                    clause
+                } else {
+                    format!("{} {}", self.filter_applied, clause)
+                };
+                self.picker_open = false;
+                self.reset_picker_draft();
+                self.apply_filter(q);
+            }
             Msg::ToggleColumn(name) => {
                 self.merge_columns();
                 if !self.columns.order.contains(&name) {
@@ -2037,6 +2181,9 @@ impl App for LogApp {
             }
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
+                // 互斥 (评审 R5): 托盘等入口无模态屏障, 开设置先关三弹层 ——
+                // 双开时 Enter 会被劫到 PickerSubmit (原「互斥保证」前提不成立)
+                self.close_popovers();
                 self.settings_open = true;
             }
             Msg::CloseSettings => {
@@ -2074,6 +2221,7 @@ impl App for LogApp {
             Msg::UpgradeGotoActivate => {
                 self.upgrade_prompt = None;
                 self.settings_tab = settings::LICENSE_TAB_INDEX;
+                self.close_popovers(); // 互斥 (评审 R5, OpenSettings 同规)
                 self.settings_open = true;
             }
             Msg::UpgradePurchase => {
@@ -2142,11 +2290,8 @@ impl App for LogApp {
                 .child(settings::upgrade_overlay(self.theme))
                 .child(settings::export_menu_overlay(self.theme))
                 .child(settings::export_menu_overlay_jsonl(self.theme))
-                .child(settings::col_menu_overlay(
-                    self.theme,
-                    self.schema.as_deref().cloned(),
-                    self.columns.clone(),
-                )),
+                .child(settings::col_menu_overlay(self.theme))
+                .child(settings::picker_overlay(self.theme)),
         )
     }
 
@@ -2160,8 +2305,8 @@ impl App for LogApp {
         // `Consumed` 了, 能走到这里的本来就不是它。
         if let Event::MouseWheel { delta, .. } = event {
             // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
-            if !self.settings_open && !self.export_menu_open && !self.col_menu_open && self.has_file
-            {
+            // (判据与键盘门禁同源: settings + 三弹层, [`Self::popover_open`])。
+            if !self.settings_open && !self.popover_open() && self.has_file {
                 let rows = wheel_rows(delta.1);
                 if rows != 0.0 {
                     self.update(Msg::ScrollRows(rows));
@@ -2187,6 +2332,12 @@ impl App for LogApp {
             if let Some(msg) = settings::handle_settings_key(key) {
                 self.update(msg);
             }
+            return;
+        }
+        // 弹层模态 (评审 R6, 与滚轮守卫同源): 三弹层开着时, 无人认领的导航键
+        // (↑↓/Space/Home/End/Page*) 不许穿到弹层后滚日志 —— 2026-09-14 设置卡
+        // 同款漏洞的守卫扩展面。卡内控件经焦点路由自行消费。
+        if self.popover_open() {
             return;
         }
         // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
@@ -2304,6 +2455,11 @@ impl App for LogApp {
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
+            // Esc 次序: 升级提示 > 设置卡 > **字段查询** > 列管理 > 导出格式菜单 > 栏
+            // (SPEC-v1x-field-picker-ui D1 插层)
+            if self.picker_open {
+                return Some(Msg::ClosePicker);
+            }
             // Esc 次序: 升级提示 > 设置卡 > **列管理** > 导出格式菜单 > 栏
             // (SPEC-v1x-table-column-config D3 插层)
             if self.col_menu_open {
@@ -2314,6 +2470,8 @@ impl App for LogApp {
                 return Some(Msg::CloseExportMenu);
             }
         }
+        // (评审 R7: 全局 Enter 拦截已撤 —— 会把算符钮的 Enter 激活劫成提交。
+        // 提交归 `PickerInput` 持有者内收口: 值框持焦时 Enter / 「过滤」钮同路。)
         let Event::Key {
             key,
             pressed: true,
@@ -2338,11 +2496,7 @@ impl App for LogApp {
         // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
         // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
         // (T7 扩展: 升级提示同享此守卫 —— 它是第二个模态层。)
-        if self.settings_open
-            || self.upgrade_prompt.is_some()
-            || self.export_menu_open
-            || self.col_menu_open
-        {
+        if self.settings_open || self.upgrade_prompt.is_some() || self.popover_open() {
             // **剪辑组合键必须放行** (评审 Critical, 2026-09-19): 框架的剪贴板
             // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里, 这里吞掉 =
             // 许可页输入框没法 Ctrl+V 粘贴 key —— 而粘贴是 200+ 字符 key 的
@@ -3196,6 +3350,293 @@ mod tests {
         );
         std::fs::remove_dir(&cols).ok();
         std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ---- T1: 拼子句 + picker 状态链 (SPEC-v1x-field-picker-ui D1/D3) ----
+
+    /// 拼子句 6 算符 → `parse_query` roundtrip 全等 (语法面零发明);
+    /// 前缀 = `=` + 值尾 `*` (parse_clause 现语义: 值去星收 Prefix)。
+    #[test]
+    fn build_clause_six_ops_roundtrip() {
+        use danqing_log::jsonl::{self, Clause, Op};
+        let cases = [
+            ("level", Op::Eq, "ERROR", "level=ERROR"),
+            ("level", Op::Prefix, "ERR", "level=ERR*"),
+            ("status", Op::GtEq, "500", "status>=500"),
+            ("status", Op::LtEq, "499", "status<=499"),
+            ("status", Op::Gt, "499", "status>499"),
+            ("status", Op::Lt, "500", "status<500"),
+        ];
+        for (field, op, value, want) in cases {
+            let s = build_clause(field, op, value).expect("非空必产出");
+            assert_eq!(s, want);
+            let q = jsonl::parse_query(&s);
+            assert_eq!(q.len(), 1, "{want}");
+            match &q[0] {
+                Clause::Field {
+                    path,
+                    op: got_op,
+                    value: got_val,
+                } => {
+                    assert_eq!(path.join("."), field);
+                    assert_eq!(*got_op, op);
+                    assert_eq!(got_val, value);
+                }
+                other => panic!("须是 Field 子句: {other:?}"),
+            }
+        }
+        // 点路径字段已被拒收面覆盖 (评审 Critical/R1) —— 语法不支持字面点,
+        // `user.id` 走嵌套拆分是 0 命中面, 不许当「点路径」放行。
+    }
+
+    /// 空值/空字段/含空白值拒绝 (D3)。
+    #[test]
+    fn build_clause_rejects_empty() {
+        use danqing_log::jsonl::Op;
+        assert!(build_clause("a", Op::Eq, "").is_none(), "空值拒绝");
+        assert!(build_clause("", Op::Eq, "v").is_none(), "空字段拒绝");
+        assert!(build_clause("a", Op::Eq, "x y").is_none(), "含空白值拒绝");
+    }
+
+    /// 评审 Critical (双路并账): 拼接面必须**盖住** parse 破坏面 ——
+    /// 被接受的 roundtrip 全等 (path 用 Vec 断言, 不许 join 假绿);
+    /// 会被 `parse_query` 改写语义的一律拒收 (None)。
+    #[test]
+    fn build_clause_rejects_anything_parse_would_rewire() {
+        use danqing_log::jsonl::{self, Clause, Op};
+        // —— 拒收面: 值含算符字符 / 算符拼合 / 尾星偷换 / 字段脏字符 ——
+        let rejected = [
+            ("a", Op::Eq, "List<String>"), // 值含 > <: 切成 a=List Lt String>
+            ("a", Op::Eq, "x>y"),
+            ("msg", Op::Eq, "a>=b"),
+            ("a", Op::Gt, "=b"), // > 与前导 = 拼出 >= 双字符算符
+            ("a", Op::Lt, "=1"),
+            ("a", Op::Eq, "b*"),       // Eq 尾星被 parse 偷换成 Prefix
+            ("a", Op::Prefix, "b*"),   // Prefix 含星双重编码 (b**)
+            ("my key", Op::Eq, "v"),   // 字段含空白 → Bare + Field 两子句
+            ("user.id", Op::Eq, "42"), // 字段含点 → 扁平键被拆嵌套 (0 命中面)
+            ("a>b", Op::Eq, "1"),      // 字段含算符
+            ("a=b", Op::Eq, "1"),
+            ("a", Op::Eq, "=x"), // 值前导 = 一律拒 (防拼合家族)
+        ];
+        for (field, op, value) in rejected {
+            assert!(
+                build_clause(field, op, value).is_none(),
+                "须拒收: {field:?} {op:?} {value:?}"
+            );
+        }
+        // —— 接受面: roundtrip 全等 (path 逐段断言) ——
+        let accepted = [
+            ("level", Op::Eq, "ERROR"),
+            ("level", Op::Prefix, "ERR"),
+            ("status", Op::GtEq, "500"),
+            ("msg", Op::Eq, "a=b"),  // 值内 = 切在第一个, 安全
+            ("msg", Op::Eq, "100%"), // % 无语义, 安全
+            ("msg", Op::Eq, "a.b"),  // 值内点不拆 (拆点只在字段侧)
+        ];
+        for (field, op, value) in accepted {
+            let s = build_clause(field, op, value).expect("干净输入必产出");
+            let q = jsonl::parse_query(&s);
+            assert_eq!(q.len(), 1, "{s}");
+            match &q[0] {
+                Clause::Field {
+                    path,
+                    op: got_op,
+                    value: got_val,
+                } => {
+                    // path 逐段断言: 扁平字段名 = 单段路径 (join 会与点号键假绿)
+                    assert_eq!(path.as_slice(), [field], "字段须是单段路径: {s}");
+                    assert_eq!(*got_op, op, "{s}");
+                    assert_eq!(got_val, value, "{s}");
+                }
+                other => panic!("须是 Field 子句: {other:?}"),
+            }
+        }
+    }
+
+    /// PickerSubmit 组装追加 (D3): 无字段提示 / 空查询直提 / 有查询空格连接 AND /
+    /// 提交即关弹层清草稿 / 空值拒绝不动查询。**摘追加拼接 = 「有查询」断言红 (A/B)**。
+    #[test]
+    fn picker_submit_appends_and_applies() {
+        let cfg = temp_cfg_path("picker-submit");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:\\logs\\p.log");
+        let p = temp_log(b"{\"level\":\"ERROR\"}\n{\"level\":\"INFO\"}\n");
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        // 无字段提交 → 提示且不动
+        app.update(Msg::PickerSubmit("ERROR".into()));
+        assert!(app.notice.is_some(), "无字段说清");
+        assert!(app.filter_applied.is_empty());
+        // 选字段, 空查询直提 (D3: 就是它)
+        app.update(Msg::OpenPicker);
+        app.update(Msg::PickPickerField("level".into()));
+        app.update(Msg::PickerSubmit("ERROR".into()));
+        assert_eq!(app.filter_applied, "level=ERROR", "空查询直提");
+        assert!(!app.picker_open, "提交即关弹层");
+        assert!(app.picker_field.is_none(), "草稿清");
+        // 再开 + 算符: 追加 AND (空格连接)
+        app.update(Msg::OpenPicker);
+        app.update(Msg::PickPickerField("level".into()));
+        app.update(Msg::PickPickerOp(jsonl::Op::Prefix));
+        app.update(Msg::PickerSubmit("ER".into()));
+        assert_eq!(
+            app.filter_applied, "level=ERROR level=ER*",
+            "有查询 = 空格连接 AND"
+        );
+        // 空值拒绝: 查询不动, 弹层不关 (留着补值)
+        app.update(Msg::OpenPicker);
+        app.update(Msg::PickPickerField("level".into()));
+        app.update(Msg::PickerSubmit("".into()));
+        assert_eq!(app.filter_applied, "level=ERROR level=ER*", "空值不动查询");
+        assert!(app.picker_open, "拒绝不关弹层");
+        std::fs::remove_file(cfg.with_extension("columns.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 互斥 (D1): 开一关二 —— picker 与 col_menu/export_menu 双向。
+    #[test]
+    fn picker_open_is_mutually_exclusive() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("picker-mutex")));
+        app.col_menu_open = true;
+        app.export_menu_open = true;
+        app.update(Msg::OpenPicker);
+        assert!(app.picker_open && !app.col_menu_open && !app.export_menu_open);
+        app.col_menu_open = false;
+        app.export_menu_open = false;
+        app.update(Msg::OpenColMenu);
+        assert!(app.col_menu_open && !app.picker_open, "开列管理关 picker");
+        app.picker_open = false;
+        // export 打开路径 (入口函数) 同款 —— 直接看臂上互斥
+        app.picker_open = true;
+        app.update(Msg::OpenPicker);
+        assert!(app.picker_open);
+        std::fs::remove_file(temp_cfg_path("picker-mutex")).ok();
+    }
+
+    /// T2 接线锁族 (评审修复后语义): Esc 次序 / 全局 Enter **不**劫 (R7) /
+    /// 模态守卫 / 关弹层清草稿 (reset_picker_draft)。
+    #[test]
+    fn picker_esc_enter_modal_and_draft_clear() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("picker-wire")));
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        let enter = Event::Key {
+            key: Key::Named(NamedKey::Enter),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        // Esc 次序: picker 先于 col_menu (D1 插层)
+        app.picker_open = true;
+        app.col_menu_open = true;
+        assert!(matches!(app.app_key_filter(&esc), Some(Msg::ClosePicker)));
+        // 评审 R7: 全局 Enter **不**拦截 (算符钮的 Enter 归按钮激活);
+        // 提交归 PickerInput 持有者内 (其单元锁见 settings 侧)
+        assert!(app.app_key_filter(&enter).is_none());
+        // 模态守卫: picker 开时全局 Ctrl 键不穿 (Ctrl+L 探针, 不碰 Ctrl+O)
+        let ctrl_l = Event::Key {
+            key: Key::Character("l".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        app.picker_open = true;
+        assert!(matches!(app.app_key_filter(&ctrl_l), Some(Msg::Noop)));
+        // 剪辑键放行 (许可页粘贴先例)
+        let ctrl_v = Event::Key {
+            key: Key::Character("v".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        assert!(app.app_key_filter(&ctrl_v).is_none());
+        // 关弹层清草稿三态 (reset_picker_draft 一处收口)
+        app.picker_field = Some("x".into());
+        app.picker_op = jsonl::Op::Gt;
+        let rev = app.picker_clear_rev;
+        app.update(Msg::ClosePicker);
+        assert!(!app.picker_open);
+        assert!(app.picker_field.is_none(), "草稿清");
+        assert_eq!(app.picker_op, jsonl::Op::Eq, "算符复位默认");
+        assert!(app.picker_clear_rev > rev, "清空代次前进 (输入框清)");
+        std::fs::remove_file(temp_cfg_path("picker-wire")).ok();
+    }
+
+    /// 评审 R5: `OpenSettings` 与三弹层互斥 (托盘无模态屏障) ——
+    /// 双开会让 Enter 被劫到提交; 开设置先关尽。
+    #[test]
+    fn open_settings_closes_transient_popovers() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg_path("picker-r5")));
+        app.picker_open = true;
+        app.col_menu_open = true;
+        app.export_menu_open = true;
+        app.update(Msg::OpenSettings);
+        assert!(app.settings_open);
+        assert!(
+            !app.picker_open && !app.col_menu_open && !app.export_menu_open,
+            "开设置关三弹层"
+        );
+        // UpgradeGotoActivate 同规
+        app.picker_open = true;
+        app.update(Msg::UpgradeGotoActivate);
+        assert!(app.settings_open && !app.picker_open);
+        std::fs::remove_file(temp_cfg_path("picker-r5")).ok();
+    }
+
+    /// 评审 R6: 弹层开着时无人认领的导航键/滚轮不许穿到弹层后 (09-14 同族)。
+    #[test]
+    fn modal_gate_swallows_nav_keys_and_wheel_when_picker_open() {
+        let cfg = temp_cfg_path("picker-r6");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        let p = temp_log(
+            (0..20)
+                .map(|i| format!("l{i}\n"))
+                .collect::<String>()
+                .as_bytes(),
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.picker_open = true;
+        // ↓ 无人认领 → 不得滚日志
+        app.event(&Event::Key {
+            key: Key::Named(NamedKey::ArrowDown),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(app.top_row, 0.0, "picker 开着 ↓ 不穿到日志");
+        // 滚轮同锁 (评审 FYI 顺手补)
+        app.event(&Event::MouseWheel {
+            delta: (0.0, 3.0),
+            position: danqing::Point::new(10.0, 10.0),
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(app.top_row, 0.0, "picker 开着滚轮不穿到日志");
+        // 对照: 关掉后照常滚
+        app.picker_open = false;
+        app.event(&Event::Key {
+            key: Key::Named(NamedKey::ArrowDown),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert!(app.top_row > 0.0, "无弹层时 ↓ 照常滚");
+        std::fs::remove_file(cfg).ok();
         std::fs::remove_file(&p).ok();
     }
 

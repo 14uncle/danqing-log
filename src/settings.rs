@@ -10,6 +10,7 @@
 
 use std::any::Any;
 
+use danqing::event::MouseButton;
 use danqing::widget::{
     Box as UiBox, Button, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay,
     Padding, Row, Switch, Tabs, Text, TextInput, Widget,
@@ -29,6 +30,10 @@ use danqing_log::license::{self, Entitlement, PaidSource};
 const CARD_WIDTH: f32 = 360.0;
 /// 卡片左右内边距。
 const CARD_PAD_X: f32 = 24.0;
+/// 弹层行列表封顶 (两处 RowList 同值; 评审 Optional: 16 行会把算符行/过滤钮
+/// 挤出小窗 —— 框架不裁剪, 溢出画到卡外就点不中了; 超出折叠进「还有 N 列」
+/// 尾行, 顺带让尾行实机可达)。
+const POPOVER_ROWS_MAX: usize = 12;
 
 /// 内容区宽度 = 卡片宽 - 左右内边距。
 ///
@@ -54,8 +59,53 @@ fn content_width() -> f32 {
 /// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
 /// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
 const PANEL_CONTENT_H: f32 = 192.0;
-/// 正文字号。
-const BODY_SIZE: u16 = 14;
+/// 正文字号 (与 [`crate::view::FONT_SIZE`] 同源别名 —— 弹层/行列表必须与
+/// 行文同号, 各写一个 14 会漂)。
+const BODY_SIZE: u16 = crate::view::FONT_SIZE;
+
+/// 弹层/设置卡壳 (bg **取值**传入 —— 传 `&T` 会被不透明返回类型捕获生命周期):
+/// 不透明底 + 圆角 + 内边距 + 定宽。内容列走 [`card_column`] (五卡同形)。
+///
+/// 底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
+/// (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是半透明
+/// —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
+/// 必然是实色)。用户要求面板背景不透明, 故用它。
+///
+/// **不描边** (用户 2026-09-13 定)。与底层的区分交给 scrim 就够: 卡外被压暗
+/// (实测 (18,18,24)), 卡内是不透明的 `background()` ((25,25,32))。
+/// 原先那圈 `border()` 在暗色下会渲染成 (131,131,135) 的亮框, 是**重复**的一道
+/// (scrim 已经在做区分) 且过重。注: `UiBox` 不调 `.border_color()` 就完全不画边,
+/// 所以这里是删掉而不是把 width 置 0。
+/// 底色走**绑定**而非构造值: `view()` 只在启动时求值一次, 构造态的颜色
+/// 不会跟着主题切换走 (与标题栏同款的坑)。浅色启动、切到暗色 → 暗色 scrim 上
+/// 浮着一张浅色卡。回归锁: `settings_card_background_follows_theme_switch`。
+fn card_shell(bg: Color, body: impl Widget + 'static) -> impl Widget {
+    UiBox::new(bg)
+        .bind_color(|app: &LogApp| app.theme.theme().background())
+        .radius(12.0)
+        .child(Padding::new(
+            Edges {
+                top: 24.0,
+                right: CARD_PAD_X,
+                bottom: 16.0,
+                left: CARD_PAD_X,
+            },
+            body,
+        ))
+        .width(CARD_WIDTH)
+}
+
+/// 卡内容列 (五卡同形: 16 间距 + 横向居中)。
+fn card_column() -> Column {
+    Column::new().gap(16.0).cross_center()
+}
+
+/// 卡标题 (静态文案卡同用): 正文号 + 主文字色, 色随主题每帧取。
+fn card_title(title: &str) -> impl Widget {
+    Text::new(title.to_string())
+        .font_size(BODY_SIZE)
+        .bind_color(|app: &LogApp| app.theme.theme().text_primary())
+}
 
 /// 设置卡浮层：danqing::Overlay 承载 scrim/居中/模态门控 (簇 C 下沉)。
 pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
@@ -71,71 +121,44 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
 /// 「关于」页签里, 摆在页签外会与页签内容同屏重复 (用户指出)。
 fn settings_card(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
-    let pad = Edges {
-        top: 24.0,
-        right: CARD_PAD_X,
-        bottom: 16.0,
-        left: CARD_PAD_X,
-    };
     let content_w = content_width();
-    // 卡片底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
-    // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是半透明
-    // —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
-    // 必然是实色)。用户要求面板背景不透明, 故用它。
-    //
-    // **不描边** (用户 2026-09-13 定)。与底层的区分交给 scrim 就够: 卡外被压暗
-    // (实测 (18,18,24)), 卡内是不透明的 `background()` ((25,25,32))。
-    // 原先那圈 `border()` 在暗色下会渲染成 (131,131,135) 的亮框, 是**重复**的一道
-    // (scrim 已经在做区分) 且过重。注: `UiBox` 不调 `.border_color()` 就完全不画边,
-    // 所以这里是删掉而不是把 width 置 0。
-    // 底色走**绑定**而非构造值: `view()` 只在启动时求值一次, 构造态的颜色
-    // 不会跟着主题切换走 (与标题栏同款的坑)。浅色启动、切到暗色 → 暗色 scrim 上
-    // 浮着一张浅色卡。回归锁: `settings_card_background_follows_theme_switch`。
-    UiBox::new(t.background())
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            pad,
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(close_row())
-                .child(
-                    Tabs::new(&t)
-                        // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
-                        // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 许可 / 3 = 关于)。
-                        // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
-                        // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
-                        // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例);
-                        // 许可 (SPEC-v1x-licensing D8) 在快捷键后、关于前。
-                        // 别处要引用「许可」下标, 用同文件相邻的 [`LICENSE_TAB_INDEX`] 常量。
-                        .tab("常规")
-                        .tab("快捷键")
-                        .tab("许可")
-                        .tab("关于")
-                        .child(panel_box(general_content()))
-                        .child(panel_box(shortcuts_section(content_w)))
-                        .child(panel_box(license_content(content_w)))
-                        .child(panel_box(about_content(content_w)))
-                        // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
-                        // 第一页更省事), 且 Esc/点遮罩关闭不丢。
-                        .bind(|app: &LogApp| app.settings_tab)
-                        // 页签**颜色**必须每帧重取 —— `Tabs::new(&t)` 是构造值,
-                        // 不挂这个绑定的话切主题时页签名会停在旧主题色
-                        // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
-                        // 回归锁: `settings_card_tabs_follow_theme_switch`。
-                        .bind_theme(|app: &LogApp| app.theme.theme())
-                        // 更新角标挂「关于」页签 (腿 A): 生产现查 hint() (与提示行
-                        // 同源); 测试经 update_hint_override 注入两态 (不碰全局 publish)。
-                        .bind_tab_badge(ABOUT_TAB_INDEX, |app: &LogApp| {
-                            app.update_hint_override
-                                .get()
-                                .unwrap_or_else(|| crate::app_update::hint().is_some())
-                        })
-                        .on_change(Msg::SelectSettingsTab),
-                ),
-        ))
-        .width(CARD_WIDTH)
+    card_shell(
+        t.background(),
+        card_column().child(close_row()).child(
+            Tabs::new(&t)
+                // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
+                // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 许可 / 3 = 关于)。
+                // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
+                // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
+                // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例);
+                // 许可 (SPEC-v1x-licensing D8) 在快捷键后、关于前。
+                // 别处要引用「许可」下标, 用同文件相邻的 [`LICENSE_TAB_INDEX`] 常量。
+                .tab("常规")
+                .tab("快捷键")
+                .tab("许可")
+                .tab("关于")
+                .child(panel_box(general_content()))
+                .child(panel_box(shortcuts_section(content_w)))
+                .child(panel_box(license_content(content_w)))
+                .child(panel_box(about_content(content_w)))
+                // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
+                // 第一页更省事), 且 Esc/点遮罩关闭不丢。
+                .bind(|app: &LogApp| app.settings_tab)
+                // 页签**颜色**必须每帧重取 —— `Tabs::new(&t)` 是构造值,
+                // 不挂这个绑定的话切主题时页签名会停在旧主题色
+                // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
+                // 回归锁: `settings_card_tabs_follow_theme_switch`。
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                // 更新角标挂「关于」页签 (腿 A): 生产现查 hint() (与提示行
+                // 同源); 测试经 update_hint_override 注入两态 (不碰全局 publish)。
+                .bind_tab_badge(ABOUT_TAB_INDEX, |app: &LogApp| {
+                    app.update_hint_override
+                        .get()
+                        .unwrap_or_else(|| crate::app_update::hint().is_some())
+                })
+                .on_change(Msg::SelectSettingsTab),
+        ),
+    )
 }
 
 /// 「许可」页签下标 —— 与 `.tab()` 链同文件相邻, 是唯一合法引用点 (T7 升级
@@ -355,39 +378,26 @@ pub(crate) fn upgrade_overlay(theme: config::AppTheme) -> impl Widget {
             .on_click(|| Msg::UpgradePurchase),
         );
     }
-    let card = UiBox::new(t.background())
-        // 底色走绑定 (同设置卡): 视图树只建一次, 构造值不跟主题切换走。
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            Edges {
-                top: 24.0,
-                right: CARD_PAD_X,
-                bottom: 16.0,
-                left: CARD_PAD_X,
-            },
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(
-                    Text::bind(|app: &LogApp| match app.upgrade_prompt {
-                        Some(f) => format!("「{}」是付费层功能", f.label()),
-                        None => String::new(),
-                    })
-                    .font_size(BODY_SIZE)
-                    .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+    let card = card_shell(
+        t.background(),
+        card_column()
+            .child(
+                Text::bind(|app: &LogApp| match app.upgrade_prompt {
+                    Some(f) => format!("「{}」是付费层功能", f.label()),
+                    None => String::new(),
+                })
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+            )
+            .child(
+                Text::new(
+                    "付费层 = 批量 / 留存 / 交付：$29 个人买断 · $59 企业，永久使用".to_string(),
                 )
-                .child(
-                    Text::new(
-                        "付费层 = 批量 / 留存 / 交付：$29 个人买断 · $59 企业，永久使用"
-                            .to_string(),
-                    )
-                    .font_size(BODY_SIZE)
-                    .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
-                )
-                .child(buttons),
-        ))
-        .width(CARD_WIDTH);
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+            )
+            .child(buttons),
+    );
     Overlay::themed(&t, Center::new(card).fill_max())
         .bind_open(|app: &LogApp| app.upgrade_prompt.is_some())
         .on_scrim_click(|| Msg::CloseUpgradePrompt)
@@ -419,7 +429,7 @@ pub(crate) fn export_menu_overlay_jsonl(theme: config::AppTheme) -> impl Widget 
     .on_scrim_click(|| Msg::CloseExportMenu)
 }
 
-/// 卡体 (bg 取值传入 —— 传 `&T` 会被不透明返回类型捕获生命周期)。
+/// 卡体 (壳见 [`card_shell`]): 标题 + 格式钮行。
 fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
     let label = |s: &str| {
         Text::new(s.to_string())
@@ -441,27 +451,7 @@ fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
                 Msg::ExportFormatChosen(ExportPick::Csv)
             }));
     }
-    UiBox::new(bg)
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            Edges {
-                top: 24.0,
-                right: CARD_PAD_X,
-                bottom: 16.0,
-                left: CARD_PAD_X,
-            },
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(
-                    Text::new("导出格式".to_string())
-                        .font_size(BODY_SIZE)
-                        .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
-                )
-                .child(rows),
-        ))
-        .width(CARD_WIDTH)
+    card_shell(bg, card_column().child(card_title("导出格式")).child(rows))
 }
 
 fn format_btn(label: Text, on_click: impl Fn() -> Msg + 'static) -> impl Widget {
@@ -473,24 +463,18 @@ fn format_btn(label: Text, on_click: impl Fn() -> Msg + 'static) -> impl Widget 
 /// 列管理弹层 (SPEC-v1x-table-column-config D3, 裁定①): 表头「列…」按钮/右键入口,
 /// 卡体 = 每列一行开关 (`[x]`/`[ ]` ASCII 勾选, GB2312 字体约束) + 「恢复默认」。
 /// 复用 export 菜单四件套范式; 与导出菜单**互斥** (开一个先关另一个, 防双 scrim 叠)。
-pub(crate) fn col_menu_overlay(
-    theme: config::AppTheme,
-    schema: Option<danqing_log::jsonl::Schema>,
-    columns: danqing_log::columns::ColumnConfig,
-) -> impl Widget {
+/// 行集走 [`col_menu_rows`] (RowList 自绘, 每帧取态 —— T0 修复: 建树快照不许冻结)。
+pub(crate) fn col_menu_overlay(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
-    Overlay::themed(
-        &t,
-        Center::new(col_menu_card(t.background(), schema, columns)).fill_max(),
-    )
-    .bind_open(|app: &LogApp| app.col_menu_open)
-    .on_scrim_click(|| Msg::CloseColMenu)
+    Overlay::themed(&t, Center::new(col_menu_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.col_menu_open)
+        .on_scrim_click(|| Msg::CloseColMenu)
 }
 
 /// 弹层行序 = 列配置**显示序** (评审 Optional: 与表格同序, 摆到哪画到哪);
 /// 空配置回退 schema 首见序 (未对账快照防御), 只保留 schema 内的列名。
 fn col_menu_row_names(
-    schema: &Option<danqing_log::jsonl::Schema>,
+    schema: Option<&danqing_log::jsonl::Schema>,
     columns: &danqing_log::columns::ColumnConfig,
 ) -> Vec<String> {
     let Some(s) = schema else {
@@ -507,51 +491,264 @@ fn col_menu_row_names(
         .collect()
 }
 
-/// 卡体 (bg 与数据全**取值**传入 —— 引用会被 'static widget 捕获,
-/// `export_menu_card` 的生命周期理由同款)。
-fn col_menu_card(
-    bg: Color,
-    schema: Option<danqing_log::jsonl::Schema>,
-    columns: danqing_log::columns::ColumnConfig,
-) -> impl Widget {
-    let label = |s: String| Text::new(s).font_size(BODY_SIZE).color(Color::WHITE);
-    let mut rows = Column::new().gap(12.0).cross_center();
-    for name in col_menu_row_names(&schema, &columns) {
-        let mark = if columns.is_hidden(&name) {
-            "[ ]"
+/// 「显示列」行集 (T0, RowList): 行文案 = `[x]`/`[ ]` + 列名, 载荷 = 列名 ——
+/// **每帧从 LogApp 取** (`col_menu_row_names` + 显隐标记), 建树后开文件/换文件
+/// 行集跟随 (启动快照 bug 的修复本体, 锁
+/// `col_menu_rows_follow_schema_across_sync`)。封顶见 [`POPOVER_ROWS_MAX`]。
+fn col_menu_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            col_menu_row_names(app.schema.as_deref(), &app.columns)
+                .into_iter()
+                .map(|name| {
+                    let mark = if app.columns.is_hidden(&name) {
+                        "[ ]"
+                    } else {
+                        "[x]"
+                    };
+                    (format!("{mark} {name}"), name)
+                })
+                .collect()
+        },
+        |_app: &LogApp| None,
+        |payload: &str| Msg::ToggleColumn(payload.to_string()),
+        |n| format!("… 还有 {n} 列"),
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]; 行数据**不**取值传入 —— 那正是启动快照 bug 的
+/// 病灶)。
+fn col_menu_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("显示列"))
+            .child(col_menu_rows())
+            .child(format_btn(
+                Text::new("恢复默认".to_string())
+                    .font_size(BODY_SIZE)
+                    .color(Color::WHITE),
+                || Msg::ResetColumns,
+            )),
+    )
+}
+
+/// 字段查询弹层 (SPEC-v1x-field-picker-ui D1): 过滤栏「字段…」按钮入口,
+/// 卡体 = 字段行 (RowList 每帧取 schema 列名) + 算符六钮 (常显) + 值输入 +
+/// 「过滤」钮 (与值输入 Enter 同路)。与 col_menu/export_menu 互斥 (开一关二)。
+pub(crate) fn picker_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(picker_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.picker_open)
+        .on_scrim_click(|| Msg::ClosePicker)
+}
+
+/// 字段行 (RowList, T2): 行 = schema 列名, 载荷 = 列名, 高亮 = 当前选中字段。
+/// 行数封顶见 [`POPOVER_ROWS_MAX`]。
+fn picker_field_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            app.schema
+                .as_deref()
+                .map(|s| {
+                    s.columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        },
+        |app: &LogApp| app.picker_field.clone(),
+        |payload: &str| Msg::PickPickerField(payload.to_string()),
+        |n| format!("… 还有 {n} 列"),
+    )
+}
+
+/// 算符钮 (静态结构, 选中色经 bind 每帧取): 显示 = `=` / `*` / `>=` / `<=` /
+/// `>` / `<` (前缀 = `=` + 值尾 `*`, 拼接在 `build_clause`, 不新造算符)。
+fn op_btn(label: &str, op: danqing_log::jsonl::Op) -> impl Widget {
+    Button::themed(
+        &LightTheme,
+        Text::new(label.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE),
+    )
+    .bind_color(move |app: &LogApp| {
+        if app.picker_op == op {
+            app.theme.theme().accent()
         } else {
-            "[x]"
-        };
-        let display = format!("{mark} {name}");
-        let toggle_name = name.clone();
-        rows = rows.child(format_btn(label(display), move || {
-            Msg::ToggleColumn(toggle_name.clone())
-        }));
+            app.theme.theme().text_secondary()
+        }
+    })
+    .on_click(move || Msg::PickPickerOp(op))
+}
+
+/// 值输入框宽度。
+const PICKER_INPUT_W: f32 = 200.0;
+/// 「过滤」钮标签 (query 卡提交钮, Enter 同路)。
+const PICKER_SUBMIT_LABEL: &str = "过滤";
+
+/// 值输入薄复合件 (Bar 同构; 评审 R3/R7/R8 三缺陷一次消解):
+/// - **提交时读 `ti.value()` 随信** —— 值不设镜像 (镜像有 `set_text`/`clear`
+///   不回 `on_change` 的脱钩窗, 评审 R3: 空框提交出脏子句);
+/// - Enter 只在本件持焦时拦截 (算符钮的 Enter 归按钮自己, 评审 R7);
+/// - 焦点代理 `focus_id = "picker-value"` (`OpenPicker` 送焦, 开弹层直接
+///   打字进值框, 评审 R8)。
+///
+/// 「过滤」钮 paint 侧 (hit 同源缓存) —— 兄弟节点读不到输入缓冲, 提交收口
+/// 必须在持有者内 (plan 核实②的「不许绕」回到原点, 镜像偏差撤销)。
+struct PickerInput {
+    ti: TextInput,
+    submit_rect: std::cell::Cell<Rect>,
+    submit_hover: std::cell::Cell<bool>,
+    /// 钮色 (sync 每帧从主题取 —— 构造值烘死会「浅色启动切暗色钮字发灰」)。
+    submit_accent: Color,
+    submit_idle: Color,
+}
+
+impl PickerInput {
+    fn new() -> Self {
+        Self {
+            ti: TextInput::themed(&LightTheme)
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                .bind_clear(|app: &LogApp| app.picker_clear_rev)
+                .font_size(BODY_SIZE)
+                .placeholder("值 (如 ERROR / 42)", Color::rgb(0.45, 0.45, 0.48)),
+            submit_rect: std::cell::Cell::new(Rect::default()),
+            submit_hover: std::cell::Cell::new(false),
+            submit_accent: Color::rgb(0.18, 0.35, 0.60),
+            submit_idle: Color::rgb(0.4, 0.4, 0.42),
+        }
     }
-    let rows = rows.child(format_btn(label("恢复默认".to_string()), || {
-        Msg::ResetColumns
-    }));
-    UiBox::new(bg)
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            Edges {
-                top: 24.0,
-                right: CARD_PAD_X,
-                bottom: 16.0,
-                left: CARD_PAD_X,
-            },
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(
-                    Text::new("显示列".to_string())
-                        .font_size(BODY_SIZE)
-                        .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
-                )
-                .child(rows),
-        ))
-        .width(CARD_WIDTH)
+
+    /// 提交 = 值随信 (Enter 与「过滤」钮同路)。
+    fn submit(&self, msgs: &mut MsgQueue) -> EventResult {
+        msgs.push(Box::new(Msg::PickerSubmit(self.ti.value().to_owned())));
+        EventResult::Consumed
+    }
+}
+
+impl Widget for PickerInput {
+    fn sync(&mut self, state: &dyn Any) {
+        // TextInput 是**字段**非子节点, 框架不替它传播 sync (Bar 同因)。
+        self.ti.sync(state);
+        if let Some(app) = state.downcast_ref::<LogApp>() {
+            let t = app.theme.theme();
+            self.submit_accent = t.accent();
+            self.submit_idle = t.text_secondary();
+        }
+    }
+
+    fn layout(&mut self, _constraints: Constraints, texts: &mut TextBatch) -> Size {
+        let ti = self
+            .ti
+            .layout(Constraints::loose(Size::new(PICKER_INPUT_W, 999.0)), texts);
+        Size::new(PICKER_INPUT_W + 8.0 + 56.0, ti.height.max(28.0))
+    }
+
+    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        self.ti.paint(
+            Rect::from_xywh(
+                area.origin.x,
+                area.origin.y,
+                PICKER_INPUT_W,
+                area.size.height,
+            ),
+            rects,
+            texts,
+        );
+        let w = texts.measure(PICKER_SUBMIT_LABEL, BODY_SIZE);
+        let bx = area.origin.x + PICKER_INPUT_W + 8.0;
+        let line_h = texts.line_height(f32::from(BODY_SIZE));
+        let base =
+            area.origin.y + (area.size.height - line_h) / 2.0 + texts.ascent(f32::from(BODY_SIZE));
+        // hover 换 accent (发现性, Bar「字段…」同款)
+        let color = if self.submit_hover.get() {
+            self.submit_accent
+        } else {
+            self.submit_idle
+        };
+        texts.push_text(PICKER_SUBMIT_LABEL, bx, base, BODY_SIZE, color);
+        self.submit_rect.set(Rect::from_xywh(
+            bx - 4.0,
+            area.origin.y,
+            w + 8.0,
+            area.size.height,
+        ));
+    }
+
+    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        match event {
+            Event::CursorMoved(p) => {
+                self.submit_hover.set(self.submit_rect.get().contains(*p));
+                self.ti.event(event, area, msgs)
+            }
+            Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position,
+                ..
+            } if self.submit_rect.get().contains(*position) => self.submit(msgs),
+            Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                ..
+            } => self.submit(msgs),
+            other => self.ti.event(other, area, msgs),
+        }
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn focus_id(&self) -> Option<&'static str> {
+        Some("picker-value")
+    }
+
+    fn wants_ime(&self) -> bool {
+        self.ti.wants_ime()
+    }
+
+    fn ime_area(&self) -> Option<Rect> {
+        self.ti.ime_area()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.ti.selected_text()
+    }
+
+    fn hit_area(&self) -> Option<Rect> {
+        self.ti.hit_area()
+    }
+
+    fn reset_focus(&mut self) {
+        self.ti.reset_focus();
+    }
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「查询字段」+ 字段行 + 算符六钮 + 值输入。
+fn picker_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("查询字段"))
+            .child(picker_field_rows())
+            .child(
+                Row::new()
+                    .gap(8.0)
+                    .cross_center()
+                    .child(op_btn("=", danqing_log::jsonl::Op::Eq))
+                    .child(op_btn("*", danqing_log::jsonl::Op::Prefix))
+                    .child(op_btn(">=", danqing_log::jsonl::Op::GtEq))
+                    .child(op_btn("<=", danqing_log::jsonl::Op::LtEq))
+                    .child(op_btn(">", danqing_log::jsonl::Op::Gt))
+                    .child(op_btn("<", danqing_log::jsonl::Op::Lt)),
+            )
+            .child(PickerInput::new()),
+    )
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -1510,13 +1707,215 @@ mod tests {
         ]);
         assert!(cfg.move_column(2, 0)); // c a b
         assert!(cfg.set_hidden("a", true));
-        assert_eq!(col_menu_row_names(&schema, &cfg), vec!["c", "a", "b"]);
+        assert_eq!(
+            col_menu_row_names(schema.as_ref(), &cfg),
+            vec!["c", "a", "b"]
+        );
         // 空配置回退 schema 首见序
         assert_eq!(
-            col_menu_row_names(&schema, &danqing_log::columns::ColumnConfig::default()),
+            col_menu_row_names(
+                schema.as_ref(),
+                &danqing_log::columns::ColumnConfig::default()
+            ),
             vec!["a", "b", "c"]
         );
         // 无 schema = 空表 (弹层本就不该开)
-        assert!(col_menu_row_names(&None, &cfg).is_empty());
+        assert!(col_menu_row_names(None, &cfg).is_empty());
+    }
+
+    /// T0 判罪锁 (SPEC-v1x-field-picker-ui D2): 「显示列」行集**每帧取态** ——
+    /// 建树后 schema 就位/换文件行跟随, 点击载荷 = 新 schema 的列名。
+    /// 修复前: 行集是 view() 建树快照 (schema=None) → 弹层永远只剩「恢复默认」。
+    #[test]
+    fn col_menu_rows_follow_schema_across_sync() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        use danqing::{Constraints, Event, Point, Rect, Size, TextBatch};
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-rows-{}.toml",
+            std::process::id()
+        ));
+        let mut list = col_menu_rows();
+        let mut texts = TextBatch::new();
+        let c = Constraints::loose(Size::new(300.0, 10_000.0));
+        // 建树时无 schema (启动快照场景) = 零行
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        list.sync(&app);
+        assert_eq!(
+            list.layout(c, &mut texts).height,
+            0.0,
+            "启动无 schema = 零行"
+        );
+        // schema 就位 → 行出现
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        list.sync(&app);
+        assert_eq!(
+            list.layout(c, &mut texts).height,
+            2.0 * crate::pick_list::ROW_H,
+            "行跟随 schema 就位"
+        );
+        // 换文件 → 行换 + 点击载荷 = 新列名
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "fresh".into(),
+                width_chars: 4,
+            }],
+        }));
+        list.sync(&app);
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 200.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let p = Point::new(20.0, 4.0);
+        list.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        list.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ToggleColumn(n)) if n == "fresh"
+            )),
+            "点击载荷 = 新 schema 列名 (非启动快照)"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 评审 R3/R7/R8: 提交值**随信** (`PickerSubmit(String)`, 不设镜像 ——
+    /// 镜像有 set_text/clear 不回 on_change 的脱钩窗); Enter 与「过滤」钮同路
+    /// (收口在持有者内, 兄弟钮读不到缓冲的唯一解)。
+    #[test]
+    fn picker_input_enter_and_button_carry_value() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-pin-{}.toml",
+            std::process::id()
+        ));
+        let mut input = PickerInput::new();
+        let app = LogApp::new_empty_at(Some(cfg.clone()));
+        input.sync(&app);
+        input.ti.set_text("ERROR");
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 32.0);
+        let mut texts = TextBatch::new();
+        let size = input.layout(Constraints::loose(Size::new(300.0, 32.0)), &mut texts);
+        // Enter (值框持焦路径) → 值随信
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::PickerSubmit(v)) if v == "ERROR"
+            )),
+            "Enter 提交带出框内值 (无镜像)"
+        );
+        // 「过滤」钮 (paint 写 rect, hit 同源) → 同路
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        input.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+        input.ti.set_text("ER2");
+        let r = input.submit_rect.get();
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, 16.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::PickerSubmit(v)) if v == "ER2"
+            )),
+            "「过滤」钮与 Enter 同路"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T2 真 paint 锁 (非零平移原点 —— v1.0.2 平移不变教训): 查询卡产出字形,
+    /// 字段行行数跟随 schema (高亮跟随在 pick_list 通用锁)。
+    #[test]
+    fn picker_card_paints_glyphs_and_field_rows_follow() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-picker-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.picker_open = true;
+        app.picker_field = Some("b".to_string());
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        // 真 paint: 卡体字形产出 (非零平移原点)
+        let mut card = picker_card(Color::rgb(0.1, 0.1, 0.1));
+        card.sync(&app);
+        let mut texts = TextBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 900.0)), &mut texts);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        card.paint(
+            Rect::new(Point::new(137.0, 89.0), size),
+            &mut rects,
+            &mut texts,
+        );
+        assert!(
+            texts.glyph_clips().count() > 0,
+            "查询卡须产出字形 (标题/行/钮)"
+        );
+        // 字段行行数跟随 schema (T0 判罪面在 pick_list 通用锁, 此处锁 builder 接线)
+        let mut rows = picker_field_rows();
+        rows.sync(&app);
+        assert_eq!(
+            rows.layout(Constraints::loose(Size::new(200.0, 900.0)), &mut texts)
+                .height,
+            2.0 * crate::pick_list::ROW_H
+        );
+        std::fs::remove_file(&cfg).ok();
     }
 }
