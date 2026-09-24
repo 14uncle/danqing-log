@@ -56,6 +56,6 @@
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | **五段全闭**（2026-09-23 一日走完: 365 测试绿, 双路评审 Critical×1+Required×6 全修 + Nit×5 清零, 零框架/引擎改动）; 人工验收**记账**（`tasks/acceptance-pending.md` A 组） |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | **五段全闭**（2026-09-23 一日走完: 双路评审 Critical×1+Required×6 全修 + simplify, 376 测试绿, 零框架/引擎改动）; 人工验收**记账**（总清单 D 组） |
 | `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | **五段全闭**（2026-09-23: 含 T0 col_menu 启动快照修复; 双路评审并账 Critical×1+Required×6 全修（拼子句守卫/镜像退役回归持有者收口/载荷锚定/键路门禁）; 2026-09-24 simplify 8 项行为零变化收口, 393 测试零修改, 零框架/引擎改动; 人工验收五条记账 E 组） |
-| `workspace-sessions` | `SPEC-v1x-workspace-sessions.md` | **build 全闭**（2026-09-24 一日: 「go」×2 裁定全按推荐 → /build auto T1–T4, 407 测试绿; 账本改名 `state.json` 一次到位 + 写穿/剔除/门控两道闸 + RowList 第三消费者契约零变化; 人工验收五条记账 F 组）—— 待 review |
+| `workspace-sessions` | `SPEC-v1x-workspace-sessions.md` | **五段全闭**（2026-09-24 一日: 「go」×2 → /build auto T1–T4（407 绿）→ 双路评审并账 Critical×3+Required×5 全修（账本可辨谓词/上限取齐/点穿/假绿锁/护在途/拒收显式清空）→ simplify 3 项零变化收口, 413 测试零修改, 零框架/引擎改动; 人工验收五条记账 F 组） |
 
 每模块按 spec → plan → build → review → code-simplify 五段推进，spec 写完不立即编码。

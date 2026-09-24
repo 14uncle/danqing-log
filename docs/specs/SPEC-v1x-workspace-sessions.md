@@ -2,9 +2,10 @@
 
 - @author 十四叔
 - @date 2026/09/24
-- 状态: **build 全闭**（2026-09-24 一日: 「go」批准 → plan「go」→ /build auto
-  T1–T4 全闭, 407 测试绿 = 393+14; 含账本改名 `state.json` 一次到位）——
-  待 review; **人工验收（五条）记账**（总清单 F 组）
+- 状态: **五段全闭**（2026-09-24 一日: 「go」→plan→/build auto T1–T4（407 绿）
+  → 双路评审并账 Critical×3+Required×5 全修 +6 锁（413 绿）→ code-simplify
+  3 项行为零变化收口（413 测试零修改）; 含账本改名 `state.json` 一次到位）;
+  **人工验收（五条）记账**（总清单 F 组）
 - 所属: 能力地图 `SPEC-v1x-map.md` 模块 `workspace-sessions`（构建顺序**末棒**;
   依赖: `licensing`（付费门, 枚举已预埋）+ `table-column-config`（列配置模型与
   写穿接缝）; 免费层欠账三连已全部建成）
@@ -39,7 +40,8 @@ ROADMAP §腿三/腿四 字面项：**命名会话（过滤器组合 + 搜索历
    （用户自管, 不吃 LRU）。temp+rename 原子落盘 / 损坏备份守卫 /
    `columns_path` panic 封死家法**整套随迁**（封死 fn 随名改 `state_path`）。
 4. **门控 = `Feature::WorkspaceSessions` 全动作**（推荐④, 枚举与 label「工作台
-   会话」licensing 已预埋）: 保存/应用/删除/重命名全在门后; **门控点位 = 入口**
+   会话」licensing 已预埋）: 保存/应用/删除全在门后（**勘误 M16**: 「重命名」
+   不设独立动作 = 同名覆盖语义, 评审 FYI 定案）; **门控点位 = 入口**
    （export D7 先例: 免费态点「会话」入口 → 统一升级提示, 在弹层/对话框**之前**）;
    **数据永在**——降级不变砖 = 锁动作不毁数据（试用过期者再购即回）。
 5. **UI = 状态栏「会话」按钮 + 弹层族四件套**（推荐⑤; 导出/设置同排先例）:
@@ -48,10 +50,11 @@ ROADMAP §腿三/腿四 字面项：**命名会话（过滤器组合 + 搜索历
    全套: 四件套（Overlay + bind_open + on_scrim_click + 行按钮）、Esc 插层、
    模态守卫、与三弹层互斥（`close_popovers`/`popover_open` 收口直扩一员）。
    同名保存 = **覆盖** + 底栏「已更新」（会话是工作台快照, 覆盖是主用法）。
-6. **上限与失效**（推荐⑥）: 每路径命名会话上限 **32** 条, 满员拒绝 + 提示
-   （书签上限先例: 「正常使用永远碰不到, 刷屏有闸」）; 展开态**行号越界剔除 +
-   无子行剔除**（书签越界剔除先例, 「安静消失」; 应用时对当前内容现算子行,
-   解析不出子行的行号丢弃）。
+6. **上限与失效**（推荐⑥; **勘误 M3**: 上限 32 → **12**, 评审定案——与弹层
+   可视封顶取齐, 可达集恒等于允许集, 超出可视的上限是静默不可达的假闸）:
+   每路径命名会话上限 **12** 条, 满员拒绝 + 提示; 展示序 = 保存时刻**降序**
+   （新存在顶）; 展开态**行号越界剔除 + 无子行剔除**（书签越界剔除先例,
+   「安静消失」; 应用时对当前内容现算子行, 解析不出子行的行号丢弃）。
 
 **In**:
 
@@ -140,8 +143,10 @@ AsyncJob 代次拒旧先例护在途）, 展开存**行号表**（应用现算�
                   "order", "hidden", "widths", "expands", "updated" } ] }
 ```
 
-列三字段复用 `ColumnConfig` 的序列化形状（order/hidden/widths, 同容错同模型）;
-坏条**丢条不丢账**; `sessions` 不吃 files 的 LRU（用户自管, 上限拒绝制）。
+列三字段复用 `ColumnConfig` 的序列化形状（**勘误 M13**: 容错面不全同 ——
+会话身份字段严（缺 name/path/updated = 条废）, 列三字段宽（容缺省, 应用时
+merge 兜底））; 坏条**丢条不丢账**; `sessions` 不吃 files 的 LRU（用户自管,
+上限拒绝制）。
 改名一次到位: `default_path`/`columns_path`→`state_path`/注释/测试封死随迁,
 旧 `columns.json` 读入即迁移（存在旧名→读旧写新, 一次性; 零真实用户但迁移
 写上防手工建过文件的人）。
@@ -177,7 +182,7 @@ AsyncJob 代次拒旧先例护在途）, 展开存**行号表**（应用现算�
    付费态放行; **付费态永不触发升级提示**（两道闸锁）
 5. ✅ 弹层接线: 开闭 / 互斥（与三弹层双向）/ Esc 次序 / 模态守卫 / 换文件关
    并草稿复位（picker 同规）; 保存/应用/删除三动作 Msg 链
-6. ✅ 上限: 第 33 条拒绝 + 提示; 删除后可再存
+6. ✅ 上限: 第 13 条拒绝 + 提示; 删除后可再存（上限随勘误 M3 = 12）
 7. ✅ 三件套全绿, **基线 393 不破**（收口 407）; A/B 精确红在案（摘会话写出 /
    摘写穿 / 摘剔除各一）
 
@@ -256,6 +261,70 @@ AsyncJob 代次拒旧先例护在途）, 展开存**行号表**（应用现算�
   三处在案; 零框架/引擎改动（`ExpandMap::lines()` 是产品 lib 增方法）。
   **修程纠偏三处**（非设计问题）: 测试夹具漏 `updated` 被容错正判 / 插块孤儿
   行崩括号 / `MouseWheel` 修饰字段构造缺项 —— 均当场纠。
+
+## 评审记（2026-09-24 review 阶段：双路独立评审 + 并账修复闭环）
+
+**双路互不知情**：①五轴全量路 ②三区深潜路（账本容错/迁移面 · save-apply 写穿
+与剔除面 · 弹层键路/门控接线面）。两路均 Request changes；并账去重（重叠取高）
+后 **Critical×3 + Required×5 + Optional×6 + Consider/FYI×2**, 全部处置、
+每修一锁（+6 新锁 + 4 处扩锁）。
+
+### 修复清单（并账去重）
+
+| 级 | 缺陷 | 来源 | 修法 | 锁 |
+|---|---|---|---|---|
+| Critical M1 | `backup_if_corrupt` 损坏判据只认 `entries` ——「files 坏条 + sessions 完好」是丢段不丢账的合法容错, 却被整账判损 rename `.bak`, 他会话丢出活跃账本（bookmark-persist Critical 守卫在两段账本上留洞） | 深潜①-C1 = 五轴 3 重叠**取高** | 「可辨账本」谓词收口 `is_recognizable`（两段任一有条目）—— 损坏备份与迁移回落**同源共用** | `state_account_recognizes_sessions_and_falls_back_then_retires_legacy`（sessions-only 不备份 + 他会话不丢） |
+| Critical M2 | 迁移读/备判据不对称 + 非「一次性」—— 坏/空新名时 save_state 先挪新名、再读旧名、拿空内存覆盖旧名本路径切片（家族 Critical 复发）; 空新名永久挡死迁移 | 五轴 1 ⊕ 深潜①-R1 | `load_state_account` **可辨**才新名优先（不可辨回落旧名, 同谓词）+ save_state 落成后旧名 rename 退役 `.migrated`（一次性; 不删 —— 数据不毁） | 同上（空新名回落 → 旧记忆写回 → 旧名退役断言） |
+| Critical M3 | 上限 32 vs 可视 12 脱节 —— 第 13 条起不可见/不可应用/不可删除, 新会话 push 队尾**存完即消失**（静默不可达） | 五轴 2 | 上限 32→**12** 与 `POPOVER_ROWS_MAX` 取齐（可达集恒等于允许集）+ 展示序 updated **降序**（新存在顶） | `session_rows_show_all_up_to_cap_newest_first`（满员全画无尾行死角 + 第一行 = 最新） |
+| Req M4 | 导出点击「点穿」: `return Consumed` 被吞落入「此处无行」, 后到 Notice **覆盖**守卫文案（家族⑤次序陷阱复发）; 旧锁只看正向消息 = 假绿 | 五轴 4 | export 分支复位 `return EventResult::Consumed` | export 锁扩「Consumed + **恰一条**消息」 |
+| Req M5 | 模态滚轮锁假绿: `wheel(3.0)` 向上滚在 `top_row=0` 被钳回 —— 门禁整段删掉断言也恒真（家族⑥复发） | 五轴 5 | 真锁改可动位（`top_row=5` + `wheel(-1.0)` 向下） | wire 锁改真（摘门禁必红） |
+| Req M6 | 互斥「与弹层族双向」半边无锁 —— `session_menu_open` 漏出 `close_popovers` 时 OpenPicker/OpenSettings 路径无锁会红 | 五轴 6 | 补双向锁 + 「三弹层」注释 10 处随名「弹层族」 | `session_menu_mutex_is_bidirectional` |
+| Req M7 | `clear_search` 不 `invalidate` 在途 `search_job` —— 清空/空搜索会话应用后旧搜索经 tick 复活（spec「代次拒旧护在途」的搜索侧半边违约） | 深潜②-R1 | 补 `search_job.invalidate()`（`clear_filter` 同规） | `clear_search_kills_pending_search_job` |
+| Req M8 | `apply_session` 遇搜索串正则拒收（跨编码/手造）时 3/4 写穿后仍 `true` 关弹层 —— 四样名不副实 | 深潜②-R2 | 搜索串先验正则, 失败 = **显式清空** + 说清（四样须「已应用或已显式清空」才许关） | `apply_session_with_invalid_search_explicitly_clears` |
+| Opt M9 | 幽灵名删除不清指针 → 反复「会话不存在」 | 深潜②-O1 | 指针随名清（找到与否都清） | cap 锁扩「幽灵名删除清指针」 |
+| Opt M10 | 名归一不一致: 空白名载入存活 vs 保存拒; 控制字符/超长名直通 notice 与行文本 | 深潜①-O1/O2 | `clean_session_name`（trim + 剔控制字符 + 截 64）保存载入同式 | `clean_session_name_trims_strips_controls_and_clamps` |
+| Opt M11 | 窄窗位置计数左缘钳制压「会话」钮字（看得见行号、点出会话） | 深潜③-O1 | 「放不下就不画」（Bar hint 家规）: 会撞钮带整条不画 | 记档（几何锁成本高, 触面 = 窄窗边缘档, 实机核对） |
+| Opt M12 | `close_popovers` 关会话不清草稿（靠下次开兜）; 换文件草稿复位无显式锁 | 深潜③-O2 ⊕ 五轴锁表 | 关清草稿随 `close_popovers` 关走 | wire 锁扩「互斥关也清草稿」 |
+| Opt M13 | D3「同容错同模型」字面与实现分叉（order 会话侧容缺省） | 五轴 7 | spec 勘误: 会话身份字段严、列三字段宽（merge 兜底） | —（文档） |
+| Opt M14 | `normalize_sessions` 双线性扫描 O(n²)（硬顶 8192 时） | 五轴 8 | HashMap 去重 + 计数 | —（行为零变化, 既有锁覆盖） |
+| Con M15 | 「删除须先应用建指针」实机语义（想删 B 先把 B 砸脸上） | 五轴 9 | **记档**: 实机抱怨再裁独立选中（hover/右键） | —（记档） |
+| FYI M16 | spec 范围④「重命名」措辞 vs 三动作 | 五轴 11 | spec 勘误: 重命名 = 同名覆盖语义 | —（文档） |
+
+### 两路排除项（核对一致）
+
+书签零触碰（结构无键 + 内存全等锁）/ `put_sessions_for_path` 只动本路径切片 /
+读改写保他路径 files+sessions / 展开剔除与 `toggle_expand` 逐点一致（含 0 与
+u64::MAX）/ 写穿次序正确 / SubmitInput 泛化逐行为零变化（layout 恒等式 / 持有者
+收口无镜像 / focus_id 注入; Enter 归属由框架焦点路由保证）/ 免费四动作 + 入口
+全拦且**「弹层开着切免费态」被上游状态机封死**（`adopt_store_entitlement` 只升
+不降）/ 两道闸付费永不误弹（`ShowUpgradePrompt` 内再兜一道）/ Esc 首插 / 模态
+三处同源接线（假绿在测试不在接线）/ 无选中删除提示 / 换文件清选中 / 
+`ExpandMap::lines()` 键序升序 / `state_path` 家法 / 测试无真实桌面副作用。
+**`OpenColMenu` 不关 settings 为既有缺口**（非本模块引入, 记档随 M15）。
+
+### 修复验证
+
+三件套全绿: fmt / clippy `-D warnings` 0 / **413 测试**（407 → 413: +6 新锁;
+M4/M5/M9/M12 为扩锁）。**红记录**: M1/M2 联合锁摘谓词必红（sessions-only 被
+备份 / 空新名挡死迁移）; M3 锁摘降序或上限取齐必红; M5 旧锁对无效门禁恒真
+（假绿实证 —— 家族⑥第二例）。修程纠偏三处: 插块孤儿行 ×2（当场清）/
+M4 锁一度装错文件（当场改正）。
+
+## 简化记（2026-09-24 code-simplify 收口: 行为零变化, 测试零修改, 413 绿）
+
+| # | 简化 | 面 | 内容 |
+|---|---|---|---|
+| 1 | widths 双向去重 | `columns.rs` | `widths_to_value`（键排序写入 —— 评审 Nit 先例的排序语义随 helper 归一）/ `widths_from_value`（逐键容错 —— 评审 C1 先例）—— `entry_*`/`session_*` 四处同用, 列三字段「同模型」的真身落地 |
+| 2 | `now_secs` 收口 | `main.rs` | `save_state`/`save_session` 双份 SystemTime 舞蹈 → 单点（钟坏按 0 落账的语义随名自明） |
+| 3 | 杂项 | `columns.rs` | `normalize_sessions` 冗余内层 `use` 删（顶层已有）; `MAX_SESSION_NAME_LEN` 常量前置到 `clean_session_name` 之前 |
+
+**不动清单**（Chesterton 判过, 合并即损）: hidden 解析双份 —— `entry_from_value`
+严（坏形状 `?` 条废）vs `session_from_value` 宽（丢字段不丢条）是 **M13 勘误的
+分叉本体**, 合并即行为变化; `picker_input`/`session_name_input` 同构双测试锁 ——
+两消费者各自显式, 合并参数化损锁名可读; `view.rs` 状态栏钮与 export 块镜像 ——
+锚链布局可读性优先, 抽多参 helper 反遮结构。
+
+**验证**: fmt / clippy `-D warnings` 0 / **413 测试零修改全绿**。
 
 ## 人工验收
 

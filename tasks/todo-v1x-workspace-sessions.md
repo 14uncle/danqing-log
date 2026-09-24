@@ -3,9 +3,11 @@
 - @author 十四叔
 - @date 2026/09/24
 - Spec: `docs/specs/SPEC-v1x-workspace-sessions.md` · Plan: `tasks/plan-v1x-workspace-sessions.md`
-- 状态: **build 全闭**（2026-09-24 一日: 「go」批准 spec + plan → /build auto
-  T1–T4 全闭, 零 commit 惯例）—— 人工验收记账（F 组）→ review → code-simplify
-- 测试基线: **393** → build 收口 **407**（393 + 14: T1 六 + T2 三 + T3 五）
+- 状态: **五段全闭**（2026-09-24 一日: 「go」×2 → /build auto T1–T4 → 双路评审
+  并账 Critical×3+Required×5 全修 → code-simplify 3 项零变化收口）——
+  人工验收记账（F 组）待实机
+- 测试基线: **393** → build 收口 407 → review 收口 **413** → simplify 收口
+  **413**（零修改）
 
 ## Phase 1: 持久化 + 状态链
 
@@ -59,8 +61,18 @@
       保存→重启→应用回来 ②同文件两会话互切/同名覆盖 ③免费态入口升级提示
       且数据不丢/激活后可用 ④轮转后应用: 布局回来/越界安静消失 ⑤换文件列表
       只显本路径
-- [ ] 进 review 阶段（`/agent-skills:code-review-and-quality`, 双路独立评审）
-- [ ] 进 code-simplify 阶段
+- [x] 进 review 阶段（2026-09-24 **双路独立评审** —— 五轴全量 + 三区深潜
+      互不知情, 均 Request changes; 并账 **Critical×3+Required×5 全修**:
+      M1/M2 账本可辨谓词收口+回落同源+旧名退役一次性 / M3 上限 12 与可视取齐
+      +降序 / M4 导出点穿复位 / M5 滚轮假绿改真锁 / M6 互斥双向锁 / M7
+      clear_search 作废在途 / M8 正则拒收显式清空; Optional/Nit 全清
+      (M9–M12 修复+锁, M13/M14/M16 文档与零变化重构, M15 记档)。+6 锁 →
+      **413 绿**。
+- [x] 进 code-simplify 阶段（2026-09-24 收口）—— 3 项行为零变化: widths
+      双向去重（列三字段同模型真身）/ `now_secs` 收口 / 杂项; **不动清单**
+      （hidden 解析分叉 = M13 本体 / 同构双锁 / 状态栏镜像块）见 spec 简化记。
+      413 测试零修改全绿。留档: M15 删除指针独立选中实机再裁 / M11 窄窗几何
+      实机核对 / `OpenColMenu` 不关 settings 既有缺口
 
 ## 遗留 / 待用户动作
 

@@ -31,7 +31,25 @@
   弹层族第四员（Esc 首插/互斥扩员/模态同源）。A/B 三红（摘恒写/摘写穿/摘
   剔除）; **407 绿**（393+14）零 commit; 人工验收 F 组五条记账（**需付费态**）;
   三处前账兑现注记（bookmark-persist 改名 / col-config 写穿 / columns.rs
-  strip）。待 review。
+  strip）。
+  **同日 review 收口（双路评审均 REQUEST CHANGES → 并账全修）**: Critical ×3
+  （M1 `backup_if_corrupt` 判据不认 sessions 段——合法容错账本被整账判损丢
+  他会话; M2 迁移读/备判据不对称+非一次性——坏/空新名经 legacy 空内存覆盖
+  本路径记忆, 修 = **可辨谓词 `is_recognizable` 收口** + 回落同源 + 旧名
+  rename 退役 `.migrated`; M3 上限 32 vs 可视 12 脱节——第 13 条起静默不可达,
+  修 = 上限取齐 12 + 展示降序）+ Required ×5（导出点穿「此处无行」覆盖守卫
+  文案——家族⑤复发 / 滚轮锁假绿——家族⑥复发改真锁 / 互斥双向补锁 /
+  `clear_search` 不作废在途复活旧搜索 / 正则拒收 3/4 写穿谎报成功→显式清空）
+  全修, Optional/Nit 全清, +6 锁 → **413 绿**。教训两笔: 家族病史⑤⑥在新
+  面复发均被本轮对照清单抓出——对照清单要继续随模块传代; spec 措辞两处
+  （「重命名」「同容错」）被实现打脸后勘误, 勘误随评审记走。
+  **同日 code-simplify 收口 → 五段全闭**: 3 项行为零变化（widths 双向去重
+  —— 列三字段同模型真身 / `now_secs` 收口 / 杂项）+ 不动清单（hidden 解析
+  分叉 = M13 本体 / 同构双锁 / 状态栏镜像块）, **413 测试零修改**。留档:
+  删除指针独立选中实机再裁 / 窄窗几何实机核对 / OpenColMenu 不关 settings
+  既有缺口。地图**七模块至此全闭**（licensing/field-analytics/export/
+  table-column-config/bookmark-persist/field-picker-ui/workspace-sessions）,
+  v1.x 首波收口。
 - 2026-09-23 (**v1.0.2 MSIX 用户已提交; 腿三 export 一日全链: spec→plan→build T1–T7**):
   商店侧余认证 (v1.0.0 同款节奏, 认证通过后照 `docs/ms-store-copy.md`「v1.x 上架时
   必须改什么」清单核隐私政策双轨口径贴的是新版)。export: 四项口径 interview 裁定
