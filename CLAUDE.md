@@ -4,6 +4,18 @@
 
 ## 状态
 
+- 2026-09-24 (**field-picker-ui code-simplify 收口 → 五段全闭**): 8 项行为零变化
+  简化 (**393 测试零修改全绿**): 拒收说清单一收口 `clause_reject_notice` (判据+
+  文案同一函数, PickerSubmit 22 行分类链→4 行; 修程: `?` 极性写反被表驱动锁当场
+  红) / `close_popovers`+`popover_open` 三弹层开合与三门禁同源 (评审 R6 落实为
+  代码) / 五卡壳收口 `card_shell`/`card_column`/`card_title` (设置/升级/导出/列
+  管理/字段查询, 约 75 行重复→3 helper, 注释随壳搬家) / `POPOVER_ROWS_MAX` /
+  `BODY_SIZE`→`view::FONT_SIZE` 别名钉同值 / RowList 假缓存字段删 / view 两处
+  「TextInput 既不裁剪」过期注释更正 (框架 09-20 已裁剪, P33 规矩保留说理) /
+  可见性收紧。**FONT_SIZE 耦合方向裁定**: view = bin 布局 token 家, 消费者指向
+  它方向正确 (同 crate 无环), 不为一 const 开新家; 真害 = 同值分家已钉。留档:
+  许可页镜像 R3 同族窗实机再收 / RowList 五闭包等第三消费者。余人工验收 E 组
+  五条记账待实机。
 - 2026-09-23 (**v1.0.2 MSIX 用户已提交; 腿三 export 一日全链: spec→plan→build T1–T7**):
   商店侧余认证 (v1.0.0 同款节奏, 认证通过后照 `docs/ms-store-copy.md`「v1.x 上架时
   必须改什么」清单核隐私政策双轨口径贴的是新版)。export: 四项口径 interview 裁定
@@ -63,6 +75,28 @@
   / 两锁补半边 / 旧注释勘误) 全修, +4 锁 → **376 绿**。
   **同日 code-simplify 收口 → 五段全闭**: 抽 `backup_if_corrupt` (save_state
   守卫策略块命名化), 不动清单见 spec 简化记, 376 绿行为零变化。
+  **同日下一棒 field-picker-ui build T0–T2 全闭** (「go」三项+T0 全按推荐):
+  **事实盘点揭发框架生命周期铁律** —— `app.view()` 一次性建树不再重建 (六处
+  框架文档), 每帧只 sync 刷值 → **揪出 table-column-config 漏判**: 「显示列」
+  弹层行集 = 建树快照 (schema=None) 结构上只剩「恢复默认」一行 (双路评审与
+  机器锁均未触到框架生命周期面) → **T0 搭车修**: `src/pick_list.rs` RowList
+  自绘行列表件 (sync 闭包每帧取态) + col_menu 换挂 (快照参数整个删除), 判罪锁
+  `col_menu_rows_follow_schema_across_sync` (摘 sync 重建红 `0.0≠84.0`)。
+  T1 拼子句 `build_clause` (6 算符+前缀尾 `*`, 空值/含空白拒绝) + picker 三态 +
+  6 Msg 臂 (**plan 偏差**: `on_change` 值镜像 = 许可页 `LicenseKeyInput` 先例,
+  替代自绘复合件; Enter 经 app_key_filter 拦 —— TextInput 不消费 Enter 已核);
+  T2 Bar「字段…」按钮 (hint 同款先测后存同帧让位, `.log` 不出) + 查询卡 +
+  Esc 插层/模态/互斥/换文件关/清草稿。**A/B 两红** (T0 sync 重建 / 追加拼接)
+  在案; **388 绿** (376+12)。人工验收五条记账 E 组 (E5 兼 table-column-config
+  A3 勘误验点)。
+  **同日 review 收口 (双路评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (**拼接面 < parse 破坏面** —— 值含 `>`/`<` 静默改写查询 / 双字符算符拼合 /
+  Eq 尾星偷换前缀 / 字段含点逃逸; 修 = build_clause 拒收面盖住破坏面 + 表驱动
+  对抗锁) + Required ×6 (托盘 OpenSettings 互斥缺口 / roundtrip 锁过弱 /
+  **值镜像 vs bind_clear 脱钩 → 镜像退役回归 PickerInput 持有者收口** ——
+  plan 偏差反转, R3/R7/R8 三缺陷一次消解: 值随信/Enter 只归值框/focus_id 送焦 /
+  RowList pressed 存行号送错列 → 载荷锚定 + rebuild 关弹层 / 弹层导航键穿透 →
+  门禁与模态清单同源) 全修, Optional/Nit 全清, +5 锁 → **393 绿**。待 simplify。
   **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
   write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
   main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。

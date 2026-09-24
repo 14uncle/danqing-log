@@ -55,7 +55,7 @@
 | `export` | `SPEC-v1x-export.md` | **五阶段全闭**（2026-09-23 一日走完, 314 测试绿; 人工验收**记账延后** 2026-09-23 用户裁定, 待实机回填） |
 | `table-column-config` | `SPEC-v1x-table-column-config.md` | **五段全闭**（2026-09-23 一日走完: 365 测试绿, 双路评审 Critical×1+Required×6 全修 + Nit×5 清零, 零框架/引擎改动）; 人工验收**记账**（`tasks/acceptance-pending.md` A 组） |
 | `bookmark-persist` | `SPEC-v1x-bookmark-persist.md` | **五段全闭**（2026-09-23 一日走完: 双路评审 Critical×1+Required×6 全修 + simplify, 376 测试绿, 零框架/引擎改动）; 人工验收**记账**（总清单 D 组） |
-| `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | **已批准 + plan 待过目**（2026-09-23「go」三项+T0 全按推荐; 同日盘点揪出 col_menu 启动快照 bug → T0 搭车修） |
+| `field-picker-ui` | `SPEC-v1x-field-picker-ui.md` | **五段全闭**（2026-09-23: 含 T0 col_menu 启动快照修复; 双路评审并账 Critical×1+Required×6 全修（拼子句守卫/镜像退役回归持有者收口/载荷锚定/键路门禁）; 2026-09-24 simplify 8 项行为零变化收口, 393 测试零修改, 零框架/引擎改动; 人工验收五条记账 E 组） |
 | `workspace-sessions` | `SPEC-v1x-workspace-sessions.md` | 未开工 |
 
 每模块按 spec → plan → build → review → code-simplify 五段推进，spec 写完不立即编码。

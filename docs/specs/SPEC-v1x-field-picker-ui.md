@@ -2,8 +2,10 @@
 
 - @author 十四叔
 - @date 2026/09/23
-- 状态: **已批准**（2026-09-23 用户「go」: 范围三项推荐 + T0 + Open Q①② 全按
-  推荐裁定）→ plan/todo 已出（`tasks/plan-v1x-field-picker-ui.md`）—— **待过目**
+- 状态: **五段全闭**（2026-09-23 一日: 「go」→plan→/build auto→
+  双路评审并账 Critical×1+Required×6 全修, 393 测试绿, 含 T0 col_menu 启动快照
+  修复; 2026-09-24 code-simplify 行为零变化收口, 393 测试零修改; 零框架/引擎改动）;
+  **人工验收（五条）记账**（总清单 E 组）
 - 所属: 能力地图 `SPEC-v1x-map.md` 模块 `field-picker-ui`（构建顺序第 6 位，接
   `bookmark-persist` 之后；免费层欠账三连**末件**；依赖: **无**——不接 licensing
   门控，免费层白送）
@@ -123,21 +125,20 @@ LogApp 缓存行文案与状态（Vec<String> + 选中索引）, `paint` 画行 
 
 ## 成功判据
 
-**机器可验**：
+**机器可验**（2026-09-23 build 收口已全过）：
 
-1. 拼子句纯函数：字段+算符+值 → `字段<op>值`（6 算符各一测, 前缀 = 值尾 `*`）;
-   空值/空字段拒绝
-2. 追加语义：空查询直提 / 有查询空格连接（AND 合成语义经 `parse_query` roundtrip
-   锁）; 提交走 `ApplyFilter` 全链（既有过滤锁零回退）
-3. **T0 回归锁（真 paint）**：建树后 schema 就位/换文件 → col_menu 行**跟随**
-   （启动快照 bug 的精确红: 摘 sync 缓存重建 = 红）; 点行发 `ToggleColumn`
-   （合成几何注入）
-4. 字段行同构锁：schema 变化行跟随 / 点行发拼接请求 / ≤16 封顶 +「还有 N 列」
-5. 弹层接线：开闭 / Esc 次序（含与 col_menu/export_menu 互斥）/ 模态守卫 /
-   scrim 关闭; 空值拒绝 + notice
-6. `.log`（schema None）不出「字段…」按钮（`schema.is_some()` 判据, export
-   同哲学）
-7. 三件套全绿，**基线 376 不破**; A/B 精确红（T0 sync 缓存重建 / 拼子句 两处必录）
+1. ✅ 拼子句纯函数：字段+算符+值 → `字段<op>值`（6 算符各一测, 前缀 = 值尾 `*`）;
+   空值/空字段/含空白值拒绝
+2. ✅ 追加语义：空查询直提 / 有查询空格连接（`parse_query` roundtrip 锁）;
+   提交走 `ApplyFilter` 全链（既有过滤锁零回退）
+3. ✅ **T0 回归锁（真 paint）**：建树后 schema 就位/换文件 → col_menu 行**跟随**
+   （摘 sync 缓存重建 = 精确红）; 点行发 `ToggleColumn`（合成几何注入）
+4. ✅ 字段行同构锁：schema 变化行跟随 / 点行发拼接请求 / ≤16 封顶 +「还有 N 列」
+   （尾行不可点）
+5. ✅ 弹层接线：开闭 / Esc 次序（含与 col_menu/export_menu 互斥）/ 模态守卫 /
+   scrim 关闭 / Enter 与「过滤」钮同路; 空值拒绝 + notice; 关闭清草稿
+6. ✅ `.log`（schema None）不出「字段…」按钮（真 paint 显示判据锁）
+7. ✅ 三件套全绿，**基线 376 不破**（收口 388）; A/B 精确红两处在案（见实现记）
 
 **人工验收**（记账 → `tasks/acceptance-pending.md` 续 E 组）：
 
@@ -169,18 +170,115 @@ LogApp 缓存行文案与状态（Vec<String> + 选中索引）, `paint` 画行 
    `src/pick_list.rs`** —— 供 col_menu 与本模块字段行两处复用
 3. 弹层卡宽/形制照 col_menu（`CARD_WIDTH`）即可, 不另设——非问题, 记档
 
-## 实现记
+## 实现记（2026-09-23 build 收口 T0–T2, 388 测试绿）
 
-（build 阶段回填）
+- **T0**（`src/pick_list.rs` 新件 + `settings.rs` 换挂）: `RowList` 自绘行列表件
+  （`rows_fn`/`highlight_fn`/`on_pick` 闭包契约 + `more_fn` 尾行, ≤`max_rows`
+  封顶; sync 每帧取态, paint 行/hover/高亮, event 按下抬起同行为触发——
+  AnalysisPanel 同款锚点纪律）; `col_menu_rows()` 换挂 RowList, **快照参数整个
+  删除**（`col_menu_overlay(theme)` 单参——参数即病灶）; `col_menu_row_names`
+  签名改 `Option<&Schema>` 免逐帧 clone。判罪锁
+  `col_menu_rows_follow_schema_across_sync`（摘 sync 行缓存重建 = `0.0≠84.0`
+  精确红）。
+- **T1**（`main.rs`）: `build_clause`（6 算符, 前缀 = `=`+值尾 `*`, 空值/空字段/
+  含空白值拒绝）+ picker 三态 + 6 个 Msg 臂; `PickerSubmit` = 组装 → `filter_applied`
+  空格追加 → `apply_filter`（唯一真相路）; 互斥开一关二。A/B 红: 摘追加拼接 →
+  `"level=ER*"≠"level=ERROR level=ER*"` 精确红。
+- **T2**: 「字段…」按钮走 Bar **hint 同款**「先测后存同帧让位」（`fields_reserved`
+  进 `input_area` 单点收口, hit rect 同源缓存; `has_schema` 判据——`.log` 不出）;
+  查询卡 = 字段行 RowList + 算符六钮（静态结构, 选中色 `bind_color` 每帧取）+
+  值输入 + 「过滤」钮; Esc 插层 `upgrade > settings > picker > col_menu >
+  export_menu > 栏` + 模态守卫补 `picker_open`（剪辑键放行先例）+ Enter 提交
+  （`app_key_filter` 拦截——TextInput 不消费 Enter 已核）+ 换文件关弹层 + 关闭
+  清草稿（`picker_clear_rev` + `bind_clear`）。
+- **plan 偏差记录**（核实②的修法换代）: 原设计「FilterForm 自绘复合件**持有**
+  值 TextInput, Enter/按钮在持有者内收口」——实现时发现 **`TextInput::on_change`
+  镜像通道**（许可页 `LicenseKeyInput` 先例）: 值随编辑进 `picker_value`, 「过滤」
+  是纯 Button、Enter 走 `app_key_filter`, **零自绘复合件**。比 plan 少一个组件,
+  且是仓内既有先例通道。
+  **偏差反转（同日 review）**: 镜像被深潜 R3 打穿（`set_text`/`clear` 不回
+  `on_change` 的脱钩窗 = 空框提交出脏子句）, 全局 Enter 拦截又被 R7 打穿（劫持
+  算符钮的 Enter）—— **镜像退役, 回归 plan 原案**: `PickerInput` 薄复合件持有
+  TextInput, 提交值随信 `PickerSubmit(String)`, Enter 只在持有者内收口 +
+  `focus_id` 送焦（R8）。三缺陷一次消解; 教训 = 「兄弟节点读不到缓冲」的收口
+  原则当时就写在 plan 核实②（「不许绕」）, 绕道镜像省的组件最后还是补回来了。
+- **修程纠偏两处**: ①Enter 拦截块一度误嵌 Esc 分支内（死代码——与评审 A2 同族
+  形态, 当场抓出挪正）②`type_complexity`/`push_text(&str)`/`crate::columns` 路径
+  三处编译纠偏。
+- **机器判据 1–6 全过**（388 绿 = 376 + 12 锁: pick_list 4 + settings 2 +
+  main 3 + view 1 + T1 2; 基线 376 不破）; A/B 红两处在案（T0 sync 重建 /
+  追加拼接）; 零框架/引擎改动（`view::FONT_SIZE` 放 `pub(crate)` 是可见性, 非改动）。
 
-## 评审记
+## 评审记（2026-09-23 review 阶段：双路独立评审 + 并账修复闭环）
 
-（review 阶段回填）
+**双路互不知情**：①五轴全量路 ②三区深潜路（拼子句查询面 / RowList 生命周期面 /
+弹层键路接线面）。两路均 Request changes；并账去重后 **Critical×1 + Required×6**，
+全部修复、每修一锁（+5 锁 + 对抗面并入扩锁）。
 
-## 简化记
+### 修复清单（并账去重）
 
-（code-simplify 阶段回填）
+| 级 | 缺陷 | 来源 | 修法 | 锁 |
+|---|---|---|---|---|
+| Critical | **拼接面 < parse 破坏面**：值含 `>`/`<` 静默改写查询（`a=List<String>`→`a=List` Lt…）/ `>` 算符+前导 `=` 拼出双字符算符 / Eq 尾 `*` 偷换前缀 / 字段含空白·点·算符逃逸（`user.id` 扁平键查嵌套 0 命中） | 五轴 C + 深潜 C1/R1/R2 | `build_clause` 拒收面盖住破坏面（字段拒空白/`.`/`=<>`；值拒空白/`<>`/前导 `=`；Eq 尾星拒；Prefix 含星拒）+ notice 分文案说清 | `build_clause_rejects_anything_parse_would_rewire`（表驱动 12 拒 + 6 受；path 逐段断言，不 join 假绿） |
+| Req R5 | 托盘 `OpenSettings`/`UpgradeGotoActivate` 不关弹层——双开时 Enter 被劫持到提交（原注释「互斥保证」前提不成立） | 五轴 R① = 深潜 R5 | 开设置关三弹层（互斥双向补全） | `open_settings_closes_transient_popovers` |
+| Req R② | roundtrip 锁过弱（`path.join` 假绿 / 无对抗输入） | 五轴 R② | 并入 Critical 表驱动锁 | 同上 |
+| Req R3 | 值镜像 vs `bind_clear` 脱钩（`set_text`/`clear` 不回 `on_change`）——空框提交出脏子句 | 深潜 R3 | **架构消解：镜像退役** —— `PickerInput` 薄复合件（Bar 同构）持有 TextInput，提交值随信 `PickerSubmit(String)`（plan 原案「持有者收口」回归，见实现记偏差反转） | `picker_input_enter_and_button_carry_value` |
+| Req R4 | RowList `pressed` 存行号——press 与 release 之间 sync 换数据把点击送错列（live-tail 轮转窗口）；`apply_rebuild` 不关弹层 | 深潜 R4 | `pressed` 改存**载荷**（全等才触发）；rebuild 关三弹层（apply_fresh 同纪律） | `press_release_survives_row_data_swap_only_for_same_payload` |
+| Req R6 | 导航键/滚轮穿透——门禁只查 settings，picker 开着 ↑↓/Space/Page* 滚背后日志（09-14 同族漏洞扩展面） | 深潜 R6 | `App::event` 键盘 + 滚轮门禁与模态清单**同源**（settings/picker/col_menu/export） | `modal_gate_swallows_nav_keys_and_wheel_when_picker_open` |
+| Req R7+R8 | 全局 Enter 拦截吃掉算符钮的 Enter 激活；开弹层不送焦，打字进不了值框 | 深潜 R7/R8 | 合并消解于 `PickerInput`：Enter 只在持有者内收口（钮的 Enter 归钮）；`focus_id="picker-value"` + `OpenPicker` 送焦；**全局 Enter 拦截撤销** | `picker_esc_enter_modal_and_draft_clear`（全局 Enter 不劫）+ `picker_input_enter_and_button_carry_value` |
+
+### Optional / Nit 裁决（全清）
+
+- **修 5**：RowList 可点行 accent 文字（可点暗示——免得纯文本行被读成只读列表，
+  五轴 Opt①）/ `max_rows` 16→12 两处（小窗适配 + **「还有 N 列」尾行从死代码
+  复活**，五轴 Opt②）/ `reset_picker_draft` 三态一处收口（Opt③）/ `fields_hover`
+  CursorLeft 不粘（Nit）/ Bar 过期注释更正（深潜 Nit：TextInput 已有内容裁剪）。
+- **记档**：许可页 `LicenseKeyInput` 镜像与 R3 同族（`license_clear_rev` 后的
+  16ms 脱钩窗——「激活即弃 key」语义下风险极低，实机撞到再收）；RowList 五闭包
+  契约等第三消费者再收（Consider 维持）；`view::FONT_SIZE` 耦合方向留 simplify。
+
+### 两路排除项（核对一致）
+
+T0 语义保全（标记行/恢复默认/守卫链）/ 让位几何同源无重叠命中面 / AsyncJob 代次
+无串台 / Esc 后过滤复位完整 / 制表符换行已拒 / `.log` 判据一致。**plan 镜像偏差
+曾被判「合理」（五轴 FYI）——随后被深潜 R3 的脱钩窗推翻，已随修复撤销**。
+
+### 修复验证
+
+三件套全绿：fmt / clippy `-D warnings` 0 / **393 测试**（388→393：main 3 +
+pick_list 1 + settings 1；对抗面并入扩锁）。**红记录**：Critical 拒收面先红
+（`须拒收: "a" Eq "List<String>"`）后绿；R5/R6/R7 三锁对旧实现必红（旧行为 =
+不关弹层/键穿透/全局 Enter 劫持）；R4 换数据锁与载荷锚定同批落（行号版实现随
+修删除，锁为回归钉）。
+
+## 简化记（2026-09-24 code-simplify 收口: 行为零变化, 测试零修改, 393 绿）
+
+| # | 简化 | 面 | 内容 |
+|---|---|---|---|
+| 1 | 拒收说清单一收口 | `main.rs` | `clause_reject_notice` = 判据+文案**同一函数**（单一事实源）; `build_clause` 委派拒收、只管拼装; `PickerSubmit` 22 行 if-else 分类链收成 4 行 —— 拒收规则改一处即全对, 判据与说理不再两份漂移。修程: `?` 极性一度写反（Some=拒收 却在 None 早退）, 表驱动锁当场红（build_clause 三红 + picker 红）, 正位后绿 |
+| 2 | 三弹层开合/判据收口 | `main.rs` | `close_popovers`（关尽列管理/导出/字段查询, 7 个写点收一处: 互斥开一关二 ×3 / 换文件 / 重建 / 开设置 / 升级去激活）+ `popover_open`（滚轮/键盘/Ctrl 三门禁**同源** —— 评审 R6「同源清单」从注释落实为代码） |
+| 3 | 五卡壳收口 | `settings.rs` | `card_shell`/`card_column`/`card_title` —— 设置卡/升级提示/导出格式/列管理/字段查询五卡同形壳（不透明底+圆角+内边距+定宽+16 间距居中列+标题）收一处, 约 75 行重复构造 → 3 个 helper; settings_card 的背景/描边/绑定三注释随壳搬家不丢 |
+| 4 | 行封顶常量 | `settings.rs` | `POPOVER_ROWS_MAX = 12` 两处引用（数字与「小窗适配」注释不再双抄） |
+| 5 | 同值常量钉死 | `settings.rs` | `BODY_SIZE` 收编为 `crate::view::FONT_SIZE` 别名（两个 14 会漂; 弹层/RowList 与行文必须同号） |
+| 6 | RowList 冗余字段 | `pick_list.rs` | `text_on_accent` 每帧恒赋 WHITE = 假缓存（主题无 on-accent token）, 删字段 paint 内联; `RefCell` 导入统一 |
+| 7 | 过期注释更正 | `view.rs` | 两处「`TextInput::paint` 既不裁剪」—— 框架 2026-09-20 起已裁剪进边框（`overflowing_text_is_clipped_inside_input_area` 锁在案）; 事实改写, P33「空态才画」规矩保留并说清留下理由 |
+| 8 | 可见性收紧 | `settings.rs` | `col_menu_rows`/`picker_field_rows` `pub(crate)` → 私有（只被同文件消费） |
+
+**FONT_SIZE 耦合方向裁定**（评审留档项, 本段了结）: `view.rs` 是 bin 布局 token 家
+（`ROW_HEIGHT`/`FONT_SIZE` 实机定档注释成对）, pick_list/settings 均为**消费者** ——
+方向正确（同 crate、无环）, 不为一个 const 开新家; 真正的害是 `BODY_SIZE` 同值
+分家会漂, 已钉别名（#5）。pick_list → `view::FONT_SIZE` 引用保持。
+
+**留档不动**（照评审记）: 许可页 `LicenseKeyInput` 镜像 R3 同族窗实机再收;
+RowList 五闭包契约等第三消费者。
+
+**验证**: fmt / clippy `-D warnings` 0 / **393 测试零修改全绿**（每项后跑锁,
+行为零变化）。
 
 ## 人工验收
 
-（记账 → `tasks/acceptance-pending.md`，实机后回填）
+**2026-09-23 记账**（用户裁定「人工验收全部记账」）: 延后待实机, 五条汇总在
+`tasks/acceptance-pending.md` **E 组**（E5 = T0 验点「列管理行随文件换」, 同时
+充作 `table-column-config` 人工验收 A3 的勘误验点）。实机后回填结论:
+
+（用户实机后回填）

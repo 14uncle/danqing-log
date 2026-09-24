@@ -8,7 +8,7 @@
   field-analytics 09-20 三轮过; async-open / text-selection / jsonl-table /
   live-tail / settings / update-hint-ui 均已过）
 - 组别: A 列配置六条 / B export 四条（需付费态）/ C 商店更新流一条 /
-  **D 书签持久化五条**
+  D 书签持久化五条 / **E 免语法字段查询五条**（E5 兼 A3 勘误验点）
 
 ## 前置准备
 
@@ -53,10 +53,21 @@
 | D4 | 手坏 columns.json 如常 | 手坏 `columns.json`（含 bookmarks 字段）再启动 | app 如常（书签回默认, 不炸） | [ ] |
 | D5 | 上限有闸 | 夹满 256 条 → 再夹; 去掉一个再夹 | 满员有提示; 去掉又能加 | [ ] |
 
+## E. field-picker-ui 免语法字段查询（五条, 免费层; 2026-09-23 记账）
+
+| # | 验收项 | 步骤 | 预期 | ✓ |
+|---|---|---|---|---|
+| E1 | 「字段…」点选全链 | JSONL 开「字段…」→ 点字段/算符/打值/「过滤」 | 命中正确、底栏计数如常 | [ ] |
+| E2 | 追加 AND + Esc 清 | 再点一子句追加提交; Esc 清过滤 | 交集正确; 回全量 | [ ] |
+| E3 | 空值 / Esc 不提交 | 空值点「过滤」; Esc/scrim 关弹层 | 有提示且查询不动; 关闭不提交 | [ ] |
+| E4 | `.log` 无按钮 / 免费直用 | 开纯文本 `.log` 看过滤栏; 免费态点「字段…」 | 无「字段…」按钮; 直接可用无门控 | [ ] |
+| E5 | **T0**: 列管理行随文件换（兼 A3 勘误验点） | 「列…」开弹层看 A 的列 → 换文件 B 再开 | 行随文件换（修复前只剩「恢复默认」） | [ ] |
+
 ## 回填规则
 
 1. 实机验一项勾一项; **同步回填所属 spec 人工验收节**（A→
    `SPEC-v1x-table-column-config.md` / B→`SPEC-v1x-export.md` / C→
-   `SPEC-update-badge.md` / D→`SPEC-v1x-bookmark-persist.md`）
+   `SPEC-update-badge.md` / D→`SPEC-v1x-bookmark-persist.md` /
+   E→`SPEC-v1x-field-picker-ui.md`; E5 兼回填 A 的勘误注记）
 2. 发现缺陷: 复现测试先行（Prove-It）→ 修 → 补锁 → 再验
 3. 全部打勾后本清单状态改「**已全部验收 \<日期\>**」——文件不删, 账目留痕

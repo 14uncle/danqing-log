@@ -351,3 +351,12 @@ wheel 锁修正假绿后红）。既有锁 `header_geometry_follows_x_offset` �
 可验部分（1–9）已全过（365 绿）。实机后回填结论:
 
 （用户实机后回填）
+
+**勘误（2026-09-23 晚, field-picker-ui 事实盘点揭发）**: 本模块「显示列」弹层
+行集原为 `view()` **建树快照** —— 框架 `app.view()` 一次性建树不再重建（六处
+框架文档铁律）, 建树时 schema 为 None, **结构上弹层只剩「恢复默认」一行**
+（换文件亦不更新）; 双路评审与机器锁均未触到框架生命周期面（锁了纯函数/Msg/
+paint, 无「建树后行跟随」锁）。**已随 `SPEC-v1x-field-picker-ui` T0 修复**
+（RowList 自绘行集每帧取态, 判罪锁
+`col_menu_rows_follow_schema_across_sync`）—— 人工验收 A3 项由总清单 **E5**
+兼验。
