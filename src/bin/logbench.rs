@@ -36,7 +36,13 @@ const RANDOM_SAMPLE: usize = 100_000;
 const HIT_CAP: usize = 1_000_000;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // merge-timeline T0b: `--merge <文件...>` 走合并基准, 与单文件口径分家。
+    if raw.first().is_some_and(|a| a == "--merge") {
+        merge_main(&raw[1..]);
+        return;
+    }
+    let mut args = raw.into_iter();
     let Some(path) = args.next().map(PathBuf::from) else {
         eprintln!(
             "用法: logbench <日志文件> [--filter \"level=ERROR status=50*\"] [--analyze <字段>] [--export <raw|pretty|csv>] [正则...]"
@@ -370,4 +376,115 @@ fn main() {
 
     println!("\n== 总计 ==");
     println!("端到端 (打开+全部基准): {} ms", t_all.elapsed().as_millis());
+}
+
+// ─── merge-timeline T0b 实测: N 源打开 → 逐行时间戳提取 → 归并, 全段计时 ───
+// T1 起探测走引擎正式通路 `timestamp::detect_route` (采样探测+失败原因, 与产品同源)。
+
+fn merge_main(files: &[String]) {
+    use danqing_log::merge::{self, SourceTimeline};
+    use danqing_log::timestamp::{self, TsRoute};
+    use std::path::Path;
+
+    if files.len() < 2 {
+        eprintln!("用法: logbench --merge <文件...> (≥2 源)");
+        std::process::exit(2);
+    }
+    println!("== 合并 (merge-timeline T0 原型) ==");
+    println!("源数           : {}", files.len());
+    let t_all = Instant::now();
+
+    // 第一遍: 开齐全部源 (LogFile 归一持有, 下面的 timeline 借用才合法)。
+    let mut opened: Vec<LogFile> = Vec::with_capacity(files.len());
+    let mut open_els: Vec<std::time::Duration> = Vec::with_capacity(files.len());
+    for p in files {
+        let t = Instant::now();
+        let f = LogFile::open(Path::new(p)).unwrap_or_else(|e| {
+            eprintln!("打开失败 {p}: {e:#}");
+            std::process::exit(1);
+        });
+        open_els.push(t.elapsed());
+        opened.push(f);
+    }
+    let first_open = open_els[0];
+
+    // 第二遍: 探测通路 + 逐行提取 (plan R6 拆雷的主测点)。
+    let mut timelines: Vec<SourceTimeline<'_>> = Vec::new();
+    let mut total_extract = std::time::Duration::ZERO;
+    let mut total_ts_bytes = 0usize;
+    for (i, f) in opened.iter().enumerate() {
+        let mib = f.stats().file_bytes as f64 / (1024.0 * 1024.0);
+        let route = match timestamp::detect_route(f) {
+            Ok(r) => r,
+            Err(reason) => {
+                println!(
+                    "[src{i}] {} —— 探测失败拒绝加入 (SPEC D2): {}",
+                    files[i],
+                    reason.label()
+                );
+                continue;
+            }
+        };
+        let t = Instant::now();
+        let (route_desc, ts) = match &route {
+            TsRoute::JsonlField(name) => (
+                format!("JSONL 字段 {name}"),
+                merge::extract_timeline(f, |line| timestamp::parse_jsonl_field(line, name, 0)),
+            ),
+            TsRoute::LogPrefix(fmt) => (
+                format!(".log {}", fmt.label()),
+                merge::extract_timeline(f, move |line| {
+                    timestamp::parse_prefix(line, *fmt, 0).map(|(v, _)| v)
+                }),
+            ),
+        };
+        let el = t.elapsed();
+        total_extract += el;
+        total_ts_bytes += ts.len() * 8;
+        let ns_per_line = el.as_nanos() as f64 / ts.len().max(1) as f64;
+        let thr = mib / el.as_secs_f64().max(1e-9);
+        println!("[src{i}] {}", files[i]);
+        println!(
+            "    打开 {:>6} ms ({mib:.0} MiB, {} 行)   通路: {route_desc}",
+            open_els[i].as_millis(),
+            f.line_count()
+        );
+        println!(
+            "    提取 {:>6} ms ({thr:.0} MiB/s, {ns_per_line:.0} ns/行)",
+            el.as_millis()
+        );
+        timelines.push(SourceTimeline { file: f, ts });
+    }
+    if timelines.len() < 2 {
+        println!("有效源 <2, 归并无意义, 仅出提取数字。");
+        return;
+    }
+
+    // 第三遍: 归并。
+    let t = Instant::now();
+    let idx = merge::build_index(&timelines);
+    let merge_el = t.elapsed();
+    println!(
+        "归并           : {} ms ({} 行, {:.0} 行/ms)",
+        merge_el.as_millis(),
+        idx.len(),
+        idx.len() as f64 / merge_el.as_millis().max(1) as f64
+    );
+    println!(
+        "时间戳向量     : {:.1} MiB (归并后退役, 峰值内存的另一半)",
+        total_ts_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "索引驻留       : {:.1} MiB ({} bytes, 16 B/行)",
+        idx.index_bytes() as f64 / (1024.0 * 1024.0),
+        idx.index_bytes()
+    );
+    println!(
+        "合并总墙钟     : {} ms (打开+提取+归并)",
+        t_all.elapsed().as_millis()
+    );
+    println!(
+        "对照           : 首源单文件打开 {} ms —— D5 红线 (CP0 校准): 3×1GB 合并就绪 ≤ 1.6s",
+        first_open.as_millis()
+    );
 }
