@@ -6,8 +6,10 @@
   双路评审并账 Critical×1+Required×6 全修 → code-simplify, 376 测试绿, 零 commit,
   零框架/引擎改动）—— **人工验收（五条）记账**（总清单 D 组）
 - 所属: 能力地图 `SPEC-v1x-map.md` 模块 `bookmark-persist`（构建顺序第 5 位，接
-  `table-column-config` 之后；免费层欠账三连第二件；依赖: **无**——不接 licensing
-  门控，免费层白送，复用 `table-column-config` 建的 per-路径状态持久化基建）
+  `table-column-config` 之后；~~免费层欠账三连第二件~~ **2026-09-27 翻案改判付费层**
+  （地图翻案块②；**会话内书签仍免费**，收费的是跨重启持久化；功能本体零返工，
+  接门待做与腿一同窗口）；依赖: **无**——~~不接 licensing 门控，免费层白送~~
+  接门后接 licensing，复用 `table-column-config` 建的 per-路径状态持久化基建）
 
 ## Objective
 
