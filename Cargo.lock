@@ -937,7 +937,7 @@ dependencies = [
 [[package]]
 name = "danqing"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing#b9620db047f8df29ed5df0b0faac1f2ec55e343f"
+source = "git+https://github.com/14uncle/danqing#c5b1fcfecc9ffb15435d0ccf3af91e8e5f90fdcb"
 dependencies = [
  "arboard",
  "bytemuck",
