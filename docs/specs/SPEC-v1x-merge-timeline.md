@@ -181,10 +181,10 @@
 ## 7. Success Criteria
 
 机器部分 (build 收口 + 评审修复后复测):
-1. [ ] 两仓 `cargo test` 全绿: danqing-logfile ≥ 68+新锁 / danqing-log ≥ 413+新锁 (实测值 plan 记录)。
-2. [ ] 两仓 `cargo fmt` + `cargo clippy --all-targets -- -D warnings` 零警告。
-3. [ ] logbench `--merge` 四组数字实测定档, 进 PERFORMANCE_REPORT (D5 校准后验收线)。
-4. [ ] `tasks/todo-gate-trio.md` (三连接门) 同窗口完成 (另案勾账, 不挡本 spec 验收)。
+1. [x] 两仓 `cargo test` 全绿: danqing-logfile **99** / danqing-log **494** (186+294+11+3) —— 09-28 实测。
+2. [x] 两仓 `cargo fmt` + `cargo clippy --all-targets -- -D warnings` 零警告。
+3. [x] logbench `--merge` 四组数字实测定档, 进 PERFORMANCE_REPORT §合并 (09-28 T9)。
+4. [x] `tasks/todo-gate-trio.md` (三连接门) 同窗口完成 (G1–G5 全勾, 09-28)。
 
 人工验收 (用户实机, **需付费态 key** 激活 MergeTimeline; 条目为草案, plan 后钉死):
 - [ ] a) 3 源 (JSONL×2 + .log×1, 各 ≥500MB) 合并打开: 时间线序正确, 滚动/跟随体感与单文件一致。
