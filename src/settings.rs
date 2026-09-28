@@ -58,7 +58,7 @@ fn content_width() -> f32 {
 /// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
 /// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
 /// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
-const PANEL_CONTENT_H: f32 = 208.0; // 2026-09-28: 许可页加免费层范围提示行 (G3) 后实测 207.5
+const PANEL_CONTENT_H: f32 = 211.0; // 2026-09-28: 快捷键页加 Ctrl+R 追踪行 (T6) 后实测 211
 /// 正文字号 (与 [`crate::view::FONT_SIZE`] 同源别名 —— 弹层/行列表必须与
 /// 行文同号, 各写一个 14 会漂)。
 const BODY_SIZE: u16 = crate::view::FONT_SIZE;
@@ -833,7 +833,15 @@ fn session_rows() -> crate::pick_list::RowList {
             let mut v: Vec<&danqing_log::columns::SessionEntry> = app.sessions.iter().collect();
             v.sort_by_key(|s| std::cmp::Reverse(s.updated));
             v.into_iter()
-                .map(|s| (s.name.clone(), s.name.clone()))
+                .map(|s| {
+                    // 合并组会话 (T8) 行内可辨: 后缀标源数 (点行 = 恢复合并);
+                    // 载荷仍是会话名 (应用链按名找人)。
+                    let label = match &s.merge {
+                        Some(g) => format!("{} · 合并 {} 源", s.name, g.sources.len()),
+                        None => s.name.clone(),
+                    };
+                    (label, s.name.clone())
+                })
                 .collect()
         },
         |app: &LogApp| app.session_selected.clone(),
@@ -883,8 +891,11 @@ fn merge_source_rows() -> crate::pick_list::RowList {
                 .iter()
                 .map(|s| {
                     let mark = if s.hidden { "[ ]" } else { "[x]" };
+                    // T7: 断流源行内明示 (stat/追加读取失败; 行集保持旧快照,
+                    // 恢复可读自清) —— 单源断流不拖垮全局, 但用户必须看得见。
+                    let tail = if s.stale { " · 断流" } else { "" };
                     let label = format!(
-                        "{mark} {} · {}",
+                        "{mark} {} · {}{tail}",
                         s.name(),
                         danqing_log::merge_view::route_label(&s.route)
                     );
@@ -1105,7 +1116,7 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 /// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
 /// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
-const SHORTCUT_KEYS: [(&str, &str); 9] = [
+const SHORTCUT_KEYS: [(&str, &str); 10] = [
     ("Ctrl+O", "打开文件"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+T", "表格 / 原始模式互切"),
@@ -1113,6 +1124,9 @@ const SHORTCUT_KEYS: [(&str, &str); 9] = [
     ("Ctrl+B", "添加书签 / 去掉书签"),
     ("Ctrl+G", "跳下一书签"),
     ("Ctrl+E", "导出…"),
+    // 腿 E/T6: 追踪在界面上**没有任何 affordance** (无钮无菜单), 不进表
+    // 就无人得知 (Ctrl+L 先例)。「合并…」入口本身底栏有钮, Ctrl+M 不列。
+    ("Ctrl+R", "追踪选中值 (合并视图)"),
     // P36 (2026-09-15): 单键两条。判据就是本表自己那句话 ——「只列**猜不出来**的」,
     // 不是新造标准: 方向键/翻页键不必教 (常识), 但 `/` 是 Vim 习惯、`f` 是本应用
     // 自造的词, 两个都猜不出来。它们原先只写在**仓外 README**, 而商店版用户没有
@@ -1698,6 +1712,7 @@ mod tests {
         .unwrap();
         let out = danqing_log::merge_view::build_merge(
             &[pa.clone(), pb.clone()],
+            &[],
             &std::sync::atomic::AtomicBool::new(false),
         );
         app.apply_merge_outcome(out);
@@ -2331,6 +2346,7 @@ mod tests {
             search: String::new(),
             config: danqing_log::columns::ColumnConfig::default(),
             expands: Vec::new(),
+            merge: None,
             updated: 1,
         }];
         app.session_selected = Some("排障A".into());
@@ -2378,6 +2394,7 @@ mod tests {
                 search: String::new(),
                 config: danqing_log::columns::ColumnConfig::default(),
                 expands: Vec::new(),
+                merge: None,
                 updated: i as u64,
             });
         }

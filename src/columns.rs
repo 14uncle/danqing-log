@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use crate::merge_view::{MergeGroup, MergeSourceState};
+
 /// 手动宽 clamp (px, D6): event 无 `TextBatch` 量不了字符宽, 常量夹取「别拖没/别拖爆」。
 pub const MIN_COL_W: f32 = 40.0;
 /// 同上, 上限。
@@ -255,6 +257,7 @@ pub struct FileEntry {
 /// 命名工作台会话 (SPEC-v1x-workspace-sessions D1/D2): per-路径命名快照,
 /// 载荷四样 = 过滤查询串 + 搜索查询串 + 列摆法 + 展开行号表 (**应用时重建真相**,
 /// 不存行集/子行内容)。**无书签字段** —— 见 [`FileEntry`] 腿四接缝注。
+/// T8 起可选第五样 = 合并组 ( [`SessionEntry::merge`], SPEC-v1x-merge-timeline D4)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionEntry {
     /// 文件路径 (exact key, 与 [`FileEntry`] 同粒度; `put_sessions_for_path` 归参)。
@@ -269,6 +272,12 @@ pub struct SessionEntry {
     pub config: ColumnConfig,
     /// 已展开的**文件行号** (**升序去重**收编态, 见 [`normalize_expands`])。
     pub expands: Vec<u64>,
+    /// 合并组载荷 (SPEC-v1x-merge-timeline D4/T8): `Some` = 合并工作区会话
+    /// (应用 = 重开源组重建合并, 源缺失明示跳过不拒全体), `None` = 单文件
+    /// 会话。`expands` 在合并会话里仍是**单文件侧**行号 (合并展开未建,
+    /// T3 边界); 若未来合并展开落盘, 键形态钉死为 `merge_view::pack_key`
+    /// 的 (src,line) 打包值。
+    pub merge: Option<MergeGroup>,
     /// 保存时刻 (调用方给 epoch 秒)。
     pub updated: u64,
 }
@@ -373,6 +382,9 @@ impl ColumnFiles {
     /// 损坏备份与迁移回落**共用本判据**, 不许各算一份。
     /// 已知残留: 合法空账 `{"files":[],"sessions":[]}` 会被误判不可辨 ——
     /// 备份侧零数据损失 (顶多多一个 .bak), 回落侧会被旧名接住 (正是迁移语义)。
+    /// T8 注: merge 段寄生在 sessions 条目内 ([`SessionEntry::merge`]), 认段随
+    /// sessions 天然成立 —— M1 复发由锁 `merge_session_keeps_ledger_recognizable`
+    /// 守 (只装合并组会话的账本必须可辨)。
     pub fn is_recognizable(&self) -> bool {
         !self.entries.is_empty() || !self.sessions.is_empty()
     }
@@ -553,7 +565,7 @@ fn entry_from_value(v: &serde_json::Value) -> Option<FileEntry> {
 /// 列三字段与 [`entry_to_value`] 同形状同排序 (widths 键排序写入);
 /// **无 `bookmarks` 键** (Open Q1: 书签不随会话 = 结构保证)。
 fn session_to_value(s: &SessionEntry) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "path": s.path,
         "name": s.name,
         "filter": s.filter,
@@ -563,12 +575,63 @@ fn session_to_value(s: &SessionEntry) -> serde_json::Value {
         "widths": widths_to_value(&s.config.widths),
         "expands": s.expands,
         "updated": s.updated,
-    })
+    });
+    // merge 段 (T8): None **省略键** (单文件会话不被新键刷屏; 载入侧缺省 = None
+    // 同义, roundtrip 不受影响); Some 恒写 sources 数组。
+    if let Some(g) = &s.merge {
+        v["merge"] = serde_json::json!({
+            "sources": g.sources.iter().map(|s| serde_json::json!({
+                "path": s.path,
+                "offset_ms": s.offset_ms,
+                "tz_offset_ms": s.tz_offset_ms,
+                "hidden": s.hidden,
+            })).collect::<Vec<_>>(),
+        });
+    }
+    v
+}
+
+/// Value → 合并组载荷 (T8); 坏形状 (非对象/无 sources 数组) 或清空后无源
+/// → None (**丢段不丢条**, C6 同粒度 —— 条目落回单文件会话存活)。
+/// 源条目缺/空 path → **跳该源不丢组**; offset/tz 容缺省 0 + 钳制 (**与 UI
+/// 手输同一条界** —— 真身在 [`crate::merge_view::clamp_offset_ms`] /
+/// [`crate::merge_view::clamp_tz_ms`], 本处不另立常量); 重复源收编跳过
+/// (保存侧已去重, 手造账本兜底); 收集硬顶 [`crate::merge_view::MAX_SOURCES`]。
+fn merge_group_from_value(v: &serde_json::Value) -> Option<MergeGroup> {
+    let arr = v.as_object()?.get("sources")?.as_array()?;
+    let mut sources: Vec<MergeSourceState> = Vec::new();
+    for x in arr {
+        if sources.len() >= crate::merge_view::MAX_SOURCES {
+            break; // 超顶按收集序放弃 (书签先例)
+        }
+        let Some(path) = x.get("path").and_then(|p| p.as_str()) else {
+            continue; // 无路径 = 无身份
+        };
+        if path.is_empty() || sources.iter().any(|s| s.path == path) {
+            continue;
+        }
+        sources.push(MergeSourceState {
+            path: path.to_string(),
+            offset_ms: crate::merge_view::clamp_offset_ms(
+                x.get("offset_ms").and_then(|o| o.as_i64()).unwrap_or(0),
+            ),
+            tz_offset_ms: crate::merge_view::clamp_tz_ms(
+                x.get("tz_offset_ms").and_then(|o| o.as_i64()).unwrap_or(0),
+            ),
+            hidden: x.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false),
+        });
+    }
+    if sources.is_empty() {
+        None // 清空即无组 —— 合并会话失去意义, 落回单文件会话 (条存活)
+    } else {
+        Some(MergeGroup { sources })
+    }
 }
 
 /// Value → 会话条目; 坏条 (缺/空 name、缺 path/updated、形状不可辨) → None 条废。
-/// filter/search/order/hidden/widths/expands **容缺省** —— 坏字段丢字段不丢条
-/// (C6 同粒度; order 坏形状 = 空表, 应用时 merge 兜底)。
+/// filter/search/order/hidden/widths/expands/**merge** 容缺省 —— 坏字段丢字段
+/// 不丢条 (C6 同粒度; order 坏形状 = 空表, 应用时 merge 兜底; merge 坏段 = None,
+/// 条目落回单文件会话)。
 fn session_from_value(v: &serde_json::Value) -> Option<SessionEntry> {
     let obj = v.as_object()?;
     let path = obj.get("path")?.as_str()?.to_string();
@@ -577,6 +640,7 @@ fn session_from_value(v: &serde_json::Value) -> Option<SessionEntry> {
         return None;
     }
     let updated = obj.get("updated")?.as_u64()?;
+    let merge = obj.get("merge").and_then(merge_group_from_value);
     let filter = obj
         .get("filter")
         .and_then(|x| x.as_str())
@@ -627,6 +691,7 @@ fn session_from_value(v: &serde_json::Value) -> Option<SessionEntry> {
             widths,
         },
         expands: normalize_expands(expands),
+        merge,
         updated,
     })
 }
@@ -1142,6 +1207,7 @@ mod tests {
             search: "timeout".into(),
             config: sample_config(),
             expands: vec![7, 3, 3, 11], // 乱序 + 重复 → 收编升序去重
+            merge: None,
             updated: 42,
         }
     }
@@ -1284,5 +1350,182 @@ mod tests {
         let bytes = serde_json::to_vec(&serde_json::json!({ "sessions": arr })).unwrap();
         let files = ColumnFiles::from_json(&bytes);
         assert_eq!(files.sessions.len(), SESSIONS_HARD_CAP, "超顶按收集序放弃");
+    }
+
+    // ---- T8: sessions 载荷 merge group (SPEC-v1x-merge-timeline D4) ----
+
+    /// 合并组载荷 roundtrip 全等 (SPEC 验收锁): 三源混合 (正偏移/负时区/显隐),
+    /// 经字节面 save/load 逐项回; None = **不写** merge 键 (单文件会话不被新键
+    /// 刷屏); 同账 files/sessions 其余条目不互扰。
+    #[test]
+    fn session_merge_group_roundtrip() {
+        let p = temp_columns_path("sess-merge-rt");
+        let mut files = ColumnFiles::default();
+        files.put_sessions_for_path("a", vec![session("ignored", "单文件台")]);
+        let mut m = session("ignored2", "事故台");
+        m.merge = Some(MergeGroup {
+            sources: vec![
+                MergeSourceState {
+                    path: "C:\\logs\\auth.log".into(),
+                    offset_ms: 0,
+                    tz_offset_ms: 28_800_000,
+                    hidden: false,
+                },
+                MergeSourceState {
+                    path: "C:\\logs\\worker.jsonl".into(),
+                    offset_ms: -3_000,
+                    tz_offset_ms: 0,
+                    hidden: true,
+                },
+                MergeSourceState {
+                    path: "C:\\logs\\db.log".into(),
+                    offset_ms: 250,
+                    tz_offset_ms: -19_800_000,
+                    hidden: false,
+                },
+            ],
+        });
+        files.put_sessions_for_path("b", vec![m]);
+        files.save_to(&p).unwrap();
+        let loaded = ColumnFiles::load_from(&p);
+        assert_eq!(loaded, files, "roundtrip 全等 (merge 段同账)");
+        let sb = loaded.sessions_for_path("b");
+        let g = sb[0].merge.as_ref().expect("merge 段须回来");
+        assert_eq!(g.sources.len(), 3);
+        assert_eq!(g.sources[1].offset_ms, -3_000, "负偏移保值");
+        assert_eq!(g.sources[2].tz_offset_ms, -19_800_000, "负时区保值");
+        assert!(g.sources[1].hidden, "显隐保值");
+        // None 省略键 / Some 写键 (字节面断言)
+        let txt = String::from_utf8(std::fs::read(&p).unwrap()).unwrap();
+        assert!(txt.contains("\"merge\""), "合并会话写 merge 键");
+        let single_only = serde_json::to_string(&session_to_value(&session("a", "n"))).unwrap();
+        assert!(
+            !single_only.contains("\"merge\""),
+            "单文件会话不写 merge 键"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 坏段丢段不丢条 (C6 同粒度): merge 段坏形状/源条缺 path/重复源/全源坏
+    /// —— 条目一律存活 (全源坏 = 落回单文件会话); 好源保留。
+    #[test]
+    fn session_merge_bad_segment_drops_segment_not_entry() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sessions": [
+                // merge 段坏形状 (sources 非数组) → 丢段
+                { "path": "a", "name": "坏段", "updated": 1,
+                  "merge": { "sources": "not-a-list" } },
+                // 混合: 好源 + 缺 path 源 + 重复源 → 跳坏留好
+                { "path": "a", "name": "混合", "updated": 2,
+                  "merge": { "sources": [
+                      { "path": "x.log", "offset_ms": 5, "hidden": true },
+                      { "offset_ms": 9 },
+                      { "path": "" },
+                      { "path": "x.log", "offset_ms": 99 }
+                  ] } },
+                // 全源坏 → merge = None (落回单文件会话)
+                { "path": "a", "name": "全坏", "updated": 3,
+                  "merge": { "sources": [ { "offset_ms": 1 } ] } },
+                // merge 段不是对象 → 丢段
+                { "path": "a", "name": "非标", "updated": 4, "merge": 7 }
+            ]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.sessions.len(), 4, "坏段不丢条 (全存活)");
+        assert!(files.sessions[0].merge.is_none(), "坏形状丢段");
+        let mixed = files.sessions[1].merge.as_ref().expect("好源在, 组就在");
+        assert_eq!(mixed.sources.len(), 1, "缺 path/空 path/重复源各跳一条");
+        assert_eq!(mixed.sources[0].path, "x.log");
+        assert_eq!(mixed.sources[0].offset_ms, 5, "首见保 (重复源跳过)");
+        assert!(mixed.sources[0].hidden);
+        assert!(files.sessions[2].merge.is_none(), "全源坏 = 落回单文件会话");
+        assert!(files.sessions[3].merge.is_none(), "非对象丢段");
+    }
+
+    /// M1 复发守卫 (认段锁): 账本**只装**合并组会话也必须可辨 —— 否则
+    /// 损坏备份判据把合法账本整账判损, 用户会话全丢 (M1 家族)。
+    #[test]
+    fn merge_session_keeps_ledger_recognizable() {
+        let mut e = session("a", "合并台");
+        e.merge = Some(MergeGroup {
+            sources: vec![
+                MergeSourceState {
+                    path: "x.log".into(),
+                    offset_ms: 0,
+                    tz_offset_ms: 0,
+                    hidden: false,
+                },
+                MergeSourceState {
+                    path: "y.log".into(),
+                    offset_ms: 0,
+                    tz_offset_ms: 0,
+                    hidden: false,
+                },
+            ],
+        });
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sessions": [session_to_value(&e)]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        assert_eq!(files.sessions.len(), 1, "merge 段不破条目解析");
+        assert!(files.sessions[0].merge.is_some());
+        assert!(
+            files.is_recognizable(),
+            "只装合并组会话的账本必须可辨 (M1 复发守卫)"
+        );
+    }
+
+    /// 钳制与截断 (账本外部数据家规): 天文 offset/tz 钳到窗口内 (提取侧裸
+    /// 加法不溢出); 源超 MAX_SOURCES 截断; 保存侧正常值不受钳制影响。
+    #[test]
+    fn session_merge_group_clamps_and_caps() {
+        let mut arr: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({ "path": format!("s{i}.log"), "offset_ms": 0,
+                    "tz_offset_ms": 0, "hidden": false })
+            })
+            .collect();
+        arr.push(serde_json::json!({
+            "path": "huge.log", "offset_ms": i64::MAX, "tz_offset_ms": i64::MIN
+        }));
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sessions": [ { "path": "a", "name": "钳", "updated": 1,
+                            "merge": { "sources": arr } } ]
+        }))
+        .unwrap();
+        let files = ColumnFiles::from_json(&bytes);
+        let g = files.sessions[0].merge.as_ref().unwrap();
+        assert_eq!(
+            g.sources.len(),
+            crate::merge_view::MAX_SOURCES,
+            "超顶按收集序截断 (前 8 源, huge.log 被截)"
+        );
+        // 天文值单独成组验钳制
+        let bytes2 = serde_json::to_vec(&serde_json::json!({
+            "sessions": [ { "path": "a", "name": "钳2", "updated": 1,
+                            "merge": { "sources": [
+                                { "path": "h.log", "offset_ms": i64::MAX,
+                                  "tz_offset_ms": i64::MIN }
+                            ] } } ]
+        }))
+        .unwrap();
+        let g2 = ColumnFiles::from_json(&bytes2)
+            .sessions
+            .pop()
+            .unwrap()
+            .merge
+            .unwrap();
+        assert_eq!(
+            g2.sources[0].offset_ms,
+            crate::merge_view::MAX_ABS_OFFSET_MS,
+            "天文偏移钳到窗"
+        );
+        assert_eq!(
+            g2.sources[0].tz_offset_ms,
+            -crate::merge_view::MAX_ABS_TZ_MS,
+            "天文时区钳到窗"
+        );
     }
 }

@@ -378,113 +378,289 @@ fn main() {
     println!("端到端 (打开+全部基准): {} ms", t_all.elapsed().as_millis());
 }
 
-// ─── merge-timeline T0b 实测: N 源打开 → 逐行时间戳提取 → 归并, 全段计时 ───
-// T1 起探测走引擎正式通路 `timestamp::detect_route` (采样探测+失败原因, 与产品同源)。
+// ─── merge-timeline T9 实测: 四组数字 (打开 / 重归并 / 隐藏重建 / 跟随追加) ───
+//
+// **走产品路径** (`merge_view::build_merge` / `MergeState`) —— 数字口径 = 用户在
+// 应用里真走的那条链 (打开+探测+schema 发现+提取+归并), 不是引擎裸拼。T0c 的
+// CP0 校准数字 (1525ms) 是引擎三段口径, 两者并列报告 (disclose 差异来源)。
 
 fn merge_main(files: &[String]) {
-    use danqing_log::merge::{self, SourceTimeline};
-    use danqing_log::timestamp::{self, TsRoute};
-    use std::path::Path;
+    use danqing_log::merge_view::{self, MergeState};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
 
     if files.len() < 2 {
         eprintln!("用法: logbench --merge <文件...> (≥2 源)");
         std::process::exit(2);
     }
-    println!("== 合并 (merge-timeline T0 原型) ==");
-    println!("源数           : {}", files.len());
-    let t_all = Instant::now();
+    let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    println!("== 合并基准 (merge-timeline T9, 产品路径, 四组) ==");
+    println!("源数: {}", paths.len());
 
-    // 第一遍: 开齐全部源 (LogFile 归一持有, 下面的 timeline 借用才合法)。
-    let mut opened: Vec<LogFile> = Vec::with_capacity(files.len());
-    let mut open_els: Vec<std::time::Duration> = Vec::with_capacity(files.len());
-    for p in files {
-        let t = Instant::now();
-        let f = LogFile::open(Path::new(p)).unwrap_or_else(|e| {
-            eprintln!("打开失败 {p}: {e:#}");
-            std::process::exit(1);
-        });
-        open_els.push(t.elapsed());
-        opened.push(f);
+    // ── ① 打开 (合并就绪) ─────────────────────────────────────────────
+    let t = Instant::now();
+    let out = merge_view::build_merge(&paths, &[], &AtomicBool::new(false));
+    let open_el = t.elapsed();
+    for (p, why) in &out.rejected {
+        println!("[拒收] {} —— {why} (SPEC D2)", p.display());
     }
-    let first_open = open_els[0];
-
-    // 第二遍: 探测通路 + 逐行提取 (plan R6 拆雷的主测点)。
-    let mut timelines: Vec<SourceTimeline<'_>> = Vec::new();
-    let mut total_extract = std::time::Duration::ZERO;
-    let mut total_ts_bytes = 0usize;
-    for (i, f) in opened.iter().enumerate() {
-        let mib = f.stats().file_bytes as f64 / (1024.0 * 1024.0);
-        let route = match timestamp::detect_route(f) {
-            Ok(r) => r,
-            Err(reason) => {
-                println!(
-                    "[src{i}] {} —— 探测失败拒绝加入 (SPEC D2): {}",
-                    files[i],
-                    reason.label()
-                );
-                continue;
-            }
-        };
-        let t = Instant::now();
-        let (route_desc, ts) = match &route {
-            TsRoute::JsonlField(name) => (
-                format!("JSONL 字段 {name}"),
-                merge::extract_timeline(f, |line| timestamp::parse_jsonl_field(line, name, 0)),
-            ),
-            TsRoute::LogPrefix(fmt) => (
-                format!(".log {}", fmt.label()),
-                merge::extract_timeline(f, move |line| {
-                    timestamp::parse_prefix(line, *fmt, 0).map(|(v, _)| v)
-                }),
-            ),
-        };
-        let el = t.elapsed();
-        total_extract += el;
-        total_ts_bytes += ts.len() * 8;
-        let ns_per_line = el.as_nanos() as f64 / ts.len().max(1) as f64;
-        let thr = mib / el.as_secs_f64().max(1e-9);
-        println!("[src{i}] {}", files[i]);
-        println!(
-            "    打开 {:>6} ms ({mib:.0} MiB, {} 行)   通路: {route_desc}",
-            open_els[i].as_millis(),
-            f.line_count()
-        );
-        println!(
-            "    提取 {:>6} ms ({thr:.0} MiB/s, {ns_per_line:.0} ns/行)",
-            el.as_millis()
-        );
-        timelines.push(SourceTimeline { file: f, ts });
-    }
-    if timelines.len() < 2 {
-        println!("有效源 <2, 归并无意义, 仅出提取数字。");
+    if out.sources.len() < 2 {
+        println!("有效源 <2, 归并无意义。");
         return;
     }
+    println!(
+        "\n① 合并就绪 (打开+探测+schema+提取+归并): {} ms",
+        open_el.as_millis()
+    );
+    let mut total_lines = 0u64;
+    let mut total_bytes = 0u64;
+    let mut ts_bytes = 0usize;
+    for (i, s) in out.sources.iter().enumerate() {
+        let st = s.file.stats();
+        total_lines += s.file.line_count();
+        total_bytes += st.file_bytes;
+        ts_bytes += out.ts[i].len() * 8;
+        println!(
+            "   [src{i}] {} —— {:.0} MiB, {} 行, 通路 {}",
+            s.path.display(),
+            st.file_bytes as f64 / (1024.0 * 1024.0),
+            s.file.line_count(),
+            merge_view::route_label(&s.route)
+        );
+    }
+    println!(
+        "   合计 {} 行 / {:.2} GiB · 索引 {:.1} MiB ({} B) · ts 向量 {:.1} MiB",
+        total_lines,
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        out.index.index_bytes() as f64 / (1024.0 * 1024.0),
+        out.index.index_bytes(),
+        ts_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!("   D5 红线 (CP0 校准, 引擎三段口径): 3×1GB ≤ 1.6s / 8×200MB ≤ 1.0s");
 
-    // 第三遍: 归并。
+    // ── ② 重归并 (加/减源 · 轮转 · 巨量追平共用的全量重跑) ─────────────
     let t = Instant::now();
-    let idx = merge::build_index(&timelines);
-    let merge_el = t.elapsed();
+    let out2 = merge_view::build_merge(&paths, &[], &AtomicBool::new(false));
+    let rebuild_el = t.elapsed();
     println!(
-        "归并           : {} ms ({} 行, {:.0} 行/ms)",
-        merge_el.as_millis(),
-        idx.len(),
-        idx.len() as f64 / merge_el.as_millis().max(1) as f64
+        "\n② 重归并 (全量重跑, 旧 bundle 在此期间保持可见): {} ms   [同进程二次, 页缓存已热]",
+        rebuild_el.as_millis()
+    );
+
+    // ── ③ 隐藏重建 (掩码重归并, 不重提时间戳) ─────────────────────────
+    let mut st = MergeState::from_outcome(out2);
+    let full_rows = st.row_count();
+    let t = Instant::now();
+    st.sources[0].hidden = true;
+    st.rebuild_masked();
+    let masked_el = t.elapsed();
+    println!(
+        "\n③ 隐藏重建 (源0 隐藏 → 掩码重归并, 不重提): {} ms → {} 行 (原 {full_rows} 行)",
+        masked_el.as_millis(),
+        st.row_count()
+    );
+    st.sources[0].hidden = false;
+    st.rebuild_masked();
+
+    // ── ④ 跟随追加 (live-tail 增量: append_from + 增量合流) ───────────
+    // 真追加不许动基准数据 → 对**目标源做临时副本**, 副本参与建场 (归并源就是它),
+    // 追加只落在副本上。两条形态都测: 追最新源 (尾行 ts 全局最大) = 常态快路;
+    // 追滞后源 (尾行 ts 落后全局尾数小时) = 尾端回找的深路径。
+    let leader = extreme_ts_source(&out.ts, true);
+    let laggard = extreme_ts_source(&out.ts, false);
+    // 块大小可调 (LOGBENCH_BLOCK_KIB): 小批验「每行成本 = 回找深度」模型。
+    let block = std::env::var("LOGBENCH_BLOCK_KIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096)
+        * 1024;
+    println!(
+        "\n④ 跟随追加 (每次 +{:.1} MiB 行对齐尾块, 目标源做临时副本):",
+        block as f64 / 1048576.0
+    );
+    // 探针: 1 GiB 源的 mmap 建立 / 释放成本 —— 每次追加都要换入新快照 (旧映射
+    // 随之释放), 这笔固定开销按**源大小**付, 与追加行数无关。
+    {
+        use danqing_log::logfile::LogFile;
+        let t = Instant::now();
+        let f = LogFile::open(&paths[0]).expect("探针源可开");
+        let open_ms = t.elapsed();
+        for l in 0..f.line_count() {
+            std::hint::black_box(f.line(l)); // 触页: 逼近归并/显示读过的驻留态
+        }
+        let t = Instant::now();
+        drop(f);
+        println!(
+            "   探针: 1 GiB 源 mmap 建立 {} ms / **释放 {} ms** (全页触过)",
+            open_ms.as_millis(),
+            t.elapsed().as_millis()
+        );
+    }
+    append_case(
+        "追最新源 (尾行 ts 全局最大 → 常态快路)",
+        &paths,
+        leader,
+        block,
+        false,
+        "lead",
+    );
+    append_case(
+        "追滞后源 (尾行 ts 落后全局尾 → 深回找)",
+        &paths,
+        laggard,
+        block,
+        false,
+        "lag",
+    );
+    append_case(
+        "追滞后源 · 追踪态 (T7 留档复核)",
+        &paths,
+        laggard,
+        block,
+        true,
+        "lagtr",
+    );
+    std::fs::remove_file(copy_path(&paths[leader], "lead")).ok();
+    std::fs::remove_file(copy_path(&paths[laggard], "lag")).ok();
+    std::fs::remove_file(copy_path(&paths[laggard], "lagtr")).ok();
+}
+
+/// 尾行 ts 最大 / 最小的源序号 (基准自己挑靶, 不靠人工指定索引)。
+fn extreme_ts_source(ts: &[Vec<i64>], want_max: bool) -> usize {
+    // 空源 (无行) 给中性值, 它不该被挑成靶; 取最小侧用 `min_by_key` 而非
+    // `-key` —— `i64::MIN` 取负会溢出 (debug panic / release 回绕, 评审 Nit)。
+    let key = |i: usize| {
+        ts[i]
+            .last()
+            .copied()
+            .unwrap_or(if want_max { i64::MIN } else { i64::MAX })
+    };
+    if want_max {
+        (0..ts.len()).max_by_key(|&i| (key(i), i)).unwrap_or(0)
+    } else {
+        (0..ts.len()).min_by_key(|&i| (key(i), i)).unwrap_or(0)
+    }
+}
+
+/// 目标源的临时副本路径 (追加只落副本)。`tag` 区分同源多例 (D3 异步释放下
+/// 旧映射可能仍在, 同路径重建会被 Windows 映射语义拒 —— 每例一个名)。
+fn copy_path(src: &std::path::Path, tag: &str) -> PathBuf {
+    let stem = src.file_name().and_then(|s| s.to_str()).unwrap_or("src");
+    std::env::temp_dir().join(format!(
+        "danqing-mergebench-{}-{stem}-{tag}",
+        std::process::id()
+    ))
+}
+
+/// 单源追加剧组: 副本建场 → (可选) 追踪 → 追加 → 计时 + 真值位诊断。
+fn append_case(
+    label: &str,
+    paths: &[PathBuf],
+    target: usize,
+    budget: usize,
+    with_trace: bool,
+    tag: &str,
+) {
+    use danqing_log::logfile::LogFile;
+    use danqing_log::merge_view::{self, MergeState};
+    use std::sync::atomic::AtomicBool;
+
+    let copy = copy_path(&paths[target], tag);
+    if std::fs::copy(&paths[target], &copy).is_err() {
+        println!("   {label}: 跳过 (临时副本创建失败)");
+        return;
+    }
+    let mut p2 = paths.to_vec();
+    p2[target] = copy.clone();
+    let mut st =
+        MergeState::from_outcome(merge_view::build_merge(&p2, &[], &AtomicBool::new(false)));
+    let block = tail_block(&copy, budget);
+    // 真值位诊断: 新行尾 ts 之后还剩多少合并行 = 尾端回找要走的步数。
+    // (块是文件尾部的副本, 其 ts 上界 = 该源当前尾行 ts。)
+    let new_max = st.ts[target].last().copied().unwrap_or(0);
+    let depth = st.index.rows().iter().filter(|r| r.ts > new_max).count();
+
+    if with_trace {
+        let value = shortest_line(&block);
+        let files: Vec<std::sync::Arc<LogFile>> = st
+            .sources
+            .iter()
+            .map(|s| std::sync::Arc::clone(&s.file))
+            .collect();
+        let clause = merge_view::trace_clause(&value);
+        let t = Instant::now();
+        let (hits, _) = merge_view::trace_hits(&files, &clause);
+        let scan = t.elapsed();
+        let t = Instant::now();
+        let n = st.apply_trace(hits.clone(), (0, 0));
+        let push = t.elapsed();
+        let t = Instant::now();
+        st.apply_trace(hits, (0, 0));
+        let repush = t.elapsed();
+        println!(
+            "      追踪 \"{value}\": 全源扫描 {} ms → {n} 命中; 过滤集重推 {} ms / 再推 {} ms (O(合并行数))",
+            scan.as_millis(),
+            push.as_millis(),
+            repush.as_millis()
+        );
+    }
+
+    append_block(&copy, &block);
+    // 选中位变体 (LOGBENCH_SEL_TAIL): 选中行落在索引深处 → 追加后的
+    // (源,行)→位置 锚定走线性扫 (position_of), 成本随合并行数走。
+    if std::env::var("LOGBENCH_SEL_TAIL").is_ok() {
+        st.selected = st.row_count().saturating_sub(1);
+    }
+    let t = Instant::now();
+    let new_file = LogFile::append_from(&st.sources[target].file, &copy).expect("副本可读");
+    let incr = t.elapsed();
+    let t = Instant::now();
+    let added = st.append_source(target as u32, new_file);
+    let merge_incr = t.elapsed();
+    println!(
+        "   {label}: 行索引增量 {} ms + 合流 {} ms = {} ms → +{added} 行 (时间线 {} 行)",
+        incr.as_millis(),
+        merge_incr.as_millis(),
+        (incr + merge_incr).as_millis(),
+        st.row_count()
     );
     println!(
-        "时间戳向量     : {:.1} MiB (归并后退役, 峰值内存的另一半)",
-        total_ts_bytes as f64 / (1024.0 * 1024.0)
+        "      诊断: 新行真值深度 {depth} 行 (T9 起插入无帽 = 真值位; 产品侧 >20000 行/轮交 worker 重归并)"
     );
-    println!(
-        "索引驻留       : {:.1} MiB ({} bytes, 16 B/行)",
-        idx.index_bytes() as f64 / (1024.0 * 1024.0),
-        idx.index_bytes()
-    );
-    println!(
-        "合并总墙钟     : {} ms (打开+提取+归并)",
-        t_all.elapsed().as_millis()
-    );
-    println!(
-        "对照           : 首源单文件打开 {} ms —— D5 红线 (CP0 校准): 3×1GB 合并就绪 ≤ 1.6s",
-        first_open.as_millis()
-    );
+}
+
+/// 取文件尾部的**行对齐**字节块 (≤ `budget`; 起点必须是行首, 末尾保持原样)。
+/// 追加它 = 真实「新行落到时间线尾」形态 (时间戳与被复制段相同、行号更大,
+/// 归并序紧跟在原段之后)。
+fn tail_block(path: &std::path::Path, budget: usize) -> Vec<u8> {
+    let bytes = std::fs::read(path).expect("基准源可读");
+    let start = bytes.len().saturating_sub(budget);
+    let head = bytes[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(start);
+    bytes[head..].to_vec()
+}
+
+/// 追加字节块 (OpenOptions append; 基准源只许追加不许改写)。
+fn append_block(path: &std::path::Path, block: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("基准源可追加");
+    f.write_all(block).expect("追加写失败");
+    f.flush().expect("flush 失败");
+}
+
+/// 块内**最短非空行** (trim 后) —— 追踪值取它: 用户可选的「选中一个值」形态,
+/// 且短行不会把 trace 值撑成半行文本。
+fn shortest_line(block: &[u8]) -> String {
+    block
+        .split(|&b| b == b'\n')
+        .map(|l| String::from_utf8_lossy(l).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .min_by_key(|l| l.len())
+        .unwrap_or_else(|| "x".to_string())
 }

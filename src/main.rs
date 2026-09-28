@@ -56,6 +56,13 @@ const SEARCH_HIT_CAP: usize = 1_000_000;
 /// 串行增量索引 ~2.4GB/s → 32MB ≈ 13ms ≤ 16ms 帧预算 (async-open plan D3)。
 const APPEND_SYNC_MAX_BYTES: u64 = 32 << 20;
 
+/// **合并态**增量合流的同步闸 (T9 实测定, 比字节闸更紧): 单文件侧的 32 MiB
+/// 口径只按**文件行索引**的成本定 («2.4GB/s»), 不含合并侧的增量合流 —— 而
+/// 后者的代价 ∝ 批行数 + 回找深度 (索引 ×16B 的内存位移)。合并态超此批行数
+/// 即交 worker 全量重归并 (旧 bundle 保持可见), 不赌 UI 线程。
+/// 常态 live-tail (每轮几十~几千行) 远在闸下, 走同步快路。
+const MERGE_SYNC_MAX_ROWS: u64 = 20_000;
+
 /// 空态底栏提示 (无参启动, 未打开文件时)。
 const EMPTY_STATUS: &str = "未打开文件 · 按 Ctrl+O 打开日志文件";
 
@@ -377,6 +384,16 @@ pub(crate) struct LogApp {
     workspace: Workspace,
     /// 归并后台作业 (AsyncJob 同款先例: launch 起线程, tick 拾取)。
     merge_job: AsyncJob<danqing_log::merge_view::MergeOutcome>,
+    /// 归并作业在途标记 (T7): AsyncJob 无 in-flight 查询, poll_growth_merge
+    /// 的「重归并在途不叠加」门禁靠它 (launch 置位 / pickup 清除)。
+    merge_job_live: bool,
+    /// 合并会话恢复载荷 (T8): apply_session (合并组) 挂上, 交卷
+    /// (apply_merge_outcome) 套回保存的源时间参数/显隐; start_merge /
+    /// rebuild_merge 清理 (用户另起/改源归并 = 旧载荷作废, 防错嫁新归并)。
+    pending_merge_apply: Option<danqing_log::merge_view::MergeGroup>,
+    /// 追踪过滤后台作业 (腿 E/T6): per-source run_filter 全源并行在线程内串行,
+    /// tick 拾取落地; 重建/退出合并即 invalidate (R5 族: 在途不得晚到复活)。
+    trace_job: AsyncJob<danqing_log::merge_view::TraceOutcome>,
 }
 
 /// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
@@ -541,6 +558,16 @@ pub(crate) enum Msg {
     /// 退出合并回单文件工作区 (MergeState 保留, 再进不重建, D4 互不丢状态)。
     /// 构造点 = 弹层「退出合并」(ToggleMergeWorkspace)。
     ExitMerge,
+    /// T6 (腿 E): 追踪选中值 —— view 出选区键 (源, 文件行, 字节区间),
+    /// 值提取 (JSONL 放大字段值 / .log 原文) + per-source 过滤在应用层。
+    TraceValue {
+        src: u32,
+        line: u32,
+        lo: usize,
+        hi: usize,
+    },
+    /// T6: 清除追踪过滤 (Esc 升级序列末级: 选区 → 追踪 → 清焦)。
+    ClearTrace,
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     ///
     /// **级别语义** (2026-09-14 实机 M0 P27): `NoticeKind::Warn` = 警示
@@ -654,6 +681,9 @@ impl LogApp {
             merge: None,
             workspace: Workspace::Single,
             merge_job: AsyncJob::new(),
+            merge_job_live: false,
+            pending_merge_apply: None,
+            trace_job: AsyncJob::new(),
         }
     }
 
@@ -875,6 +905,14 @@ impl LogApp {
             search: self.search_query.clone(),
             config: self.columns.clone(),
             expands: self.expanded.lines(),
+            // T8 (SPEC-v1x-merge-timeline D4): 合并工作区保存 = 单文件侧四样
+            // (冻结现场, 属 self.path) + 合并组快照 (源/时间参数/显隐);
+            // 追踪过滤串首版不落盘 (MergeGroup 注释)。
+            merge: if self.workspace == Workspace::Merge {
+                self.merge.as_ref().map(|m| m.snapshot_group())
+            } else {
+                None
+            },
             updated,
         };
         if let Some(slot) = self.sessions.iter_mut().find(|s| s.name == name) {
@@ -888,18 +926,91 @@ impl LogApp {
         self.set_notice(format!("会话「{name}」{verb}{tail}"), NoticeKind::Info);
     }
 
-    /// 应用命名会话 (D1/D2): ①列换入**写穿** per-file 条目 ②过滤/搜索走既有
-    /// 全链重跑 (查询串 = 真相重建) ③展开重建 (越界/不可展开剔除) ④回顶。
+    /// 应用命名会话 (D1/D2): 单文件会话 = 四样全链重跑; 合并组会话 (T8) =
+    /// 先验源 (缺失明示跳过, 不足两源整体不动) → 单文件侧四样照旧 → 后台
+    /// 重开源组重建合并, 保存的源参数交卷时套回 (apply_merge_outcome)。
     /// 应用即记选中 (「删除」指针, T3)。**书签零触碰** (Open Q1)。
-    /// 返回是否找到 (未知名不动账, 留弹层重选)。
+    /// 返回是否已应用 (未知名/源不足不动账, 留弹层重选)。
     fn apply_session(&mut self, name: &str) -> bool {
-        // 命名会话是**单文件**现场 (per-路径载荷): 合并中应用 = 先切回 Single
-        // (合并 bundle 保留); 合并工作区的会话载荷在 T8。
-        self.workspace = Workspace::Single;
         let Some(s) = self.sessions.iter().find(|s| s.name == name).cloned() else {
             self.set_notice("会话不存在".into(), NoticeKind::Warn);
             return false;
         };
+        if let Some(group) = s.merge.clone() {
+            // 先验源 (T8 验收 g): 缺失/暂不可读明示跳过; 现存不足两个 =
+            // 整体不应用 (零副作用, 会话留着, 修源后重试)。
+            let mut paths: Vec<PathBuf> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            let mut refused = 0usize;
+            for src in &group.sources {
+                let p = PathBuf::from(&src.path);
+                if paths.contains(&p) {
+                    continue; // 手造账本重复源 (载入侧已收编, 双保险)
+                }
+                // 设备命名空间 (\\.\PhysicalDrive0 之类) 不是日志: 拒收明示。
+                // 账本路径本身是「用户自己的文件」= 已信任假设 (含 UNC 网络盘:
+                // 那可能是用户真在看的共享日志), 但设备命名空间会把原始设备
+                // 当普通文件整个映射 —— 行为不可预期, 一律不认 (安全审计同条)。
+                if src.path.starts_with(r"\\.\") {
+                    refused += 1;
+                    continue;
+                }
+                if FileStat::of(&p).is_ok() {
+                    paths.push(p);
+                } else {
+                    missing.push(src.path.clone());
+                }
+            }
+            if paths.len() < 2 {
+                self.set_notice(
+                    format!(
+                        "会话「{name}」的合并源现存不足两个 (缺失 {} 个), 未应用",
+                        missing.len()
+                    ),
+                    NoticeKind::Warn,
+                );
+                return false;
+            }
+            self.workspace = Workspace::Single; // 单文件侧载荷在 Single 路由下应用
+            self.apply_session_payload(&s);
+            // 合并组重开 (后台归并); 源集合换了 → 在途追踪作废。
+            self.discard_trace_job();
+            self.pending_merge_apply = Some(group.clone());
+            self.merge_job_live = true;
+            // 保存的源参数**带进 worker**: 偏移/时区在提取时就施加 (评审 R3 ——
+            // 原先交卷后在 UI 线程重提 3×1GiB ≈1s, 与「重活在 worker」自相矛盾),
+            // 显隐在建索引时就掩码 (落点零重建)。
+            let saved_sources = group.sources.clone();
+            self.merge_job.launch(move || {
+                danqing_log::merge_view::build_merge(
+                    &paths,
+                    &saved_sources,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+            });
+            let mut skip = if missing.is_empty() {
+                String::new()
+            } else {
+                format!(" (跳过 {} 个缺失源)", missing.len())
+            };
+            if refused > 0 {
+                skip.push_str(&format!(" (忽略 {refused} 个设备路径)"));
+            }
+            self.set_notice(format!("恢复合并会话「{name}」…{skip}"), NoticeKind::Info);
+            return true;
+        }
+        // 单文件会话: 合并中应用 = 先切回 Single (合并 bundle 保留, D4 不丢)。
+        // 离场同样作废 (评审 C1: 否则旧命中表会在下次进合并时落地)。
+        self.discard_trace_job();
+        self.workspace = Workspace::Single;
+        self.apply_session_payload(&s);
+        true
+    }
+
+    /// 单文件侧四样应用 (D1/D2): ①列换入**写穿** per-file 条目 ②过滤/搜索走
+    /// 既有全链重跑 (查询串 = 真相重建) ③展开重建 (越界/不可展开剔除) ④回顶。
+    /// 单文件会话与合并组会话共用 (T8 拆出, 行为零变化)。
+    fn apply_session_payload(&mut self, s: &danqing_log::columns::SessionEntry) {
         self.columns = s.config.clone();
         self.merge_columns();
         self.save_state(); // 写穿 (接缝定案: 会话应用 = 写穿 per-file 条目)
@@ -921,8 +1032,7 @@ impl LogApp {
         self.rebuild_expands(&s.expands);
         self.set_top(0.0);
         self.set_selected(0);
-        self.session_selected = Some(s.name);
-        true
+        self.session_selected = Some(s.name.clone());
     }
 
     /// 删除命名会话 (Open Q4: 无确认, 说清即走 —— 快照非唯一记忆, 重存即可)。
@@ -1585,8 +1695,15 @@ impl LogApp {
     /// F 键：跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
     fn toggle_follow(&mut self) {
         if self.workspace == Workspace::Merge {
-            // T3: 合并跟随的合流在 T7 —— 「按了没反应」要说话 (P24), 不静默。
-            self.set_notice("合并视图的跟随随 T7 接通".into(), NoticeKind::Info);
+            // T7 (腿 F): 合并跟随接通 —— 钉时间线尾 (最新事件处); 新行合流时
+            // append_source 内钉 (pin_tail), 与单文件「跟随新行」同语义。
+            if let Some(m) = self.merge_active_mut() {
+                m.follow = !m.follow;
+                if m.follow {
+                    m.pin_tail();
+                }
+            }
+            self.refresh_status();
             return;
         }
         self.follow = !self.follow;
@@ -1622,24 +1739,31 @@ impl LogApp {
             return;
         }
         if paths.len() > danqing_log::merge_view::MAX_SOURCES {
-            self.set_notice(
-                format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES),
-                NoticeKind::Warn,
-            );
+            self.set_notice(Self::merge_cap_notice(), NoticeKind::Warn);
             return;
         }
         // cancel 插桩在源间 (build_merge 内); UI 侧作废走 AsyncJob 代次, 不设显式取消钮 (T3)。
+        // T8: 用户另起归并 = 作废旧会话恢复载荷 (防错嫁到新归并)。
+        self.pending_merge_apply = None;
+        self.merge_job_live = true;
         self.merge_job.launch(move || {
-            danqing_log::merge_view::build_merge(&paths, &std::sync::atomic::AtomicBool::new(false))
+            danqing_log::merge_view::build_merge(
+                &paths,
+                &[],
+                &std::sync::atomic::AtomicBool::new(false),
+            )
         });
         self.set_notice("合并中…".into(), NoticeKind::Info);
     }
 
-    /// 归并作业拾取 (tick 每帧)。
+    /// 归并作业拾取 (tick 每帧)。**交付才清在途标记** —— 摘「先清后 poll」:
+    /// 首帧 poll 空转就把 live 清了 = 「重归并在途不叠加」门禁在飞行中提前
+    /// 开门 (T7 遗留错形, T8 测试撞出: pump 首拾取即返回, 作业还在飞)。
     fn pickup_merge_job(&mut self) {
         let Some(out) = self.merge_job.poll() else {
             return;
         };
+        self.merge_job_live = false;
         self.apply_merge_outcome(out);
     }
 
@@ -1657,10 +1781,7 @@ impl LogApp {
                 return;
             }
             if paths.len() >= danqing_log::merge_view::MAX_SOURCES {
-                self.set_notice(
-                    format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES),
-                    NoticeKind::Warn,
-                );
+                self.set_notice(Self::merge_cap_notice(), NoticeKind::Warn);
                 return;
             }
             paths.push(path);
@@ -1723,46 +1844,187 @@ impl LogApp {
         let (off, tz) = (m.sources[src].offset_ms, m.sources[src].tz_offset_ms);
         let (new_off, new_tz) = f(off, tz);
         m.set_time_params(src, new_off.unwrap_or(off), new_tz.unwrap_or(tz));
+        self.discard_trace_job(); // 时间参数变了 = 过滤行集作废 (rebuild_masked)
         self.refresh_status();
     }
 
     /// 源列表变化后的重归并 (加/减源共用): 后台重跑 build_merge,
     /// 交卷时 [`merge_view::carry_view_state`] 按路径把书签/显隐/选中搬过来。
+    /// **源参数按路径随行** (评审 T9 补): 时钟偏移/时区是用户调过的现场,
+    /// 不加/减源就丢 —— 旧 `carry_view_state` 只搬显隐 (那是评审抓到的静默重置)。
     fn rebuild_merge(&mut self, paths: Vec<PathBuf>) {
+        self.discard_trace_job(); // 源集合变了
+        // T8: 改源归并 = 作废旧会话恢复载荷 (防错嫁到新归并)。
+        self.pending_merge_apply = None;
+        let saved = self
+            .merge
+            .as_ref()
+            .map(|m| m.snapshot_group().sources)
+            .unwrap_or_default();
+        self.merge_job_live = true;
         self.merge_job.launch(move || {
-            danqing_log::merge_view::build_merge(&paths, &std::sync::atomic::AtomicBool::new(false))
+            danqing_log::merge_view::build_merge(
+                &paths,
+                &saved,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
         });
         self.set_notice("重归并中…".into(), NoticeKind::Info);
+    }
+
+    // ---- 腿 E (T6): req_id 追踪 ----
+
+    /// 追踪选中值: 值提取 (JSONL 行落在字符串字面量内 → 放大整个字段值;
+    /// 否则选区原文, .log 同款) → **单条 Bare 子句** (不经 parse_query, 见
+    /// `trace_clause` 注释) → per-source run_filter 后台作业。
+    fn start_trace(&mut self, src: u32, line: u32, lo: usize, hi: usize) {
+        let (value, files) = {
+            let Some(m) = self.merge_active() else {
+                self.set_notice("追踪只在合并视图内可用".into(), NoticeKind::Info);
+                return;
+            };
+            // 下面两条 = 拓扑在「手势 → 落地」之间变过 (加/减源/换文件)。**出声**
+            // (P24: 不许静默吞动作), 不猜用户想追哪一行。
+            let Some(source) = m.sources.get(src as usize) else {
+                self.set_notice("合并源已变化, 请重新选中再追踪".into(), NoticeKind::Warn);
+                return;
+            };
+            let text = danqing_log::merge_view::row_text(&source.file, line);
+            let Some(sel) = text.get(lo..hi) else {
+                self.set_notice("该行内容已变化, 请重新选中再追踪".into(), NoticeKind::Warn);
+                return;
+            };
+            let value: &str =
+                if matches!(source.route, danqing_log::timestamp::TsRoute::JsonlField(_)) {
+                    match danqing_log::merge_view::snap_jsonl_string(&text, lo, hi) {
+                        Some((a, b)) => &text[a..b],
+                        None => sel,
+                    }
+                } else {
+                    sel
+                };
+            if value.trim().is_empty() {
+                self.set_notice(
+                    "追踪值为空 —— 双击或框选消息里的追踪值 (如 req_id)".into(),
+                    NoticeKind::Info,
+                );
+                return;
+            }
+            let files: Vec<Arc<LogFile>> = m.file_handles();
+            (value.to_string(), files)
+        };
+        let clause = danqing_log::merge_view::trace_clause(&value);
+        let v = value.clone();
+        self.trace_job.launch(move || {
+            let t = Instant::now();
+            let (hits, scanned) = danqing_log::merge_view::trace_hits(&files, &clause);
+            danqing_log::merge_view::TraceOutcome {
+                hits,
+                scanned,
+                value: v,
+                anchor: (src, line),
+                elapsed: t.elapsed(),
+            }
+        });
+        self.set_notice(format!("追踪 \"{value}\" 中…"), NoticeKind::Info);
+    }
+
+    /// 源上限拒绝文案 (D7 同一句话, 两个入口: 起并 / 加源) —— 收口一处,
+    /// 免得上限改了只改一处; 上限值本身仍取 `merge_view::MAX_SOURCES` 真身。
+    fn merge_cap_notice() -> String {
+        format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES)
+    }
+
+    /// **在途追踪作废** (R5 族唯一收口): 命中表按「某时刻的源集合」编号 ——
+    /// 源集合变 (加/减源/换工作区/显隐/时间参数) 或工作区离场后, 旧表对新状态
+    /// 就是错账: 轻则把命中贴到别源, 重则按 `src` 索引越界 (release=abort)。
+    /// 所有「集合/参数/工作区变了」的路径都必须调它; `apply_trace_outcome` 另有
+    /// 到点校验兜底 (评审 C1 双保险)。
+    fn discard_trace_job(&mut self) {
+        self.trace_job.invalidate();
+    }
+
+    /// 追踪交卷落地 (tick 拾取 / 测试同步注入共用 —— apply_merge_sync 先例):
+    /// 过滤行集进 MergeState + 选中锚回发起行 + 视口跟上 + 底栏两通道反馈
+    /// (notice = 对动作的回答; status = 常驻「追踪中」态)。
+    fn apply_trace_outcome(&mut self, out: danqing_log::merge_view::TraceOutcome) {
+        let Some(m) = self.merge_active_mut() else {
+            return; // 已退出合并 → 丢 (R5 族)
+        };
+        // 源集合不符 = 换过源 (在途窗口里加/减源或换过工作区) → 命中表按旧序号
+        // 编号, 用了就是越界/错贴。丢弃并**出声** (评审 C1; P24: 不许静默)。
+        if out.hits.len() != m.sources.len() {
+            self.set_notice(
+                "合并源已变化, 本次追踪作废 (请重新追踪)".into(),
+                NoticeKind::Warn,
+            );
+            return;
+        }
+        // T7 缝: 在途窗口内源可能已追加 —— 扫描快照行数 < 当前行数的源,
+        // 缺口 [scanned-1, 当前) 增量补滤 (退一行 = 末行补全改判同区间,
+        // 摘/补对称同 apply_appended 纪律), 不许追踪永久缺那窗里进来的行。
+        let mut hits = out.hits;
+        for (i, s) in m.sources.iter().enumerate() {
+            let cur = s.file.line_count();
+            let scanned = out.scanned.get(i).copied().unwrap_or(cur);
+            if cur > scanned {
+                let from = scanned.saturating_sub(1);
+                let gap = jsonl::run_filter_from(
+                    &s.file,
+                    &[danqing_log::merge_view::trace_clause(&out.value)],
+                    from,
+                );
+                let h = &mut hits[i];
+                let keep = h.partition_point(|&l| l < from);
+                h.truncate(keep);
+                h.extend(gap); // 升序接升序 (from 分界)
+            }
+        }
+        let n = m.apply_trace(hits, out.anchor);
+        m.trace = Some(out.value.clone());
+        m.top_row = m.selected.saturating_sub(3) as f64; // 锚行上方留三行上下文
+        self.set_notice(
+            format!(
+                "追踪 \"{}\" · 命中 {n} 行 ({} ms)",
+                out.value,
+                out.elapsed.as_millis()
+            ),
+            NoticeKind::Info,
+        );
+        self.refresh_status();
     }
 
     /// 归并交卷换入: 建 MergeState + 切 Merge 工作区 + 拒收源明示 (SPEC D2);
     /// 旧 bundle 在场 = carry 保书签/显隐/选中 (加减源重建不丢, D4)。
     fn apply_merge_outcome(&mut self, out: danqing_log::merge_view::MergeOutcome) {
+        // 源集合整体换入的唯一落地点 (评审 C1: 不在此作废, 旧命中表必越界)
+        self.discard_trace_job();
         let rejected = out.rejected.len();
         let n_sources = out.sources.len();
         let rows = out.index.len();
-        let mut fresh = danqing_log::merge_view::MergeState {
-            sources: out.sources,
-            ts: out.ts,
-            index: out.index,
-            filtered: None,
-            top_row: 0.0,
-            selected: 0,
-            bookmarks: std::collections::BTreeSet::new(),
-            expanded: ExpandMap::new(),
-            follow: false,
-        };
+        let mut fresh = danqing_log::merge_view::MergeState::from_outcome(out);
         if let Some(old) = self.merge.as_ref() {
             // 加/减源重建: 旧 bundle 在场 → 书签/显隐/选中按路径搬 (D4 不丢)。
             // 首次合并 (old = None) 不走 —— 全新状态。
             danqing_log::merge_view::carry_view_state(old, &mut fresh);
         }
+        // T8: 会话恢复载荷殿后 (carry 先跑 = 书签/展开零触碰, 载荷后跑 =
+        // 显隐以保存值为准)。返回有变化的源数 (0 = 全同, 零打扰)。
+        let restored = match self.pending_merge_apply.take() {
+            Some(saved) => fresh.apply_saved_params(&saved),
+            None => 0,
+        };
         self.merge = Some(fresh);
         self.workspace = Workspace::Merge;
         if rejected > 0 {
             self.set_notice(
                 format!("{rejected} 个源未加入 (探测失败), 已明示; 合并 {n_sources} 源 {rows} 行"),
                 NoticeKind::Warn,
+            );
+        } else if restored > 0 {
+            self.set_notice(
+                format!("合并会话参数已套回 ({restored} 源, {n_sources} 源 {rows} 行)"),
+                NoticeKind::Info,
             );
         }
         self.focus_target = Some("log-view");
@@ -1772,8 +2034,9 @@ impl LogApp {
     /// 增长检测 (live-tail): 文件变长 → `append_from` 增量; 缩容/轮转 → 全量重建。
     fn poll_growth(&mut self) {
         if self.workspace == Workspace::Merge {
-            // T3: 合并期间单文件 tail 冻结 (合并跟随合流在 T7); 退出合并后
-            // 这里的 stat 轮询自然发现过期 → 追平/重建, 零状态残留。
+            // T7 (腿 F): 合并期间单文件 tail 仍冻结 (app.file 不动, 退出后追平
+            // 零残留), 但**合并源各自轮询合流** —— 见 poll_growth_merge。
+            self.poll_growth_merge();
             return;
         }
         if !self.has_file {
@@ -1823,6 +2086,122 @@ impl LogApp {
         } else {
             // 同文件缩容 (截断): 全量重建
             self.rebuild_file();
+        }
+    }
+
+    /// 合并工作区的 live-tail (腿 F/T7): **per-source** stat 轮询 ——
+    ///
+    /// - 未变: 跳过; 读取失败: 断流标记 (单源断流不拖垮全局, 弹层/底栏明示);
+    /// - 增长: 小增量同步合流 (`MergeState::append_source`); 巨量追平 /
+    ///   UTF-16 副本增量不适用 → 全量重归并 (worker, 旧 bundle 保持可见);
+    /// - 轮转/缩容 (head 变 / len 缩): 全量重归并 (单文件 rebuild_file 同族)。
+    ///
+    /// 门禁与单文件同款: 重归并在途不叠加 (D3 同族); trace 在途不挡追加
+    /// (落地时缺口补滤对账, 见 apply_trace_outcome)。
+    fn poll_growth_merge(&mut self) {
+        if self.merge_job_live {
+            return; // 重归并在途不叠加 (打开/重建期间 stat 必过期, 下轮再来)
+        }
+        enum MergeTailAct {
+            Append(u32, LogFile),
+            Rotate(String),
+        }
+        let mut acts: Vec<MergeTailAct> = Vec::new();
+        let mut dirty = false;
+        {
+            let Some(m) = self.merge_active_mut() else {
+                return;
+            };
+            for (i, s) in m.sources.iter_mut().enumerate() {
+                let Ok(cur) = FileStat::of(&s.path) else {
+                    if !s.stale {
+                        s.stale = true;
+                        dirty = true;
+                    }
+                    continue;
+                };
+                // 恢复可读即清断流 (内容是否过期由下面 stat 比对管 —— 能 stat 到
+                // 就有资格再试; 追加失败会重新标记)。
+                if s.stale {
+                    s.stale = false;
+                    dirty = true;
+                }
+                let known = s.file.stat_snapshot();
+                if cur == known {
+                    continue; // 未变化
+                }
+                if cur.head != known.head || cur.len < known.len {
+                    acts.push(MergeTailAct::Rotate(s.name().to_string()));
+                    break; // 一次重建覆盖全部, 不用再扫
+                }
+                let delta = cur.len - known.len;
+                // 巨量追平 / UTF-16 转码副本 (增量不适用, append_from 会退全量
+                // 且转码整文件 —— 那是 worker 的活, 不在 UI 线程付): 全量重归并
+                let utf16 = matches!(
+                    s.file.encoding(),
+                    danqing::encoding::Encoding::Utf16Le | danqing::encoding::Encoding::Utf16Be
+                );
+                if delta >= APPEND_SYNC_MAX_BYTES || utf16 {
+                    acts.push(MergeTailAct::Rotate(s.name().to_string()));
+                    break;
+                }
+                match LogFile::append_from(&s.file, &s.path) {
+                    Ok(new) => {
+                        let grew = new.line_count() > s.file.line_count();
+                        // 行数没长也可能有事: 旧末行被追加**补全** (写了一半的行
+                        // 续完) —— 内容/ts 都改判, 不落地会一直显示残行。
+                        let tail_completed = !grew && {
+                            let oc = s.file.line_count();
+                            oc > 0 && new.line(oc - 1) != s.file.line(oc - 1)
+                        };
+                        let new_rows = new.line_count().saturating_sub(s.file.line_count());
+                        if new_rows > MERGE_SYNC_MAX_ROWS {
+                            // 大批: 交 worker 全量重归并 (加数 + 一键) —— 增量合流
+                            // 的代价 ∝ 批行数 + 回找深度, 大批不该在 UI 线程付
+                            // (T9 实测: 引擎整批单遍后仍随批行数线性长)。
+                            acts.push(MergeTailAct::Rotate(s.name().to_string()));
+                            break;
+                        }
+                        if grew || tail_completed {
+                            acts.push(MergeTailAct::Append(i as u32, new));
+                        }
+                        // 否则: 半行在写中, 下轮再说
+                    }
+                    Err(_) => {
+                        if !s.stale {
+                            s.stale = true;
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        for act in acts {
+            match act {
+                MergeTailAct::Append(src, new) => {
+                    if let Some(m) = self.merge_active_mut() {
+                        m.append_source(src, new);
+                        dirty = true;
+                    }
+                }
+                MergeTailAct::Rotate(name) => {
+                    // 轮转/截断/巨量/UTF-16: 全量重归并 (旧 bundle 保持可见至交卷)
+                    let paths: Vec<PathBuf> = self
+                        .merge
+                        .as_ref()
+                        .map(|m| m.sources.iter().map(|s| s.path.clone()).collect())
+                        .unwrap_or_default();
+                    self.rebuild_merge(paths);
+                    self.set_notice(
+                        format!("源 {name} 已轮转/截断, 重归并中…"),
+                        NoticeKind::Warn,
+                    );
+                    return; // rebuild_merge 自带提示与状态, 余下动作下轮再扫
+                }
+            }
+        }
+        if dirty {
+            self.refresh_status();
         }
     }
 
@@ -2221,9 +2600,26 @@ impl LogApp {
         // 合并工作区 (腿一 T3): 底栏报合并口径 (源数/行数/跟随/书签),
         // 不拼单文件行数 —— 单文件 base_status 在合并期间保持冻结, 退出即还原。
         if let Some(m) = self.merge_active() {
-            let mut s = format!("合并: {} 源 · {} 行", m.sources.len(), m.row_count());
+            // 追踪态 (T6): 行数口径 = 过滤后命中数, 值与清除路径常驻明示
+            // (无过滤栏的合并视图里, 底栏是「当前有过滤在生效」的唯一去处)。
+            let mut s = if let Some(v) = &m.trace {
+                format!(
+                    "合并: {} 源 · 追踪 \"{}\" → {} 行 (Esc 清除)",
+                    m.sources.len(),
+                    v,
+                    m.row_count()
+                )
+            } else {
+                format!("合并: {} 源 · {} 行", m.sources.len(), m.row_count())
+            };
             if m.follow {
                 s.push_str(" · 跟随");
+            }
+            // T7: 断流源计数常驻 (弹层行内也有标记) —— 「这条时间线有一部分
+            // 不再更新」必须随时可见, 否则用户拿旧行当实时。
+            let stale = m.sources.iter().filter(|s| s.stale).count();
+            if stale > 0 {
+                s.push_str(&format!(" · 断流 {stale} 源"));
             }
             if !m.bookmarks.is_empty() {
                 s.push_str(&format!(" · 书签 {}", m.bookmarks.len()));
@@ -2858,6 +3254,7 @@ impl App for LogApp {
                         }
                         m.rebuild_masked();
                     }
+                    self.discard_trace_job(); // 掩码重建 = 过滤行集作废
                     self.refresh_status();
                 }
             }
@@ -3040,7 +3437,15 @@ impl App for LogApp {
             Msg::StartMerge(paths) => self.start_merge(paths),
             Msg::ExitMerge => {
                 if self.workspace == Workspace::Merge {
+                    self.discard_trace_job(); // 工作区离场
                     self.workspace = Workspace::Single;
+                    self.refresh_status();
+                }
+            }
+            Msg::TraceValue { src, line, lo, hi } => self.start_trace(src, line, lo, hi),
+            Msg::ClearTrace => {
+                if let Some(m) = self.merge_active_mut() {
+                    m.clear_trace();
                     self.refresh_status();
                 }
             }
@@ -3182,15 +3587,42 @@ impl App for LogApp {
                     self.set_notice("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info);
                     return;
                 }
+                if s.eq_ignore_ascii_case("r") {
+                    // 腿 E/T6: 合并视图持焦时 LogView 已消费 Ctrl+R (选区键在
+                    // 组件侧); 到这里的 = 单文件态或未持焦 —— 说清为什么 (P24)。
+                    match self.workspace {
+                        Workspace::Merge => self.set_notice(
+                            "先双击/框选消息里的追踪值, 再按 Ctrl+R".into(),
+                            NoticeKind::Info,
+                        ),
+                        Workspace::Single => self.set_notice(
+                            "追踪跨源值在合并视图可用 (底栏「合并…」/Ctrl+M)".into(),
+                            NoticeKind::Info,
+                        ),
+                    }
+                    return;
+                }
             }
             return;
         }
         // 原始模式：`/` 开搜索栏; `b`/`'` 书签; `f` 跟随 (栏聚焦时键进 TextInput, 不达此处)
-        if self.mode == ViewMode::Raw {
+        // T7: 合并工作区放行 b/'/f (书签/跟随都路由 merge bundle); `/` 不放行 —
+        // 合并搜索栏属后续波次 (T3 边界清单), 开了搜的是单文件快照 = 错账。
+        let raw_or_merge = self.mode == ViewMode::Raw || self.workspace == Workspace::Merge;
+        if raw_or_merge {
             if let Key::Character(s) = key {
                 match s.as_str() {
-                    "/" => {
+                    "/" if self.workspace == Workspace::Single => {
                         self.open_search();
+                        return;
+                    }
+                    "/" => {
+                        // 合并态: 搜索栏属后续波次 (T3 边界清单) —— 说清, 不静默
+                        // (P24); 顺带指路已接通的跨源追踪。
+                        self.set_notice(
+                            "合并视图暂无搜索栏; 跨源追踪: 框选消息后按 Ctrl+R".into(),
+                            NoticeKind::Info,
+                        );
                         return;
                     }
                     "b" => {
@@ -3373,6 +3805,9 @@ impl App for LogApp {
         self.pickup_open_job();
         self.pickup_levels_job();
         self.pickup_merge_job();
+        if let Some(out) = self.trace_job.poll() {
+            self.apply_trace_outcome(out);
+        }
         // T5: 商店授权查询 / 购买结果
         if let Some(e) = self.store_license_job.poll() {
             self.adopt_store_entitlement(e);
@@ -3760,6 +4195,7 @@ mod tests {
             search: String::new(),
             config: danqing_log::columns::ColumnConfig::default(),
             expands: vec![0, 1, 99],
+            merge: None,
             updated: 1,
         });
         app.update(Msg::ApplySession("越界台".into()));
@@ -4100,6 +4536,7 @@ mod tests {
             search: "(".into(), // UTF-8 下 `(?i)(` 正则无效
             config: danqing_log::columns::ColumnConfig::default(),
             expands: Vec::new(),
+            merge: None,
             updated: 1,
         });
         app.update(Msg::ApplySession("坏正则台".into()));
@@ -4712,6 +5149,9 @@ mod tests {
     fn toggle_says_truth_when_save_fails() {
         let cfg = temp_cfg_path("bm-savefail");
         let cols = cfg.with_extension("state.json");
+        // 开头防御性清理 + 结尾整树删 (见末行注): 本用例历史上会**泄漏**占位目录,
+        // 下一次同 pid 复用时 `create_dir` 撞 AlreadyExists → flaky (2026-09-28 抓到)。
+        std::fs::remove_dir_all(&cols).ok();
         std::fs::create_dir(&cols).unwrap(); // 非空目录占住落盘路径 → rename 必败
         std::fs::write(cols.join("sentinel"), b"x").unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
@@ -4729,7 +5169,10 @@ mod tests {
                 .is_some_and(|(_, k)| matches!(k, crate::NoticeKind::Warn)),
             "落盘失败须提示"
         );
-        std::fs::remove_dir(&cols).ok();
+        // `remove_dir` 删不掉**非空**目录 (里面有 sentinel) → 静默 `.ok()` 把它
+        // 永久留在 temp: 等 pid 被复用, 下次开头的 create_dir 就撞 AlreadyExists。
+        // 用整树删 (flaky 根因, 2026-09-28 抓到)。
+        std::fs::remove_dir_all(&cols).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
     }
@@ -6812,6 +7255,7 @@ mod tests {
     fn apply_merge_sync(app: &mut LogApp, paths: Vec<PathBuf>) {
         let out = danqing_log::merge_view::build_merge(
             &paths,
+            &[],
             &std::sync::atomic::AtomicBool::new(false),
         );
         app.apply_merge_outcome(out);
@@ -6916,7 +7360,7 @@ mod tests {
         assert_eq!(
             app.file.line_count(),
             3,
-            "合并期间单文件 tail 冻结 (T7 才合流)"
+            "合并期间**单文件侧** tail 冻结 (T7 起合流发生在合并源上, app.file 不动)"
         );
         assert!(app.open_job.is_none());
         app.update(Msg::ExitMerge);
@@ -6928,18 +7372,23 @@ mod tests {
         std::fs::remove_file(&b).ok();
     }
 
+    /// T7 翻案 (原 `follow_key_in_merge_notices_instead_of_silent_noop` 告示锁退役):
+    /// f 在合并态 = 合并跟随 toggle (钉时间线尾), **单文件 follow 不动** (D4)。
     #[test]
-    fn follow_key_in_merge_notices_instead_of_silent_noop() {
+    fn follow_key_in_merge_toggles_merge_follow_only() {
         let (mut app, cur, a, b) = merge_fixture("follow");
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
         app.toggle_follow();
-        assert!(!app.follow, "单文件 follow 不动");
-        assert!(
-            !app.merge.as_ref().unwrap().follow,
-            "合并 follow 不动 (T7 才接通)"
+        assert!(!app.follow, "单文件 follow 不动 (D4)");
+        assert!(app.merge.as_ref().unwrap().follow, "合并 follow 接通 (T7)");
+        assert_eq!(
+            app.merge.as_ref().unwrap().selected,
+            app.merge.as_ref().unwrap().row_count() - 1,
+            "开跟随即钉时间线尾"
         );
-        assert!(app.notice.is_some(), "「按了没反应」要说话 (P24)");
+        app.toggle_follow();
+        assert!(!app.merge.as_ref().unwrap().follow, "再按解除");
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
@@ -7264,6 +7713,7 @@ l2
                 offset_ms: 0,
                 tz_offset_ms: 0,
                 hidden: false,
+                stale: false,
             });
         }
         assert_eq!(m.sources.len(), 8, "灌满至上限");
@@ -7290,6 +7740,340 @@ l2
             "重复源明示"
         );
         assert_eq!(app.merge.as_ref().unwrap().sources.len(), 8);
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    // ---- 腿 E (T6): req_id 追踪 ----
+
+    /// T6 夹具: 在 merge_fixture 上覆写 cur/b —— cur.log 行1 含 req_id=aaa111,
+    /// b.jsonl 行1 同值 (且 msg 带空格, 供字段值放大验), a.log 无命中。
+    fn trace_fixture(tag: &str) -> (LogApp, PathBuf, PathBuf, PathBuf) {
+        let (app, cur, a, b) = merge_fixture(tag);
+        std::fs::write(
+            &cur,
+            b"2026-09-27T00:00:00Z INFO boot\n2026-09-27T00:00:02Z INFO request done req_id=aaa111\n2026-09-27T00:00:04Z INFO idle\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            br#"{"ts":"2026-09-27T00:00:01.500Z","msg":"enter"}
+{"ts":"2026-09-27T00:00:02.500Z","msg":"request timeout","req_id":"aaa111"}
+{"ts":"2026-09-27T00:00:06.000Z","msg":"end"}
+"#,
+        )
+        .unwrap();
+        (app, cur, a, b)
+    }
+
+    /// 泵追踪作业至落地 (真线程, 小文件瞬时完成; 有界自旋防挂死)。
+    fn pump_trace(app: &mut LogApp) {
+        for _ in 0..1000 {
+            if let Some(out) = app.trace_job.poll() {
+                app.apply_trace_outcome(out);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("追踪作业 1s 内未完成");
+    }
+
+    /// 端到端: .log 源选区子串追踪 → 三源同请求行一次滤出 → 锚定回发起行 →
+    /// 底栏常驻追踪态 → ClearTrace 回全量 (验收 b 的机器半边)。
+    #[test]
+    fn trace_value_filters_across_sources_and_anchors() {
+        let (mut app, cur, a, b) = trace_fixture("chain");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.merge.as_ref().unwrap().row_count(), 9);
+        // 从 .log 源 (源0) 行1 追踪子串 "aaa111" (选区字节直注, 鼠标路径在 view 锁)
+        let text =
+            danqing_log::merge_view::row_text(&app.merge.as_ref().unwrap().sources[0].file, 1);
+        let lo = text.find("aaa111").unwrap();
+        app.update(Msg::TraceValue {
+            src: 0,
+            line: 1,
+            lo,
+            hi: lo + 6,
+        });
+        pump_trace(&mut app);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.trace.as_deref(), Some("aaa111"), "追踪值落账");
+        assert_eq!(m.row_count(), 2, "三源同请求行一次滤出");
+        let seq: Vec<(u32, u32)> = (0..m.row_count())
+            .map(|p| m.row_at(p).map(|r| (r.src, r.line)).unwrap())
+            .collect();
+        assert_eq!(seq, vec![(0, 1), (2, 1)], "命中集按时间线序");
+        assert_eq!(
+            m.row_at(m.selected).map(|r| (r.src, r.line)),
+            Some((0, 1)),
+            "选中锚回发起行"
+        );
+        assert!(
+            app.status.contains("追踪 \"aaa111\""),
+            "底栏常驻追踪态: {}",
+            app.status
+        );
+        app.update(Msg::ClearTrace);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.row_count(), 9, "清除回全量");
+        assert!(m.trace.is_none());
+        assert_eq!(
+            m.row_at(m.selected).map(|r| (r.src, r.line)),
+            Some((0, 1)),
+            "清除后选中锚行不漂"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// JSONL 行「取字段值」: 双击落在带空格值内部 → 放大整个字段值
+    /// (选区只圈 "timeout", 追踪值 = "request timeout")。
+    #[test]
+    fn trace_on_jsonl_row_snaps_to_full_field_value() {
+        let (mut app, cur, a, b) = trace_fixture("snap");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        let text =
+            danqing_log::merge_view::row_text(&app.merge.as_ref().unwrap().sources[2].file, 1);
+        let lo = text.find("timeout").unwrap();
+        app.update(Msg::TraceValue {
+            src: 2,
+            line: 1,
+            lo,
+            hi: lo + 7,
+        });
+        pump_trace(&mut app);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(
+            m.trace.as_deref(),
+            Some("request timeout"),
+            "字段值放大 (含空格全值; 摘掉 snap 此断言红)"
+        );
+        assert_eq!(m.row_count(), 1, "全值作一条 Bare 字面量命中本行");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// R5 族: 在途追踪遇显隐切换 (掩码重建) → 代次作废, 晚到不复活。
+    #[test]
+    fn trace_in_flight_invalidated_on_source_toggle() {
+        let (mut app, cur, a, b) = trace_fixture("stale");
+        open_single(&mut app, &cur);
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        let text =
+            danqing_log::merge_view::row_text(&app.merge.as_ref().unwrap().sources[0].file, 1);
+        let lo = text.find("aaa111").unwrap();
+        app.update(Msg::TraceValue {
+            src: 0,
+            line: 1,
+            lo,
+            hi: lo + 6,
+        });
+        // 不泵, 直接切显隐 —— 掩码重建作废过滤行集, 在途追踪同作废
+        app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
+        // 注 (评审 Nit): 本锁管的是**接线** (该路径确实调了 invalidate);
+        // 「已完成但仍被丢弃」那一半由 search.rs 的
+        // `async_job_invalidate_discards_inflight_result` 用确定性子锁住 ——
+        // 这里不做「睡够久再断言」的时序猜测 (家法: 测试不许时序侥幸)。
+        for _ in 0..200 {
+            assert!(app.trace_job.poll().is_none(), "作废旧轮的晚到结果不得拾取");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let m = app.merge.as_ref().unwrap();
+        assert!(
+            m.filtered.is_none() && m.trace.is_none(),
+            "重建后无追踪残留 (filter_landed 同族纪律)"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// Ctrl+R 单文件态 → 出声指路合并视图 (P24); 合并态未持焦 → 指路选值。
+    #[test]
+    fn ctrl_r_outside_merge_selection_says_why() {
+        let (mut app, cur, a, b) = trace_fixture("ctrl-r");
+        open_single(&mut app, &cur);
+        press_ctrl(&mut app, "r");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("合并视图")),
+            "单文件态 Ctrl+R 说清为什么: {:?}",
+            app.notice
+        );
+        // 合并态 (LogView 未持焦 → 键到应用层): 指路先选值
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.notice = None;
+        press_ctrl(&mut app, "r");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("追踪值")),
+            "合并态未持焦指路选值: {:?}",
+            app.notice
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    // ---- 腿 F (T7): live-tail 合流 ----
+
+    /// 泵归并作业至落地 (真线程, 小文件瞬时; 有界自旋防挂死)。
+    fn pump_merge(app: &mut LogApp) {
+        for _ in 0..1000 {
+            app.pickup_merge_job();
+            if !app.merge_job_live {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("归并作业 1s 内未完成");
+    }
+
+    /// per-source 增量合流端到端: 合并期间某源长大 → 合并时间线收新行,
+    /// **单文件侧保持冻结** (app.file 不动, 退出后自然追平 —— D4)。
+    #[test]
+    fn poll_growth_merge_appends_per_source_single_side_frozen() {
+        let (mut app, cur, a, b) = merge_fixture("mrg-tail");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.merge.as_ref().unwrap().row_count(), 9);
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&cur).unwrap();
+            w.write_all(b"2026-09-27T00:00:09Z INFO c3\n").unwrap();
+        }
+        app.poll_growth();
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.row_count(), 10, "合并时间线收新行 (源0 行3)");
+        let last = m.row_at(9).unwrap();
+        assert_eq!((last.src, last.line), (0, 3), "新行在时间线尾");
+        assert_eq!(app.file.line_count(), 3, "单文件侧仍冻结 (退出才追平)");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 断流降级: 源文件消失 → 标记 + 底栏「断流 N 源」, 其余源照常合流;
+    /// 恢复可读 (stat 成功) 即清标记。
+    #[test]
+    fn poll_growth_merge_marks_stale_and_recovers() {
+        let (mut app, cur, a, b) = merge_fixture("mrg-stale");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        std::fs::remove_file(&a).unwrap(); // 源1 消失 (mmap 持有仍可读旧快照)
+        app.poll_growth();
+        {
+            let m = app.merge.as_ref().unwrap();
+            assert!(m.sources[1].stale, "消失的源标断流");
+            assert!(!m.sources[0].stale && !m.sources[2].stale, "其余源不连坐");
+        }
+        assert!(app.status.contains("断流 1 源"), "底栏明示: {}", app.status);
+        // 断流期间其余源照常合流 (不拖垮全局)
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&cur).unwrap();
+            w.write_all(b"2026-09-27T00:00:09Z INFO c3\n").unwrap();
+        }
+        app.poll_growth();
+        assert_eq!(
+            app.merge.as_ref().unwrap().row_count(),
+            10,
+            "断流源在场, 其他源照常合流"
+        );
+        // 恢复可读即清 (注入断流标记到**健在**的源0 —— 源1 已被删, stat 只会
+        // 继续失败; Windows 上被 mmap 持有的文件删除后处于 delete-pending,
+        // 同名重建被拒直到句柄关闭, 真轮转走改名+新建):
+        app.merge.as_mut().unwrap().sources[0].stale = true;
+        app.poll_growth();
+        assert!(
+            !app.merge.as_ref().unwrap().sources[0].stale,
+            "恢复可读自清 (内容比对管后续)"
+        );
+        assert!(
+            app.merge.as_ref().unwrap().sources[1].stale,
+            "源1 仍断流 (文件没回来)"
+        );
+        assert!(!app.merge_job_live, "无变化不触发重归并");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 轮转 (head 变): 全量重归并 (worker), 旧 bundle 保持可见至交卷;
+    /// 在途期间轮询不叠加 (merge_job_live 门禁)。
+    #[test]
+    fn poll_growth_merge_rotation_rebuilds_via_worker() {
+        let (mut app, cur, a, b) = merge_fixture("mrg-rot");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 源1 轮转: **改名 + 新建** (真轮转形态 —— 被 mmap 持有的文件不能
+        // 就地覆写, Windows ERROR_USER_MAPPED_FILE; 改名靠 DELETE 共享走得通)
+        let rotated = a.with_extension("old");
+        std::fs::rename(&a, &rotated).unwrap();
+        std::fs::write(
+            &a,
+            b"2026-09-27T01:00:00Z INFO r0\n2026-09-27T01:00:01Z INFO r1\n2026-09-27T01:00:02Z INFO r2\n",
+        )
+        .unwrap();
+        app.poll_growth();
+        assert!(app.merge_job_live, "轮转 → 重归并作业在途");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, k)| t.contains("轮转") && matches!(k, crate::NoticeKind::Warn)),
+            "轮转明示: {:?}",
+            app.notice
+        );
+        // 在途期间再 poll 不叠加 (旧 bundle 行数没变 = 旧内容保持可见)
+        app.poll_growth();
+        assert_eq!(
+            app.merge.as_ref().unwrap().row_count(),
+            9,
+            "交卷前旧 bundle 在"
+        );
+        pump_merge(&mut app);
+        assert_eq!(
+            app.merge.as_ref().unwrap().sources[1].file.line_count(),
+            3,
+            "轮转源新内容落地"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&rotated).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 合并跟随 (T7): f 键接通 —— 开即钉时间线尾, 新行合流保持钉尾。
+    #[test]
+    fn merge_follow_pins_timeline_tail() {
+        let (mut app, cur, a, b) = merge_fixture("mrg-follow");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.merge.as_mut().unwrap().selected = 0;
+        press(&mut app, Key::Character("f".to_string()));
+        let m = app.merge.as_ref().unwrap();
+        assert!(m.follow, "f 键接通合并跟随 (T3 告示退役)");
+        assert_eq!(m.selected, 8, "开跟随即钉尾");
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&cur).unwrap();
+            w.write_all(b"2026-09-27T00:00:09Z INFO c3\n").unwrap();
+        }
+        app.poll_growth();
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.row_count(), 10);
+        assert_eq!(m.selected, 9, "新行合流保持钉尾");
+        press(&mut app, Key::Character("f".to_string()));
+        assert!(!app.merge.as_ref().unwrap().follow, "再按解除");
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
@@ -7350,6 +8134,457 @@ l2
             .collect();
         app.update(Msg::StartMerge(many));
         assert!(app.merge.is_none(), "超上限拒绝");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    // ---- T8: sessions 载荷 merge group (SPEC-v1x-merge-timeline D4) ----
+
+    /// T8 载荷简写。
+    fn mss(
+        p: &std::path::Path,
+        off: i64,
+        tz: i64,
+        hidden: bool,
+    ) -> danqing_log::merge_view::MergeSourceState {
+        danqing_log::merge_view::MergeSourceState {
+            path: p.to_string_lossy().into_owned(),
+            offset_ms: off,
+            tz_offset_ms: tz,
+            hidden,
+        }
+    }
+
+    /// 保存侧: 合并工作区存会话 = 单文件侧四样 + 合并组快照 (源/偏移/显隐),
+    /// 落盘读回逐项对得上。
+    #[test]
+    fn save_session_in_merge_captures_merge_group() {
+        let cfg = temp_cfg_path("t8-save");
+        let (mut app, cur, a, b) = merge_fixture("t8-save");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 造可辨现场: 源1 拨 -3s (tz 不动), 源2 隐藏
+        {
+            let tz = app.merge.as_ref().unwrap().sources[1].tz_offset_ms;
+            let m = app.merge.as_mut().unwrap();
+            m.set_time_params(1, -3000, tz);
+            m.sources[2].hidden = true;
+            m.rebuild_masked();
+        }
+        app.update(Msg::SaveSession("事故台".into()));
+        assert_eq!(app.sessions.len(), 1);
+        let g = app.sessions[0]
+            .merge
+            .as_ref()
+            .expect("合并态保存须带 merge 段");
+        assert_eq!(g.sources.len(), 3);
+        assert_eq!(g.sources[0].path, cur.to_string_lossy());
+        assert_eq!(g.sources[1].offset_ms, -3000);
+        assert!(g.sources[2].hidden);
+        // 单文件侧载荷仍来自冻结现场 (filter 串是单文件侧的)
+        assert_eq!(app.sessions[0].path, cur.to_string_lossy());
+        // 落盘 → 读回 (账本面 roundtrip 一并实证)
+        let saved = danqing_log::columns::ColumnFiles::load_from(&cfg.with_extension("state.json"));
+        let g2 = saved.sessions_for_path(&cur.to_string_lossy())[0]
+            .merge
+            .clone()
+            .expect("落盘后 merge 段存活");
+        assert_eq!(g2.sources[1].offset_ms, -3000);
+        assert!(g2.sources[2].hidden);
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 恢复侧端到端: 合并中存 → 退出合并 + bundle 丢弃 (「明天重开」) →
+    /// 应用会话 → 真线程归并落地 → 源组/偏移/显隐全回 (排序与行集双证)。
+    #[test]
+    fn apply_merge_session_restores_group_offsets_and_hidden() {
+        let cfg = temp_cfg_path("t8-apply");
+        let (mut app, cur, a, b) = merge_fixture("t8-apply");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        {
+            let tz = app.merge.as_ref().unwrap().sources[1].tz_offset_ms;
+            let m = app.merge.as_mut().unwrap();
+            m.set_time_params(1, -3000, tz);
+            m.sources[2].hidden = true;
+            m.rebuild_masked();
+        }
+        app.update(Msg::SaveSession("事故台".into()));
+        // 明天重开 = 退出合并且 bundle 不在 (会话是唯一记忆)
+        app.update(Msg::ExitMerge);
+        app.merge = None;
+        app.update(Msg::ApplySession("事故台".into()));
+        assert!(app.merge_job_live, "合并组会话应用 = 后台归并在途");
+        pump_merge(&mut app);
+        assert_eq!(app.workspace, Workspace::Merge, "交卷后进合并工作区");
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 3, "源组回来");
+        assert_eq!(m.sources[1].offset_ms, -3000, "保存偏移套回");
+        assert!(m.sources[2].hidden, "保存显隐套回");
+        assert_eq!(m.row_count(), 6, "隐藏源行不进索引 (3+3)");
+        let r0 = m.row_at(0).unwrap();
+        assert_eq!(
+            (r0.src, r0.line),
+            (1, 0),
+            "偏移生效: a0@01s-3s=前日 23:59:58 排最前"
+        );
+        assert_eq!(
+            app.session_selected.as_deref(),
+            Some("事故台"),
+            "应用记选中 (删除指针)"
+        );
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 源缺失**明示跳过**不拒全体 (T8 验收 g): 三源缺一 → 两源重建,
+    /// notice 说清跳过几个。
+    #[test]
+    fn apply_merge_session_skips_missing_sources_with_notice() {
+        let cfg = temp_cfg_path("t8-skip");
+        let (mut app, cur, a, b) = merge_fixture("t8-skip");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        let ghost = std::env::temp_dir().join("danqing-mt-t8-skip-ghost.log");
+        std::fs::remove_file(&ghost).ok(); // 保证不存在
+        let local_tz = danqing_log::merge_view::local_tz_offset_ms();
+        app.sessions.push(danqing_log::columns::SessionEntry {
+            path: cur.to_string_lossy().into_owned(),
+            name: "残缺台".into(),
+            filter: String::new(),
+            search: String::new(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: Vec::new(),
+            merge: Some(danqing_log::merge_view::MergeGroup {
+                sources: vec![
+                    mss(&cur, 0, local_tz, false),
+                    mss(&a, 0, local_tz, false),
+                    mss(&ghost, 0, local_tz, false),
+                ],
+            }),
+            updated: 1,
+        });
+        app.update(Msg::ApplySession("残缺台".into()));
+        let note = app
+            .notice
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(note.contains("跳过 1 个缺失源"), "缺失明示, 实得: {note}");
+        pump_merge(&mut app);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 2, "缺失源不进组");
+        assert_eq!(m.row_count(), 6, "两源行集 (3+3)");
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 现存源不足两个 = 整体拒绝并说清 (零副作用: 工作区不动/不起作业/
+    /// 会话留着); 合并现场不被误伤。
+    #[test]
+    fn apply_merge_session_refuses_when_fewer_than_two_sources_survive() {
+        let cfg = temp_cfg_path("t8-refuse");
+        let (mut app, cur, a, b) = merge_fixture("t8-refuse");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        let ghost1 = std::env::temp_dir().join("danqing-mt-t8-refuse-g1.log");
+        let ghost2 = std::env::temp_dir().join("danqing-mt-t8-refuse-g2.log");
+        std::fs::remove_file(&ghost1).ok();
+        std::fs::remove_file(&ghost2).ok();
+        app.sessions.push(danqing_log::columns::SessionEntry {
+            path: cur.to_string_lossy().into_owned(),
+            name: "全缺台".into(),
+            filter: String::new(),
+            search: String::new(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: Vec::new(),
+            merge: Some(danqing_log::merge_view::MergeGroup {
+                sources: vec![mss(&ghost1, 0, 0, false), mss(&ghost2, 0, 0, false)],
+            }),
+            updated: 1,
+        });
+        app.update(Msg::ApplySession("全缺台".into()));
+        assert_eq!(app.workspace, Workspace::Merge, "拒绝不动工作区");
+        assert!(!app.merge_job_live, "拒绝不起归并作业");
+        assert!(app.pending_merge_apply.is_none(), "拒绝不挂载荷");
+        let note = app
+            .notice
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(note.contains("不足两个"), "说清为何拒, 实得: {note}");
+        assert!(
+            app.sessions.iter().any(|s| s.name == "全缺台"),
+            "会话留着 (修源后重试)"
+        );
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// pickup **交付才清**在途标记 (T8 修 T7 遗留错形): 在途 poll 空转
+    /// **不清** live —— 「重归并在途不叠加」门禁不许提前开门 (旧
+    /// 「先清后 poll」形让 pump 首拾取即返回, 作业还在飞)。慢作业
+    /// (50ms) 保证在途窗口确定存在, 无时序侥幸。
+    #[test]
+    fn pickup_merge_job_keeps_live_flag_until_delivery() {
+        let (mut app, cur, a, b) = merge_fixture("t8-live");
+        open_single(&mut app, &cur);
+        app.merge_job_live = true;
+        let paths = vec![cur.clone(), a.clone(), b.clone()];
+        app.merge_job.launch(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            danqing_log::merge_view::build_merge(
+                &paths,
+                &[],
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        });
+        app.pickup_merge_job(); // 在途空转
+        assert!(app.merge_job_live, "在途 poll 空转不清 live 标记");
+        assert!(app.merge.is_none(), "未交付不换入");
+        pump_merge(&mut app);
+        assert!(!app.merge_job_live, "交付后清");
+        assert_eq!(app.merge.as_ref().unwrap().row_count(), 9);
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 评审 C1 端到端 (安全审计 Required 同源): 换源落地点 (apply_merge_outcome)
+    /// 之后, **旧源集合的在途追踪结果**迟到 —— 必须丢弃 + 出声, 不许越界 panic
+    /// (release 档 = 整进程 abort)。
+    #[test]
+    fn late_trace_after_source_swap_is_discarded_with_notice() {
+        use danqing_log::merge_view::TraceOutcome;
+        let (mut app, cur, a, b) = merge_fixture("t9-c1");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.merge.as_ref().unwrap().sources.len(), 3);
+        // 三源时代发起的追踪交卷 (命中表 3 条) —— 但期间源集合换成了 2 源
+        let stale = TraceOutcome {
+            hits: vec![vec![0], vec![0], vec![0]],
+            scanned: vec![3, 3, 3],
+            value: "req".into(),
+            anchor: (0, 0),
+            elapsed: std::time::Duration::ZERO,
+        };
+        app.merge = None; // 「明天重开」: 换一组源
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone()]);
+        assert_eq!(app.merge.as_ref().unwrap().sources.len(), 2);
+        app.apply_trace_outcome(stale); // 迟到交卷: 不许崩
+        let note = app
+            .notice
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(note.contains("源已变化"), "出声说清, 实得: {note}");
+        assert!(app.merge.as_ref().unwrap().trace.is_none(), "追踪未落地");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 评审 Optional 9: 「重启后**没有单文件在手**」直接应用合并组会话 ——
+    /// 单文件侧载荷跑在空现场上 (无文件/无 schema), 不许炸、不许半途留下
+    /// 半套状态; 合并组照常重建。
+    #[test]
+    fn merge_session_restore_without_open_file_is_safe() {
+        let cfg = temp_cfg_path("t9-nofile");
+        let (mut app, cur, a, b) = merge_fixture("t9-nofile");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.update(Msg::SaveSession("冷启台".into()));
+        // 冷启: 无文件在手 (has_file = false, file = 空文件占位)
+        app.has_file = false;
+        app.file = Arc::new(LogFile::open(&cur).unwrap());
+        app.merge = None;
+        app.update(Msg::ApplySession("冷启台".into()));
+        assert!(app.merge_job_live, "合并组照常起归并");
+        pump_merge(&mut app);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 3, "源组重建");
+        assert_eq!(m.row_count(), 9);
+        assert_eq!(app.workspace, Workspace::Merge);
+        std::fs::remove_file(cfg.with_extension("state.json")).ok();
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// T9 评审补 (静默重置洞): 时钟偏移/时区是用户调过的现场 —— 加/减源重归并
+    /// 必须**按路径随行** (旧 carry_view_state 只搬显隐与键, 偏移会被重置成默认)。
+    #[test]
+    fn rebuild_merge_keeps_time_params_by_path() {
+        let (mut app, cur, a, b) = merge_fixture("t9-params");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        {
+            let tz = app.merge.as_ref().unwrap().sources[1].tz_offset_ms;
+            app.merge.as_mut().unwrap().set_time_params(1, -3000, tz);
+        }
+        // 加一个源 (走 rebuild_merge 全量重跑)
+        app.rebuild_merge(vec![cur.clone(), a.clone(), b.clone()]);
+        pump_merge(&mut app);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 3);
+        assert_eq!(
+            m.sources[1].offset_ms, -3000,
+            "时钟偏移按路径随行 (加/减源不重置)"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// spec §5 宣称的产品级锁 (家法核对补): 藏一个源 → 时间线按掩码重建
+    /// (行数减、余序不乱) → 恢复 → 全序回来。
+    #[test]
+    fn merge_source_hide_rebuilds_and_restores_order() {
+        let (mut app, cur, a, b) = merge_fixture("t9-hide");
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        let full: Vec<(u32, u32)> = {
+            let m = app.merge.as_ref().unwrap();
+            (0..m.row_count())
+                .map(|p| {
+                    let r = m.row_at(p).unwrap();
+                    (r.src, r.line)
+                })
+                .collect()
+        };
+        assert_eq!(full.len(), 9);
+        // 藏源2 (b.jsonl, 3 行)
+        app.update(Msg::ToggleMergeSource(b.to_string_lossy().into_owned()));
+        let hidden_rows: Vec<(u32, u32)> = {
+            let m = app.merge.as_ref().unwrap();
+            assert_eq!(m.row_count(), 6, "隐藏源行不进时间线");
+            (0..m.row_count())
+                .map(|p| {
+                    let r = m.row_at(p).unwrap();
+                    (r.src, r.line)
+                })
+                .collect()
+        };
+        let expect: Vec<(u32, u32)> = full.iter().copied().filter(|r| r.0 != 2).collect();
+        assert_eq!(hidden_rows, expect, "余序不乱 (掩码不改其余源相对序)");
+        // 恢复
+        app.update(Msg::ToggleMergeSource(b.to_string_lossy().into_owned()));
+        let back: Vec<(u32, u32)> = {
+            let m = app.merge.as_ref().unwrap();
+            assert_eq!(m.row_count(), 9, "恢复后全序回来");
+            (0..m.row_count())
+                .map(|p| {
+                    let r = m.row_at(p).unwrap();
+                    (r.src, r.line)
+                })
+                .collect()
+        };
+        assert_eq!(back, full, "恢复后序与原全序逐位相同");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// T9 D4: 追加落在**选中行之前** → 位置整体推后, 选中仍钉同一 (源,行)。
+    /// (有界窗口重定位; 窗口按 [原位-补全, 原位+批行数] 取, 编不出更远。)
+    #[test]
+    fn append_source_keeps_selection_on_same_row() {
+        let (mut app, cur, a, b) = merge_fixture("t9-anchor");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // fixture 归并序: c0 a0 b0 a1 b1 b2 c1 c2 a2 —— 位 7 = (源0, 行2)
+        app.merge.as_mut().unwrap().selected = 7;
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&a).unwrap();
+            w.write_all(b"2026-09-27T00:00:02.500Z INFO a0b\n").unwrap();
+        }
+        app.poll_growth();
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.row_count(), 10, "新行进时间线");
+        let at3 = m.row_at(3).unwrap();
+        assert_eq!((at3.src, at3.line), (1, 3), "新行落在位 3 (选中之前)");
+        let r = m.row_at(m.selected).unwrap();
+        assert_eq!(
+            (r.src, r.line),
+            (0, 2),
+            "选中仍钉同一 (源,行): {:?}",
+            m.selected
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// T9 产品闸: 合并源单轮增长超 [`MERGE_SYNC_MAX_ROWS`] → 交 worker 全量
+    /// 重归并 (旧 bundle 保持可见), 不在 UI 线程做增量合流。
+    #[test]
+    fn merge_large_growth_routes_to_rebuild_not_incremental() {
+        let (mut app, cur, a, b) = merge_fixture("t9-gate");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        let before = app.merge.as_ref().unwrap().row_count();
+        let n = MERGE_SYNC_MAX_ROWS + 1;
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&a).unwrap();
+            let mut buf = String::new();
+            for i in 0..n {
+                buf.push_str(&format!(
+                    "2026-09-27T00:10:{:02}.000Z INFO bulk {i}\n",
+                    i % 60
+                ));
+            }
+            w.write_all(buf.as_bytes()).unwrap();
+        }
+        app.poll_growth();
+        assert!(
+            app.merge_job_live,
+            "超闸增量 → worker 重归并在途, 不走同步合流"
+        );
+        assert_eq!(
+            app.merge.as_ref().unwrap().row_count(),
+            before,
+            "旧 bundle 未动 (重归并在途期间保持可见)"
+        );
+        pump_merge(&mut app);
+        assert_eq!(
+            app.merge.as_ref().unwrap().row_count(),
+            before + n,
+            "重归并交卷后新行全进时间线"
+        );
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();

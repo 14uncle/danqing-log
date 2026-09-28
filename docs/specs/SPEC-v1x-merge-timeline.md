@@ -145,11 +145,20 @@
 - `merge_incremental_append`: live-tail 新行尾部合流 + 乱序走窗口。
 - 全部**先红后绿**, A/B 留痕 (摘归并/摘继承必精确红)。
 
-**danqing-log (基线 413 不许破)**:
-- `merge_view_lines_contract`: Lines 第四实现契约 (len/get 双向映射, 与展开实现同套断言)。
-- `source_hide_rebuilds_index`: 隐藏→重归并→恢复三态 (行数与序双断言)。
+**danqing-log (基线 413 不许破)** —— **2026-09-28 家法核对后按实际锁名勘误** (原表三条
+  名字与落地分叉, 见下注):
+- 显示行二态契约: `merge_state_filtered_row_at_maps_positions` + `window_decodes_visible_rows_only`
+  (行位置 ↔ 合并行双向映射; 与 `position_of_and_next_bookmark_pos` 合起来覆盖原
+  「len/get 契约」的意图)。**勘误注**: 原写「`merge_view_lines_contract`: Lines 第四实现
+  契约」—— 落地时合并态**没有**扩展 `expand::Lines` 枚举, 而是 `MergeState.filtered:
+  Option<Vec<u32>>` + 自己的 `row_at`/`window` (见 §9 实现记 9)。
+- 隐藏三态: `rebuild_masked_hides_source_and_keeps_ids` (引擎, 行数 + 源序号不漂) +
+  `merge_source_hide_rebuilds_and_restores_order` (产品, 藏→行数减且余序不乱→恢复全序逐位相同)。
+  **勘误**: 原名 `source_hide_rebuilds_index` 从未落地 —— 产品级那条 2026-09-28 补上。
 - `offset_applied_at_parse_boundary`: 偏移单源施加 (排序与显示同源锁, 两处各算必红)。
-- `gate_free_state_opens_upgrade_dialog`: 免费态入口拦截两态 (注入惯例, export/sessions 先例)。
+- 门控两态: `merge_gate_blocks_free_tier_and_never_prompts_paid` (免费态入口 → `upgrade_prompt
+  == Some(MergeTimeline)` 且弹层不开; 付费态放行且全程不误弹)。
+  **勘误**: 原名 `gate_free_state_opens_upgrade_dialog` 未落地, 覆盖在同名不同措辞的锁里。
 - `session_merge_group_roundtrip`: 载荷 (源列表+偏移+隐藏) roundtrip + 坏条丢条 +
   `is_recognizable` 认新段 (M1 复发守卫)。
 - `trace_field_value_builds_filter`: 选中值 → 过滤串生成 + 跨源过滤链。
@@ -200,3 +209,123 @@
   CP0)**: **显式窗口退役** —— min-head 归并的「文件内行序严格保持」天然就是钉住语义
   (乱序行只在成为游标头时按当时最小值找位, 不回头重排), 无需窗口参数; 增量合流的插入
   = 尾端回找 (WALK_CAP 兜底, 见 merge.rs 注释)。T0 六组归并锁已按此语义钉死。
+  **2026-09-28 (T9) 回写**: 增量插入的**回找帽退役** —— 批插入改整批单遍后深回找只付
+  一次 (2M 行 ≈ 数 ms), 帽的「近似位」没有存在理由了, 插入位改**真值位** (锁
+  `insert_rows_deep_walkback_is_exact_not_capped`); 帽仍在 `remove_row` (摘除目标天然
+  近尾, 超帽 = 找不到 → 调用方兜底重建)。
+
+## 9. 实现记 (2026-09-28, T9 收口)
+
+**口径分叉与实测回填** (数字全文 `PERFORMANCE_REPORT.md` 合并节):
+
+1. **① 合并就绪 = 源级并行 (用户 2026-09-28 裁「源级并行提取」)**: 红线 1.6 s 出自
+   CP0 的**引擎三段**实测 (1525 ms); 产品路径 (`build_merge`) 另含 `detect_route`
+   采样与 JSONL **列发现** (1 GiB 单源 ~71 ms), 串行版实测 **1676–1731 ms** (超线
+   ~5–8%)。修法 = **逐源流水线并行** (打开→探测→schema→提取, 每源一线程, 结果
+   **按源序回填** —— 源序号是 tie-break 依据, 不许按完成序排; 归并仍串行), 实测
+   **947–967 ms (1.78×)**, 红线内且把列发现的口径差一并吸收。D5 的**非红线目标
+   ≤0.8 s** 尚差 ~17% (3 线程同读 3 GiB 的带宽争用 + 归并 215 ms 串行段), 记档
+   不追 (红线已过)。保序锁 `build_merge_keeps_source_order_under_parallel_build`
+   (大源慢/小源快 = 完成序与源序相反, 等 ts 行仍按源序; A/B 倒序回填 → 红)。
+2. **D10 内存超募**: 建索引多留 `APPEND_SLACK_DIV = 16` (6.25%) 追加位 —— live-tail
+   增量插入若不撞容量就不重分配 (否则 `Vec` 翻倍: 一次追加拷 259 MiB + 驻留翻倍)。
+   `index_bytes()` 口径仍是行数 ×16 B (实测 259.2 MiB 相符), 超募部分单列。
+3. **④ 增量合流的成本模型 (T9 实测揪出并修)**: 首版逐行 `Vec::insert` 的代价 =
+   Σ(回找深度), 批量追尾时新行互为障碍 ⇒ **O(k²/2)**: 4 MiB/2.6 万行实测 792–953 ms;
+   慢时钟源触帽后每行常数 2.45 ms ⇒ 2 万行 **48.0 s** 且落近似位。三条修:
+   引擎**整批单遍归并插入** + **回找去帽** + **容量留位**; 产品侧**单轮增长 > 20,000 行
+   交 worker 重归并** (`MERGE_SYNC_MAX_ROWS`, 与既有的 32 MiB 字节闸并列)。修后
+   同两例 **50 ms / 46 ms**。**A/B 留痕**: 反转合并方向 → 差分锁红; 摘容量留位 →
+   留位锁红; 摘产品闸 → 分流锁红; 摘锚定窗口 → 选中行锁红。
+4. **D3 快照释放挪出 UI 线程**: 1 GiB 映射释放实测 50–58 ms (swap 路径曾测 157 ms),
+   live-tail 每次换快照都付 —— 现由一次性线程释放 (`dispose_snapshot`)。
+   **已知代价**: 旧映射可能短暂仍在 (测试里对同一路径立刻重写/复制会被 Windows
+   映射语义拒) —— 基准与测试一律用**独立路径**, 家法「测试不许时序侥幸」。
+5. **D4 选中锚定改写**: 追加后的 `(源,行) → 位置` 原走 `position_of` (从头线性扫,
+   17M 行实测 158–250 ms/次), 改为**有界窗口重定位** —— 批行只插在原位之后、末行补全
+   至多先摘 1 条, 故新位置必落 `[原位−1, 原位+k]` (k = 批行数)。`position_of` 本身
+   保留 (追踪落地/书签跳转/掩码重建, 低频各一次)。
+6. **T8 会话载荷的两处口径**: ①「格式手改记录」**无物可存** —— D2 的 route 手改首版
+   未建, 载荷故无 route 字段 (探测结论恢复时重探); ②合并态 `expands` 仍是**单文件侧**
+   行号 (合并展开未建, T3 边界), 若将来落盘, 键形态钉死为 `merge_view::pack_key`
+   的 `(src,line)` 打包值 (结构注已写)。③合并追踪串首版不落盘。
+7. **T7 留档复核**: 追踪态过滤集重推实测 **66–86 ms/次** (17M 行, O(合并行数)) ——
+   与留档估的 30 ms 同量级, 高约 2.5×, 判「有界可接受」维持。
+8. **人工验收九条 (a–i)**: 机器半边全绿; **实机待做** (需付费态 key), 记账在
+   `tasks/acceptance-pending.md` G 组; (i) 的性能半边已由本节实测回填。
+9. **显示行抽象的分叉 (评审期记账)**: 本 spec §5 原写「Lines 第四实现」—— 落地时
+   合并态**没有**扩 `expand::Lines` 枚举, 而是 `MergeState.filtered: Option<Vec<u32>>`
+   + `row_at`/`window` 自成一路。**意图 (二态显示行 + 位置↔行双向映射) 是兑现的**,
+   代价是过滤/滚动/选中的位置数学在单文件与合并两条路上各有一份。是否收口成
+   一层抽象, 交模块评审/后续波次裁 (收口会动单文件侧, 不是零风险改动)。
+10. **评审轮 (2026-09-28, 双路独立) 的发现与修复** —— 代码评审 REQUEST CHANGES
+   (Critical ×2 + Required ×4), 安全审计 0 Critical / Required ×1 (与 C1 同源):
+   - **C1 (两路同指)**: 在途追踪 + 源集合换过 → `filtered_from_hits` 按 `src` 索引
+     越界 (release 档 `panic=abort` = 整进程死); 等长但重排时则**静默把命中贴到别源**。
+     两个漏点: `apply_merge_outcome` (换源落地点) 与 `apply_session` 单文件分支
+     (离场) 都未 `invalidate`; 另有「换源期间新起的追踪」绕过旧作废。修: 两处作废
+     + `apply_trace_outcome` 到点校验 (不符 → 丢弃 + 出声) + `apply_trace` 运行期闸
+     (+ `filtered_from_hits` 改 `get` 纵深)。**复现锁**: 摘运行期闸 → 越界 panic (精确红)。
+   - **C2**: `append_source` 的选中锚定有界窗口**证明前提写错** —— 锚行**自身**是被
+     补全改判的残行时键变了、位置可任意远 (评审给的反例: (0,2)@位3 → 补全后 @位10,
+     窗口 [2,5] 搜不到 → `unwrap_or(lo)` 静默跳到 (0,1))。修: 窗口之外回落
+     `position_of` 精确定位。**复现锁**: 摘回落 → 断言精确红在「实得位 2 的 (0,1)」。
+   - **R1**: worker panic 会让 `merge_job_live` 永卡 → live-tail 静默冻结 (unwind 档);
+     修: 源线程内 `catch_unwind` 兜成「该源拒收」 + `Builder` 释放线程 (建线程失败就地 drop)。
+   - **R2**: 「旧 mmap 释放挪出 UI 线程」原**没达成** —— `LogView.merge_files` 同持 Arc,
+     state 侧只减一个引用, 真正的 munmap 落在同帧 view 的 sync (UI 线程)。修: view 侧
+     退役整表也走同一释放通道 (`dispose_snapshots`) + 退出合并即松手。**报告口径已同步改正**。
+   - **R3**: `apply_saved_params` 曾在 UI 线程重提时间戳 (3×1GiB ≈1s)。修: `build_merge`
+     收会话参数 (**worker 里**提取时就施加偏移/时区, 并在建索引时掩码显隐), 落点零重提零重建。
+   - **评审未抓、本轮自查抓到**: `carry_view_state` **不搬 offset/tz** —— 加/减源会把用户
+     T5 校准的时钟偏移**静默重置**。R3 的改法 (参数按路径随行) 一并解决, 锁
+     `rebuild_merge_keeps_time_params_by_path`。
+   - 其余收口: UI 手输偏移/时区与账本同一条钳制 (`set_time_params` 收口) + `saturating_add`;
+     会话恢复拒绝 `\\.\` 设备命名空间 (源路径其余按「用户自己的文件」= 已信任假设, UNC
+     网络盘合法但**这是本应用唯一会触网的路径**, 隐私政策口径按此理解); `start_trace`
+     两处静默 return 改出声 (P24); 补「无文件在手时恢复合并会话」锁。
+   - **已核无问题 (评审给判据)**: 引擎 `insert_rows` 整批单遍与旧逐行语义**逐位等价**
+     (评审用 90 万随机用例差分对拍独立验证零失配; 反向合并的内存安全不变式成立);
+     账本反序列化无 panic/无界分配/钳制到位; `u32` 行号余量 >8×; 轮转/截断竞态有界诚实;
+     测试均不触真实桌面/剪贴板/网络。
+   - **记档不修 (留痕)**: ①`position_of` 仍是 O(合并行数) 线性扫 (低频入口: 追踪落地/
+     书签跳转/掩码重建/C2 回落, 17M 行 ~158–250 ms/次); ②增量追加不重探 route/schema;
+     ③门控漏点 (TraceValue/ClearTrace/follow 不过 `merge_gate`, 今日不可达, 属纵深防御);
+     ④单帧多源同时增长时追踪态重推累乘 (3 源 ≈200–260 ms/帧); ⑤引擎 `timestamp.rs`
+     的 `n.abs()`/`v*scale` 在手工极值下可回绕 (既有代码, 本次未动)。
+
+## 10. code-simplify 收口 (2026-09-28)
+
+**7 项行为零变化** (产品 494 绿 / 引擎 99 绿, 测试**零改动**, 连跑 5 遍稳):
+1. **钳制单一真身**: `columns.rs` 里那份 `MAX_ABS_OFFSET_MS`/`MAX_ABS_TZ_MS` 私有常量
+   与 `merge_view` 的重复 (T9 评审修 D3 时新造的分家) → 账本侧改调
+   `merge_view::clamp_offset_ms/clamp_tz_ms`, 常量只留一处。
+2. **释放策略单一 spawn 点**: `dispose_snapshot` / `dispose_snapshots` 两条同构函数
+   → 一个私有 `dispose_offthread<T: Send>` (Builder 回退就地 drop 的注释也归一处)。
+3. **在途追踪作废收口**: 7 个调用点各带一句「R5 族」注释 → `discard_trace_job()`
+   一个方法 (家族规矩写在方法上, 调用点只留一句指路)。
+4. **概念命名**: `MergeState::anchor_at(pos)` (行身份 = (源,行), 生产侧 3 处) +
+   `MergeState::file_handles()` (4 处)。
+5. **合并复制链单一解析点**: `copy_source` 判「有无可复制文本」与 `selected_text`
+   取串原先靠注释约定两处一致 (T6 在这条链上漏出过「说有选中却复制错行」) →
+   `merge_sel_slice()` 一个解析点, 判据与取串同源由**构造**保证。
+   唯一语义收紧: 源句柄缺失这一**不可达**分支由「静默不复制」变为「出声指路」。
+6. **过期前向引用修正**: 合并态 Ctrl+C 的指路 notice 原写「整行复制随 T7」,
+   而 T7 波并未做 —— 改为「整行复制未接」(spec 边界如实记)。
+7. **顺带修一条既有 flaky 测试** (bookmark-persist 模块 2026-09-23 起潜伏, 非本模块):
+   `toggle_says_truth_when_save_fails` 往占位目录写 sentinel 后用 `remove_dir` 删
+   (非空删不掉, `.ok()` 静默) → 目录泄漏 → **pid 被复用**时下次 `create_dir`
+   撞 AlreadyExists → 约 1/5 复现 (本次靠连跑 5 遍抓到)。修: 开头防御性整树清理 +
+   结尾 `remove_dir_all`。**教训**: 「连跑多遍」是抓 flaky 的唯一手段, 单跑绿不算数。
+
+**不动清单 (想过但不改)**:
+- `apply_saved_params` 现在是**网**不是主通路 (参数已进 `build_merge`; 只有
+  「carry 覆盖了显隐」这类差额需要它) —— 留着, 它有独立单测且是 C 类改动的护栏。
+- `position_of` 的全表线性扫: 低频入口 (追踪落地/书签跳转/掩码重建/C2 回落),
+  收口要给索引建反向结构, 不值得为 O(1) 次/用户动作开新机制。
+- 双模式位置数学分叉 (单文件 vs 合并各一套): 收口必然动单文件侧, 属设计决定,
+  留模块评审/后续波次 (§9.9)。
+- 引擎 `insert_rows` 的注释密度与 `logbench` 的参数个数: 前者是**不变量声明** (值钱),
+  后者是开发者工具 (不为它引结构体)。
+- 测试里的内联形状 (`row_at(p).map(|r| (r.src, r.line))` 等): 生产侧已收口,
+  测试保持现状换**零 churn** (改测试 = 改锚, 不值)。

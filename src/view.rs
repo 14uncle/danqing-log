@@ -762,6 +762,14 @@ struct RowGeom {
     offs: Vec<(f32, usize)>,
 }
 
+/// caret 归属 (hit_text 单点, 单文件/合并两分支同源): 首个 x_end > content_x
+/// 的字符即 caret (TextInput hit_to_index 同语义); 全在左侧 → 末字符后;
+/// 全在右侧 (左缘点击) → base_byte。
+fn caret_at_geom(g: &RowGeom, content_x: f32) -> usize {
+    let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
+    if n == 0 { g.base_byte } else { g.offs[n - 1].1 }
+}
+
 /// 构建一行可见窗口的命中几何: 从 `base` (左截断字节) 起逐字符累计宽度,
 /// 越过 `right_bound` (内容域 x) 即停 —— 右缘外字符用户点不到, 不测。
 /// `start_x` = base 处的内容域 x (调用方由 scroll_trim 的 sub 换算, 免重复测量)。
@@ -932,8 +940,43 @@ pub(crate) struct LogView {
     merge_sources: Vec<(String, bool)>,
     /// 合并书签 pack 键集 (gutter 标记; 用户量级逐帧克隆无感)。
     merge_bookmarks: std::collections::BTreeSet<u64>,
+    /// 合并文本选区 (腿 E/T6): (源, 文件行, anchor/caret 字节) —— **单行选区**。
+    /// 键用 (源,行) 不用合并位置: 位置随过滤/滚动漂, (源,行) 内容稳定
+    /// (偏移/显隐/追踪都不动它; 加/减源经 sel_rev 代次清空)。
+    /// 跨行选区首版不做 —— 合并视图相邻行可能来自**不同文件**, 跨行复制的
+    /// 字节语义没有诚实答案。
+    merge_sel: Option<MergeSel>,
+    /// 合并消息列的绝对 x (paint 缓存; event 无 TextBatch, 命中/按下靠它
+    /// 划内容域 —— 时间栏/源栏点击不启动选区)。
+    merge_msg_x: std::cell::Cell<f32>,
+    /// 合并源文件句柄 (sync 每帧 Arc 克隆, ≤8 个可忽略): 复制/追踪取行原文用 ——
+    /// 窗口快照只有可见行, 选中行滚出窗后 Ctrl+C 仍要拿得到 (单文件 `file`
+    /// 常驻同款语义)。
+    merge_files: Vec<Arc<LogFile>>,
+    /// 追踪过滤在途标记 (sync 自 MergeState.trace): Esc 清追踪的判据 (view 侧
+    /// 升级序列 = 选区 → 追踪过滤, 与单文件「先局部后全局」同款)。
+    merge_traced: bool,
+    /// 已见的合并选区代次 (sync 对账: 源集合一变, 选区键失效清空)。
+    merge_sel_rev_seen: u64,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
+}
+
+/// 合并文本选区 (腿 E/T6): 单行, anchor/caret 为解码文本字节偏移 (trim_end 口径,
+/// 见 `merge_view::row_text`)。空选区 (anchor == caret) 视同无选区。
+struct MergeSel {
+    src: u32,
+    line: u32,
+    anchor: usize,
+    caret: usize,
+}
+
+impl MergeSel {
+    /// 规范化字节区间; 空选区 → None。
+    fn range(&self) -> Option<(usize, usize)> {
+        (self.anchor != self.caret)
+            .then(|| (self.anchor.min(self.caret), self.anchor.max(self.caret)))
+    }
 }
 
 impl LogView {
@@ -1001,6 +1044,11 @@ impl LogView {
             merge_total: 0,
             merge_sources: Vec::new(),
             merge_bookmarks: std::collections::BTreeSet::new(),
+            merge_sel: None,
+            merge_msg_x: std::cell::Cell::new(0.0),
+            merge_files: Vec::new(),
+            merge_traced: false,
+            merge_sel_rev_seen: 0,
         }
     }
 
@@ -1158,6 +1206,15 @@ impl LogView {
     /// `label = value` 串 (构造点 = [`sub_row_text`], paint 与行兜底同用)。
     /// 无文件/子行缺失 → 空串 (复制拼装对零宽切片本就跳过)。
     fn row_content(&self, row: u64) -> String {
+        // 合并分支 (腿 E/T6): 行内容 = 窗口快照消息列文本 (双击只发生在可见行,
+        // 与命中几何同窗口同源)。复制路径不走这里 (selected_text 直读源文件)。
+        if self.merge_active {
+            return self
+                .merge_rows
+                .get(row.saturating_sub(self.merge_rows_from) as usize)
+                .map(|rv| rv.text.clone())
+                .unwrap_or_default();
+        }
         let Some(file) = self.file.as_ref() else {
             return String::new();
         };
@@ -1229,7 +1286,27 @@ impl LogView {
 
     /// 复制来源的三级 (T18)。**判据的唯一真身** —— `selected_text` (取文本) 与
     /// 复制回执 (取说明) 都从它出发, 于是「真复制了」与「说复制了」不可能分家。
+    /// 合并态文本选区的**唯一解析点**: 选区键 `(源,行)` + 字节区间 → 源文件
+    /// 句柄 + 原文切片区间。`None` = 无选区 / 空选区 / 拓扑已变 (源集合换过)。
+    /// 「有没有可复制的文本」([`Self::copy_source`]) 与「取出来是什么」
+    /// ([`Self::selected_text`]) 都判它 —— 此前靠注释约定两处一致, 现在靠构造
+    /// (T6 那轮在这条链上漏出过「说有选中却复制错行」, 故不再留约定)。
+    fn merge_sel_slice(&self) -> Option<(&LogFile, u32, std::ops::Range<usize>)> {
+        let sel = self.merge_sel.as_ref()?;
+        let (lo, hi) = sel.range()?;
+        let file = self.merge_files.get(sel.src as usize)?;
+        Some((file, sel.line, lo..hi))
+    }
+
     fn copy_source(&self) -> Option<CopySource> {
+        // 合并分支 (腿 E/T6): 仅文本选区可复制。整行兜底**不能**走下面那条 —
+        // line_at/file 是单文件机制, 在合并位置空间会静默复制**错行** (T6 前
+        // 的活洞: 合并态 Ctrl+C 复制的是单文件文件的无关行)。整行复制**未接**
+        // (非「随某波」—— T7 波没做, 记 spec 实现记)。
+        if self.merge_active {
+            self.merge_sel_slice()?; // 判据与取串同源 (见该函数注)
+            return Some(CopySource::Text { rows: 1 });
+        }
         if let Some(sel) = &self.selection {
             if !sel.is_empty() {
                 if self.selection_over_limit() {
@@ -1335,15 +1412,43 @@ impl LogView {
                 // 与命中几何/渲染同串 (三源一体), token 边界才不偏
                 let text = self.row_content(r);
                 let (s, e) = selection::token_at(&text, b);
-                self.selection = Some(TextSelection::new((r, s), (r, e)));
+                if self.merge_active {
+                    // 腿 E/T6: 双击 token = 合并选区 (单行, (源,行) 键)
+                    if let Some((src, line)) = self.merge_row_key_at(r) {
+                        self.merge_sel = Some(MergeSel {
+                            src,
+                            line,
+                            anchor: s,
+                            caret: e,
+                        });
+                    }
+                } else {
+                    self.selection = Some(TextSelection::new((r, s), (r, e)));
+                }
             }
             self.press = None;
             self.dragging = false;
             self.last_click = None; // 三连击不链式放大, 重新开始计数
         } else {
             self.press = self.hit_text(area, position).map(|(r, b)| (r, b, position));
+            if self.merge_active {
+                // 按下即落定空选区 (anchor=caret, 不可见); 拖动升级为选区
+                // (CursorMoved), 单击抬起 = 清旧选区 (单文件同惯例)。
+                self.merge_sel = None;
+                if let Some((r, b, _)) = self.press {
+                    if let Some((src, line)) = self.merge_row_key_at(r) {
+                        self.merge_sel = Some(MergeSel {
+                            src,
+                            line,
+                            anchor: b,
+                            caret: b,
+                        });
+                    }
+                }
+            } else {
+                self.selection = None;
+            }
             self.dragging = false;
-            self.selection = None;
             self.last_click = Some((now, position));
         }
     }
@@ -1368,6 +1473,13 @@ impl LogView {
             return None;
         }
         let row = self.row_at(rel_y);
+        // 合并分支 (腿 E/T6): 内容域 = 消息列 (x 起自 paint 缓存的 merge_msg_x);
+        // 合并视图**无水平滚动**, 无 x_offset 分叉; 行几何键 = 合并位置。
+        if self.merge_active {
+            let geom = self.row_geom.borrow();
+            let g = geom.get(&row)?;
+            return Some((row, caret_at_geom(g, pos.x - self.merge_msg_x.get())));
+        }
         let text_x = self.text_x(area);
         let (_, sub_off) = self.line_at(row);
         let content_x = if sub_off > 0 {
@@ -1377,11 +1489,14 @@ impl LogView {
         };
         let geom = self.row_geom.borrow();
         let g = geom.get(&row)?;
-        // 首个 x_end > content_x 的字符即 caret 归属 (TextInput hit_to_index 同语义);
-        // 全在左侧 → 末字符后; 全在右侧 (左缘点击) → base_byte。
-        let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
-        let byte = if n == 0 { g.base_byte } else { g.offs[n - 1].1 };
-        Some((row, byte))
+        Some((row, caret_at_geom(g, content_x)))
+    }
+
+    /// 合并位置 → (源, 文件行) —— 只能从**当前窗口快照**解析 (选择只发生在
+    /// 可见行; geom 未缓存的行 hit_text 本就拒, 两者同一张网)。
+    fn merge_row_key_at(&self, pos: u64) -> Option<(u32, u32)> {
+        let i = pos.checked_sub(self.merge_rows_from)? as usize;
+        self.merge_rows.get(i).map(|rv| (rv.src, rv.line))
     }
 
     /// 列区间命中 (M4): 屏幕 x → 列下标。读 paint 缓存的绝对窗口坐标
@@ -1537,11 +1652,36 @@ impl Widget for LogView {
                 .map(|s| (s.name().to_string(), s.hidden))
                 .collect();
             self.merge_bookmarks = m.bookmarks.clone();
+            // T6 (腿 E): 源文件句柄 (复制/追踪取原文) + 追踪态 (Esc 升级序列判据)
+            // + 选区代次对账 (源集合一变, (源,行) 键漂移 → 选区失效)。
+            // **退役整表交释放通道** (评审 R2): state 侧换快照时只减一个引用
+            // (refcount 2→1), 真正的 munmap 会落到这里 (UI 线程) —— 所以本侧
+            // 退役的 Arc 也要走同一条一次性线程, 保证**最后一次** drop 不压 UI。
+            let fresh: Vec<Arc<LogFile>> = m.file_handles();
+            let changed = fresh.len() != self.merge_files.len()
+                || fresh
+                    .iter()
+                    .zip(self.merge_files.iter())
+                    .any(|(a, b)| !Arc::ptr_eq(a, b));
+            if changed {
+                let old = std::mem::replace(&mut self.merge_files, fresh);
+                danqing_log::merge_view::dispose_snapshots(old);
+            }
+            self.merge_traced = m.trace.is_some();
+            if self.merge_sel_rev_seen != m.sel_rev {
+                self.merge_sel = None;
+                self.merge_sel_rev_seen = m.sel_rev;
+            }
         } else {
             self.merge_rows.clear();
             self.merge_total = 0;
             self.merge_sources.clear();
             self.merge_bookmarks.clear();
+            // 退出合并即松手 (评审 Optional: 否则 Single 态仍攥着 ≤8 个 mmap)
+            if !self.merge_files.is_empty() {
+                let old = std::mem::take(&mut self.merge_files);
+                danqing_log::merge_view::dispose_snapshots(old);
+            }
         }
         self.search_hits = app.search.as_ref().map(|n| Arc::clone(n.hits()));
         self.encoding = app.file.encoding();
@@ -1869,6 +2009,10 @@ impl Widget for LogView {
                 .unwrap_or(4)
                 .clamp(4, 16);
             let src_w = texts.measure(&"8".repeat(src_chars), AUX_FONT_SIZE) + 16.0;
+            // 消息列 x (循环不变量): paint 缓存给 event 侧划选区内容域 (T6)。
+            let msg_x = text_x + time_w + src_w;
+            self.merge_msg_x.set(msg_x);
+            let msg_w = (text_right - msg_x).max(0.0);
             for (i, rv) in self.merge_rows.iter().enumerate() {
                 let pos = self.merge_rows_from + i as u64;
                 let y = row_y(pos);
@@ -1938,16 +2082,41 @@ impl Widget for LogView {
                     AUX_FONT_SIZE,
                     src_color,
                 );
-                let msg_x = text_x + time_w + src_w;
+                // 消息列 (rv.text 已在 window() 解码+trim_end —— 选区字节同口径)。
                 fit_push(
                     texts,
-                    rv.text.trim_end(),
-                    (text_right - msg_x).max(0.0),
+                    &rv.text,
+                    msg_w,
                     msg_x,
                     y + baseline_off,
                     FONT_SIZE,
                     th.text_primary(),
                 );
+                // 选区命中几何 (腿 E/T6): 内容域 = 消息列 (x 起自 0, 无横滚);
+                // 与单文件同一 measure_row_geom (event 无 TextBatch, 靠缓存同源)。
+                let geom = measure_row_geom(texts, &rv.text, 0, 0.0, msg_w);
+                self.row_geom.borrow_mut().insert(pos, geom);
+                // 选区带: 单行选区 + (源,行) 键比对; 持焦才画 (与单文件
+                // visible_selection 同纪律 —— 看得见与复制得到同一个因)。
+                if self.focused {
+                    if let Some(sel) = &self.merge_sel {
+                        if sel.src == rv.src && sel.line == rv.line {
+                            if let Some((b0, b1)) = sel.range() {
+                                let x0 = (msg_x + texts.measure(&rv.text[..b0], FONT_SIZE))
+                                    .min(text_right);
+                                let x1 = (msg_x + texts.measure(&rv.text[..b1], FONT_SIZE))
+                                    .min(text_right);
+                                if x1 > x0 {
+                                    rects.push_rect(
+                                        Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                        th.selection(),
+                                        2.0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else {
             for block in expand_block_rects(
@@ -2429,8 +2598,9 @@ impl Widget for LogView {
         };
         // 命名会话入口 (SPEC-v1x-workspace-sessions D5): 导出入口左侧;
         // 空态不画 (Open Q3: 无文件不出入口)。
-        // 合并工作区不画 (合并会话载荷在 T8; apply_session 有 Single 切换守卫)。
-        let sessions_anchor_x = if self.has_file && !self.merge_active {
+        // 合并工作区**照画** (T8 翻案: 合并组会话载荷已接通 —— 保存带 merge
+        // 段, 应用重开源组重建合并, apply_session 有载荷分流)。
+        let sessions_anchor_x = if self.has_file {
             let sw = texts.measure(SESSIONS_BTN_LABEL, AUX_FONT_SIZE);
             let sx = export_anchor_x - 16.0 - sw;
             self.sessions_btn_rect
@@ -2573,7 +2743,18 @@ impl Widget for LogView {
                         || (position.y - pos0.y).abs() > CLICK_DIST;
                     if self.dragging || moved {
                         self.dragging = true;
-                        if let Some((crow, cbyte)) = self.hit_text(area, *position) {
+                        if self.merge_active {
+                            // 腿 E/T6 单行选区: caret 只在**同一行**内跟随;
+                            // 拖出该行 = 冻结在最后有效点 (合并相邻行可能来自
+                            // 不同文件, 跨行选区首版不做 —— 字段注释)。
+                            if let Some((crow, cbyte)) = self.hit_text(area, *position) {
+                                if crow == arow {
+                                    if let Some(sel) = self.merge_sel.as_mut() {
+                                        sel.caret = cbyte;
+                                    }
+                                }
+                            }
+                        } else if let Some((crow, cbyte)) = self.hit_text(area, *position) {
                             self.selection = Some(TextSelection::new((arow, abyte), (crow, cbyte)));
                         }
                     }
@@ -2819,33 +3000,45 @@ impl Widget for LogView {
                         }
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
-                        let text_x = self.text_x(area);
-                        let sub_row = self.line_at(row).1 > 0;
-                        // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
-                        // | 表格模式仅展开子行); 右键不清选区/不污染双击判定
-                        // (评审 O1); 左键落 gutter = 仅行选中并清选区
-                        if *button == MouseButton::Left
-                            && (!self.table_mode() || sub_row)
-                            && self.has_file
-                        {
-                            if position.x >= text_x {
+                        // 腿 E/T6: 合并视图先行分流 —— table_mode()/line_at 是单文件
+                        // 机制, 在合并位置空间是垃圾值; 选区只在**消息列**内启动
+                        // (时间栏/源栏/gutter 左键 = 仅行选中并清选区, gutter 同惯例)。
+                        if self.merge_active {
+                            if *button == MouseButton::Left && position.x >= self.merge_msg_x.get()
+                            {
                                 self.handle_text_press(area, *position);
-                            } else {
-                                self.selection = None;
+                            } else if *button == MouseButton::Left {
+                                self.merge_sel = None;
                             }
-                            self.selected_cell = None; // M4: 文本选区动作清单元格选中
-                        } else if *button == MouseButton::Left
-                            && self.table_mode()
-                            && self.has_file
-                            && !sub_row
-                            && position.x >= text_x
-                        {
-                            // 单元格双击 (M4): 表格模式普通行的文本区左键
-                            self.handle_cell_press(row, *position);
-                        } else if *button == MouseButton::Left && self.table_mode() {
-                            // 表格普通行的 gutter/行号区单击: 也清单元格选中
-                            // (单击他处 = 放弃, 与文本选区的 gutter 惯例一致)
-                            self.selected_cell = None;
+                        } else {
+                            let text_x = self.text_x(area);
+                            let sub_row = self.line_at(row).1 > 0;
+                            // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
+                            // | 表格模式仅展开子行); 右键不清选区/不污染双击判定
+                            // (评审 O1); 左键落 gutter = 仅行选中并清选区
+                            if *button == MouseButton::Left
+                                && (!self.table_mode() || sub_row)
+                                && self.has_file
+                            {
+                                if position.x >= text_x {
+                                    self.handle_text_press(area, *position);
+                                } else {
+                                    self.selection = None;
+                                }
+                                self.selected_cell = None; // M4: 文本选区动作清单元格选中
+                            } else if *button == MouseButton::Left
+                                && self.table_mode()
+                                && self.has_file
+                                && !sub_row
+                                && position.x >= text_x
+                            {
+                                // 单元格双击 (M4): 表格模式普通行的文本区左键
+                                self.handle_cell_press(row, *position);
+                            } else if *button == MouseButton::Left && self.table_mode() {
+                                // 表格普通行的 gutter/行号区单击: 也清单元格选中
+                                // (单击他处 = 放弃, 与文本选区的 gutter 惯例一致)
+                                self.selected_cell = None;
+                            }
                         }
                     }
                     EventResult::Consumed
@@ -2912,6 +3105,14 @@ impl Widget for LogView {
                         crate::NoticeKind::Warn,
                     )));
                     EventResult::Ignored
+                } else if self.merge_active {
+                    // 腿 E/T6 边界: 合并视图整行复制未接 (待 T7 波) —— 说清怎么
+                    // 复制得到 (P24), 不静默吞键 (T6 前这里会静默复制**错行**)。
+                    msgs.push(Box::new(Msg::Notice(
+                        "合并视图: 复制需先双击/框选消息文本 (整行复制未接)".into(),
+                        crate::NoticeKind::Info,
+                    )));
+                    EventResult::Ignored
                 } else {
                     EventResult::Ignored
                 }
@@ -2929,6 +3130,28 @@ impl Widget for LogView {
                 self.abandon_header_gesture();
                 EventResult::Consumed
             }
+            // 腿 E/T6: Ctrl+R 追踪选中值 (合并视图) —— view 只出选区键
+            // (源,行,字节), 值提取/过滤链在应用层 (Msg::TraceValue)。
+            Event::Key {
+                key: Key::Character(s),
+                ctrl: true,
+                pressed: true,
+                ..
+            } if self.merge_active && s.eq_ignore_ascii_case("r") => {
+                let armed = self
+                    .merge_sel
+                    .as_ref()
+                    .and_then(|sel| sel.range().map(|(lo, hi)| (sel.src, sel.line, lo, hi)));
+                if let Some((src, line, lo, hi)) = armed {
+                    msgs.push(Box::new(Msg::TraceValue { src, line, lo, hi }));
+                } else {
+                    msgs.push(Box::new(Msg::Notice(
+                        "先双击或框选消息里的追踪值 (如 req_id)".into(),
+                        crate::NoticeKind::Info,
+                    )));
+                }
+                EventResult::Consumed
+            }
             Event::Key {
                 key: Key::Named(NamedKey::Escape),
                 pressed: true,
@@ -2939,16 +3162,26 @@ impl Widget for LogView {
                 // T4: 表头手势 (列宽预览/换位/潜伏) 同弃 —— 预览零半提交, 列配置
                 // 真身从未被碰, Esc 自动回拖前值 (D2);
                 // 全无 → Ignored (框架清焦, 现状)
+                let merge_sel_live = self.merge_sel.as_ref().is_some_and(|s| s.range().is_some());
                 if self.selection.as_ref().is_none_or(|s| s.is_empty())
                     && self.selected_cell.is_none()
                     && self.press.is_none()
                     && !self.dragging
                     && !self.header_gesture_active()
+                    && !merge_sel_live
                 {
+                    // 腿 E/T6: 本地全空时合并追踪过滤是下一级 Esc 目标 ——
+                    // 先局部后全局 (第一下清选区, 第二下清追踪), 与单文件
+                    // 栏 Esc (先清草稿再清已应用) 同款升级序列。
+                    if self.merge_active && self.merge_traced {
+                        msgs.push(Box::new(Msg::ClearTrace));
+                        return EventResult::Consumed;
+                    }
                     EventResult::Ignored
                 } else {
                     self.selection = None;
                     self.selected_cell = None;
+                    self.merge_sel = None;
                     self.press = None;
                     self.dragging = false;
                     self.abandon_header_gesture();
@@ -3017,6 +3250,15 @@ impl Widget for LogView {
     /// 本函数只负责把选中的那一级**取成字符串** (那两处 `?` 在 `copy_source`
     /// 返回 `Some` 的前提下不可能落空, 留着只为 `Option` 收口)。
     fn selected_text(&self) -> Option<String> {
+        // 合并分支 (腿 E/T6): 选区键 (源,行) → 源文件原文切片; 滚出窗口仍复制
+        // 得到 (merge_files 常驻, 与单文件「滚出屏幕仍能复制」同语义)。
+        if self.merge_active {
+            return self.merge_sel_slice().and_then(|(file, line, r)| {
+                danqing_log::merge_view::row_text(file, line)
+                    .get(r)
+                    .map(str::to_string)
+            });
+        }
         match self.copy_source()? {
             CopySource::Text { .. } => {
                 let sel = self.selection.as_ref()?;
@@ -4890,6 +5132,33 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&path2).ok();
+    }
+
+    /// T8 翻案锁: 合并工作区**照画**会话入口 (合并组会话载荷已接通 ——
+    /// 保存带 merge 段, 应用重开源组); 原「合并不画」旧规退役。
+    /// 次序不重叠: 合并… · 会话 (导出入口合并态本就不画, T3 边界)。
+    #[test]
+    fn sessions_button_present_in_merge_mode() {
+        let (mut v, path) = merge_paint_fixture("sess-btn-merge");
+        let area = Rect::from_xywh(0.0, 0.0, 1280.0, 720.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let sess = v.sessions_btn_rect.get();
+        assert!(sess.size.width > 0.0, "合并工作区会话入口必须在场 (T8)");
+        let merge = v.merge_btn_rect.get();
+        assert!(
+            merge.size.width > 0.0 && merge.origin.x + merge.size.width <= sess.origin.x,
+            "次序: 合并… 在 会话 左侧且不重叠"
+        );
+        let p = Point::new(sess.origin.x + 2.0, sess.origin.y + 2.0);
+        let msgs = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenSessionMenu))),
+            "合并态点「会话」须发 OpenSessionMenu (门控在应用层)"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// 空态零痕迹: 无文件不画导出入口 (导出无对象), 命中矩形塌缩。
@@ -7252,6 +7521,175 @@ mod tests {
                 "源 {i} 名必须用 source_palette[{i}] 着色, 字形色流里没找到"
             );
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- 腿 E (T6): 合并文本选区 / 追踪手势 ----
+
+    /// T6 夹具扩展: 给合并夹具挂上真源文件句柄 (复制链按 (源,行) 取原文)。
+    /// src1 行5 = "ERROR worker boom" (与窗口快照同行内容)。
+    fn merge_sel_fixture(tag: &str) -> (LogView, std::path::PathBuf, std::path::PathBuf) {
+        let (mut v, path) = merge_paint_fixture(tag);
+        let p1 = std::env::temp_dir().join(format!(
+            "danqing-log-mv-{tag}-src1-{}.log",
+            std::process::id()
+        ));
+        std::fs::write(&p1, b"l0\nl1\nl2\nl3\nl4\nERROR worker boom\n").unwrap();
+        v.merge_files.push(Arc::new(LogFile::open(&path).unwrap()));
+        v.merge_files.push(Arc::new(LogFile::open(&p1).unwrap()));
+        (v, path, p1)
+    }
+
+    /// 双击消息列 → token 选区 ((源,行) 键) → 选区带真画 (selection 色矩形) →
+    /// Ctrl+C 复制源文件该行的选中子串。paint/event/复制三链同锁。
+    #[test]
+    fn merge_double_click_token_selects_paints_and_copies() {
+        let (mut v, path, p1) = merge_sel_fixture("dblsel");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        // paint 缓存: 消息列 x + 两行命中几何 (event 侧同源)
+        let msg_x = v.merge_msg_x.get();
+        assert!(msg_x > area.origin.x, "消息列在时间/源两栏右侧");
+        assert!(
+            v.row_geom.borrow().contains_key(&0) && v.row_geom.borrow().contains_key(&1),
+            "paint 必须给合并行缓存命中几何 (event 无 TextBatch)"
+        );
+        // 双击行1 的 "worker" (文本 "ERROR worker boom", worker 起自字节 6)
+        let w_pre = texts.measure("ERROR ", FONT_SIZE);
+        let rows_top = area.origin.y + v.chrome_top();
+        let click = Point::new(msg_x + w_pre + 1.0, rows_top + ROW_HEIGHT + 4.0);
+        let press = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: click,
+        };
+        let mut msgs = MsgQueue::new();
+        v.event(&press, area, &mut msgs);
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: click,
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(&press, area, &mut msgs); // 第二击 = 双击
+        let sel = v.merge_sel.as_ref().expect("双击应产合并选区");
+        assert_eq!((sel.src, sel.line), (1, 5), "选区键 = (源, 文件行)");
+        assert_eq!(sel.range(), Some((6, 12)), "token = worker");
+        // 选区带真画 (腿二教训: 断言产出不断言标志位)
+        let mut rects2 = RectBatch::new();
+        let mut texts2 = TextBatch::new();
+        v.paint(area, &mut rects2, &mut texts2);
+        let band = Rect::from_xywh(
+            msg_x + texts2.measure("ERROR ", FONT_SIZE),
+            rows_top + ROW_HEIGHT + 2.0,
+            texts2.measure("worker", FONT_SIZE),
+            ROW_HEIGHT - 4.0,
+        );
+        assert!(
+            rect_painted(&rects2, band, v.theme.theme().selection()),
+            "选区带必须真画在消息列 (颜色 = selection token)"
+        );
+        // 复制链: 选中子串来自**源文件** ((源,行) 键), 不依赖窗口快照
+        assert_eq!(v.selected_text().as_deref(), Some("worker"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&p1).ok();
+    }
+
+    /// 修洞锁 (T6 前活洞): 合并态无文本选区时 Ctrl+C 不得走单文件行兜底
+    /// 复制**错行** (line_at/file 在合并位置空间是垃圾值) —— 不消费 +
+    /// 出声指路 (P24)。
+    #[test]
+    fn merge_copy_without_selection_does_not_copy_wrong_line() {
+        let (mut v, path) = merge_paint_fixture("copybug");
+        v.selected = 1; // 行选中在, 文本选区无
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut msgs = MsgQueue::new();
+        let r = v.event(&Event::Copy, area, &mut msgs);
+        assert_eq!(r, EventResult::Ignored, "无选区不消费 (剪贴板不动)");
+        assert_eq!(
+            v.selected_text(),
+            None,
+            "合并态行兜底复制 = 错行来源, 不许有"
+        );
+        let mut iter = msgs.drain(..);
+        let said = iter.any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::Notice(t, _) if t.contains("合并视图")))
+        });
+        assert!(said, "应出声指引双击/框选 (P24)");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Esc 升级序列: 有选区先清选区 (追踪还在); 选区空了再 Esc → ClearTrace。
+    #[test]
+    fn merge_esc_clears_selection_then_trace() {
+        let (mut v, path) = merge_paint_fixture("esc");
+        v.merge_sel = Some(MergeSel {
+            src: 1,
+            line: 5,
+            anchor: 6,
+            caret: 12,
+        });
+        v.merge_traced = true;
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        let mut msgs = MsgQueue::new();
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert!(v.merge_sel.is_none(), "第一下清选区");
+        let sent_trace = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::ClearTrace))
+        });
+        assert!(!sent_trace, "选区在场时 Esc 不还手追踪");
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        let sent_trace = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::ClearTrace))
+        });
+        assert!(sent_trace, "第二下清追踪过滤");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 追踪手势 (Ctrl+R): 有选区 → TraceValue 带选区键; 无选区 → 指路提示,
+    /// 两边都**消费** (不许漏到应用层被「先合并」提示覆盖)。
+    #[test]
+    fn merge_ctrl_r_traces_selection_or_guides() {
+        let (mut v, path) = merge_paint_fixture("trace-key");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let ctrl_r = Event::Key {
+            key: Key::Character("r".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        let mut msgs = MsgQueue::new();
+        // 无选区 → 指路
+        assert_eq!(v.event(&ctrl_r, area, &mut msgs), EventResult::Consumed);
+        let guided = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::Notice(t, _) if t.contains("追踪值")))
+        });
+        assert!(guided, "无选区要指路 (P24)");
+        // 有选区 → TraceValue(源1, 行5, 6..12)
+        v.merge_sel = Some(MergeSel {
+            src: 1,
+            line: 5,
+            anchor: 6,
+            caret: 12,
+        });
+        assert_eq!(v.event(&ctrl_r, area, &mut msgs), EventResult::Consumed);
+        let traced = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::TraceValue { src: 1, line: 5, lo: 6, hi: 12 }))
+        });
+        assert!(traced, "选区键 (源,行,字节) 发 TraceValue");
         std::fs::remove_file(&path).ok();
     }
 
