@@ -51,7 +51,9 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
   要靠扩展（Daucloud 同文件冷启动实测约 7 秒），还占着编辑器、吃编辑器资源。
 
 > 完整对比表与逐项证据日期见 [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md)「竞品对比」
-> 与 [DEEP_COMPETITIVE_RESEARCH.md](docs/DEEP_COMPETITIVE_RESEARCH.md)。
+> 与 [DEEP_COMPETITIVE_RESEARCH.md](docs/DEEP_COMPETITIVE_RESEARCH.md)；
+> **哪些是对齐项、哪些是缺口、哪些是真创新**见
+> [FEATURE-MATRIX.md](docs/FEATURE-MATRIX.md)。
 
 ## 功能
 

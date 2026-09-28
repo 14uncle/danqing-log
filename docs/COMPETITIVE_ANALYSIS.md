@@ -2,6 +2,8 @@
 
 > ⚠️ **本文档是 POC 期产物（2026-09-21 清扫时保留作档案）**。权威口径以
 > `../PERFORMANCE_REPORT.md`、`DEEP_COMPETITIVE_RESEARCH.md` §2.2、`ROADMAP-v1x.md` §六为准。
+> **功能对齐 / 缺口 / 创新的分类总表 = `FEATURE-MATRIX.md`**；本文「ANSI 颜色 ✅」「JSONL 独家」
+> 等主张已被证伪，**禁止引用**（详见 `FEATURE-MATRIX.md` §5 第 4 条）。
 
 ## 竞品对比总览
 
