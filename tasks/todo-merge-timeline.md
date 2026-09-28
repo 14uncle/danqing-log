@@ -37,10 +37,53 @@
 
 ## Phase 2 — 产品（danqing-log）
 
-- [ ] T3 merge_view.rs 视图模型（MergeSource + MergeLines 二态 + 展开键 (src,line) + Workspace 双模式 + 归并 AsyncJob + 三栏绘制 + 滚动/选中/书签复刻; Single 零触碰; `merge_view_lines_contract` 先红后绿; 413 基线不破）
-- [ ] **CP2 检查点: D11 源色板提请用户批准**（框架 token or 退路单色 chip）
-- [ ] T4 源管理弹层 + 「合并…」入口 + `Feature::MergeTimeline` 门控两道闸 + 并集列（上限 24 首见截断）+ 混合源
-- [ ] T5 时钟偏移/时区（弹层编辑 + 解析边界单源施加 + 重归并; `offset_applied_at_parse_boundary`）
+- [x] T3 merge_view.rs 视图模型（MergeSource + MergeLines 二态 + 展开键 (src,line) + Workspace 双模式 + 归并 AsyncJob + 三栏绘制 + 滚动/选中/书签复刻; Single 零触碰; `merge_view_lines_contract` 先红后绿; 413 基线不破）
+      —— **2026-09-27 落地 (432 绿 = 160 lib + 258 main + 11 genlog + 3 keygen)**:
+      lib `merge_view.rs` (MergeState/window 窗口拷贝纪律/pack_key/position_of/
+      next_bookmark_pos/fmt_time_of_day + build_merge worker, 8 锁); main.rs
+      `Workspace::Single|Merge` 双模式 + cur_top/cur_selected 访问器路由 (~30 触点)
+      + 生命周期 (start_merge/pickup/apply) + 守卫组 (poll_growth 冻结/toggle_follow
+      告示 P24/apply_session 切 Single/reload_file 回 Single) + 7 行为锁; view.rs
+      合并三栏 paint (时间|源|消息, row_y 同源) + sync 快照 + Bar/底栏钮/侧栏 merge
+      门禁 + 真 paint 锁 (A/B 摘快照字形减)。**真发现**: ①小追加走同步通路不开
+      open_job (测试断言改行为口径) ②`#[expect(dead_code)]` 在非 test 构建才成立、
+      test 构建反报 unfulfilled → 用 allow+注释 ③探测 <3 行文件必拒 (继承
+      jsonl::detect 证据不足不判) —— 人工验收须知。**已知边界 (T3 明言)**: 合并内
+      无嵌套展开/无搜索过滤栏/无侧栏/无导出会话钮/无合并态复制 (待 T4-T7 波;
+      spec 实现记收录)
+- [x] **CP2 检查点: D11 源色板提请用户批准**（框架 token or 退路单色 chip）—— **已过 (2026-09-27「A」= 框架 token)**;
+      框架 `Theme::source_palette()` 默认实现按 `background()` 亮度自动选明/暗两套
+      (SceneTheme/LogTheme 零成本继承), 8 色 = 色相环均分逐支压/提亮度解出 WCAG AA
+      (常驻面 4.5 / 瞬时面 3.0, 与产品侧语义色板同一把尺); 三锁 (AA 两档 / 两两可辨
+      ≥25 / 亮度自动选板) + A/B 变异红 (亮橙→1.82 炸 AA 锁); 框架 630 绿 (+3)。
+      产品侧: 合并源名着色 `source_palette()[src]` + 真 paint 锁 (字形色流找两支,
+      A/B 统一 accent 红); **433 绿** (+1)。联动提交攒批待批 (patch 现开, lock path 态)
+- [x] T4 源管理弹层 + 「合并…」入口 + `Feature::MergeTimeline` 门控两道闸 + 并集列（上限 24 首见截断）+ 混合源
+      —— **2026-09-28 落地 (444 绿 = 165 lib + 265 main + 11 genlog + 3 keygen)**:
+      `license.rs` Feature::MergeTimeline+label; `merge_view.rs` 并集列模型 (union_columns
+      首见序/去重/截断 + union_cells 异源缺列留空(判据=schema 列集, 杂散字段不填) +
+      route_label + **carry_view_state**(加/减源重建按路径搬书签/显隐/选中, 序号漂移仍找回);
+      `settings.rs` 源管理弹层 (弹层族第七员: RowList 第四消费者+色块 with_swatch 加法 builder+
+      并集列截断提示 merge_union_hint); `main.rs` 门控两道闸 (入口 OpenMergeMenu + 动作兜底
+      merge_gate) + 加/减源/显隐/ToggleMergeWorkspace 臂 + apply_merge_outcome 接 carry;
+      `view.rs` 底栏「合并…」+ Ctrl+M。**真发现**: rebuild_masked 后选中位漂到别的行
+      (位置语义 vs 行身份) —— 修 = 选中按 (源,行) 锚定, 键不漂原则同书签 (修复前
+      carry 锁红 = 天然 A/B)。锁: 门控两态/上限拒绝+去重/弹层互斥+Esc 插层/并集断言×3/
+      carry 行为/色块×1/hint 三态。**T3 注释兑现**: StartMerge/ExitMerge 的
+      allow(dead_code) 已删 (构造点接通)
+- [x] T5 时钟偏移/时区（弹层编辑 + 解析边界单源施加 + 重归并; `offset_applied_at_parse_boundary`）
+      —— **2026-09-28 落地 (452 绿 = 168 lib + 270 main + 11 genlog + 3 keygen)**:
+      `merge_view.rs` set_time_params (只重提该源 ts + 重归并, 文件行索引不动;
+      书签/展开键 = (源,行) 不含时间 → 天然不受扰) + parse_tz_ms (±hh:mm/小时数,
+      双符号/越界拒收) + local_tz_offset_ms (Win32 GetTimeZoneInformation 裸 extern
+      —— danqing-encoding GBK FFI 同款范式, 不扩 windows feature; 夏令时取当前
+      生效档不回溯) + build_merge 默认 tz=本地 (腿 D「无 tz 格式必填, 默认本地」);
+      `settings.rs` 弹层时间编辑区 (快捷档 ±1s/±1min/±1h op_btn 同款 + 偏移 ms 手输
+      + 时区手输, 作用选中源)。**真发现**: 默认本地时区使测试涉及时区依赖机器 ——
+      锁一律先 set_time_params 归一到 tz=0 再断言 (时钟字面量 00:00:10.000 级断言,
+      施加两遍必红 23:59:56.000); tie-break 复核 = 等时刻源序号小者先。锁: 主锁
+      `offset_applied_at_parse_boundary` (排序+显示两侧同红) / tz 只动无 tz 行 /
+      parse 矩阵 / 应用层选中指针+门控
 - [ ] T6 req_id 追踪（选中值 → 跨源过滤 + 命中导航; `trace_field_value_builds_filter`）
 - [ ] T7 live-tail 合流（per-source append + 增量进索引 + 跟随钉尾 + 轮转重建 + 断流降级标记）
 - [ ] T8 sessions 载荷 merge group（is_recognizable 认新段 M1 守卫 + roundtrip + 源缺失明示跳过; 超支 → D4 退路裁 Open Q2 不烂尾）

@@ -58,7 +58,7 @@ fn content_width() -> f32 {
 /// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
 /// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
 /// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
-const PANEL_CONTENT_H: f32 = 192.0;
+const PANEL_CONTENT_H: f32 = 208.0; // 2026-09-28: 许可页加免费层范围提示行 (G3) 后实测 207.5
 /// 正文字号 (与 [`crate::view::FONT_SIZE`] 同源别名 —— 弹层/行列表必须与
 /// 行文同号, 各写一个 14 会漂)。
 const BODY_SIZE: u16 = crate::view::FONT_SIZE;
@@ -252,6 +252,22 @@ fn license_content(content_w: f32) -> impl Widget {
         .child(content_row(key_input_box(), content_w))
         .child(content_row(license_buttons_row(), content_w))
         .child(content_row(license_feedback_text(), content_w))
+        .child(content_row(free_tier_scope_note(), content_w))
+}
+
+/// 免费层范围提示 (todo-gate-trio G3): 书签持久化已收付费 —— **提示位唯一归处**
+/// 就是这行 (G3 裁决: 不在 toggle 时弹对话框, 会话内书签照用)。
+/// 免费态才显示 (付费了再说就是噪音)。
+fn free_tier_scope_note() -> impl Widget {
+    Text::bind(|app: &LogApp| {
+        if app.entitlement.allows(license::Feature::BookmarkPersist) {
+            String::new()
+        } else {
+            "免费层: 书签仅本次会话内有效（跨重启不恢复）。".to_string()
+        }
+    })
+    .font_size(BODY_SIZE)
+    .bind_color(|app: &LogApp| app.theme.theme().text_secondary())
 }
 
 fn tier_status_text() -> impl Widget {
@@ -839,6 +855,169 @@ fn sessions_card(bg: Color) -> impl Widget {
                     .font_size(BODY_SIZE)
                     .color(Color::WHITE),
                 || Msg::DeleteSelectedSession,
+            )),
+    )
+}
+
+/// 合并源管理弹层 (SPEC-v1x-merge-timeline T4, 弹层族第七员): 底栏「合并…」/
+/// `Ctrl+M` 入口 (门控在应用层)。卡体 = 源行 (RowList 第四消费者, 色块 = D11
+/// 源色板按源序号) + 加源/移除/退出合并 三钮。互斥/Esc 插层入家族清单。
+pub(crate) fn merge_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(merge_menu_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.merge_menu_open)
+        .on_scrim_click(|| Msg::CloseMergeMenu)
+}
+
+/// 源行 (RowList): 行 = `[x]`/`[ ]` + 源名 · 格式结论 (T3 探测结论),
+/// 载荷 = 路径; 点行 = 切显隐 + 记选中 (「移除」指针, ApplySession 同规)。
+/// 行首色块 = `source_palette()[源序号]` (D11/CP2-A 同一 token 族)。
+fn merge_source_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            let Some(m) = app.merge.as_ref() else {
+                return Vec::new(); // 未合并: 空列表 (「加源」起并后填)
+            };
+            m.sources
+                .iter()
+                .map(|s| {
+                    let mark = if s.hidden { "[ ]" } else { "[x]" };
+                    let label = format!(
+                        "{mark} {} · {}",
+                        s.name(),
+                        danqing_log::merge_view::route_label(&s.route)
+                    );
+                    (label, s.path.to_string_lossy().into_owned())
+                })
+                .collect()
+        },
+        |app: &LogApp| app.merge_source_selected.clone(),
+        |payload: &str| Msg::ToggleMergeSource(payload.to_string()),
+        |n| format!("… 还有 {n} 个"),
+    )
+    .with_swatch(|app: &LogApp, payload: &str| {
+        let m = app.merge.as_ref()?;
+        let idx = m
+            .sources
+            .iter()
+            .position(|s| s.path.to_string_lossy() == payload)?;
+        Some(app.theme.theme().source_palette()[idx])
+    })
+}
+
+/// 并集列提示行 (spec Q3「弹层可见提示」): 截断时如实报「超上限截断」——
+/// 用户要知道自己的列被截了; 未截只报列数。抽出独立函数是为可测。
+fn merge_union_hint(app: &LogApp) -> String {
+    let Some(m) = app.merge.as_ref() else {
+        return String::new();
+    };
+    let u = danqing_log::merge_view::union_columns(m.sources.iter().map(|s| s.schema.as_deref()));
+    if u.truncated > 0 {
+        format!(
+            "并集列 {} 列 · 超上限截断至 {}",
+            u.names.len() + u.truncated,
+            danqing_log::merge_view::UNION_COL_CAP
+        )
+    } else {
+        format!("并集列 {} 列", u.names.len())
+    }
+}
+
+/// 时间参数编辑区 (T5 腿 D, 作用**选中**源): 快捷档 ±1s/±1min/±1h (增量,
+/// op_btn 同款小钮) + 偏移 ms 手输 + 时区手输。无选中时动作在应用层说清
+/// (指针语义, DeleteSelectedSession 同规) —— 钮不因此禁用 (视觉态会漂,
+/// 说清文案在应用层有唯一出处)。
+fn merge_time_edit() -> impl Widget {
+    let step = |label: &'static str, delta: i64| {
+        Button::themed(
+            &LightTheme,
+            Text::new(label.to_string())
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+        )
+        .bind_color(|app: &LogApp| app.theme.theme().text_secondary())
+        .on_click(move || Msg::NudgeMergeOffset(delta))
+    };
+    Row::new()
+        .gap(6.0)
+        .cross_center()
+        .child(step("-1h", -3_600_000))
+        .child(step("-1m", -60_000))
+        .child(step("-1s", -1_000))
+        .child(step("+1s", 1_000))
+        .child(step("+1m", 60_000))
+        .child(step("+1h", 3_600_000))
+}
+
+/// 偏移手输 (±ms 粒度, 绝对值): Enter/「设偏移」同路。
+fn merge_offset_input() -> SubmitInput {
+    SubmitInput::new(
+        "偏移 ms (选中源)",
+        "设偏移",
+        64.0,
+        "merge-offset",
+        |app: &LogApp| app.merge_clear_rev,
+        Msg::SetMergeOffset,
+    )
+}
+
+/// 时区手输 (无 tz 时间戳按它解释, 腿 D): ±hh:mm 或小时数。
+fn merge_tz_input() -> SubmitInput {
+    SubmitInput::new(
+        "时区 (如 +08:00)",
+        "设时区",
+        64.0,
+        "merge-tz",
+        |app: &LogApp| app.merge_clear_rev,
+        Msg::SetMergeTz,
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「合并源」+ 源行 + 加源/移除 + 退出合并。
+/// 「退出合并/返回合并」label 随态 —— `Text::bind` 每帧取 (建树冻结铁律)。
+fn merge_menu_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("合并源"))
+            .child(merge_source_rows())
+            .child(
+                Text::bind(merge_union_hint)
+                    .font_size(BODY_SIZE)
+                    .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+            )
+            .child(merge_time_edit())
+            .child(merge_offset_input())
+            .child(merge_tz_input())
+            .child(
+                Row::new()
+                    .gap(8.0)
+                    .cross_center()
+                    .child(format_btn(
+                        Text::new("加源…".to_string())
+                            .font_size(BODY_SIZE)
+                            .color(Color::WHITE),
+                        || Msg::PickMergeSource,
+                    ))
+                    .child(format_btn(
+                        Text::new("移除".to_string())
+                            .font_size(BODY_SIZE)
+                            .color(Color::WHITE),
+                        || Msg::RemoveSelectedMergeSource,
+                    )),
+            )
+            .child(format_btn(
+                Text::bind(|app: &LogApp| {
+                    if app.workspace == crate::Workspace::Merge {
+                        "退出合并".to_string()
+                    } else {
+                        "返回合并".to_string()
+                    }
+                })
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+                || Msg::ToggleMergeWorkspace,
             )),
     )
 }
@@ -1483,6 +1662,68 @@ mod tests {
         assert!(has("/"), "`/` 猜不出来 (Vim 习惯), 必须在卡上");
         assert!(has("f"), "`f` 是本应用自造的词, 必须在卡上");
         assert!(!has("→") && !has("←"), "方向键属常识, 不进卡 (README 兜底)");
+    }
+
+    /// 并集列提示 (spec Q3 弹层可见提示): 未合并零文案; 截断如实报;
+    /// 未截只报列数。
+    #[test]
+    fn merge_union_hint_reports_truncation_honestly() {
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-hint-{}-{}.toml",
+            std::process::id(),
+            "u"
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        assert_eq!(merge_union_hint(&app), "", "未合并零文案");
+        // 两源 3+3 列共 6 列 → 未截
+        let dir = std::env::temp_dir();
+        let pa = dir.join(format!("hint-a-{}.jsonl", std::process::id()));
+        let pb = dir.join(format!("hint-b-{}.jsonl", std::process::id()));
+        // 每源 ≥3 行 —— 探测 <3 行必拒 (T3 已知边界, 这里踩过一次)
+        std::fs::write(
+            &pa,
+            br#"{"ts":"2026-09-28T00:00:00Z","level":"INFO","msg":"a"}
+{"ts":"2026-09-28T00:00:01Z","level":"INFO","msg":"a"}
+{"ts":"2026-09-28T00:00:02Z","level":"INFO","msg":"a"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &pb,
+            br#"{"ts":"2026-09-28T00:00:03Z","req":"r","extra":"e"}
+{"ts":"2026-09-28T00:00:04Z","req":"r","extra":"e"}
+{"ts":"2026-09-28T00:00:05Z","req":"r","extra":"e"}
+"#,
+        )
+        .unwrap();
+        let out = danqing_log::merge_view::build_merge(
+            &[pa.clone(), pb.clone()],
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        app.apply_merge_outcome(out);
+        // ts 跨源去重: ts/level/msg + req/extra = 5 列
+        assert_eq!(merge_union_hint(&app), "并集列 5 列", "未截只报列数");
+        // 灌宽 schema → 截断如实报 (上限 24)
+        {
+            use danqing_log::jsonl::{Column, Schema};
+            let m = app.merge.as_mut().unwrap();
+            let wide: Vec<Column> = (0..30)
+                .map(|i| Column {
+                    name: format!("c{i:02}"),
+                    width_chars: 8,
+                })
+                .collect();
+            m.sources[0].schema = Some(std::sync::Arc::new(Schema { columns: wide }));
+        }
+        let h = merge_union_hint(&app);
+        // 并集 = 宽源 30 列 + 源 b 的 ts/req/extra = 33; 截断 24 但总数如实报
+        assert!(
+            h.contains("超上限截断至 24") && h.starts_with("并集列 33 列"),
+            "截断如实报总数与上限: {h}"
+        );
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
+        std::fs::remove_file(&cfg).ok();
     }
 
     /// 回归锁 (2026-09-14): 合并行 `("Ctrl+B · Ctrl+G", "切换书签 / 下一书签")` 拆成两行时,

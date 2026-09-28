@@ -52,7 +52,9 @@ impl Sidebar {
 impl Widget for Sidebar {
     fn sync(&mut self, state: &dyn Any) {
         if let Some(app) = state.downcast_ref::<LogApp>() {
-            self.visible = app.histogram_visible;
+            // 合并工作区 (腿一 T3): 侧栏整体收起 —— 直方图/字段分析是单文件口径,
+            // 跨源计数的合并语义另裁 (不在 T3 范围)。
+            self.visible = app.histogram_visible && app.workspace == crate::Workspace::Single;
         }
         self.inner.sync(state);
     }

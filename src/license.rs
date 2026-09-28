@@ -187,6 +187,16 @@ pub enum Feature {
     FieldAnalytics,
     Export,
     WorkspaceSessions,
+    /// 多文件合并时间线 (SPEC-v1x-merge-timeline D6): 门控点 = 「合并…」入口。
+    MergeTimeline,
+    /// 列配置三件套 (todo-gate-trio G2): 门控点 = 「列管理」入口 + 表头手势起点;
+    /// 免费态默认列摆法照用 (v1.0 行为)。
+    ColumnConfig,
+    /// 书签持久化 (G3, **通路型**): 门控点 = state.json bookmarks 段读与写;
+    /// 会话内书签照用 (toggle 不拦不弹窗)。
+    BookmarkPersist,
+    /// 免语法字段查询 (G4): 门控点 = 「字段…」按钮; 手输迷你语法照用。
+    FieldPicker,
 }
 
 impl Feature {
@@ -196,6 +206,10 @@ impl Feature {
             Feature::FieldAnalytics => "字段分析",
             Feature::Export => "导出",
             Feature::WorkspaceSessions => "工作台会话",
+            Feature::MergeTimeline => "合并时间线",
+            Feature::ColumnConfig => "列配置",
+            Feature::BookmarkPersist => "书签持久化",
+            Feature::FieldPicker => "字段查询",
         }
     }
 }
@@ -528,6 +542,10 @@ mod tests {
             Feature::FieldAnalytics,
             Feature::Export,
             Feature::WorkspaceSessions,
+            Feature::MergeTimeline,
+            Feature::ColumnConfig,
+            Feature::BookmarkPersist,
+            Feature::FieldPicker,
         ] {
             assert!(!e.allows_at(f, 1_700_000_000));
         }
@@ -542,6 +560,10 @@ mod tests {
             Feature::FieldAnalytics,
             Feature::Export,
             Feature::WorkspaceSessions,
+            Feature::MergeTimeline,
+            Feature::ColumnConfig,
+            Feature::BookmarkPersist,
+            Feature::FieldPicker,
         ] {
             assert!(e.allows_at(f, 1_700_000_000));
         }

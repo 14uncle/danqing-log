@@ -289,3 +289,15 @@ RowList 五闭包契约等第三消费者。
 关弹层不提交; `.log` 无「字段…」按钮、免费态直接可用无门控。**E5（T0 验点
 「列管理行随文件换」）通过** —— 兼充 `SPEC-v1x-table-column-config.md` A3
 勘误验点收口（开 A 看 A 的列、换 B 看 B 的列）。
+
+**免费态门控补验**（2026-09-28, todo-gate-trio G5; 本功能已由免费层欠账改判付费 ——
+2026-09-27 裁决②）: A/D/E 组已过条目**不动**; 增补两条待实机:
+- [ ] 免费态拦截可见（入口/手势/通路按 G0 口径表拦下并弹升级对话框; 书签持久化为
+      通路型不弹窗, 提示位 = 设置卡许可页一行）
+- [ ] 付费态功能如旧（激活后与已验收行为逐条一致, 零回归）
+
+机器侧两态锁已落: `column_gate_blocks_free_tier_and_never_prompts_paid` /
+`column_config_segment_skips_read_write_in_free_but_preserves_paid` /
+`bookmark_persist_gated_but_in_session_free` /
+`picker_gate_blocks_free_tier_and_never_prompts_paid`（既有锁按注入惯例注付费态,
+断言不动）。

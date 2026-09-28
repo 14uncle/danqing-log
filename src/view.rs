@@ -35,7 +35,7 @@ use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Column, Schema, SubRow};
 use danqing_log::logfile::LogFile;
 
-use crate::{LogApp, Msg, ViewMode};
+use crate::{LogApp, Msg, ViewMode, Workspace};
 
 /// 复制行数上限 (R3 业务护栏): 滚轮甩底可造出全文件选区, 无上限复制 = 逐行
 /// 解码 + 逐行分配, UI 冻结分钟级。10 万行 ≈ 16MB 文本, 剪贴板与内存都安全。
@@ -72,6 +72,8 @@ const GLYPH_EXPANDED: &str = "-";
 const STATUS_HEIGHT: f32 = 26.0;
 /// 命名会话入口标签 (SPEC-v1x-workspace-sessions D5)。
 const SESSIONS_BTN_LABEL: &str = "会话";
+/// 底栏「合并…」按钮标签 (merge-timeline T4, D6 入口)。
+const MERGE_BTN_LABEL: &str = "合并…";
 
 /// 更新角标直径 (逻辑像素; 圆点半径取直径之半)。SPEC-update-badge D1, 拟态值待验收 (e) 定档。
 const UPDATE_DOT_D: f32 = 6.0;
@@ -859,6 +861,10 @@ pub(crate) struct LogView {
     /// 「会话」入口 (D5): hover + hit rect, export 同规。
     sessions_hover: std::cell::Cell<bool>,
     sessions_btn_rect: std::cell::Cell<Rect>,
+    merge_hover: std::cell::Cell<bool>,
+    merge_btn_rect: std::cell::Cell<Rect>,
+    /// 列配置门快照 (G2): true = 免费态, 表头拖宽/换位手势不启动 (发升级提示)。
+    col_gesture_free: bool,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
@@ -913,6 +919,19 @@ pub(crate) struct LogView {
     /// 无它 focusable 形同虚设 —— hit_focusable 只认 hit_area (评审自查发现:
     /// 只加 focusable 不加 hit_area, 点击永不聚焦, Ctrl+C 链路断路)。
     area: std::cell::Cell<Rect>,
+    // ---- 合并工作区 (merge-timeline 腿一 T3) ----
+    /// 合并模式激活 (sync 自 app.workspace; D4)。
+    merge_active: bool,
+    /// 可见窗口行快照 (sync 每帧拷; 窗口拷贝纪律见 merge_view 模块头)。
+    merge_rows: Vec<danqing_log::merge_view::MergeRowView>,
+    /// 窗口首行位置 (merge_rows[0] 的合并行号)。
+    merge_rows_from: u64,
+    /// 合并总行数 (滚动条/行号槽口径)。
+    merge_total: u64,
+    /// 源元数据 (名, hidden) —— 行首源标签; 源色 = `theme.source_palette()[序号]` (D11/CP2-A)。
+    merge_sources: Vec<(String, bool)>,
+    /// 合并书签 pack 键集 (gutter 标记; 用户量级逐帧克隆无感)。
+    merge_bookmarks: std::collections::BTreeSet<u64>,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
 }
@@ -951,6 +970,9 @@ impl LogView {
             export_btn_rect: std::cell::Cell::new(Rect::default()),
             sessions_hover: std::cell::Cell::new(false),
             sessions_btn_rect: std::cell::Cell::new(Rect::default()),
+            merge_hover: std::cell::Cell::new(false),
+            merge_btn_rect: std::cell::Cell::new(Rect::default()),
+            col_gesture_free: false, // 默认放行: 测试直构造零 sync = 付费语义; 生产 sync 每帧写真值
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
             hover_expand: std::cell::Cell::new(false),
@@ -973,6 +995,12 @@ impl LogView {
             gutter_w: std::cell::Cell::new(GUTTER_MIN),
             area: std::cell::Cell::new(Rect::default()),
             theme: crate::config::AppTheme::Light,
+            merge_active: false,
+            merge_rows: Vec::new(),
+            merge_rows_from: 0,
+            merge_total: 0,
+            merge_sources: Vec::new(),
+            merge_bookmarks: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1095,6 +1123,10 @@ impl LogView {
     /// 顶部 chrome 高度: 过滤/搜索栏是独立 sibling (Column 上面), LogView 不含它;
     /// 表格模式只留表头, 原始模式无 chrome。
     fn chrome_top(&self) -> f32 {
+        // 合并工作区 (T3): 三栏表头 (时间|源|消息) 占表头高。
+        if self.merge_active {
+            return HEADER_H;
+        }
         if self.table_mode() { HEADER_H } else { 0.0 }
     }
 
@@ -1109,7 +1141,11 @@ impl LogView {
     }
 
     /// 显示行数: 文件行数 + 展开子行数。
+    /// 合并工作区 (T3) = 合并总行数 (无展开子行, 嵌套展开待并集列波再裁)。
     fn display_count(&self) -> u64 {
+        if self.merge_active {
+            return self.merge_total;
+        }
         expand::display_count(self.lines(), &self.expanded)
     }
 
@@ -1465,8 +1501,8 @@ impl Widget for LogView {
         self.file = Some(Arc::clone(&app.file));
         self.has_file = app.has_file;
         self.loading_label = app.loading_label.clone();
-        self.top_row = app.top_row;
-        self.selected = app.selected;
+        self.top_row = app.cur_top();
+        self.selected = app.cur_selected();
         self.status = app.status.clone();
         self.status_error = app.status_error;
         self.notice = app.notice.clone();
@@ -1481,12 +1517,43 @@ impl Widget for LogView {
         self.mode = app.mode;
         self.schema = app.schema.clone();
         self.filtered = app.filtered.clone();
+        // 合并工作区快照 (腿一 T3): 窗口拷贝纪律见 merge_view 模块头;
+        // 单文件显示模式的遗物 (Table/schema/filtered) 在合并期**清空**,
+        // 免得表头命中/单元格选中那套单文件机制在合并视图背后误动作。
+        let merge_on = app.merge_active().is_some();
+        self.merge_active = merge_on;
+        if merge_on {
+            self.mode = ViewMode::Raw;
+            self.schema = None;
+            self.filtered = None;
+            let m = app.merge.as_ref().expect("merge_active 保证 bundle 在");
+            let from = m.top_row.floor().max(0.0) as u64;
+            self.merge_rows_from = from;
+            self.merge_rows = m.window(from, danqing_log::merge_view::WINDOW_ROWS);
+            self.merge_total = m.row_count();
+            self.merge_sources = m
+                .sources
+                .iter()
+                .map(|s| (s.name().to_string(), s.hidden))
+                .collect();
+            self.merge_bookmarks = m.bookmarks.clone();
+        } else {
+            self.merge_rows.clear();
+            self.merge_total = 0;
+            self.merge_sources.clear();
+            self.merge_bookmarks.clear();
+        }
         self.search_hits = app.search.as_ref().map(|n| Arc::clone(n.hits()));
         self.encoding = app.file.encoding();
         self.bookmarks = app.bookmarks.clone();
         self.expanded = app.expanded.clone();
         self.sub_rows = app.sub_rows.clone();
         self.theme = app.theme;
+        // 列配置门快照 (gate-trio G2): 手势起点判据 —— 免费态拖宽/换位手势
+        // **不启动** (G0 口径), event 只读本缓存 (D2 同规: event 无 App)。
+        self.col_gesture_free = !app
+            .entitlement
+            .allows(danqing_log::license::Feature::ColumnConfig);
         // 列配置镜像 (T3): 真身在 LogApp; 拷入后对账一次 —— paint 只信
         // 「order 覆盖全部 schema 列」的不变量。幂等且 ≤16 列, 每帧成本可忽略。
         self.columns = app.columns.clone();
@@ -1721,6 +1788,55 @@ impl Widget for LogView {
                 th.text_secondary(),
             );
         }
+        // merge-timeline 腿一 T3: 合并三栏表头 (时间|源|消息) —— 必须在行裁剪区
+        // **外** (裁剪只护行区; 表头画进裁剪区会被整片裁掉 = 永远看不见)。
+        // 固定三栏, T3 不做横向滚动/列管理 (列配置三件套在合并视图的形态待 T4 并集列)。
+        if self.merge_active {
+            let hy = area.origin.y;
+            rects.push_rect(
+                Rect::from_xywh(area.origin.x, hy, area.size.width, HEADER_H - 1.0),
+                th.surface_variant(),
+                0.0,
+            );
+            let time_w = texts.measure("00:00:00.000", AUX_FONT_SIZE) + 16.0;
+            // 源列宽 = 最宽源名 (字符数钳 [4,16]) 实测 + 垫 —— 源名截断到源列宽。
+            let src_chars = self
+                .merge_sources
+                .iter()
+                .map(|(n, _)| n.chars().count())
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 16);
+            let src_w = texts.measure(&"8".repeat(src_chars), AUX_FONT_SIZE) + 16.0;
+            let mut hx = text_x;
+            for (label, w) in [("时间", time_w), ("源", src_w)] {
+                fit_push(
+                    texts,
+                    label,
+                    w,
+                    hx,
+                    hy + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
+                );
+                hx += w;
+            }
+            fit_push(
+                texts,
+                "消息",
+                (text_right - hx).max(0.0),
+                hx,
+                hy + aux_baseline_off,
+                AUX_FONT_SIZE,
+                th.text_secondary(),
+            );
+            rects.push_rect(
+                Rect::from_xywh(area.origin.x, hy + HEADER_H - 1.0, area.size.width, 1.0),
+                header_line(&th),
+                0.0,
+            );
+        }
+
         // 裁剪: 行内容不溢出到表头/底栏
         let clip = Rect::from_xywh(area.origin.x, rows_top, area.size.width, list_h);
         rects.push_clip(clip);
@@ -1740,124 +1856,294 @@ impl Widget for LogView {
             // → rel_y = (j - top_row) * ROW_HEIGHT; 绝对 y = rows_top + rel_y
             rows_top + (j as f64 - self.top_row) as f32 * ROW_HEIGHT
         };
-        for block in expand_block_rects(
-            first,
-            scan_limit,
-            row_y,
-            |j| self.line_at(j).1 > 0,
-            area.origin.x,
-            area.size.width - SCROLLBAR_W,
-        ) {
-            rects.push_rect(block, expand_block_bg(self.theme), 0.0);
-        }
-        let mut i = first;
-        loop {
-            let y = row_y(i);
-            // 行顶部超出可见区底部 → 停止
-            if y >= rows_bottom || i >= count {
-                break;
-            }
-            // 行完全在可见区上方 → 跳过 (滚动时首行可能部分溢出)
-            if y + ROW_HEIGHT <= rows_top {
-                i += 1;
-                continue;
-            }
-            // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
-            // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
-            // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
-            // → 命中行底 (hit_row_bg, 弱一档) → 选中 (底色 + 左侧 3px 强调条)
-            // → hover (永画, 压过命中行底 —— 「指针现在在哪」必须盖过「搜索留下的痕迹」)
-            let row_rect =
-                Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
-            let (line_no, sub_off) = self.line_at(i);
-            let is_sub_row = sub_off > 0;
-            // 展开块底色已在上面整层铺完 (2026-09-13): 子行原先与真实行长得一模一样
-            // (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
-            // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
-            if table && i % 2 == 1 && !is_sub_row {
-                // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
-                // 交替条纹会把它切碎、语义又糊回去。
-                rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
-            }
-            // **三态不是互斥关系** (2026-09-14 实机 M0 P10): 原先
-            // `if selected && !has_text_sel {…} else if hover {…}` 有两重压制 ——
-            // ① 有文本选区时选中行的底与左 accent 竖条一起消失;
-            // ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
-            // 修复 = 各自独立: 选中行**永画**, hover **永画**, 文本选区照旧只画区间带。
-            //
-            // 画序 (2026-09-14 实机 M0 P11): 命中行底**先**画, hover **后**画 ——
-            // 命中行是「搜索留下的痕迹」, hover 是「指针现在在哪」, 后者必须压过前者。
-            // 原先把命中行底画在 hover 之后且同用 `th.selection()`, 命中行上 hover 无反馈。
-            if table {
-                if let Some(hits) = &self.search_hits {
-                    if hits.binary_search(&line_no).is_ok() {
-                        rects.push_rect(
-                            Rect::from_xywh(
-                                area.origin.x,
-                                y,
-                                area.size.width - SCROLLBAR_W,
-                                ROW_HEIGHT,
-                            ),
-                            hit_row_bg(self.theme),
-                            0.0,
-                        );
-                    }
+        // merge-timeline 腿一 T3: 合并工作区的行循环 (时间|源|消息三栏) ——
+        // 单文件行循环整体跳过; 行底色/选中/hover/书签的视觉层级与单文件同款,
+        // y 映射复用同一个 row_y 闭包 (S1 单点纪律)。
+        if self.merge_active {
+            let time_w = texts.measure("00:00:00.000", AUX_FONT_SIZE) + 16.0;
+            let src_chars = self
+                .merge_sources
+                .iter()
+                .map(|(n, _)| n.chars().count())
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 16);
+            let src_w = texts.measure(&"8".repeat(src_chars), AUX_FONT_SIZE) + 16.0;
+            for (i, rv) in self.merge_rows.iter().enumerate() {
+                let pos = self.merge_rows_from + i as u64;
+                let y = row_y(pos);
+                if y >= rows_bottom {
+                    break;
                 }
-            }
-            if i == self.selected && self.focused {
-                rects.push_rect(row_rect, th.selection(), 0.0);
-                rects.push_rect(
-                    Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
-                    th.accent(),
-                    0.0,
+                if y + ROW_HEIGHT <= rows_top {
+                    continue;
+                }
+                let row_rect =
+                    Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
+                // 选中 (底色 + 左 accent 条) → hover —— 层级与单文件一致。
+                if pos == self.selected && self.focused {
+                    rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
+                        th.accent(),
+                        0.0,
+                    );
+                } else if pos == self.hover_row.get() {
+                    rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
+                }
+                // 书签 (pack 键): gutter 内圆点 (bookmark_color 同 token)。
+                let key = danqing_log::merge_view::pack_key(rv.src, rv.line);
+                if self.merge_bookmarks.contains(&key) {
+                    let bx = area.origin.x + gutter_w / 2.0 - 3.0;
+                    rects.push_rect(
+                        Rect::from_xywh(bx, y + ROW_HEIGHT / 2.0 - 3.0, 6.0, 6.0),
+                        bookmark_color(self.theme),
+                        3.0,
+                    );
+                }
+                // gutter 行号 = 合并位置 (1-based), 右对齐同单文件口径。
+                let no = format!("{}", pos + 1);
+                let nw = texts.measure(&no, AUX_FONT_SIZE);
+                fit_push(
+                    texts,
+                    &no,
+                    gutter_w - 8.0,
+                    area.origin.x + gutter_w - nw - 6.0,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
+                );
+                // 三栏: 时间 | 源 | 消息。
+                let ts_text = danqing_log::merge_view::fmt_time_of_day(rv.ts);
+                fit_push(
+                    texts,
+                    &ts_text,
+                    time_w,
+                    text_x,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
+                );
+                let (src_name, _) = &self.merge_sources[rv.src as usize];
+                // D11 (CP2-A): 源名按源着色 —— `source_palette` 索引 = 源序号,
+                // 一眼分源 (LogViewPlus/logmerge 全部按源着色, 合并视图可读性核心)。
+                // 色板上限 8 与 `merge_view::MAX_SOURCES` 同值, 序号不越界。
+                let src_color = th.source_palette()[rv.src as usize];
+                fit_push(
+                    texts,
+                    src_name,
+                    (src_w - 8.0).max(0.0),
+                    text_x + time_w,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    src_color,
+                );
+                let msg_x = text_x + time_w + src_w;
+                fit_push(
+                    texts,
+                    rv.text.trim_end(),
+                    (text_right - msg_x).max(0.0),
+                    msg_x,
+                    y + baseline_off,
+                    FONT_SIZE,
+                    th.text_primary(),
                 );
             }
-            if i == self.hover_row.get() {
-                // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
-                // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
-                // 不再与选中行互斥 —— 拖框选经过选中行时 hover 仍可见。
-                rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
+        } else {
+            for block in expand_block_rects(
+                first,
+                scan_limit,
+                row_y,
+                |j| self.line_at(j).1 > 0,
+                area.origin.x,
+                area.size.width - SCROLLBAR_W,
+            ) {
+                rects.push_rect(block, expand_block_bg(self.theme), 0.0);
             }
-            // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
-            // 与行选中可同存 —— 单元格是更具体的选中, 画在上层)
-            if let Some((srow, scol)) = self.selected_cell {
-                if srow == i && !is_sub_row && self.focused {
-                    let spans = self.col_spans.borrow();
-                    if let Some((x0, x1, _)) = spans.iter().find(|(_, _, ci)| *ci == scol) {
-                        let hx0 = x0.max(text_x);
-                        let hx1 = x1.min(text_right);
-                        if hx1 > hx0 {
-                            let cell_rect =
-                                Rect::from_xywh(hx0, y + 2.0, hx1 - hx0, ROW_HEIGHT - 4.0);
-                            // 两笔: 底色 (与行选中同 token, 见 cell_highlight_colors)
-                            // + 描边 (唯一指出「具体哪一格」的一笔, 按钮焦点环同款原语)
-                            let (fill, border) = cell_highlight_colors(&th);
-                            rects.push_rect(cell_rect, fill, 2.0);
-                            rects.push_rounded_border(cell_rect, border, 2.0, 1.5);
+            let mut i = first;
+            loop {
+                let y = row_y(i);
+                // 行顶部超出可见区底部 → 停止
+                if y >= rows_bottom || i >= count {
+                    break;
+                }
+                // 行完全在可见区上方 → 跳过 (滚动时首行可能部分溢出)
+                if y + ROW_HEIGHT <= rows_top {
+                    i += 1;
+                    continue;
+                }
+                // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
+                // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
+                // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
+                // → 命中行底 (hit_row_bg, 弱一档) → 选中 (底色 + 左侧 3px 强调条)
+                // → hover (永画, 压过命中行底 —— 「指针现在在哪」必须盖过「搜索留下的痕迹」)
+                let row_rect =
+                    Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
+                let (line_no, sub_off) = self.line_at(i);
+                let is_sub_row = sub_off > 0;
+                // 展开块底色已在上面整层铺完 (2026-09-13): 子行原先与真实行长得一模一样
+                // (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
+                // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
+                if table && i % 2 == 1 && !is_sub_row {
+                    // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
+                    // 交替条纹会把它切碎、语义又糊回去。
+                    rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
+                }
+                // **三态不是互斥关系** (2026-09-14 实机 M0 P10): 原先
+                // `if selected && !has_text_sel {…} else if hover {…}` 有两重压制 ——
+                // ① 有文本选区时选中行的底与左 accent 竖条一起消失;
+                // ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
+                // 修复 = 各自独立: 选中行**永画**, hover **永画**, 文本选区照旧只画区间带。
+                //
+                // 画序 (2026-09-14 实机 M0 P11): 命中行底**先**画, hover **后**画 ——
+                // 命中行是「搜索留下的痕迹」, hover 是「指针现在在哪」, 后者必须压过前者。
+                // 原先把命中行底画在 hover 之后且同用 `th.selection()`, 命中行上 hover 无反馈。
+                if table {
+                    if let Some(hits) = &self.search_hits {
+                        if hits.binary_search(&line_no).is_ok() {
+                            rects.push_rect(
+                                Rect::from_xywh(
+                                    area.origin.x,
+                                    y,
+                                    area.size.width - SCROLLBAR_W,
+                                    ROW_HEIGHT,
+                                ),
+                                hit_row_bg(self.theme),
+                                0.0,
+                            );
                         }
                     }
                 }
-            }
-            // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
-            if is_sub_row {
-                if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1)) {
-                    let indent = (row.depth as f32 - 1.0) * 16.0;
-                    let s = sub_row_text(row);
-                    let draw_x = text_x + indent;
-                    if draw_x < text_right {
-                        // 选区命中几何 (M3): 串由 `sub_row_text` 单点构造, 命中/渲染/
-                        // 复制三源一体; 子行不参与水平滚动 (无 x_off) → 内容域起点
-                        // = indent, hit_text 对子行相应不加 x_offset (D3 分叉)
-                        let geom =
-                            measure_row_geom(texts, &s, 0, indent, text_right - text_x + 64.0);
-                        self.row_geom.borrow_mut().insert(i, geom);
-                        // 文本选区区间 (M3): 与 raw 行同法 (measure 前缀→矩形),
-                        // 唯二差异 = 串是子行串、无 x_off (子行不水平滚动)
-                        if let Some(sel) = self.visible_selection() {
-                            if let Some((b0, b1)) = selection::row_slice(sel, i, &s) {
-                                let x0 = (draw_x + texts.measure(&s[..b0], FONT_SIZE)).max(text_x);
-                                let x1 =
-                                    (draw_x + texts.measure(&s[..b1], FONT_SIZE)).min(text_right);
+                if i == self.selected && self.focused {
+                    rects.push_rect(row_rect, th.selection(), 0.0);
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
+                        th.accent(),
+                        0.0,
+                    );
+                }
+                if i == self.hover_row.get() {
+                    // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
+                    // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
+                    // 不再与选中行互斥 —— 拖框选经过选中行时 hover 仍可见。
+                    rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
+                }
+                // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
+                // 与行选中可同存 —— 单元格是更具体的选中, 画在上层)
+                if let Some((srow, scol)) = self.selected_cell {
+                    if srow == i && !is_sub_row && self.focused {
+                        let spans = self.col_spans.borrow();
+                        if let Some((x0, x1, _)) = spans.iter().find(|(_, _, ci)| *ci == scol) {
+                            let hx0 = x0.max(text_x);
+                            let hx1 = x1.min(text_right);
+                            if hx1 > hx0 {
+                                let cell_rect =
+                                    Rect::from_xywh(hx0, y + 2.0, hx1 - hx0, ROW_HEIGHT - 4.0);
+                                // 两笔: 底色 (与行选中同 token, 见 cell_highlight_colors)
+                                // + 描边 (唯一指出「具体哪一格」的一笔, 按钮焦点环同款原语)
+                                let (fill, border) = cell_highlight_colors(&th);
+                                rects.push_rect(cell_rect, fill, 2.0);
+                                rects.push_rounded_border(cell_rect, border, 2.0, 1.5);
+                            }
+                        }
+                    }
+                }
+                // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
+                if is_sub_row {
+                    if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1))
+                    {
+                        let indent = (row.depth as f32 - 1.0) * 16.0;
+                        let s = sub_row_text(row);
+                        let draw_x = text_x + indent;
+                        if draw_x < text_right {
+                            // 选区命中几何 (M3): 串由 `sub_row_text` 单点构造, 命中/渲染/
+                            // 复制三源一体; 子行不参与水平滚动 (无 x_off) → 内容域起点
+                            // = indent, hit_text 对子行相应不加 x_offset (D3 分叉)
+                            let geom =
+                                measure_row_geom(texts, &s, 0, indent, text_right - text_x + 64.0);
+                            self.row_geom.borrow_mut().insert(i, geom);
+                            // 文本选区区间 (M3): 与 raw 行同法 (measure 前缀→矩形),
+                            // 唯二差异 = 串是子行串、无 x_off (子行不水平滚动)
+                            if let Some(sel) = self.visible_selection() {
+                                if let Some((b0, b1)) = selection::row_slice(sel, i, &s) {
+                                    let x0 =
+                                        (draw_x + texts.measure(&s[..b0], FONT_SIZE)).max(text_x);
+                                    let x1 = (draw_x + texts.measure(&s[..b1], FONT_SIZE))
+                                        .min(text_right);
+                                    if x1 > x0 {
+                                        rects.push_rect(
+                                            Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                            th.selection(),
+                                            2.0,
+                                        );
+                                    }
+                                }
+                            }
+                            fit_push(
+                                texts,
+                                &s,
+                                text_right - draw_x,
+                                draw_x,
+                                y + baseline_off,
+                                FONT_SIZE,
+                                th.text_secondary(),
+                            );
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                // 行号 (文件真实行号; 书签行金色)
+                let no = format!("{}", line_no + 1);
+                let no_w = texts.measure(&no, AUX_FONT_SIZE);
+                let bookmarked = self.bookmarks.contains(&line_no);
+                if bookmarked {
+                    // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
+                    // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
+                    // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
+                    // 两条都可见; 表格模式的 +/- 在 [0,EXPAND_W) 内, 不撞。
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
+                        bookmark_color(self.theme),
+                        0.0,
+                    );
+                }
+                let no_color = if bookmarked {
+                    bookmark_color(self.theme)
+                } else {
+                    th.text_secondary()
+                };
+                texts.push_text(
+                    &no,
+                    area.origin.x + EXPAND_W + gutter_w - 10.0 - no_w,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    no_color,
+                );
+                let raw = file.line(line_no);
+                // 原始模式: 命中行内区间高亮 (仅命中行跑 regex, 逐可见行恒定成本;
+                // 前缀宽度测量与行显示同一解码路径, 宽度一致)
+                if !table {
+                    if let (Some(re), Some(hits)) = (&self.search_re, &self.search_hits) {
+                        if hits.binary_search(&line_no).is_ok() {
+                            for m in re.find_iter(raw) {
+                                let px0 = texts.measure(
+                                    &danqing::encoding::decode_line(
+                                        self.encoding,
+                                        &raw[..m.start()],
+                                    ),
+                                    FONT_SIZE,
+                                );
+                                let px1 = px0
+                                    + texts.measure(
+                                        &danqing::encoding::decode_line(
+                                            self.encoding,
+                                            &raw[m.start()..m.end()],
+                                        ),
+                                        FONT_SIZE,
+                                    );
+                                let x0 = (text_x + px0 - x_off).max(text_x);
+                                let x1 = (text_x + px1 - x_off).min(text_right);
                                 if x1 > x0 {
                                     rects.push_rect(
                                         Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
@@ -1867,213 +2153,145 @@ impl Widget for LogView {
                                 }
                             }
                         }
-                        fit_push(
-                            texts,
-                            &s,
-                            text_right - draw_x,
-                            draw_x,
-                            y + baseline_off,
-                            FONT_SIZE,
-                            th.text_secondary(),
-                        );
                     }
                 }
-                i += 1;
-                continue;
-            }
-            // 行号 (文件真实行号; 书签行金色)
-            let no = format!("{}", line_no + 1);
-            let no_w = texts.measure(&no, AUX_FONT_SIZE);
-            let bookmarked = self.bookmarks.contains(&line_no);
-            if bookmarked {
-                // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
-                // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
-                // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
-                // 两条都可见; 表格模式的 +/- 在 [0,EXPAND_W) 内, 不撞。
-                rects.push_rect(
-                    Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
-                    bookmark_color(self.theme),
-                    0.0,
-                );
-            }
-            let no_color = if bookmarked {
-                bookmark_color(self.theme)
-            } else {
-                th.text_secondary()
-            };
-            texts.push_text(
-                &no,
-                area.origin.x + EXPAND_W + gutter_w - 10.0 - no_w,
-                y + aux_baseline_off,
-                AUX_FONT_SIZE,
-                no_color,
-            );
-            let raw = file.line(line_no);
-            // 原始模式: 命中行内区间高亮 (仅命中行跑 regex, 逐可见行恒定成本;
-            // 前缀宽度测量与行显示同一解码路径, 宽度一致)
-            if !table {
-                if let (Some(re), Some(hits)) = (&self.search_re, &self.search_hits) {
-                    if hits.binary_search(&line_no).is_ok() {
-                        for m in re.find_iter(raw) {
-                            let px0 = texts.measure(
-                                &danqing::encoding::decode_line(self.encoding, &raw[..m.start()]),
-                                FONT_SIZE,
-                            );
-                            let px1 = px0
-                                + texts.measure(
-                                    &danqing::encoding::decode_line(
-                                        self.encoding,
-                                        &raw[m.start()..m.end()],
-                                    ),
+                if table {
+                    // 单元格: 逐可见行 serde_json parse (真 parser, 消除 memmem 内嵌误判),
+                    // 取顶层字段紧凑显示; level 列按级别着色;
+                    // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
+                    let parsed = jsonl::parse_line(raw);
+                    // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
+                    // (字体是 GB2312 子集, 无 +/- 几何形, 用 ASCII +- 保可用)
+                    let expanded_here = self.expanded.is_expanded(line_no);
+                    let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
+                    if expanded_here || expandable {
+                        // 字符见 `GLYPH_EXPANDED` / `GLYPH_COLLAPSED` 上的说明
+                        // (ASCII 约束是硬要求, 不是风格)。
+                        let glyph = if expanded_here {
+                            GLYPH_EXPANDED
+                        } else {
+                            GLYPH_COLLAPSED
+                        };
+                        // P3 的另一半: **可点却无任何 hover 指示**。悬停时换 accent 色。
+                        // 只在真有 glyph 的行点亮 —— `hover_expand` 只说明指针在展开列里,
+                        // 「这一行画不画 glyph」是 paint 才知道的事 (见字段注释)。
+                        let hot = self.hover_expand.get() && i == self.hover_row.get();
+                        texts.push_text(
+                            glyph,
+                            Self::expand_glyph_x(area),
+                            y + row_baseline_off,
+                            EXPAND_FONT_SIZE,
+                            if hot { th.accent() } else { th.text_primary() },
+                        );
+                    }
+                    for (cx, cw, col) in &cols {
+                        let Some(v) = parsed
+                            .as_ref()
+                            .and_then(|p| p.get(col.name.as_str()))
+                            .map(jsonl::cell_display)
+                        else {
+                            continue;
+                        };
+                        let color = cell_color(&col.name, &v, &th);
+                        let cell_x = cx + 8.0;
+                        let left_cut = (text_x - cell_x).max(0.0);
+                        let right_edge = (cx + cw - 8.0).min(text_right);
+                        // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
+                        if left_cut <= 0.0 && is_numeric(&v) {
+                            let (shown, truncated) =
+                                danqing::fit::fit_line(&v, right_edge - cell_x, |t| {
+                                    texts.measure(t, FONT_SIZE)
+                                });
+                            if !truncated {
+                                let w = texts.measure(shown, FONT_SIZE);
+                                texts.push_text(
+                                    shown,
+                                    right_edge - w,
+                                    y + baseline_off,
                                     FONT_SIZE,
+                                    color,
                                 );
-                            let x0 = (text_x + px0 - x_off).max(text_x);
-                            let x1 = (text_x + px1 - x_off).min(text_right);
+                                continue;
+                            }
+                        }
+                        let (shown, sub) = danqing::fit::scroll_trim(&v, left_cut, |t| {
+                            texts.measure(t, FONT_SIZE)
+                        });
+                        let draw_x = cell_x + left_cut - sub;
+                        let max_w = right_edge - draw_x;
+                        if max_w > 0.0 {
+                            fit_push(
+                                texts,
+                                shown,
+                                max_w,
+                                draw_x,
+                                y + baseline_off,
+                                FONT_SIZE,
+                                color,
+                            );
+                        }
+                    }
+                } else {
+                    // 原始模式: 整行级别着色 + 水平左截断 (scroll_trim) + 右截断省略;
+                    // 行内容宽度边测边长 (max_seen, 水平滚动范围估计)
+                    let raw = file.line_lossy(line_no);
+                    let color = level_color(raw.as_bytes(), &th);
+                    let full_w = texts.measure(&raw, FONT_SIZE);
+                    if full_w > self.max_seen.get() {
+                        self.max_seen.set(full_w);
+                    }
+                    let (shown, sub) =
+                        danqing::fit::scroll_trim(&raw, x_off, |t| texts.measure(t, FONT_SIZE));
+                    // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
+                    // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
+                    let base = raw.len() - shown.len();
+                    let geom =
+                        measure_row_geom(texts, &raw, base, x_off - sub, x_off + text_w + 64.0);
+                    self.row_geom.borrow_mut().insert(i, geom);
+                    // 文本选区区间 (T3): 与命中高亮同法 (measure 前缀→矩形);
+                    // 在循环末尾才画 = 与同批命中矩形交叠时选区优先
+                    if let Some(sel) = self.visible_selection() {
+                        if let Some((b0, b1)) = selection::row_slice(sel, i, &raw) {
+                            let x0 =
+                                (text_x + texts.measure(&raw[..b0], FONT_SIZE) - x_off).max(text_x);
+                            // 整行选中时复用刚算过的 full_w, 省一次 O(行长) 测量
+                            let w1 = if b1 == raw.len() {
+                                full_w
+                            } else {
+                                texts.measure(&raw[..b1], FONT_SIZE)
+                            };
+                            let x1 = (text_x + w1 - x_off).min(text_right);
                             if x1 > x0 {
+                                // T9 (2026-09-14 实机 M0 P28): 超复制上限的选区带
+                                // **拖选进行中即**换警示色 —— 原先只在 Ctrl+C 时才报
+                                // (view.rs:1621), 用户拖到一半不知道已经越界。
+                                let sel_color = if self.selection_over_limit() {
+                                    th.danger()
+                                } else {
+                                    th.selection()
+                                };
                                 rects.push_rect(
                                     Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                    th.selection(),
+                                    sel_color,
                                     2.0,
                                 );
                             }
                         }
                     }
-                }
-            }
-            if table {
-                // 单元格: 逐可见行 serde_json parse (真 parser, 消除 memmem 内嵌误判),
-                // 取顶层字段紧凑显示; level 列按级别着色;
-                // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
-                let parsed = jsonl::parse_line(raw);
-                // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
-                // (字体是 GB2312 子集, 无 +/- 几何形, 用 ASCII +- 保可用)
-                let expanded_here = self.expanded.is_expanded(line_no);
-                let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
-                if expanded_here || expandable {
-                    // 字符见 `GLYPH_EXPANDED` / `GLYPH_COLLAPSED` 上的说明
-                    // (ASCII 约束是硬要求, 不是风格)。
-                    let glyph = if expanded_here {
-                        GLYPH_EXPANDED
-                    } else {
-                        GLYPH_COLLAPSED
-                    };
-                    // P3 的另一半: **可点却无任何 hover 指示**。悬停时换 accent 色。
-                    // 只在真有 glyph 的行点亮 —— `hover_expand` 只说明指针在展开列里,
-                    // 「这一行画不画 glyph」是 paint 才知道的事 (见字段注释)。
-                    let hot = self.hover_expand.get() && i == self.hover_row.get();
-                    texts.push_text(
-                        glyph,
-                        Self::expand_glyph_x(area),
-                        y + row_baseline_off,
-                        EXPAND_FONT_SIZE,
-                        if hot { th.accent() } else { th.text_primary() },
+                    let draw_x = text_x - sub;
+                    fit_push(
+                        texts,
+                        shown,
+                        text_right - draw_x,
+                        draw_x,
+                        y + baseline_off,
+                        FONT_SIZE,
+                        color,
                     );
                 }
-                for (cx, cw, col) in &cols {
-                    let Some(v) = parsed
-                        .as_ref()
-                        .and_then(|p| p.get(col.name.as_str()))
-                        .map(jsonl::cell_display)
-                    else {
-                        continue;
-                    };
-                    let color = cell_color(&col.name, &v, &th);
-                    let cell_x = cx + 8.0;
-                    let left_cut = (text_x - cell_x).max(0.0);
-                    let right_edge = (cx + cw - 8.0).min(text_right);
-                    // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
-                    if left_cut <= 0.0 && is_numeric(&v) {
-                        let (shown, truncated) =
-                            danqing::fit::fit_line(&v, right_edge - cell_x, |t| {
-                                texts.measure(t, FONT_SIZE)
-                            });
-                        if !truncated {
-                            let w = texts.measure(shown, FONT_SIZE);
-                            texts.push_text(
-                                shown,
-                                right_edge - w,
-                                y + baseline_off,
-                                FONT_SIZE,
-                                color,
-                            );
-                            continue;
-                        }
-                    }
-                    let (shown, sub) =
-                        danqing::fit::scroll_trim(&v, left_cut, |t| texts.measure(t, FONT_SIZE));
-                    let draw_x = cell_x + left_cut - sub;
-                    let max_w = right_edge - draw_x;
-                    if max_w > 0.0 {
-                        fit_push(
-                            texts,
-                            shown,
-                            max_w,
-                            draw_x,
-                            y + baseline_off,
-                            FONT_SIZE,
-                            color,
-                        );
-                    }
-                }
-            } else {
-                // 原始模式: 整行级别着色 + 水平左截断 (scroll_trim) + 右截断省略;
-                // 行内容宽度边测边长 (max_seen, 水平滚动范围估计)
-                let raw = file.line_lossy(line_no);
-                let color = level_color(raw.as_bytes(), &th);
-                let full_w = texts.measure(&raw, FONT_SIZE);
-                if full_w > self.max_seen.get() {
-                    self.max_seen.set(full_w);
-                }
-                let (shown, sub) =
-                    danqing::fit::scroll_trim(&raw, x_off, |t| texts.measure(t, FONT_SIZE));
-                // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
-                // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
-                let base = raw.len() - shown.len();
-                let geom = measure_row_geom(texts, &raw, base, x_off - sub, x_off + text_w + 64.0);
-                self.row_geom.borrow_mut().insert(i, geom);
-                // 文本选区区间 (T3): 与命中高亮同法 (measure 前缀→矩形);
-                // 在循环末尾才画 = 与同批命中矩形交叠时选区优先
-                if let Some(sel) = self.visible_selection() {
-                    if let Some((b0, b1)) = selection::row_slice(sel, i, &raw) {
-                        let x0 =
-                            (text_x + texts.measure(&raw[..b0], FONT_SIZE) - x_off).max(text_x);
-                        // 整行选中时复用刚算过的 full_w, 省一次 O(行长) 测量
-                        let w1 = if b1 == raw.len() {
-                            full_w
-                        } else {
-                            texts.measure(&raw[..b1], FONT_SIZE)
-                        };
-                        let x1 = (text_x + w1 - x_off).min(text_right);
-                        if x1 > x0 {
-                            // T9 (2026-09-14 实机 M0 P28): 超复制上限的选区带
-                            // **拖选进行中即**换警示色 —— 原先只在 Ctrl+C 时才报
-                            // (view.rs:1621), 用户拖到一半不知道已经越界。
-                            let sel_color = if self.selection_over_limit() {
-                                th.danger()
-                            } else {
-                                th.selection()
-                            };
-                            rects.push_rect(
-                                Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                sel_color,
-                                2.0,
-                            );
-                        }
-                    }
-                }
-                let draw_x = text_x - sub;
-                fit_push(
-                    texts,
-                    shown,
-                    text_right - draw_x,
-                    draw_x,
-                    y + baseline_off,
-                    FONT_SIZE,
-                    color,
-                );
+                i += 1;
             }
-            i += 1;
-        }
+        } // merge 分支收口 (腿一 T3: else 里是单文件行循环)
         rects.pop_clip();
         texts.pop_clip();
 
@@ -2186,7 +2404,8 @@ impl Widget for LogView {
         );
         // 导出入口 (SPEC-v1x-export D7): 设置入口左侧; 作业态标签变「取消导出 N%」
         // (同一按钮 = 取消, spec D2 单作业语义)。空态不画 (导出无对象)。
-        let export_anchor_x = if self.has_file {
+        // 合并工作区不画 (腿一 T3: 合并时间线的导出口径随 T9 实测波再裁)。
+        let export_anchor_x = if self.has_file && !self.merge_active {
             let export_w = texts.measure(&self.export_label, AUX_FONT_SIZE);
             let export_x = settings_x - 16.0 - export_w;
             self.export_btn_rect
@@ -2210,7 +2429,8 @@ impl Widget for LogView {
         };
         // 命名会话入口 (SPEC-v1x-workspace-sessions D5): 导出入口左侧;
         // 空态不画 (Open Q3: 无文件不出入口)。
-        let sessions_anchor_x = if self.has_file {
+        // 合并工作区不画 (合并会话载荷在 T8; apply_session 有 Single 切换守卫)。
+        let sessions_anchor_x = if self.has_file && !self.merge_active {
             let sw = texts.measure(SESSIONS_BTN_LABEL, AUX_FONT_SIZE);
             let sx = export_anchor_x - 16.0 - sw;
             self.sessions_btn_rect
@@ -2226,7 +2446,24 @@ impl Widget for LogView {
             self.sessions_btn_rect.set(Rect::default());
             export_anchor_x
         };
-        // 位置计数: 会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画);
+        // 合并入口 (merge-timeline T4, D6): 会话入口左侧; 空态不画 (合并以当前
+        // 文件为主源, 无主源无合并)。合并工作区**仍画** —— 它就是源管理弹层入口。
+        let merge_anchor_x = if self.has_file {
+            let mw = texts.measure(MERGE_BTN_LABEL, AUX_FONT_SIZE);
+            let mx = sessions_anchor_x - 16.0 - mw;
+            self.merge_btn_rect.set(export_hit_rect(mx, mw, status_y));
+            let merge_color = if self.merge_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(MERGE_BTN_LABEL, mx, sy, AUX_FONT_SIZE, merge_color);
+            mx
+        } else {
+            self.merge_btn_rect.set(Rect::default());
+            sessions_anchor_x
+        };
+        // 位置计数: 合并/会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画);
         // **放不下就不画** (评审 M11, Bar hint 家规): 窄窗下左缘钳制会把 pos 推
         // 进「会话」钮带 —— 画序后画的 pos 压钮字 = 看得见行号点出会话, 与钮
         // hit 带重叠即整条不画。
@@ -2238,7 +2475,7 @@ impl Widget for LogView {
             format!("行 {}/{count}", self.selected + 1)
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
-        let pos_x = sessions_anchor_x - 16.0 - pos_w;
+        let pos_x = merge_anchor_x - 16.0 - pos_w;
         if pos.is_empty() || pos_x >= area.origin.x + 10.0 {
             texts.push_text(
                 &pos,
@@ -2262,6 +2499,8 @@ impl Widget for LogView {
                     .set(self.export_btn_rect.get().contains(*position));
                 self.sessions_hover
                     .set(self.sessions_btn_rect.get().contains(*position));
+                self.merge_hover
+                    .set(self.merge_btn_rect.get().contains(*position));
                 // T3: 表头 hover (手柄/「列…」) —— 命中几何来自 paint 缓存 (D2)
                 let hhit = self.header_hit_at(area, *position);
                 self.hover_cols_btn
@@ -2345,6 +2584,7 @@ impl Widget for LogView {
                 self.settings_hover.set(false);
                 self.export_hover.set(false);
                 self.sessions_hover.set(false);
+                self.merge_hover.set(false);
                 self.hover_row.set(u64::MAX);
                 // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
                 // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
@@ -2438,6 +2678,12 @@ impl Widget for LogView {
                     msgs.push(Box::new(Msg::OpenSessionMenu));
                     return EventResult::Consumed;
                 }
+                // 合并入口 (merge-timeline T4/D6): 门控/开弹层全在应用层
+                // (Msg::OpenMergeMenu), 与会话钮同规 (点穿防护同 return)。
+                if self.merge_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::OpenMergeMenu));
+                    return EventResult::Consumed;
+                }
                 // 表头命中 (T3/T4, SPEC-v1x-table-column-config): 表头行内一律收口,
                 // 不再落「此处无行」—— 手柄拖宽 / 表头体换位 /「列…」(T5 开弹层)。
                 if self.table_mode()
@@ -2446,6 +2692,22 @@ impl Widget for LogView {
                     let now = Instant::now();
                     let dbl = self.is_double_click(now, *position);
                     match self.header_hit_at(area, *position) {
+                        HeaderHit::Handle(schema_idx) if self.col_gesture_free => {
+                            // G2 免费态手势不启动 (拖宽/恢复都不启动), 弹升级对话框
+                            let _ = schema_idx;
+                            msgs.push(Box::new(Msg::ShowUpgradePrompt(
+                                danqing_log::license::Feature::ColumnConfig,
+                            )));
+                            return EventResult::Consumed;
+                        }
+                        HeaderHit::Body(schema_idx) if self.col_gesture_free => {
+                            // G2 同拦换位潜伏 (不启动 = 不进 header_press)
+                            let _ = schema_idx;
+                            msgs.push(Box::new(Msg::ShowUpgradePrompt(
+                                danqing_log::license::Feature::ColumnConfig,
+                            )));
+                            return EventResult::Consumed;
+                        }
                         HeaderHit::Handle(schema_idx) => {
                             if dbl {
                                 // 双击手柄恢复采样宽 (D2): 删手动宽覆盖
@@ -3068,7 +3330,9 @@ impl Widget for Bar {
             .downcast_ref::<LogApp>()
             .expect("Bar 绑定状态类型不匹配");
         // 生效角色: 表格=过滤, 原始=搜索 (搜索栏始终可见, 不可隐藏); 空态无文件不出栏。
-        self.active = if !app.has_file {
+        // 合并工作区 (腿一 T3): 栏整体隐藏 —— 单文件口径的过滤/搜索串不许在
+        // 合并视图背后悄悄跑 (合并过滤 = 跨源, 语义在 T6 req_id 追踪接通)。
+        self.active = if !app.has_file || app.workspace == Workspace::Merge {
             ActiveBar::Hidden
         } else if app.mode == ViewMode::Table {
             ActiveBar::Filter
@@ -6899,6 +7163,95 @@ mod tests {
         let geom = v.header_geom.borrow();
         assert_eq!(geom.len(), 2);
         assert_eq!(geom[0].schema_idx, 1, "列序跟随 order");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- merge-timeline 腿一 T3: 合并三栏真 paint 锁 ----
+
+    /// 合并视图夹具 (注入快照, 不走 app —— VersionRow 同款注入惯例)。
+    fn merge_paint_fixture(tag: &str) -> (LogView, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-mv-{tag}-{}.log", std::process::id()));
+        std::fs::write(&path, b"2026-09-27T00:00:00Z INFO x\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        // 夹具 = 「用户正在日志区里操作」(持焦) —— T14/P19: 不持焦选中行不画。
+        v.focused = true;
+        v.merge_active = true;
+        v.merge_rows_from = 0;
+        v.merge_total = 2;
+        v.merge_sources = vec![("auth.log".into(), false), ("worker.jsonl".into(), false)];
+        v.merge_rows = vec![
+            danqing_log::merge_view::MergeRowView {
+                ts: 1_790_467_200_000,
+                src: 0,
+                line: 0,
+                text: "INFO auth boot".into(),
+            },
+            danqing_log::merge_view::MergeRowView {
+                ts: 1_790_467_201_234,
+                src: 1,
+                line: 5,
+                text: "ERROR worker boom".into(),
+            },
+        ];
+        (v, path)
+    }
+
+    /// 合并三栏真 paint: 表头 (时间/源/消息) + 两行字形产出 (腿二教训: 回归锁
+    /// 必须真 paint 断言字形产出, 且原点必须含**非零平移** —— v1.0.2 教训)。
+    #[test]
+    fn merge_paint_produces_timeline_glyphs() {
+        let (mut v, path) = merge_paint_fixture("3col");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let n_merge = texts.instance_rects().len();
+        assert!(n_merge > 0, "合并视图有字形产出");
+        // 表头线 + 选中条等矩形产出
+        assert!(!rects.instance_rects().is_empty());
+        // A/B: 摘掉合并激活 → 表头与行字形必须减 (锁不画空气)
+        v.merge_active = false;
+        v.merge_rows.clear();
+        v.merge_total = 0;
+        let mut rects2 = RectBatch::new();
+        let mut texts2 = TextBatch::new();
+        v.paint(area, &mut rects2, &mut texts2);
+        assert!(
+            texts2.instance_rects().len() < n_merge,
+            "摘合并快照字形必须减 (A/B 锁): {n_merge} vs {}",
+            texts2.instance_rects().len()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// D11 (CP2-A): 源名按源着色 —— 两行不同源, 字形色流里必须出现
+    /// `source_palette()[0]` 与 `[1]` 两支 (linear 口径, 与 instance_colors 同源)。
+    /// A/B: 把源名改回统一 accent, 本锁精确红 (palette 两色消失)。
+    #[test]
+    fn merge_paint_colors_source_names_by_palette_index() {
+        let (v, path) = merge_paint_fixture("src-color");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let pal = v.theme.theme().source_palette();
+        // `TextBatch::instance_colors` 返回 LinearRgba 按字段取 (与提示色锁同款)。
+        let colors = texts.instance_colors();
+        for (i, src_pal) in pal.iter().enumerate().take(2) {
+            let want = lin(*src_pal);
+            assert!(
+                colors.iter().any(|c| {
+                    (c.r - want[0]).abs() < 1e-4
+                        && (c.g - want[1]).abs() < 1e-4
+                        && (c.b - want[2]).abs() < 1e-4
+                }),
+                "源 {i} 名必须用 source_palette[{i}] 着色, 字形色流里没找到"
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 

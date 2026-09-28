@@ -369,3 +369,15 @@ paint, 无「建树后行跟随」锁）。**已随 `SPEC-v1x-field-picker-ui` T
 （RowList 自绘行集每帧取态, 判罪锁
 `col_menu_rows_follow_schema_across_sync`）—— 人工验收 A3 项由总清单 **E5**
 兼验。
+
+**免费态门控补验**（2026-09-28, todo-gate-trio G5; 本功能已由免费层欠账改判付费 ——
+2026-09-27 裁决②）: A/D/E 组已过条目**不动**; 增补两条待实机:
+- [ ] 免费态拦截可见（入口/手势/通路按 G0 口径表拦下并弹升级对话框; 书签持久化为
+      通路型不弹窗, 提示位 = 设置卡许可页一行）
+- [ ] 付费态功能如旧（激活后与已验收行为逐条一致, 零回归）
+
+机器侧两态锁已落: `column_gate_blocks_free_tier_and_never_prompts_paid` /
+`column_config_segment_skips_read_write_in_free_but_preserves_paid` /
+`bookmark_persist_gated_but_in_session_free` /
+`picker_gate_blocks_free_tier_and_never_prompts_paid`（既有锁按注入惯例注付费态,
+断言不动）。

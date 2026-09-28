@@ -68,6 +68,19 @@ pub(crate) enum ViewMode {
     Table,
 }
 
+/// 工作区模式 (merge-timeline 腿一 T3, SPEC-v1x-merge-timeline D4):
+/// Single = 单文件 (v1.0 起既有全部行为); Merge = 多源合并时间线。
+/// 与 ViewMode (Raw|Table 显示模式) 正交 —— 合并视图有自己的三栏形态,
+/// 合并期间 Single 的 mode/schema/filtered 等字段**保持原值不触碰**,
+/// 退出合并即原样回来 (互不丢状态)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Workspace {
+    /// 单文件。
+    Single,
+    /// 合并时间线。
+    Merge,
+}
+
 /// 过滤作业产物。
 pub(crate) struct FilterOutcome {
     lines: Vec<u64>,
@@ -332,6 +345,12 @@ pub(crate) struct LogApp {
     sessions: Vec<danqing_log::columns::SessionEntry>,
     /// 会话弹层最近点选名 (「删除」指针, T3; 应用即记选中)。换文件清。
     session_selected: Option<String>,
+    /// 合并源管理弹层开合 (T4; 与弹层族互斥并入 `close_popovers`/`popover_open`)。
+    merge_menu_open: bool,
+    /// 源管理弹层选中源 (路径串; 「移除」指针 —— DeleteSelectedSession 同款)。
+    merge_source_selected: Option<String>,
+    /// 弹层输入框清稿计数 (关弹层 bump, SubmitInput bind_clear 同 session 规)。
+    merge_clear_rev: u64,
     /// 命名会话弹层开合 (D5; 与弹层族互斥并入 `close_popovers`/`popover_open`)。
     session_menu_open: bool,
     /// 命名输入清空代次 (`bind_clear` 消费): 开/关/保存/应用时 +1。
@@ -350,6 +369,14 @@ pub(crate) struct LogApp {
     analysis_running: bool,
     /// 发起计数 —— 测试断言门控拦截时**没有**发起扫描用的观测点。
     analysis_launches: u32,
+    // ---- merge-timeline 腿一 (T3) ----
+    /// 合并工作区状态 bundle (None = 从未进过合并)。SPEC-v1x-merge-timeline D4:
+    /// 与 Single 字段并列互不动 —— 退出合并回 Single 时单文件现场原样还在。
+    merge: Option<danqing_log::merge_view::MergeState>,
+    /// 工作区模式 (D4; 与 ViewMode 正交, 见枚举注释)。
+    workspace: Workspace,
+    /// 归并后台作业 (AsyncJob 同款先例: launch 起线程, tick 拾取)。
+    merge_job: AsyncJob<danqing_log::merge_view::MergeOutcome>,
 }
 
 /// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
@@ -482,6 +509,38 @@ pub(crate) enum Msg {
     PickerSubmit(String),
     /// Ctrl+O / 拖拽文件：打开新文件。
     OpenFile(PathBuf),
+    /// 底栏「合并…」/ `Ctrl+M` (SPEC-v1x-merge-timeline D6): **门控点位 = 入口**
+    /// (免费态弹升级对话框) → 开合并源管理弹层 (弹层族第七员)。
+    OpenMergeMenu,
+    /// 关合并源管理弹层 (Esc/scrim)。
+    CloseMergeMenu,
+    /// 「加源…」: 开系统文件对话框 (UI 层, 测试不发 —— 家法: 测试不触真实桌面),
+    /// 选出后发 [`Msg::MergeSourcePicked`]。
+    PickMergeSource,
+    /// 对话框选定追加源 (payload = 路径; 也供测试直注): 未合并 → 以此起并;
+    /// 已合并 → 追加重归并。**动作兜底闸** (两道闸第二道) 在臂内。
+    MergeSourcePicked(PathBuf),
+    /// 「移除」: 移除**选中**源 (指针语义, DeleteSelectedSession 同款) → 重归并;
+    /// 减到不足两源 = 退出合并 (D7 下限语义)。
+    RemoveSelectedMergeSource,
+    /// 点源行: 切显隐 + 记选中 (payload = 路径; 「点行 = 动作并记选中」对齐
+    /// ApplySession 先例)。显隐 = 掩码重建 (源序号不漂移), 不重跑提取。
+    ToggleMergeSource(String),
+    /// 弹层「退出合并 / 返回合并」一钮双态 (D4 互不丢: 退出 bundle 保留,
+    /// 返回不重建; 无合并 = 提示)。
+    ToggleMergeWorkspace,
+    /// T5 选中源偏移微调 (快捷档 ±1s/±1min/±1h; 值 = **增量** ms)。
+    NudgeMergeOffset(i64),
+    /// T5 选中源偏移手输 (绝对值 ms; ±ms 粒度)。
+    SetMergeOffset(String),
+    /// T5 选中源时区手输 (±hh:mm 或小时数; 无 tz 时间戳按它解释, 腿 D)。
+    SetMergeTz(String),
+    /// 启动合并 (merge-timeline 腿一 T3): 源列表 = 当前文件 (主源) + 追加源。
+    /// 构造点 = 弹层加源首并 (add_merge_source); D6 两道闸在入口层, 不在作业层。
+    StartMerge(Vec<PathBuf>),
+    /// 退出合并回单文件工作区 (MergeState 保留, 再进不重建, D4 互不丢状态)。
+    /// 构造点 = 弹层「退出合并」(ToggleMergeWorkspace)。
+    ExitMerge,
     /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
     ///
     /// **级别语义** (2026-09-14 实机 M0 P27): `NoticeKind::Warn` = 警示
@@ -573,6 +632,9 @@ impl LogApp {
             upgrade_prompt: None,
             purchase_in_flight: false,
             export_job: ExportJob::new(),
+            merge_menu_open: false,
+            merge_source_selected: None,
+            merge_clear_rev: 0,
             export_menu_open: false,
             col_menu_open: false,
             picker_open: false,
@@ -589,6 +651,9 @@ impl LogApp {
             analysis_filter_src: String::new(),
             analysis_running: false,
             analysis_launches: 0,
+            merge: None,
+            workspace: Workspace::Single,
+            merge_job: AsyncJob::new(),
         }
     }
 
@@ -756,9 +821,20 @@ impl LogApp {
         let files = self.load_state_account();
         match files.get_entry(self.path.to_string_lossy().as_ref()) {
             Some(e) => {
-                self.columns = e.config.clone();
+                // 通路段「不读」(gate-trio G2/G3): 免费态列配置段/书签段**不读**
+                // —— 默认列摆法 (v1.0 行为) / 书签不跨重启恢复 (会话内照用)。
+                // 读侧拦住, 磁盘上的付费期数据原样躺着 (数据永在, 不删不改)。
+                if self.entitlement.allows(Feature::ColumnConfig) {
+                    self.columns = e.config.clone();
+                } else {
+                    self.columns = danqing_log::columns::ColumnConfig::default();
+                }
                 let total = self.file.line_count();
-                self.bookmarks = e.bookmarks.iter().copied().filter(|&l| l < total).collect();
+                if self.entitlement.allows(Feature::BookmarkPersist) {
+                    self.bookmarks = e.bookmarks.iter().copied().filter(|&l| l < total).collect();
+                } else {
+                    self.bookmarks.clear();
+                }
             }
             None => {
                 self.columns = danqing_log::columns::ColumnConfig::default();
@@ -817,6 +893,9 @@ impl LogApp {
     /// 应用即记选中 (「删除」指针, T3)。**书签零触碰** (Open Q1)。
     /// 返回是否找到 (未知名不动账, 留弹层重选)。
     fn apply_session(&mut self, name: &str) -> bool {
+        // 命名会话是**单文件**现场 (per-路径载荷): 合并中应用 = 先切回 Single
+        // (合并 bundle 保留); 合并工作区的会话载荷在 T8。
+        self.workspace = Workspace::Single;
         let Some(s) = self.sessions.iter().find(|s| s.name == name).cloned() else {
             self.set_notice("会话不存在".into(), NoticeKind::Warn);
             return false;
@@ -840,8 +919,8 @@ impl LogApp {
             }
         }
         self.rebuild_expands(&s.expands);
-        self.top_row = 0.0;
-        self.selected = 0;
+        self.set_top(0.0);
+        self.set_selected(0);
         self.session_selected = Some(s.name);
         true
     }
@@ -921,6 +1000,11 @@ impl LogApp {
         self.col_menu_open = false;
         self.export_menu_open = false;
         self.picker_open = false;
+        if self.merge_menu_open {
+            self.merge_menu_open = false;
+            self.merge_source_selected = None; // 关清草稿 (CloseSessionMenu 同纪律)
+            self.merge_clear_rev += 1;
+        }
         if self.session_menu_open {
             self.session_menu_open = false;
             // 关清草稿随关走 (评审 M12): 换文件/重建/互斥全在这收口, 不靠下次
@@ -932,7 +1016,42 @@ impl LogApp {
     /// 弹层族任一开着 —— 模态清单的共同判据 (滚轮/键盘门禁与 Ctrl 守卫**同源**,
     /// 评审 R6: 各列一份就漏一项)。
     fn popover_open(&self) -> bool {
-        self.col_menu_open || self.export_menu_open || self.picker_open || self.session_menu_open
+        self.col_menu_open
+            || self.export_menu_open
+            || self.picker_open
+            || self.session_menu_open
+            || self.merge_menu_open
+    }
+
+    /// 列配置门 (todo-gate-trio G2, 两道闸): 免费态弹统一升级提示并拦下动作。
+    /// 免费态默认列摆法照用 (v1.0 行为), 不因此毁数据 —— 通路段另有「不读不写」。
+    fn column_gate(&mut self) -> bool {
+        if self.entitlement.allows(Feature::ColumnConfig) {
+            return true;
+        }
+        self.update(Msg::ShowUpgradePrompt(Feature::ColumnConfig));
+        false
+    }
+
+    /// 字段点选门 (todo-gate-trio G4): 免费态「字段…」按钮拦下; 手输迷你语法
+    /// 照用 (过滤栏输入不在本闸后)。
+    fn picker_gate(&mut self) -> bool {
+        if self.entitlement.allows(Feature::FieldPicker) {
+            return true;
+        }
+        self.update(Msg::ShowUpgradePrompt(Feature::FieldPicker));
+        false
+    }
+
+    /// 合并动作门 (两道闸, D6): 免费态弹统一升级提示并拦下动作。
+    /// 入口闸在 `OpenMergeMenu` 臂; 本闸兜住加源/减源/显隐三个动作
+    /// (会话 session_gate 同构 —— 门控点位在动作层, 不在作业层)。
+    fn merge_gate(&mut self) -> bool {
+        if self.entitlement.allows(Feature::MergeTimeline) {
+            return true;
+        }
+        self.update(Msg::ShowUpgradePrompt(Feature::MergeTimeline));
+        false
     }
 
     /// 会话动作门 (两道闸第二道, D4): 免费态弹统一升级提示并拦下动作。
@@ -989,16 +1108,31 @@ impl LogApp {
         // 读改写 (含旧名迁移读): sessions 段随 from_json/save_to 恒写自动保真
         let mut files = self.load_state_account();
         let now = now_secs();
-        // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式, 脏行号不得出内存)
-        let evicted = files.put(danqing_log::columns::FileEntry {
-            path: self.path.to_string_lossy().into_owned(),
-            config: self.columns.clone(),
-            bookmarks: self
-                .bookmarks
+        // 通路段「不写」(gate-trio G2/G3): 免费态两段**取磁盘原值**写回 ——
+        // 免费期的运行态不上账, 付费期已写的原样保留 (数据永在, 读改写不许
+        // 把这两段改掉)。列配置与书签分门各判, 互不牵连。
+        let prev = files
+            .get_entry(self.path.to_string_lossy().as_ref())
+            .cloned();
+        let config = if self.entitlement.allows(Feature::ColumnConfig) {
+            self.columns.clone()
+        } else {
+            prev.as_ref().map(|e| e.config.clone()).unwrap_or_default()
+        };
+        let bookmarks = if self.entitlement.allows(Feature::BookmarkPersist) {
+            // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式, 脏行号不得出内存)
+            self.bookmarks
                 .iter()
                 .copied()
                 .filter(|&l| l < self.file.line_count())
-                .collect(),
+                .collect()
+        } else {
+            prev.map(|e| e.bookmarks).unwrap_or_default()
+        };
+        let evicted = files.put(danqing_log::columns::FileEntry {
+            path: self.path.to_string_lossy().into_owned(),
+            config,
+            bookmarks,
             updated: now,
         });
         for e in evicted {
@@ -1345,8 +1479,65 @@ impl LogApp {
     }
 
     /// 显示行数：文件行数 + 展开子行数。
+    /// Merge 工作区 = 合并时间线行数 (T3: 合并内暂无展开子行 —— 嵌套展开待
+    /// 并集列 (T4) 波再裁, spec 实现记收录)。
     fn display_count(&self) -> u64 {
+        if let Some(m) = self.merge_active() {
+            return m.row_count();
+        }
         expand::display_count(self.lines(), &self.expanded)
+    }
+
+    // ---- merge-timeline T3: 工作区访问器 ----
+
+    /// Merge 激活时借状态 bundle (workspace=Merge 且 bundle 在); 否则 None。
+    fn merge_active(&self) -> Option<&danqing_log::merge_view::MergeState> {
+        if self.workspace == Workspace::Merge {
+            self.merge.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// 同上, 可变。
+    fn merge_active_mut(&mut self) -> Option<&mut danqing_log::merge_view::MergeState> {
+        if self.workspace == Workspace::Merge {
+            self.merge.as_mut()
+        } else {
+            None
+        }
+    }
+
+    /// 当前工作区的首可见显示行 (Merge 读 bundle, Single 读自身字段 —— D4)。
+    fn cur_top(&self) -> f64 {
+        match self.merge_active() {
+            Some(m) => m.top_row,
+            None => self.top_row,
+        }
+    }
+
+    /// 写首可见行 (路由到当前工作区)。
+    fn set_top(&mut self, v: f64) {
+        match self.merge_active_mut() {
+            Some(m) => m.top_row = v,
+            None => self.top_row = v,
+        }
+    }
+
+    /// 当前工作区的选中显示行。
+    fn cur_selected(&self) -> u64 {
+        match self.merge_active() {
+            Some(m) => m.selected,
+            None => self.selected,
+        }
+    }
+
+    /// 写选中行 (路由到当前工作区)。
+    fn set_selected(&mut self, v: u64) {
+        match self.merge_active_mut() {
+            Some(m) => m.selected = v,
+            None => self.selected = v,
+        }
     }
 
     /// 最大首行：保守取 count-1 (尾部可滚出少量空白，POC 不追求贴底钳制)。
@@ -1393,16 +1584,198 @@ impl LogApp {
 
     /// F 键：跟随 toggle。开启时跳到当前底部 (从此跟随新行)。
     fn toggle_follow(&mut self) {
+        if self.workspace == Workspace::Merge {
+            // T3: 合并跟随的合流在 T7 —— 「按了没反应」要说话 (P24), 不静默。
+            self.set_notice("合并视图的跟随随 T7 接通".into(), NoticeKind::Info);
+            return;
+        }
         self.follow = !self.follow;
         if self.follow {
-            self.top_row = self.max_top();
-            self.selected = self.display_count().saturating_sub(1);
+            self.set_top(self.max_top());
+            self.set_selected(self.display_count().saturating_sub(1));
         }
+        self.refresh_status();
+    }
+
+    // ---- merge-timeline 腿一 (T3): 合并生命周期 ----
+
+    /// 启动合并 (T3 内部直驱通路; 可见入口 + Feature::MergeTimeline 门控在 T4)。
+    /// 源列表 = 当前文件 (主源, D4) + 追加源 (去重); 归并进后台作业。
+    fn start_merge(&mut self, extra: Vec<PathBuf>) {
+        if self.workspace == Workspace::Merge {
+            return; // 已在合并: 源增删走源管理弹层 (T4), 本通路不叠加
+        }
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if self.has_file {
+            paths.push(self.path.clone());
+        }
+        for p in extra {
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+        if paths.len() < 2 {
+            self.set_notice(
+                "合并至少需要两个源 (当前文件 + 追加)".into(),
+                NoticeKind::Info,
+            );
+            return;
+        }
+        if paths.len() > danqing_log::merge_view::MAX_SOURCES {
+            self.set_notice(
+                format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES),
+                NoticeKind::Warn,
+            );
+            return;
+        }
+        // cancel 插桩在源间 (build_merge 内); UI 侧作废走 AsyncJob 代次, 不设显式取消钮 (T3)。
+        self.merge_job.launch(move || {
+            danqing_log::merge_view::build_merge(&paths, &std::sync::atomic::AtomicBool::new(false))
+        });
+        self.set_notice("合并中…".into(), NoticeKind::Info);
+    }
+
+    /// 归并作业拾取 (tick 每帧)。
+    fn pickup_merge_job(&mut self) {
+        let Some(out) = self.merge_job.poll() else {
+            return;
+        };
+        self.apply_merge_outcome(out);
+    }
+
+    /// 加源 (弹层「加源…」/ 对话框选定): 未合并 = 以此起并 (当前文件主源);
+    /// 已合并 = 源列表 + 本源**重归并** (carry 保书签/显隐/选中)。
+    /// 上限/去重拒绝明示 (D7)。
+    fn add_merge_source(&mut self, path: PathBuf) {
+        if self.workspace == Workspace::Merge {
+            let Some(m) = self.merge.as_ref() else {
+                return;
+            };
+            let mut paths: Vec<PathBuf> = m.sources.iter().map(|s| s.path.clone()).collect();
+            if paths.contains(&path) {
+                self.set_notice("该源已在合并中".into(), NoticeKind::Info);
+                return;
+            }
+            if paths.len() >= danqing_log::merge_view::MAX_SOURCES {
+                self.set_notice(
+                    format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES),
+                    NoticeKind::Warn,
+                );
+                return;
+            }
+            paths.push(path);
+            self.rebuild_merge(paths);
+        } else {
+            self.update(Msg::StartMerge(vec![path]));
+        }
+    }
+
+    /// 减源 (弹层「移除」作用选中源; 指针语义): 重归并; 不足两源 = 退出合并
+    /// (保 bundle —— 再「加源」回来时 carry 能找回旧书签, D4 不丢)。
+    fn remove_selected_merge_source(&mut self) {
+        let Some(sel) = self.merge_source_selected.clone() else {
+            self.set_notice("先点选源再移除".into(), NoticeKind::Info);
+            return;
+        };
+        let Some(m) = self.merge.as_ref() else {
+            self.set_notice("当前没有合并".into(), NoticeKind::Info);
+            return;
+        };
+        let paths: Vec<PathBuf> = m
+            .sources
+            .iter()
+            .map(|s| s.path.clone())
+            .filter(|p| p.as_path() != std::path::Path::new(&sel))
+            .collect();
+        if paths.len() < 2 {
+            // 源减到不足两源: 合并失去意义 → 退出 (bundle 保留)
+            self.merge_source_selected = None;
+            if self.workspace == Workspace::Merge {
+                self.update(Msg::ExitMerge);
+            }
+            self.set_notice("源不足两个, 已退出合并".into(), NoticeKind::Info);
+            return;
+        }
+        self.merge_source_selected = None;
+        self.rebuild_merge(paths);
+    }
+
+    /// 改**选中**源的时间参数 (T5 腿 D): 偏移/时区在解析边界单源施加 ——
+    /// 只重提该源时间戳 + 重归并 (文件行索引不动)。无选中 = 提示 (指针语义)。
+    /// 变换给出 (新偏移, 新时区); None 臂 = 该参数不动。
+    fn edit_source_time(&mut self, f: impl FnOnce(i64, i64) -> (Option<i64>, Option<i64>)) {
+        let Some(sel) = self.merge_source_selected.clone() else {
+            self.set_notice("先点选源再改时间参数".into(), NoticeKind::Info);
+            return;
+        };
+        let Some(m) = self.merge.as_mut() else {
+            self.set_notice("当前没有合并".into(), NoticeKind::Info);
+            return;
+        };
+        let Some(src) = m
+            .sources
+            .iter()
+            .position(|s| s.path.as_path() == std::path::Path::new(&sel))
+        else {
+            self.set_notice("选中源已不在合并中".into(), NoticeKind::Info);
+            return;
+        };
+        let (off, tz) = (m.sources[src].offset_ms, m.sources[src].tz_offset_ms);
+        let (new_off, new_tz) = f(off, tz);
+        m.set_time_params(src, new_off.unwrap_or(off), new_tz.unwrap_or(tz));
+        self.refresh_status();
+    }
+
+    /// 源列表变化后的重归并 (加/减源共用): 后台重跑 build_merge,
+    /// 交卷时 [`merge_view::carry_view_state`] 按路径把书签/显隐/选中搬过来。
+    fn rebuild_merge(&mut self, paths: Vec<PathBuf>) {
+        self.merge_job.launch(move || {
+            danqing_log::merge_view::build_merge(&paths, &std::sync::atomic::AtomicBool::new(false))
+        });
+        self.set_notice("重归并中…".into(), NoticeKind::Info);
+    }
+
+    /// 归并交卷换入: 建 MergeState + 切 Merge 工作区 + 拒收源明示 (SPEC D2);
+    /// 旧 bundle 在场 = carry 保书签/显隐/选中 (加减源重建不丢, D4)。
+    fn apply_merge_outcome(&mut self, out: danqing_log::merge_view::MergeOutcome) {
+        let rejected = out.rejected.len();
+        let n_sources = out.sources.len();
+        let rows = out.index.len();
+        let mut fresh = danqing_log::merge_view::MergeState {
+            sources: out.sources,
+            ts: out.ts,
+            index: out.index,
+            filtered: None,
+            top_row: 0.0,
+            selected: 0,
+            bookmarks: std::collections::BTreeSet::new(),
+            expanded: ExpandMap::new(),
+            follow: false,
+        };
+        if let Some(old) = self.merge.as_ref() {
+            // 加/减源重建: 旧 bundle 在场 → 书签/显隐/选中按路径搬 (D4 不丢)。
+            // 首次合并 (old = None) 不走 —— 全新状态。
+            danqing_log::merge_view::carry_view_state(old, &mut fresh);
+        }
+        self.merge = Some(fresh);
+        self.workspace = Workspace::Merge;
+        if rejected > 0 {
+            self.set_notice(
+                format!("{rejected} 个源未加入 (探测失败), 已明示; 合并 {n_sources} 源 {rows} 行"),
+                NoticeKind::Warn,
+            );
+        }
+        self.focus_target = Some("log-view");
         self.refresh_status();
     }
 
     /// 增长检测 (live-tail): 文件变长 → `append_from` 增量; 缩容/轮转 → 全量重建。
     fn poll_growth(&mut self) {
+        if self.workspace == Workspace::Merge {
+            // T3: 合并期间单文件 tail 冻结 (合并跟随合流在 T7); 退出合并后
+            // 这里的 stat 轮询自然发现过期 → 追平/重建, 零状态残留。
+            return;
+        }
         if !self.has_file {
             return; // 空态无文件可轮询
         }
@@ -1511,14 +1884,16 @@ impl LogApp {
         self.search_elapsed = None;
         self.expanded = ExpandMap::new();
         self.sub_rows.clear();
-        self.top_row = 0.0;
-        self.selected = 0;
+        self.set_top(0.0);
+        self.set_selected(0);
         self.set_notice("文件已截断/轮转".into(), NoticeKind::Warn);
     }
 
     /// 热替换文件 (Ctrl+O / 拖拽): 异步管道发起 (在途旧 job 被 drop = 取消);
     /// 旧视图保持至 worker 交卷 (spec 裁决 A), 换入走 [`Self::apply_fresh`]。
     fn reload_file(&mut self, new_path: PathBuf) {
+        // D4 切换语义: 打开新文件 = 回单文件工作区 (合并 bundle 保留, 不丢)。
+        self.workspace = Workspace::Single;
         self.open_job = Some(OpenJob::launch(OpenKind::Fresh, &new_path));
         self.refresh_status();
     }
@@ -1569,8 +1944,8 @@ impl LogApp {
         self.load_state_for_current_file();
         self.adopt_level_column(level_column);
         self.launch_levels_job();
-        self.top_row = 0.0;
-        self.selected = 0;
+        self.set_top(0.0);
+        self.set_selected(0);
         self.filtered = None;
         self.filter_applied.clear();
         self.filter_landed.clear();
@@ -1643,8 +2018,8 @@ impl LogApp {
             None => self.append_filter_hits(from),
         }
         if self.follow {
-            self.top_row = self.max_top();
-            self.selected = self.display_count().saturating_sub(1);
+            self.set_top(self.max_top());
+            self.set_selected(self.display_count().saturating_sub(1));
         }
         self.refresh_status();
     }
@@ -1843,6 +2218,19 @@ impl LogApp {
     }
 
     fn refresh_status(&mut self) {
+        // 合并工作区 (腿一 T3): 底栏报合并口径 (源数/行数/跟随/书签),
+        // 不拼单文件行数 —— 单文件 base_status 在合并期间保持冻结, 退出即还原。
+        if let Some(m) = self.merge_active() {
+            let mut s = format!("合并: {} 源 · {} 行", m.sources.len(), m.row_count());
+            if m.follow {
+                s.push_str(" · 跟随");
+            }
+            if !m.bookmarks.is_empty() {
+                s.push_str(&format!(" · 书签 {}", m.bookmarks.len()));
+            }
+            self.set_status(s);
+            return;
+        }
         if let Some((verb, name, detail)) = self.loading_parts() {
             self.set_status(format!("{verb} {name} · {detail}"));
             // 无旧文件才上占位文案 (有旧文件: 列表照画, 进度只上底栏)
@@ -1950,8 +2338,8 @@ impl LogApp {
             self.filtered = None;
             self.filter_landed.clear();
             self.filter_elapsed = None;
-            self.top_row = 0.0;
-            self.selected = 0;
+            self.set_top(0.0);
+            self.set_selected(0);
             self.refresh_status();
             return;
         }
@@ -1978,8 +2366,8 @@ impl LogApp {
         self.filter_landed.clear();
         self.filter_elapsed = None;
         self.filtered = None;
-        self.top_row = 0.0;
-        self.selected = 0;
+        self.set_top(0.0);
+        self.set_selected(0);
         self.refresh_status();
     }
 
@@ -2053,8 +2441,11 @@ impl LogApp {
     /// 跳到命中行 (置视口中部，选中跟随)。
     fn jump_to_file_line(&mut self, file_line: u64) {
         let row = self.display_row_of(file_line);
-        self.top_row = clamp_top(row as f64 - PAGE_ROWS / 2.0, self.display_count());
-        self.selected = row;
+        self.set_top(clamp_top(
+            row as f64 - PAGE_ROWS / 2.0,
+            self.display_count(),
+        ));
+        self.set_selected(row);
     }
 
     fn next_hit(&mut self) {
@@ -2081,7 +2472,29 @@ impl LogApp {
     /// (删除照常 —— 守卫不得堵死腾位路径)。增删成功即落盘 (D2), 落盘失败
     /// **不许说谎** (评审 R①)。
     fn toggle_bookmark(&mut self) {
-        let Some((line, _)) = expand::file_line_at(self.selected, self.lines(), &self.expanded)
+        // 合并工作区: 书签打在 (源, 文件行) pack 键上, 进 merge bundle ——
+        // 单文件书签集与 state.json 通路**零触碰** (D4); 合并书签的持久化
+        // 随会话载荷走 (T8), T3 会话内有效。
+        if let Some(m) = self.merge_active_mut() {
+            let Some(row) = m.row_at(m.selected) else {
+                self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Info);
+                return;
+            };
+            match m.toggle_bookmark(row.src, row.line, danqing_log::columns::MAX_BOOKMARKS) {
+                Some(true) => self.set_notice("已添加书签".into(), NoticeKind::Info),
+                Some(false) => self.set_notice("已去掉书签".into(), NoticeKind::Info),
+                None => self.set_notice(
+                    format!(
+                        "书签已达上限 {}, 先去掉一些",
+                        danqing_log::columns::MAX_BOOKMARKS
+                    ),
+                    NoticeKind::Warn,
+                ),
+            }
+            return;
+        }
+        let Some((line, _)) =
+            expand::file_line_at(self.cur_selected(), self.lines(), &self.expanded)
         else {
             self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Info);
             return;
@@ -2119,7 +2532,18 @@ impl LogApp {
 
     /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。状态栏报位次 `书签 i/N`。
     fn goto_next_bookmark(&mut self) {
-        if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.selected)) {
+        // 合并工作区: 按时间线位置序找下一个 (环绕), 位次报底栏。
+        if let Some(m) = self.merge_active_mut() {
+            let Some((pos, rank, total)) = m.next_bookmark_pos() else {
+                self.set_notice("没有书签 ('b' 夹在当前行)".into(), NoticeKind::Info);
+                return;
+            };
+            m.selected = pos;
+            m.top_row = crate::clamp_top(pos as f64, m.row_count());
+            self.set_status(format!("书签 {rank}/{total}"));
+            return;
+        }
+        if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.cur_selected())) {
             self.jump_to_file_line(line);
             self.refresh_status();
             // line 必在集合内: 位次 = 比它小的书签数 + 1
@@ -2262,26 +2686,41 @@ impl App for LogApp {
         match msg {
             // ---- 列配置三件套 (SPEC-v1x-table-column-config T4): 变更即落盘 ----
             Msg::ColumnWidthSet(name, w) => {
-                self.merge_columns();
-                self.columns.set_width(&name, w);
-                self.save_state();
+                if self.column_gate() {
+                    self.merge_columns();
+                    self.columns.set_width(&name, w);
+                    self.save_state();
+                }
             }
             Msg::ColumnWidthClear(name) => {
-                self.merge_columns();
-                self.columns.widths.remove(&name);
-                self.save_state();
+                if self.column_gate() {
+                    self.merge_columns();
+                    self.columns.widths.remove(&name);
+                    self.save_state();
+                }
             }
             Msg::ColumnMoveBefore(name, before) => {
-                self.merge_columns();
-                self.columns.move_name_before(&name, before.as_deref());
-                self.save_state();
+                if self.column_gate() {
+                    self.merge_columns();
+                    self.columns.move_name_before(&name, before.as_deref());
+                    self.save_state();
+                }
             }
             Msg::OpenColMenu => {
+                // G2 门控点位 = 入口 (免费态弹升级对话框, 手势起点另有拦截)
+                if !self.column_gate() {
+                    return;
+                }
                 self.close_popovers(); // 互斥 (D3): 双 scrim 不叠, 开一关二
                 self.col_menu_open = true;
             }
             Msg::CloseColMenu => self.col_menu_open = false,
             Msg::OpenPicker => {
+                // G4 门控点位 = 「字段…」按钮 (免费态弹升级对话框; 手输迷你语法
+                // 不经此臂, 照用)
+                if !self.picker_gate() {
+                    return;
+                }
                 // 互斥 (D1): 「开一关二」+ 关 settings (评审 R5: 托盘双开会让
                 // Enter 被劫到提交)。
                 self.close_popovers();
@@ -2358,6 +2797,109 @@ impl App for LogApp {
                     }
                 }
             }
+            // ---- 合并源管理 (SPEC-v1x-merge-timeline T4) ----
+            Msg::OpenMergeMenu => {
+                // 门控 (D6, 两道闸第一道 = 入口): 免费态点「合并…」→ 升级提示
+                if !self.merge_gate() {
+                    return;
+                }
+                if !self.has_file {
+                    // 合并以当前文件为主源 (D4): 空态没主源, 说清再拦
+                    self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
+                    return;
+                }
+                self.close_popovers();
+                self.settings_open = false;
+                self.merge_menu_open = true;
+            }
+            Msg::CloseMergeMenu => {
+                self.merge_menu_open = false;
+                self.merge_source_selected = None;
+                self.merge_clear_rev += 1; // 关清草稿 (session 同纪律)
+            }
+            Msg::PickMergeSource => {
+                // 「加源…」: 系统对话框 (UI 层 —— 测试走 MergeSourcePicked 直注,
+                // 家法: 测试不触真实桌面)。**门在对话框之前**: 免费态连框都不该开。
+                if !self.merge_gate() {
+                    return;
+                }
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("选择要合并的源")
+                    .pick_file()
+                {
+                    self.update(Msg::MergeSourcePicked(p));
+                }
+            }
+            Msg::MergeSourcePicked(path) => {
+                if self.merge_gate() {
+                    self.add_merge_source(path);
+                }
+            }
+            Msg::RemoveSelectedMergeSource => {
+                if self.merge_gate() {
+                    self.remove_selected_merge_source();
+                }
+            }
+            Msg::ToggleMergeSource(path) => {
+                if !self.merge_gate() {
+                    return;
+                }
+                // 「点行 = 动作并记选中」(ApplySession 先例): 记指针给「移除」;
+                // 合并中才谈显隐 (未合并无掩码对象, 只选中)。
+                self.merge_source_selected = Some(path.clone());
+                if self.workspace == Workspace::Merge {
+                    if let Some(m) = self.merge.as_mut() {
+                        if let Some(s) = m
+                            .sources
+                            .iter_mut()
+                            .find(|s| s.path.as_path() == std::path::Path::new(&path))
+                        {
+                            s.hidden = !s.hidden;
+                        }
+                        m.rebuild_masked();
+                    }
+                    self.refresh_status();
+                }
+            }
+            Msg::NudgeMergeOffset(delta) => {
+                if self.merge_gate() {
+                    self.edit_source_time(|o, t| (Some(o + delta), Some(t)));
+                }
+            }
+            Msg::SetMergeOffset(raw) => {
+                if self.merge_gate() {
+                    match raw.trim().parse::<i64>() {
+                        Ok(v) => self.edit_source_time(|_, t| (Some(v), Some(t))),
+                        Err(_) => {
+                            self.set_notice("偏移须是毫秒整数 (如 -3000)".into(), NoticeKind::Warn)
+                        }
+                    }
+                }
+            }
+            Msg::SetMergeTz(raw) => {
+                if self.merge_gate() {
+                    match danqing_log::merge_view::parse_tz_ms(raw.trim()) {
+                        Some(v) => self.edit_source_time(|o, _| (Some(o), Some(v))),
+                        None => self.set_notice(
+                            "时区格式: ±hh:mm 或 小时数 (如 +08:00 / 8)".into(),
+                            NoticeKind::Warn,
+                        ),
+                    }
+                }
+            }
+            Msg::ToggleMergeWorkspace => {
+                // 「退出合并」/「返回合并」一个钮 (label 随态, 见 settings 卡):
+                // 退出 = 回单文件 (bundle 保留, D4 不丢); 返回 = 再进**不重建**。
+                if self.merge.is_none() {
+                    self.set_notice("当前没有合并".into(), NoticeKind::Info);
+                } else if self.workspace == Workspace::Merge {
+                    self.update(Msg::ExitMerge);
+                } else {
+                    self.workspace = Workspace::Merge;
+                    self.focus_target = Some("log-view");
+                    self.refresh_status();
+                }
+            }
             Msg::ToggleColumn(name) => {
                 self.merge_columns();
                 if !self.columns.order.contains(&name) {
@@ -2384,24 +2926,24 @@ impl App for LogApp {
                     self.follow = false;
                     self.refresh_status();
                 }
-                self.top_row = clamp_top(self.top_row + d, self.display_count());
+                self.set_top(clamp_top(self.cur_top() + d, self.display_count()));
                 // 方向键滚动时选中跟随首行，底栏读数即当前位置
-                self.selected = self.top_row as u64;
+                self.set_selected(self.cur_top() as u64);
             }
             Msg::ScrollTo { top, at_bottom } => {
                 // 往回(上)拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)。
                 // **拖到条底不算往回** —— 见枚举上的注释: 跟随态的 `top_row` 比条能
                 // 表达的底还大, 不排除这一格就会「在底部碰一下条 → FOLLOW 没了」。
-                if !at_bottom && top < self.top_row && self.follow {
+                if !at_bottom && top < self.cur_top() && self.follow {
                     self.follow = false;
                     self.refresh_status();
                 }
                 // **不动 `selected`**: 抓滚动条是「看」不是「选」(T17 不变量 ③)。
-                self.top_row = clamp_top(top, self.display_count());
+                self.set_top(clamp_top(top, self.display_count()));
             }
             Msg::Select(row) => {
                 if row < self.display_count() {
-                    self.selected = row;
+                    self.set_selected(row);
                 }
             }
             Msg::ToggleExpand(row) => {
@@ -2409,12 +2951,12 @@ impl App for LogApp {
                 self.toggle_expand(file_line);
             }
             Msg::GotoStart => {
-                self.top_row = 0.0;
-                self.selected = 0;
+                self.set_top(0.0);
+                self.set_selected(0);
             }
             Msg::GotoEnd => {
-                self.top_row = self.max_top();
-                self.selected = self.display_count().saturating_sub(1);
+                self.set_top(self.max_top());
+                self.set_selected(self.display_count().saturating_sub(1));
                 // End 跳底自动恢复跟随
                 if !self.follow {
                     self.follow = true;
@@ -2495,6 +3037,13 @@ impl App for LogApp {
             Msg::OpenFile(path) => {
                 self.reload_file(path);
             }
+            Msg::StartMerge(paths) => self.start_merge(paths),
+            Msg::ExitMerge => {
+                if self.workspace == Workspace::Merge {
+                    self.workspace = Workspace::Single;
+                    self.refresh_status();
+                }
+            }
             Msg::Notice(text, kind) => self.set_notice(text, kind),
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
@@ -2549,7 +3098,8 @@ impl App for LogApp {
                 .child(settings::export_menu_overlay_jsonl(self.theme))
                 .child(settings::col_menu_overlay(self.theme))
                 .child(settings::picker_overlay(self.theme))
-                .child(settings::session_menu_overlay(self.theme)),
+                .child(settings::session_menu_overlay(self.theme))
+                .child(settings::merge_menu_overlay(self.theme)),
         )
     }
 
@@ -2663,8 +3213,10 @@ impl App for LogApp {
             Key::Named(NamedKey::ArrowUp) => self.update(Msg::ScrollRows(-1.0)),
             Key::Named(NamedKey::ArrowDown) => self.update(Msg::ScrollRows(1.0)),
             // 展开/折叠 (表格模式; → 展开 ← 折叠选中行，子行归父行)
-            Key::Named(NamedKey::ArrowRight) if self.mode == ViewMode::Table => {
-                let file_line = self.file_line_of(self.selected);
+            Key::Named(NamedKey::ArrowRight)
+                if self.workspace == Workspace::Single && self.mode == ViewMode::Table =>
+            {
+                let file_line = self.file_line_of(self.cur_selected());
                 if !self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
                 } else {
@@ -2672,8 +3224,10 @@ impl App for LogApp {
                     self.set_notice("本行已展开".into(), NoticeKind::Info);
                 }
             }
-            Key::Named(NamedKey::ArrowLeft) if self.mode == ViewMode::Table => {
-                let file_line = self.file_line_of(self.selected);
+            Key::Named(NamedKey::ArrowLeft)
+                if self.workspace == Workspace::Single && self.mode == ViewMode::Table =>
+            {
+                let file_line = self.file_line_of(self.cur_selected());
                 if self.expanded.is_expanded(file_line) {
                     self.toggle_expand(file_line);
                 } else {
@@ -2712,6 +3266,11 @@ impl App for LogApp {
                 // 时按 Esc 也走这条路径：整卡通关，而非先收下拉。与「设置卡
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
+            }
+            // Esc 次序: 升级提示 > 设置卡 > **合并源管理** > 命名会话 > 字段查询 >
+            // 列管理 > 导出格式菜单 > 栏 (merge-timeline T4 插层, 会话插层同规)
+            if self.merge_menu_open {
+                return Some(Msg::CloseMergeMenu);
             }
             // Esc 次序: 升级提示 > 设置卡 > **命名会话** > 字段查询 > 列管理 >
             // 导出格式菜单 > 栏 (SPEC-v1x-workspace-sessions 插层)
@@ -2794,6 +3353,10 @@ impl App for LogApp {
         if s.eq_ignore_ascii_case("e") {
             return Some(Msg::ExportEntryClicked);
         }
+        // Ctrl+M 合并 (SPEC-v1x-merge-timeline D6): 与底栏「合并…」同消息, 门控在应用层
+        if s.eq_ignore_ascii_case("m") {
+            return Some(Msg::OpenMergeMenu);
+        }
         None
     }
 
@@ -2809,6 +3372,7 @@ impl App for LogApp {
         self.expire_notice();
         self.pickup_open_job();
         self.pickup_levels_job();
+        self.pickup_merge_job();
         // T5: 商店授权查询 / 购买结果
         if let Some(e) = self.store_license_job.poll() {
             self.adopt_store_entitlement(e);
@@ -2829,8 +3393,8 @@ impl App for LogApp {
             self.filter_landed = self.filter_applied.clone();
             self.filtered = Some(Arc::new(out.lines));
             self.filter_elapsed = Some(out.elapsed);
-            self.top_row = 0.0;
-            self.selected = 0;
+            self.set_top(0.0);
+            self.set_selected(0);
             self.refresh_status();
         }
         if let Some(out) = self.search_job.poll() {
@@ -2839,7 +3403,7 @@ impl App for LogApp {
             self.search_query = out.query;
             self.search_elapsed = Some(out.elapsed);
             // 首跳：当前选中行之后的第一条命中 (无则环绕回首条)
-            let from = self.file_line_of(self.selected);
+            let from = self.file_line_of(self.cur_selected());
             let first = nav.jump_first_from(from);
             self.search = Some(nav);
             if let Some(hit) = first {
@@ -2999,6 +3563,11 @@ mod tests {
     fn column_msgs_mutate_and_persist_state_account() {
         let cfg = temp_cfg_path("cols-msg");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\a.jsonl");
         app.schema = Some(Arc::new(jsonl::Schema {
@@ -3060,6 +3629,11 @@ mod tests {
         )
         .unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from(path_str);
         app.file = Arc::new(LogFile::open(&p).unwrap());
@@ -3419,6 +3993,11 @@ mod tests {
         )
         .unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from(path_str);
         app.file = Arc::new(LogFile::open(&p).unwrap());
@@ -3448,6 +4027,10 @@ mod tests {
         .unwrap();
         std::fs::write(&newp, b"").unwrap(); // 空新名: 不许挡死迁移 (M2)
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 同上: 迁移/回落实验跑在付费态 (断言不动)
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from(path_str);
         app.file = Arc::new(LogFile::open(&p).unwrap());
@@ -3550,6 +4133,11 @@ mod tests {
     fn col_menu_toggle_reset_guard_and_persist() {
         let cfg = temp_cfg_path("cols-menu");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\m.jsonl");
         app.schema = Some(Arc::new(jsonl::Schema {
@@ -3596,6 +4184,11 @@ mod tests {
     fn apply_fresh_loads_per_path_memory_and_closes_col_menu() {
         let cfg = temp_cfg_path("cols-fresh");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         let schema = || {
             Some(jsonl::Schema {
                 columns: vec![
@@ -3825,6 +4418,11 @@ mod tests {
         app.path = std::path::PathBuf::from("C:\\logs\\bm.log");
         let p = temp_log(b"l0\nl1\nl2\n");
         app.file = Arc::new(LogFile::open(&p).unwrap());
+        // 「增即落盘」是**付费通路**语义 (gate-trio G3 书签持久化已收付费):
+        // 本锁验的是持久化, 按注入惯例注付费态; 断言不动。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.selected = 1;
         app.toggle_bookmark();
         assert!(app.bookmarks.contains(&1), "toggle 添加");
@@ -3864,6 +4462,11 @@ mod tests {
     fn bookmarks_are_per_path_and_apply_fresh_replaces_with_memory() {
         let cfg = temp_cfg_path("bm-path");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         let p = temp_log(b"x\ny\n"); // 2 行
         let out = || OpenOutcome {
             file: LogFile::open(&p).unwrap(),
@@ -3908,6 +4511,11 @@ mod tests {
     fn load_state_drops_out_of_bounds_bookmarks() {
         let cfg = temp_cfg_path("bm-oob");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\oob.log");
         let p = temp_log(b"l0\nl1\nl2\n"); // 3 行
@@ -4234,6 +4842,11 @@ mod tests {
     fn picker_submit_appends_and_applies() {
         let cfg = temp_cfg_path("picker-submit");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\p.log");
         let p = temp_log(b"{\"level\":\"ERROR\"}\n{\"level\":\"INFO\"}\n");
@@ -4273,6 +4886,11 @@ mod tests {
     #[test]
     fn picker_open_is_mutually_exclusive() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("picker-mutex")));
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 断言不动 (既有锁不许动语义)。
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
         app.col_menu_open = true;
         app.export_menu_open = true;
         app.update(Msg::OpenPicker);
@@ -6152,5 +6770,588 @@ mod tests {
                 "{name}: 被吞掉的输入须说出「{expect}」, 实得「{text}」"
             );
         }
+    }
+
+    // ---- merge-timeline 腿一 T3: 合并工作区行为锁 ----
+
+    /// 合并 fixture: cur (单文件现场, 3 行 ISO) + 源 a (.log ISO) + 源 b (.jsonl)。
+    fn merge_fixture(tag: &str) -> (LogApp, PathBuf, PathBuf, PathBuf) {
+        let app = LogApp::new_empty_at(Some(temp_cfg_path(tag)));
+        let dir = std::env::temp_dir();
+        let cur = dir.join(format!("danqing-mt-{tag}-cur.log"));
+        let a = dir.join(format!("danqing-mt-{tag}-a.log"));
+        let b = dir.join(format!("danqing-mt-{tag}-b.jsonl"));
+        std::fs::write(
+            &cur,
+            b"2026-09-27T00:00:00Z INFO c0\n2026-09-27T00:00:06Z INFO c1\n2026-09-27T00:00:07Z INFO c2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &a,
+            b"2026-09-27T00:00:01Z INFO a0\n2026-09-27T00:00:03Z INFO a1\n2026-09-27T00:00:08Z INFO a2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            br#"{"ts":"2026-09-27T00:00:02Z","msg":"b0"}
+{"ts":"2026-09-27T00:00:04Z","msg":"b1"}
+{"ts":"2026-09-27T00:00:05Z","msg":"b2"}
+"#,
+        )
+        .unwrap();
+        (app, cur, a, b)
+    }
+
+    fn open_single(app: &mut LogApp, path: &std::path::Path) {
+        app.file = Arc::new(LogFile::open(path).unwrap());
+        app.has_file = true;
+        app.path = path.to_path_buf();
+    }
+
+    /// 同步直驱归并交卷 (注入惯例: 不起线程, 直接喂 apply)。
+    fn apply_merge_sync(app: &mut LogApp, paths: Vec<PathBuf>) {
+        let out = danqing_log::merge_view::build_merge(
+            &paths,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        app.apply_merge_outcome(out);
+    }
+
+    #[test]
+    fn merge_switches_workspace_and_preserves_single_state() {
+        let (mut app, cur, a, b) = merge_fixture("switch");
+        open_single(&mut app, &cur);
+        app.selected = 2;
+        app.top_row = 1.0;
+        app.bookmarks.insert(1);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.workspace, Workspace::Merge);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 3, "当前文件主源 + 两追加");
+        assert_eq!(m.row_count(), 9);
+        assert_eq!(m.top_row, 0.0);
+        // Single 现场冻结原值 (D4 互不丢状态)
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.top_row, 1.0);
+        assert!(app.bookmarks.contains(&1));
+        assert_eq!(app.cur_selected(), 0, "访问器读 merge bundle");
+        app.update(Msg::ExitMerge);
+        assert_eq!(app.workspace, Workspace::Single);
+        assert_eq!(app.cur_selected(), 2, "退出后访问器路由回 Single");
+        assert!(app.merge.is_some(), "bundle 保留 (再进不重建)");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn merge_bookmark_toggle_uses_pack_keys_single_untouched() {
+        let (mut app, cur, a, b) = merge_fixture("bm");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 时间线: cur0(00) a0(01) b0(02) a1(03) → pos 3 = (源1, 行1)
+        app.merge.as_mut().unwrap().selected = 3;
+        app.toggle_bookmark();
+        let m = app.merge.as_ref().unwrap();
+        assert!(
+            m.bookmarks
+                .contains(&danqing_log::merge_view::pack_key(1, 1)),
+            "合并书签打在 (源1, 行1) pack 键"
+        );
+        assert!(app.bookmarks.is_empty(), "单文件书签集零触碰 (D4)");
+        assert!(app.notice.is_some(), "书签动作有回执");
+        app.goto_next_bookmark();
+        assert_eq!(
+            app.merge.as_ref().unwrap().selected,
+            3,
+            "只有一个书签 → 环绕回它"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn merge_goto_end_routes_to_merge_bundle() {
+        let (mut app, cur, a, b) = merge_fixture("nav");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.update(Msg::GotoEnd);
+        assert_eq!(app.merge.as_ref().unwrap().selected, 8, "9 行 → 末行 8");
+        assert_eq!(app.selected, 0, "Single 字段不动 (D4)");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn open_file_switches_back_to_single_workspace() {
+        let (mut app, cur, a, b) = merge_fixture("openback");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        assert_eq!(app.workspace, Workspace::Merge);
+        app.reload_file(a.clone());
+        assert_eq!(app.workspace, Workspace::Single, "打开新文件回单文件 (D4)");
+        assert!(app.merge.is_some(), "bundle 保留");
+        // open_job 在途: 测试不拾取, drop 语义收尾 (open.rs)。
+        app.open_job = None;
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn poll_growth_frozen_during_merge_and_resumes_after_exit() {
+        let (mut app, cur, a, b) = merge_fixture("tail");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 单文件在合并期长大
+        {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().append(true).open(&cur).unwrap();
+            w.write_all(b"2026-09-27T00:00:09Z INFO c3\n").unwrap();
+        }
+        app.last_stat_poll = Instant::now() - Duration::from_secs(1);
+        app.poll_growth();
+        assert_eq!(
+            app.file.line_count(),
+            3,
+            "合并期间单文件 tail 冻结 (T7 才合流)"
+        );
+        assert!(app.open_job.is_none());
+        app.update(Msg::ExitMerge);
+        app.poll_growth();
+        // 小追加走同步增量通路 (不开 open_job —— 那是巨量追平的通道)
+        assert_eq!(app.file.line_count(), 4, "退出合并后 stat 轮询自然追平");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn follow_key_in_merge_notices_instead_of_silent_noop() {
+        let (mut app, cur, a, b) = merge_fixture("follow");
+        open_single(&mut app, &cur);
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.toggle_follow();
+        assert!(!app.follow, "单文件 follow 不动");
+        assert!(
+            !app.merge.as_ref().unwrap().follow,
+            "合并 follow 不动 (T7 才接通)"
+        );
+        assert!(app.notice.is_some(), "「按了没反应」要说话 (P24)");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// D4 不丢 (加/减源重建): 旧 bundle 在场的重归并交卷**按路径**搬
+    /// 书签/显隐/选中 (carry_view_state) —— 减源后序号漂移仍找回, 消失源的
+    /// 键静默丢。首并 (无旧 bundle) 不 carry, 全新状态。
+    #[test]
+    fn rebuild_reapply_carries_bookmarks_hidden_and_selection() {
+        let (mut app, cur, a, b) = merge_fixture("m-carry");
+        open_single(&mut app, &cur);
+        // 显隐动作有 merge_gate —— 注付费态 (注入惯例)
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 书签打在**将被隐藏**的源1 (键不因隐藏失效, T3 语义);
+        // 选中打在可见源2 (b) —— 掩码索引里找得回才有意义。
+        {
+            let m = app.merge.as_mut().unwrap();
+            m.selected = m.position_of(2, 1).unwrap();
+            m.toggle_bookmark(1, 1, 256);
+        }
+        app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
+        // 重归并交卷: 减掉源0 (cur) → 旧源1→新源0, 旧源2→新源1 (序号漂移)
+        apply_merge_sync(&mut app, vec![a.clone(), b.clone()]);
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources.len(), 2);
+        assert!(m.sources[0].hidden, "显隐按路径继承 (a 仍藏)");
+        assert!(
+            m.bookmarks
+                .contains(&danqing_log::merge_view::pack_key(0, 1)),
+            "书签按路径重映射: 旧 (1,1) → 新 (0,1)"
+        );
+        assert_eq!(
+            m.selected,
+            m.position_of(1, 1).unwrap(),
+            "选中行按 (路径,行) 找回: 旧 (2,1) → 新 (1,1)"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// D6 门控两态 (两道闸): 免费态入口/三动作全拦 (升级提示 + 零变更);
+    /// 付费态放行且**永不触发升级提示**。与 session_gate 锁同构。
+    #[test]
+    fn merge_gate_blocks_free_tier_and_never_prompts_paid() {
+        let (mut app, cur, a, b) = merge_fixture("m-gate");
+        open_single(&mut app, &cur);
+        // 免费态: 入口被拦, 弹层不开
+        app.update(Msg::OpenMergeMenu);
+        assert_eq!(
+            app.upgrade_prompt,
+            Some(Feature::MergeTimeline),
+            "免费态入口 = 升级提示"
+        );
+        assert!(!app.merge_menu_open, "免费态不得开弹层");
+        // 免费态: 动作兜底闸全拦 (零变更)
+        app.update(Msg::MergeSourcePicked(a.clone()));
+        assert!(app.merge.is_none(), "免费态加源零起并");
+        app.update(Msg::RemoveSelectedMergeSource);
+        app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
+        assert!(app.merge.is_none(), "免费态动作零变更");
+        // 付费态: 放行; 全程永不触发升级提示
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.upgrade_prompt = None;
+        app.update(Msg::OpenMergeMenu);
+        assert!(app.merge_menu_open, "付费态开弹层");
+        assert!(app.upgrade_prompt.is_none(), "付费态永不误弹");
+        app.update(Msg::MergeSourcePicked(a.clone()));
+        assert!(app.upgrade_prompt.is_none());
+        // 起并走 AsyncJob: 测试不拾取, drop 语义收尾 (open.rs 同规)
+        app.merge_job = Default::default();
+        // 直注交卷验证付费动作真生效 (注入惯例)
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
+        assert!(
+            app.merge.as_ref().unwrap().sources[1].hidden,
+            "付费态显隐真切换"
+        );
+        assert!(app.upgrade_prompt.is_none(), "动作后仍不误弹");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    // ---- 三连接门 (todo-gate-trio G2/G3/G4 两态锁) ----
+
+    /// T5 应用层 (腿 D): 快捷档/手输走同一 edit_source_time 通路 ——
+    /// 作用**选中**源, 解析边界重提 (ts 变, 文件行索引不动), 门控两态。
+    #[test]
+    fn merge_time_edit_targets_selected_and_reextracts() {
+        let (mut app, cur, a, b) = merge_fixture("m-time");
+        open_single(&mut app, &cur);
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 无选中 → 提示零变更
+        app.update(Msg::NudgeMergeOffset(-1_000));
+        assert!(app.merge.as_ref().unwrap().sources[0].offset_ms == 0);
+        // 选中源1, 快捷档 -1s
+        app.merge_source_selected = Some(a.to_string_lossy().into_owned());
+        app.update(Msg::NudgeMergeOffset(-1_000));
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources[1].offset_ms, -1_000, "快捷档落选中源");
+        assert_eq!(m.sources[0].offset_ms, 0, "别源零触碰");
+        // 手输偏移 (绝对值) + 时区
+        app.update(Msg::SetMergeOffset("-7000".into()));
+        app.update(Msg::SetMergeTz("+08:00".into()));
+        let m = app.merge.as_ref().unwrap();
+        assert_eq!(m.sources[1].offset_ms, -7_000);
+        assert_eq!(m.sources[1].tz_offset_ms, 8 * 3_600_000);
+        // 拒收明示 (非数)
+        app.update(Msg::SetMergeOffset("abc".into()));
+        assert!(app.notice.as_ref().is_some_and(|(t, _)| t.contains("毫秒")));
+        // 免费态: 门拦零变更 (两道闸)
+        app.entitlement = Entitlement::Free;
+        app.upgrade_prompt = None;
+        app.update(Msg::NudgeMergeOffset(1_000));
+        assert_eq!(
+            app.upgrade_prompt,
+            Some(Feature::MergeTimeline),
+            "免费态动作兜底闸"
+        );
+        assert_eq!(app.merge.as_ref().unwrap().sources[1].offset_ms, -7_000);
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// G2 列配置两态: 免费态入口/手势动作全拦 (升级提示 + 零变更 + 不落盘);
+    /// 付费态放行永不误弹。列配置段「不读不写」另有通路锁。
+    #[test]
+    fn column_gate_blocks_free_tier_and_never_prompts_paid() {
+        let cfg = temp_cfg_path("g2");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(
+            b"{\"a\":1}
+{\"a\":2}
+{\"a\":3}
+",
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:/logs/g2.jsonl");
+        // 铺 schema (set_width 只收已知列名)
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "a".into(),
+                width_chars: 8,
+            }],
+        }));
+        // 免费态: 入口拦
+        app.update(Msg::OpenColMenu);
+        assert_eq!(app.upgrade_prompt, Some(Feature::ColumnConfig));
+        assert!(!app.col_menu_open);
+        // 免费态: 三动作兜底闸全拦 (列摆法零变更)
+        app.update(Msg::ColumnWidthSet("a".into(), 250.0));
+        app.update(Msg::ColumnWidthClear("a".into()));
+        app.update(Msg::ColumnMoveBefore("a".into(), None));
+        assert!(app.columns.widths.is_empty(), "免费态列摆法零变更");
+        // 付费态: 放行且永不误弹
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.upgrade_prompt = None;
+        app.update(Msg::OpenColMenu);
+        assert!(app.col_menu_open && app.upgrade_prompt.is_none());
+        app.update(Msg::CloseColMenu);
+        app.update(Msg::ColumnWidthSet("a".into(), 250.0));
+        assert_eq!(
+            app.columns.widths.get("a"),
+            Some(&250.0),
+            "付费态动作真生效"
+        );
+        assert!(app.upgrade_prompt.is_none());
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// G2 通路段「不读不写」: 免费期运行态不上账; **付费期已写的保留不删**
+    /// (数据永在 —— 降级不毁数据)。
+    #[test]
+    fn column_config_segment_skips_read_write_in_free_but_preserves_paid() {
+        let cfg = temp_cfg_path("g2-seg");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(
+            b"{\"a\":1}
+{\"a\":2}
+{\"a\":3}
+",
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:/logs/seg.jsonl");
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "a".into(),
+                width_chars: 8,
+            }],
+        }));
+        // 付费期写入列宽
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.update(Msg::ColumnWidthSet("a".into(), 300.0));
+        assert!(app.save_state());
+        // 降级免费: 不读 (默认摆法), 不写 (磁盘原值保留)
+        app.entitlement = Entitlement::Free;
+        app.columns.widths.clear();
+        app.load_state_for_current_file();
+        assert!(app.columns.widths.is_empty(), "免费态不读列配置段");
+        app.save_state(); // 免费态落盘: 付费数据须原样保留
+        // 再回付费: 付费期写的还在 (没被免费期 save 抹掉)
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.load_state_for_current_file();
+        assert_eq!(
+            app.columns.widths.get("a"),
+            Some(&300.0),
+            "免费期 save 不毁付费期列配置"
+        );
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// G3 书签持久化两态: 会话内书签照用 (toggle 不拦不弹窗, v1.0 行为);
+    /// 免费态不跨重启恢复; 付费期已写的免费期不删。
+    #[test]
+    fn bookmark_persist_gated_but_in_session_free() {
+        let cfg = temp_cfg_path("g3");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(
+            b"l0
+l1
+l2
+",
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:/logs/g3.log");
+        // 免费态: 会话内书签照用 —— toggle 不弹窗 (提示位在许可页, 不在这)
+        app.update(Msg::Noop); // 起步
+        app.bookmarks.insert(1);
+        app.upgrade_prompt = None;
+        assert!(app.bookmarks.contains(&1), "会话内书签照用");
+        assert!(app.upgrade_prompt.is_none(), "toggle 不弹窗 (G3 裁决)");
+        // 付费期写书签 → 降级: 免费期不读不写, 付费数据保留
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.bookmarks.insert(2);
+        assert!(app.save_state());
+        app.entitlement = Entitlement::Free;
+        app.bookmarks.clear();
+        app.load_state_for_current_file();
+        assert!(app.bookmarks.is_empty(), "免费态不跨重启恢复");
+        app.save_state();
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.load_state_for_current_file();
+        assert!(app.bookmarks.contains(&2), "免费期 save 不毁付费期书签");
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// G4 字段点选两态: 免费态「字段…」拦 (升级提示, 弹层不开);
+    /// 付费态放行永不误弹。手输迷你语法不经此门 (照用)。
+    #[test]
+    fn picker_gate_blocks_free_tier_and_never_prompts_paid() {
+        let cfg = temp_cfg_path("g4");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        let p = temp_log(
+            b"{\"a\":1}
+{\"a\":2}
+{\"a\":3}
+",
+        );
+        app.file = Arc::new(LogFile::open(&p).unwrap());
+        app.has_file = true;
+        app.path = std::path::PathBuf::from("C:/logs/g4.jsonl");
+        app.update(Msg::OpenPicker);
+        assert_eq!(app.upgrade_prompt, Some(Feature::FieldPicker));
+        assert!(!app.picker_open, "免费态不开弹层");
+        // 付费态放行且永不误弹
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        app.upgrade_prompt = None;
+        app.update(Msg::OpenPicker);
+        assert!(app.picker_open && app.upgrade_prompt.is_none());
+        std::fs::remove_file(&cfg).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 上限拒绝 (D7): 已 8 源时加第 9 个 = 明示拒绝 + 零变更。
+    #[test]
+    fn merge_add_source_rejects_ninth_with_notice() {
+        let (mut app, cur, a, b) = merge_fixture("m-cap");
+        open_single(&mut app, &cur);
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
+        // 灌满: 追加到 8 源 (直接改 sources 不可行 —— 走 add 的去重/上限逻辑前先造满)
+        let m = app.merge.as_mut().unwrap();
+        for i in 0..5 {
+            m.sources.push(danqing_log::merge_view::MergeSource {
+                path: std::env::temp_dir().join(format!("filler-{i}.log")),
+                file: Arc::new(LogFile::open(&cur).unwrap()),
+                schema: None,
+                route: danqing_log::timestamp::TsRoute::LogPrefix(
+                    danqing_log::timestamp::TsFormat::Iso8601,
+                ),
+                offset_ms: 0,
+                tz_offset_ms: 0,
+                hidden: false,
+            });
+        }
+        assert_eq!(m.sources.len(), 8, "灌满至上限");
+        app.update(Msg::MergeSourcePicked(
+            std::env::temp_dir().join("ninth.log"),
+        ));
+        assert_eq!(
+            app.merge.as_ref().unwrap().sources.len(),
+            8,
+            "第 9 个拒绝加入 (D7)"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, k)| t.contains("上限") && matches!(k, crate::NoticeKind::Warn)),
+            "明示上限文案"
+        );
+        // 去重拒绝 (明示)
+        app.update(Msg::MergeSourcePicked(a.clone()));
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|(t, _)| t.contains("已在合并")),
+            "重复源明示"
+        );
+        assert_eq!(app.merge.as_ref().unwrap().sources.len(), 8);
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// 弹层家族规矩 (T4): 互斥入 close_popovers/popover_open + Esc 插层
+    /// (升级提示 > 设置卡 > **合并源管理** > 命名会话 > …)。
+    #[test]
+    fn merge_menu_joins_popover_family_with_esc_insertion() {
+        let (mut app, cur, a, b) = merge_fixture("m-family");
+        open_single(&mut app, &cur);
+        app.entitlement = Entitlement::Paid {
+            source: PaidSource::StoreAddOn,
+        };
+        // 互斥: 开二关一
+        app.update(Msg::OpenSessionMenu);
+        app.update(Msg::OpenMergeMenu);
+        assert!(app.merge_menu_open && !app.session_menu_open, "开二关一");
+        assert!(app.popover_open(), "家族判据纳入 merge_menu");
+        // Esc 插层: 合并源管理在命名会话**前**被关
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        assert!(matches!(
+            app.app_key_filter(&esc),
+            Some(Msg::CloseMergeMenu)
+        ));
+        app.update(Msg::CloseMergeMenu);
+        assert!(!app.merge_menu_open);
+        assert!(app.merge_source_selected.is_none(), "关清草稿 (指针)");
+        // 设置卡优先于合并源管理
+        app.update(Msg::OpenMergeMenu);
+        app.update(Msg::OpenSettings);
+        // OpenSettings 走 close_popovers: 弹层先被关 (互斥), 无并存
+        assert!(
+            app.settings_open && !app.merge_menu_open,
+            "设置卡与弹层互斥"
+        );
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn start_merge_refuses_bad_arity_and_over_cap() {
+        let (mut app, cur, a, b) = merge_fixture("arity");
+        // 无文件 + 零追加 = 不够两源
+        app.update(Msg::StartMerge(vec![]));
+        assert!(app.merge.is_none(), "不够两源不启动");
+        assert!(app.notice.is_some());
+        // 9 个追加源 > 上限 8 (无当前文件)
+        let many: Vec<PathBuf> = (0..9)
+            .map(|i| std::env::temp_dir().join(format!("nope-{i}.log")))
+            .collect();
+        app.update(Msg::StartMerge(many));
+        assert!(app.merge.is_none(), "超上限拒绝");
+        std::fs::remove_file(&cur).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 }

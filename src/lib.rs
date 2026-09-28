@@ -12,5 +12,6 @@ pub mod expand;
 pub mod export;
 pub mod levels;
 pub mod license;
+pub mod merge_view;
 pub mod open;
 pub mod search;

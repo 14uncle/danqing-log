@@ -25,6 +25,9 @@ pub(crate) const ROW_H: f32 = 28.0;
 type RowsFn = Box<dyn Fn(&LogApp) -> Vec<(String, String)>>;
 /// 高亮载荷 (选中行); None = 无高亮 —— sync 每帧取。
 type HighlightFn = Box<dyn Fn(&LogApp) -> Option<String>>;
+/// 行首色块 (可选第四闭包, 合并源弹层用): (app, 载荷) → 色; None = 该行不画块。
+/// **加法不改契约** —— 既有三消费者不 `with_swatch` 就是零变化 (画法见 paint)。
+type SwatchFn = Box<dyn Fn(&LogApp, &str) -> Option<Color>>;
 
 /// 行列表件 (自绘; 契约见模块注释)。
 pub(crate) struct RowList {
@@ -36,8 +39,11 @@ pub(crate) struct RowList {
     max_rows: usize,
     /// 尾行文案 (N → 文案)。
     more_fn: Box<dyn Fn(usize) -> String>,
+    /// 行首色块 (可选; [`RowList::with_swatch`] 装)。
+    swatch_fn: Option<SwatchFn>,
     // ---- sync 缓存 (paint/event 只读) ----
     rows: Vec<(String, String)>,
+    swatches: Vec<Option<Color>>,
     more: usize,
     highlight: Option<String>,
     text_secondary: Color,
@@ -65,7 +71,9 @@ impl RowList {
             on_pick: Box::new(on_pick),
             max_rows,
             more_fn: Box::new(more_fn),
+            swatch_fn: None,
             rows: Vec::new(),
+            swatches: Vec::new(),
             more: 0,
             highlight: None,
             text_secondary: Color::rgb(0.4, 0.4, 0.42),
@@ -108,6 +116,18 @@ impl RowList {
     fn row_clickable(&self, row: usize) -> bool {
         row < self.rows.len()
     }
+
+    /// 装行首色块 (加法 builder; 既有消费者零变化)。
+    pub(crate) fn with_swatch(
+        mut self,
+        f: impl Fn(&LogApp, &str) -> Option<Color> + 'static,
+    ) -> Self {
+        self.swatch_fn = Some(Box::new(f));
+        self
+    }
+
+    /// 色块宽 (含与文案的间隔) —— paint 与文案 x 同源。
+    const SWATCH_W: f32 = 18.0;
 }
 
 impl Widget for RowList {
@@ -119,6 +139,10 @@ impl Widget for RowList {
         let all = (self.rows_fn)(app);
         self.more = all.len().saturating_sub(self.max_rows);
         self.rows = all.into_iter().take(self.max_rows).collect();
+        self.swatches = match &self.swatch_fn {
+            Some(f) => self.rows.iter().map(|(_, p)| f(app, p)).collect(),
+            None => Vec::new(),
+        };
         self.highlight = (self.highlight_fn)(app);
         let t = app.theme.theme();
         self.text_secondary = t.text_secondary();
@@ -146,9 +170,25 @@ impl Widget for RowList {
             // 免得纯文本行被读成只读列表); 高亮行反白在 accent 底上 (主题无
             // on-accent token, 白字即两主题下的既定呈现)。
             let color = if is_hi { Color::WHITE } else { self.accent };
+            // 行首色块 (with_swatch 装了才画): 10×10 圆角小块, 画块才右移文案
+            // (x 偏移与色块同源 —— 两处各写一个 8.0 会漂)。
+            let mut text_x = r.origin.x + 8.0;
+            if let Some(c) = self.swatches.get(i).copied().flatten() {
+                rects.push_rect(
+                    Rect::from_xywh(
+                        r.origin.x + 8.0,
+                        r.origin.y + (ROW_H - 10.0) / 2.0,
+                        10.0,
+                        10.0,
+                    ),
+                    c,
+                    2.0,
+                );
+                text_x += Self::SWATCH_W;
+            }
             texts.push_text(
                 label,
-                r.origin.x + 8.0,
+                text_x,
                 r.origin.y + base_off,
                 crate::view::FONT_SIZE,
                 color,
@@ -269,6 +309,51 @@ mod tests {
             |payload: &str| Msg::ToggleColumn(payload.to_string()),
             |n| format!("… 还有 {n}"),
         )
+    }
+
+    /// 色块锁 (T4 加法): `with_swatch` 装了才画块 —— 每可点行恰一块;
+    /// 不装 = 零块 (既有消费者零变化的 A/B 面)。
+    #[test]
+    fn swatch_paints_one_chip_per_clickable_row_only_when_installed() {
+        let cfg = temp_cfg("swatch");
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![
+                Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        let c = Constraints::loose(Size::new(300.0, 10_000.0));
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 200.0);
+        // 不装: 零块
+        let mut list = test_list();
+        list.sync(&app);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        let _ = list.layout(c, &mut texts);
+        list.paint(area, &mut rects, &mut texts);
+        assert_eq!(rects.instance_rects().len(), 0, "没装色块 = 零块");
+        // 装了: 每可点行恰一块
+        let mut list = test_list().with_swatch(|_app, payload| {
+            Some(if payload == "a" {
+                Color::from_srgb8(0xFF, 0, 0)
+            } else {
+                Color::from_srgb8(0, 0, 0xFF)
+            })
+        });
+        list.sync(&app);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        let _ = list.layout(c, &mut texts);
+        list.paint(area, &mut rects, &mut texts);
+        assert_eq!(rects.instance_rects().len(), 2, "两可点行 = 两块");
+        std::fs::remove_file(&cfg).ok();
     }
 
     /// 评审判罪锁 (T0): 行**每帧重取** —— 建树后 schema 就位/换文件, 行集跟随。
