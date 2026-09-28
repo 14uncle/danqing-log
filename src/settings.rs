@@ -947,6 +947,13 @@ fn merge_time_edit() -> impl Widget {
                 .font_size(BODY_SIZE)
                 .color(Color::WHITE),
         )
+        // 横向 padding 收紧到 spacing_sm: 六枚一排按默认 (横 16) 自然宽 348,
+        // 顶穿卡片内容宽 312、画到卡外 (守卫 merge_time_edit_row_fits_card_width)。
+        // 纵向保持默认 (spacing_md) —— 钮高不变, 与卡上其他钮同高。
+        .padding(Edges::symmetric(
+            LightTheme.spacing_sm(),
+            LightTheme.spacing_md(),
+        ))
         .bind_color(|app: &LogApp| app.theme.theme().text_secondary())
         .on_click(move || Msg::NudgeMergeOffset(delta))
     };
@@ -2438,5 +2445,23 @@ mod tests {
             "降序: 最新会话 (updated 最大) 在第一行"
         );
         std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 复现 (2026-09-28 用户实机): 合并源卡第一排钮 (±1h/±1m/±1s 六枚步进)
+    /// 自然宽超出卡片内容宽 —— 框架 `Row` 不折行不裁剪, 超宽直接画到卡外。
+    /// 量的是这排钮**自报的自然宽** vs 卡片内容宽 (与 `shortcut_rows_fit_the_card_width`
+    /// 同一把尺, 那条只管文案行, 没管钮排)。
+    #[test]
+    fn merge_time_edit_row_fits_card_width() {
+        let mut texts = TextBatch::default();
+        let mut row = merge_time_edit();
+        let w = row
+            .layout(Constraints::loose(Size::new(10_000.0, 100.0)), &mut texts)
+            .width;
+        assert!(
+            w <= content_width(),
+            "步进钮排自然宽 {w} > 卡片内容宽 {}: Row 不换行不裁剪, 会画出卡片右边界",
+            content_width()
+        );
     }
 }

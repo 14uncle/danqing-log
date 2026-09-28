@@ -4,6 +4,20 @@
 
 ## 状态
 
+- 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
+  spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
+  机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
+  `merge_view::build_merge` / `MergeState`) 实测回填 `PERFORMANCE_REPORT.md` 合并节:
+  **947 / 962 / 967 ms** 三跑热缓存 (复查另得 1439 ms 负载波动如实记), D5 红线 ✅
+  (非红线目标 ≤0.8 s 差 ~17%)。**人工验收 G 组九条** (spec §7 原文) 记账总清单
+  `tasks/acceptance-pending.md` ⬜ 待实机 —— **需付费态 key**, 与 B/F 同一条
+  license key 本地激活通路 (三源合并打开 / req_id 追踪 / 按源着色隐藏 / 时钟偏移 /
+  无 ts 行 / 免费态门控 / merge group 会话 / 探测失败明示 / 性能体感)。
+  **试跑即修一条 (同日)**: 合并源卡首排步进钮 (±1h/±1m/±1s 六枚) 走 Button 默认
+  横向 padding (16×2) 自然宽 **348** > 卡片内容宽 **312**, Row 不裁剪画出卡外
+  (用户实机报) → 横向收紧 `spacing_sm`(8) 纵向不动; 锁
+  `merge_time_edit_row_fits_card_width` (修复前精确红 348>312), **实机复验通过**,
+  缺陷记录落 `tasks/acceptance-pending.md` G 组「验收中缺陷记录」, **495 绿**。
 - 2026-09-28 (**功能对齐/创新矩阵落盘 = `docs/FEATURE-MATRIX.md`**): 用户问「对齐竞品的功能
   与创新功能列出」→ 盘点发现**这套信息散在五处文档**(DEEP §2.1 / ROADMAP §一·§二 / 调研 §十 /
   禁声称清单 / PERFORMANCE_REPORT §功能对比)且**两处互相打架** → 落成唯一总表, 三档分类
