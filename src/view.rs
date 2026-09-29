@@ -69,7 +69,7 @@ const EXPAND_FONT_SIZE: u16 = 16;
 const GLYPH_COLLAPSED: &str = "+";
 const GLYPH_EXPANDED: &str = "-";
 /// 底栏状态行高度。
-const STATUS_HEIGHT: f32 = 26.0;
+pub(crate) const STATUS_HEIGHT: f32 = 26.0;
 /// 命名会话入口标签 (SPEC-v1x-workspace-sessions D5)。
 const SESSIONS_BTN_LABEL: &str = "会话";
 /// 底栏「合并…」按钮标签 (merge-timeline T4, D6 入口)。
@@ -824,13 +824,14 @@ pub(crate) struct LogView {
     status: String,
     /// 底栏那行 `status` 是不是**错误** (P27)。2026-09-15 用户裁定「**常驻红**」——
     /// 不给它走 notice 通道: notice 有 4 秒消退期, 而「正则无效」是「你刚按的那下
-    /// 没生效」, 不该自己消失 (用户原话)。与 notice 的 `Warn` 档共用 `danger()`,
+    /// 没生效」, 不该自己消失 (用户原话)。与 toast 浮层共用 `danger()` 语义色,
     /// 但活在另一条通道上。真身是 `app.status_error`, 唯一写入点是
     /// `LogApp::set_status_error`。
     status_error: bool,
-    /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的 —— 常态信息
-    /// `text_secondary()` / 提示 `text_primary()` / 警示 `danger()`, 见 paint。
-    /// sync 时从 `app.notice` 读; **不得**再拼进 `status` (那会画两遍)。
+    /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的。
+    /// SPEC-notice-visibility D4 (2026-09-28): **只画 Info** (色块衬底) —— Warn 的
+    /// 呈现位挪 toast 浮层, 底栏不重复画。sync 时从 `app.notice` 读;
+    /// **不得**再拼进 `status` (那会画两遍)。
     notice: Option<(String, crate::NoticeKind)>,
     mode: ViewMode,
     schema: Option<Arc<Schema>>,
@@ -2512,14 +2513,11 @@ impl Widget for LogView {
         // M3 (2026-09-14 实机 M0 P27): notice 与常态信息**分通道** —— 原先整个
         // status 字符串一个颜色, 错误在视觉上不存在。
         //
-        // 三档取色: 警示 `danger()` / 提示 `text_primary()` / 常态 `text_secondary()`。
-        // 提示**不能**也用 `text_secondary()` —— 那就与常态同色, 等于没分通道
-        // (T11 的验收判据正是「同屏可辨」)。常态那一档不再随有无 notice 变化:
-        // 「降噪」既没有更暗的 token 可用, 又会让整行文字在提示出现时集体变一下。
-        let notice_color = self.notice.as_ref().map(|(_, kind)| match kind {
-            crate::NoticeKind::Warn => th.danger(),
-            crate::NoticeKind::Info => th.text_primary(),
-        });
+        // SPEC-notice-visibility D4 (2026-09-28): notice 呈现按 kind **分派** ——
+        // Warn 挪 toast 浮层 (视野内, 底栏不再画, 方案二无留痕); **Info 留底栏**,
+        // 加圆角色块衬底 (腿 B): 原先与常态信息只差一档文字色, 「扫到了也读不出
+        // 是给我的反馈」—— 色块与常态信息形成样式差。常态档不随有无 notice 变化
+        // (「降噪」既没有更暗的 token 可用, 又会让整行文字集体变一下)。
         texts.push_text(
             &self.status,
             area.origin.x + 10.0,
@@ -2533,15 +2531,18 @@ impl Widget for LogView {
                 th.text_secondary()
             },
         );
-        if let Some((notice_text, _)) = &self.notice {
+        if let Some((notice_text, crate::NoticeKind::Info)) = &self.notice {
             let status_w = texts.measure(&self.status, AUX_FONT_SIZE);
-            texts.push_text(
-                notice_text,
-                area.origin.x + 10.0 + status_w + 16.0,
-                sy,
-                AUX_FONT_SIZE,
-                notice_color.unwrap_or_else(|| th.text_primary()),
+            let nw = texts.measure(notice_text, AUX_FONT_SIZE);
+            let nx = area.origin.x + 10.0 + status_w + 16.0;
+            // 色块衬底: `surface_variant` 打底 (与 hover 块同 token 家族; 两主题
+            // 与底色都有台阶 —— 浅色 D1 修过, 暗色 1.25 淡台阶), 几何包住文本。
+            rects.push_rect(
+                Rect::from_xywh(nx - 6.0, status_y + 3.0, nw + 12.0, STATUS_HEIGHT - 6.0),
+                th.surface_variant(),
+                4.0,
             );
+            texts.push_text(notice_text, nx, sy, AUX_FONT_SIZE, th.text_primary());
         }
         // 设置入口 (S2): ⚙ 设置 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 设置";
@@ -2995,7 +2996,7 @@ impl Widget for LogView {
                         } else {
                             msgs.push(Box::new(Msg::Notice(
                                 "本行无嵌套可展".into(),
-                                crate::NoticeKind::Info,
+                                crate::NoticeKind::Warn,
                             )));
                         }
                     } else {
@@ -3051,7 +3052,7 @@ impl Widget for LogView {
                     // 2026-09-15 用户实机报它没出声, 因为原先只判了 ①)。
                     msgs.push(Box::new(Msg::Notice(
                         "此处无行".into(),
-                        crate::NoticeKind::Info,
+                        crate::NoticeKind::Warn,
                     )));
                     EventResult::Ignored
                 }
@@ -3110,7 +3111,7 @@ impl Widget for LogView {
                     // 复制得到 (P24), 不静默吞键 (T6 前这里会静默复制**错行**)。
                     msgs.push(Box::new(Msg::Notice(
                         "合并视图: 复制需先双击/框选消息文本 (整行复制未接)".into(),
-                        crate::NoticeKind::Info,
+                        crate::NoticeKind::Warn,
                     )));
                     EventResult::Ignored
                 } else {
@@ -3147,7 +3148,7 @@ impl Widget for LogView {
                 } else {
                     msgs.push(Box::new(Msg::Notice(
                         "先双击或框选消息里的追踪值 (如 req_id)".into(),
-                        crate::NoticeKind::Info,
+                        crate::NoticeKind::Warn,
                     )));
                 }
                 EventResult::Consumed
@@ -4222,12 +4223,15 @@ mod tests {
         v.paint(area, &mut rects, &mut texts);
         let plain = texts.instance_colors();
 
-        v.notice = Some(("此处无行".into(), crate::NoticeKind::Info));
+        v.notice = Some(("已复制 3 行".into(), crate::NoticeKind::Info));
         let mut texts = TextBatch::new();
         v.paint(area, &mut rects, &mut texts);
         let with_notice = texts.instance_colors();
 
-        let n = "此处无行".chars().count();
+        // Info 样本用真 Info 文案 (2026-09-29 分档大盘点后「此处无行」生产上
+        // 已是 Warn —— 拿 Warn 文案当 Info 样本会误导; 锁的本意是「Info 画
+        // 一次且颜色独立」, 与具体文案无关)。
+        let n = "已复制 3 行".chars().filter(|c| !c.is_whitespace()).count();
         assert_eq!(
             with_notice.len() - plain.len(),
             n,
@@ -4399,6 +4403,79 @@ mod tests {
             n,
             "置错误态后, status 那 {n} 个字形须**全部**离开 `text_secondary` \
              (A/B: 去掉 paint 里的分支, 这条必红)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SPEC-notice-visibility D4 分派锁: **Warn 不再画在底栏** (呈现位挪 toast
+    /// 浮层, 方案二无留痕), Info 留底栏。三态差手法 (status_error 锁同款):
+    /// 无 notice = N; Warn = 仍 N (底栏零增量); Info = N + 文案字形数。
+    /// A/B: 把 paint 里的 `NoticeKind::Info` 匹配放宽成 `_` → Warn 档立即红
+    /// (已验证: 摘锁精确红在 warn ≠ base)。
+    #[test]
+    fn warn_notice_leaves_status_bar_info_stays() {
+        let (mut v, path) = cell_fixture("notice-dispatch");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.status = "索引 92ms · 2 行".into();
+        let glyph_count = |v: &mut LogView| {
+            let mut texts = TextBatch::new();
+            let mut rects = RectBatch::new();
+            v.paint(area, &mut rects, &mut texts);
+            texts.glyph_clips().count()
+        };
+        v.notice = None;
+        let base = glyph_count(&mut v);
+        v.notice = Some(("警示甲乙丙".into(), crate::NoticeKind::Warn));
+        let warn = glyph_count(&mut v);
+        assert_eq!(warn, base, "Warn 不得再画在底栏 (挪 toast 浮层)");
+        let info_text = "提示甲乙丙";
+        v.notice = Some((info_text.into(), crate::NoticeKind::Info));
+        let info = glyph_count(&mut v);
+        let n = info_text.chars().filter(|c| !c.is_whitespace()).count();
+        assert_eq!(info, base + n, "Info 留底栏: 字形增量须恰为文案字形数");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 腿 B 色块锁: Info 时底栏画 `surface_variant` 衬底圆角块, 几何包住文案
+    /// (宽 = 文案宽+12 横向 padding, 高 = 状态栏-6), 落在底栏带内。
+    /// 画面上还有其他 surface_variant 面 (表头底) —— 用尺寸谓词挑出色块。
+    #[test]
+    fn info_notice_has_surface_chip_behind_text() {
+        let (mut v, path) = cell_fixture("notice-chip");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.status = "索引 92ms · 2 行".into();
+        let info_text = "提示甲乙丙";
+        v.notice = Some((info_text.into(), crate::NoticeKind::Info));
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let nw = texts.measure(info_text, AUX_FONT_SIZE);
+        let want = lin(v.theme.theme().surface_variant());
+        let status_y = area.origin.y + area.size.height - STATUS_HEIGHT;
+        let chips: Vec<Rect> = rects
+            .instance_rects()
+            .into_iter()
+            .zip(rects.instance_colors())
+            .filter(|(_, c)| *c == want)
+            .map(|(r, _)| r)
+            .collect();
+        let chip = chips.iter().find(|r| {
+            (r.size.height - (STATUS_HEIGHT - 6.0)).abs() < 0.01
+                && (r.size.width - (nw + 12.0)).abs() < 0.5
+        });
+        let chip = chip.unwrap_or_else(|| {
+            panic!(
+                "Info 衬底色块须存在且几何包住文案 (高 {}, 宽 {}); 候选面: {:?}",
+                STATUS_HEIGHT - 6.0,
+                nw + 12.0,
+                chips
+            )
+        });
+        assert!(
+            chip.origin.y >= status_y - 0.01
+                && chip.origin.y + chip.size.height <= area.origin.y + area.size.height + 0.01,
+            "色块须在底栏带内: {:?}",
+            chip
         );
         std::fs::remove_file(&path).ok();
     }

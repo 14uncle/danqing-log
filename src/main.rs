@@ -24,6 +24,7 @@ mod pick_list;
 mod settings;
 mod sidebar;
 mod store_license;
+mod toast;
 mod tray;
 mod view;
 
@@ -56,14 +57,14 @@ const SEARCH_HIT_CAP: usize = 1_000_000;
 /// 串行增量索引 ~2.4GB/s → 32MB ≈ 13ms ≤ 16ms 帧预算 (async-open plan D3)。
 const APPEND_SYNC_MAX_BYTES: u64 = 32 << 20;
 
-/// **合并态**增量合流的同步闸 (T9 实测定, 比字节闸更紧): 单文件侧的 32 MiB
+/// **合并态**增量合流的同步闸 (T9 实测定，比字节闸更紧): 单文件侧的 32 MiB
 /// 口径只按**文件行索引**的成本定 («2.4GB/s»), 不含合并侧的增量合流 —— 而
 /// 后者的代价 ∝ 批行数 + 回找深度 (索引 ×16B 的内存位移)。合并态超此批行数
 /// 即交 worker 全量重归并 (旧 bundle 保持可见), 不赌 UI 线程。
-/// 常态 live-tail (每轮几十~几千行) 远在闸下, 走同步快路。
+/// 常态 live-tail (每轮几十~几千行) 远在闸下，走同步快路。
 const MERGE_SYNC_MAX_ROWS: u64 = 20_000;
 
-/// 空态底栏提示 (无参启动, 未打开文件时)。
+/// 空态底栏提示 (无参启动，未打开文件时)。
 const EMPTY_STATUS: &str = "未打开文件 · 按 Ctrl+O 打开日志文件";
 
 /// 视图模式 (仅 JSONL 检出后可进表格; Ctrl+T 互切)。
@@ -77,7 +78,7 @@ pub(crate) enum ViewMode {
 
 /// 工作区模式 (merge-timeline 腿一 T3, SPEC-v1x-merge-timeline D4):
 /// Single = 单文件 (v1.0 起既有全部行为); Merge = 多源合并时间线。
-/// 与 ViewMode (Raw|Table 显示模式) 正交 —— 合并视图有自己的三栏形态,
+/// 与 ViewMode (Raw|Table 显示模式) 正交 —— 合并视图有自己的三栏形态，
 /// 合并期间 Single 的 mode/schema/filtered 等字段**保持原值不触碰**,
 /// 退出合并即原样回来 (互不丢状态)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,10 +111,10 @@ pub(crate) struct SearchOutcome {
 /// 六项 (`base` / `accent` / `text_primary` / `text_secondary` / `surface` /
 /// `surface_input`) **全部取自 `LogTheme`**, 不再手抄。手抄的后果是同一个界面里
 /// 出现**两套强调色**: 原先浅色分支的 accent 是蓝 `0.18,0.35,0.60`, 而框架玉色是
-/// `#0F766E`; `base` 也手抄成 `0.96` 灰, 与主题真实的 `#F0F8F6` 差一截。
+/// `#0F766E`; `base` 也手抄成 `0.96` 灰，与主题真实的 `#F0F8F6` 差一截。
 ///
 /// `backdrop_light` / `backdrop_dark` **保留手写**: 框架没有对应 token ——
-/// 它们是场景层的前后景渐变端点, 只服务标题栏这一层场景。
+/// 它们是场景层的前后景渐变端点，只服务标题栏这一层场景。
 /// 回归锁 `title_theme_derives_tokens_from_log_theme`。
 fn title_theme(theme: config::AppTheme) -> SceneTheme {
     let t = theme.theme();
@@ -133,15 +134,15 @@ fn title_theme(theme: config::AppTheme) -> SceneTheme {
     })
 }
 
-/// 窗口清屏色 —— **单点定义, 启动与切主题都取它**。
+/// 窗口清屏色 —— **单点定义，启动与切主题都取它**。
 ///
-/// 为什么必须是单点: 清屏色有两条来路 (启动的 `WindowConfig`、运行时的
+/// 为什么必须是单点：清屏色有两条来路 (启动的 `WindowConfig`、运行时的
 /// `set_clear_color`), 各算一份就会漂 —— 本仓已有先例 (设置卡页签序号曾在两个文件
 /// 各抄一份、双双漂掉)。
 ///
-/// 为什么它值得存在: 标题栏那条亮带**就是**清屏色。框架 `TitleBar` 的背景是有意的
+/// 为什么它值得存在：标题栏那条亮带**就是**清屏色。框架 `TitleBar` 的背景是有意的
 /// `TRANSPARENT` (`danqing/src/widget/title_bar.rs`, 且有测试锁死), 让窗口底色透出;
-/// 内容区反而看不见它 (被不透明的 `th.background()` 盖住)。所以清屏色不跟随主题时,
+/// 内容区反而看不见它 (被不透明的 `th.background()` 盖住)。所以清屏色不跟随主题时，
 /// 症状恰好是「暗色下标题栏一条白板」。
 fn window_clear_color(theme: config::AppTheme) -> Color {
     theme.theme().background()
@@ -149,17 +150,17 @@ fn window_clear_color(theme: config::AppTheme) -> Color {
 
 /// 标题栏 (含嵌入的过滤栏)。
 ///
-/// 抽成函数不只为了整洁 —— **测试必须复用同一份构建代码**才守得住下面这个坑:
+/// 抽成函数不只为了整洁 —— **测试必须复用同一份构建代码**才守得住下面这个坑：
 /// `view()` 只在启动时求值一次 (`danqing/src/window/mod.rs:207` 的
 /// `let tree = app.view();`, 之后整棵交给 Handler, 不再重建), 所以
 /// `TitleBar::themed(&title_theme(..))` 烘进去的是**启动那一刻**的主题色。
-/// 卡面上其它控件走 `bind_color` 闭包、每帧重读, 于是切主题时**只有标题栏停在旧色**
-/// —— 底色换了、文字没换: 切到浅色是浅字压浅底, 切到暗色是暗字压暗底
+/// 卡面上其它控件走 `bind_color` 闭包、每帧重读，于是切主题时**只有标题栏停在旧色**
+/// —— 底色换了、文字没换：切到浅色是浅字压浅底，切到暗色是暗字压暗底
 /// (用户实机报的「标题看不清」, 两个方向都成立)。
 ///
-/// `bind_theme` 是框架**专为这件事**准备的 API (见 `TitleBar` 文档,
+/// `bind_theme` 是框架**专为这件事**准备的 API (见 `TitleBar` 文档，
 /// 「每帧从应用状态重取主题」)。**不许删**。
-/// 参数取**值**而非 `&LogApp`: edition 2024 里 `impl Trait` 会捕获全部输入生命周期,
+/// 参数取**值**而非 `&LogApp`: edition 2024 里 `impl Trait` 会捕获全部输入生命周期，
 /// 借 `&LogApp` 返回的话这个类型就不是 `'static`, `Column::child` 直接编译不过
 /// (E0521 「borrowed data escapes」)。
 fn title_bar(theme: config::AppTheme, title: String) -> impl Widget {
@@ -184,7 +185,7 @@ pub(crate) struct LogApp {
     /// 窗口事件发送器 (显隐/退出等)。
     window_sender: Option<danqing::WindowEventSender>,
     file: Arc<LogFile>,
-    /// 是否已打开真实文件 (false = 无参启动空态占位: 轮询/键盘导航全门禁,
+    /// 是否已打开真实文件 (false = 无参启动空态占位：轮询/键盘导航全门禁，
     /// 仅 Ctrl+O 与设置可用)。
     has_file: bool,
     /// 首可见显示行 (行锚定，小数 = 行内偏移，任意文件大小无损; 见 view.rs 注释)。
@@ -195,7 +196,7 @@ pub(crate) struct LogApp {
     base_status: String,
     /// 底栏合成文本 (base + 模式 + 过滤 + 搜索)。
     status: String,
-    /// 这一行 `status` 是不是**错误** (P27)。只由 [`Self::set_status_error`] 置位,
+    /// 这一行 `status` 是不是**错误** (P27)。只由 [`Self::set_status_error`] 置位，
     /// 由 [`Self::set_status`] / [`Self::refresh_status`] 清除 —— **单一写入点**,
     /// 别处直接 `self.status = …` 会让标志与实际内容脱钩。
     status_error: bool,
@@ -203,10 +204,10 @@ pub(crate) struct LogApp {
     /// JSONL 列定义 (检出才有; Ctrl+T 切换的前置条件)。
     schema: Option<Arc<Schema>>,
     /// 列配置真身 (SPEC-v1x-table-column-config D1): 用户列宽/显隐/列序,
-    /// 换文件 (`apply_fresh`) 载入该路径记忆, 变更即落 `state.json` (D4)。
+    /// 换文件 (`apply_fresh`) 载入该路径记忆，变更即落 `state.json` (D4)。
     columns: danqing_log::columns::ColumnConfig,
     /// 全文件级别计数 (level-histogram 侧栏)。随文件同批换入 —— worker 算好
-    /// 与 file 一起交卷, 故不存在「行数已更新、计数还是旧的」窗口。
+    /// 与 file 一起交卷，故不存在「行数已更新、计数还是旧的」窗口。
     level_counts: Arc<LevelCounts>,
     /// 计数所用的级别类列名 (None = 行口径)。追加时据此选同一条口径 ——
     /// 口径混用会让同一个侧栏里出现两种数法。
@@ -218,8 +219,8 @@ pub(crate) struct LogApp {
     ///
     /// **计数不在打开管道里** (2026-09-12 用户实机反馈后改): 字段口径的
     /// `extract_field` 要在整行里找 `"level":`, 成本随行内容走; 对某些文件它是
-    /// 打开路径上最重的一段, 挡在内容显示之前就是「索引 92ms 却等十几秒」。
-    /// 现在打开只交出口径列名, 计数由这里的作业后台完成, 侧栏随后补入。
+    /// 打开路径上最重的一段，挡在内容显示之前就是「索引 92ms 却等十几秒」。
+    /// 现在打开只交出口径列名，计数由这里的作业后台完成，侧栏随后补入。
     levels_job: AsyncJob<levels::LevelsOutcome>,
     /// 计数是否仍在算 —— 侧栏据此显示「计算中」而非把 0 当数读。
     levels_pending: bool,
@@ -229,10 +230,10 @@ pub(crate) struct LogApp {
     filter_applied: String,
     /// **落账**过滤查询 —— 产出当前 `filtered` 行集的那一串。
     ///
-    /// 与 `filter_applied` 的差异只在「作业在途」窗口: `apply_filter` 发起时
+    /// 与 `filter_applied` 的差异只在「作业在途」窗口：`apply_filter` 发起时
     /// 即写 `filter_applied`, 而行集要等 job 拾取才换 (评审 R5)。窗口内两者
-    /// 脱钩, 凡消费「行集 ↔ 过滤串」对应关系的 (分析快照) 必须读本字段;
-    /// 增量过滤合并在本窗口内直接禁行 (全程重跑会覆盖, 合并是白干+错账)。
+    /// 脱钩，凡消费「行集 ↔ 过滤串」对应关系的 (分析快照) 必须读本字段;
+    /// 增量过滤合并在本窗口内直接禁行 (全程重跑会覆盖，合并是白干 + 错账)。
     filter_landed: String,
     /// 过滤作业在途 (发起未拾取)。见上。
     filter_pending: bool,
@@ -249,8 +250,8 @@ pub(crate) struct LogApp {
     /// `"log-view"` = 日志列表。`None` = 不请求。
     ///
     /// 泛化自原先的 `focus_bar: bool` —— 打开文件后也得把焦点送进列表 (T14 之后
-    /// 高亮只在持焦时画, 否则打开文件看到的是「一行都没选中」, 而按 ↑↓ 只动底栏
-    /// 行号、屏上什么都不动: 本模块自己判据里的「按了没反应」)。
+    /// 高亮只在持焦时画，否则打开文件看到的是「一行都没选中」, 而按 ↑↓ 只动底栏
+    /// 行号、屏上什么都不动：本模块自己判据里的「按了没反应」)。
     focus_target: Option<&'static str>,
     /// 已应用搜索的导航态 (命中表 + 当前位置)。
     search: Option<SearchNav>,
@@ -259,14 +260,14 @@ pub(crate) struct LogApp {
     search_pattern: Option<String>,
     search_elapsed: Option<Duration>,
     search_job: AsyncJob<SearchOutcome>,
-    /// 书签：文件行号集合 (per-路径持久化 + 越界剔除, SPEC-v1x-bookmark-persist D1/D2)。
+    /// 书签：文件行号集合 (per-路径持久化 + 越界剔除，SPEC-v1x-bookmark-persist D1/D2)。
     bookmarks: std::collections::BTreeSet<u64>,
     /// 展开态 (jsonl-table T4): 文件行号 → 子行数。
     expanded: ExpandMap,
     /// 展开行的拍平子行 (渲染用; 与 expanded 同生同灭，惰性 parse)。
     sub_rows: std::collections::BTreeMap<u64, Vec<SubRow>>,
     /// 展开态修订号 (M3): `toggle_expand` 每次实际改动 +1; LogView 据它
-    /// 作废旧选区/单元格选中 —— 展开/折叠改变显示行映射, 旧 (显示行, 偏移)
+    /// 作废旧选区/单元格选中 —— 展开/折叠改变显示行映射, 旧 (显示行，偏移)
     /// 会指向错误的行。
     expand_rev: u64,
     // ---- live-tail (T2) ----
@@ -278,7 +279,7 @@ pub(crate) struct LogApp {
     last_stat_poll: Instant,
     /// 底栏提示 (截断/轮转等一次性事件)。
     ///
-    /// **改它一律走 [`Self::set_notice`]**, 不直接赋值 —— 直接赋值会漏掉消退期限,
+    /// **改它一律走 [`Self::set_notice`]**, 不直接赋值 —— 直接赋值会漏掉消退期限，
     /// 那条提示就永远赖在底栏上 (T18/Q3 之前是 8 处各写各的)。
     notice: Option<(String, NoticeKind)>,
     /// notice 的消退时刻; `None` = 当前无提示。见 [`Self::set_notice`]。
@@ -286,7 +287,7 @@ pub(crate) struct LogApp {
     /// 窗口是否已最大化 (TitleBar::bind_maximized 读; 框架 Handler 经 maximized_changed 写)。
     maximized: bool,
     /// 在途打开作业 (async-open): Some = 打开/重建/追平进行中, UI 全程可响应;
-    /// 取消 = 置 None (worker 持 cancel Arc 早退, 见 open.rs drop 语义)。
+    /// 取消 = 置 None (worker 持 cancel Arc 早退，见 open.rs drop 语义)。
     open_job: Option<OpenJob>,
     /// Loading 占位文案 (仅 无旧文件 + job 在途 时 Some; view 空态分支呈现)。
     loading_label: Option<(String, String)>,
@@ -294,19 +295,19 @@ pub(crate) struct LogApp {
     settings_open: bool,
     /// 主题模式 (浅色/深色)。
     theme: config::AppTheme,
-    /// 级别计数侧栏是否显示 (`Ctrl+L` 切换, 落 config.toml)。
+    /// 级别计数侧栏是否显示 (`Ctrl+L` 切换，落 config.toml)。
     histogram_visible: bool,
     /// 配置读写路径。`None` = 用户真实配置 (`%APPDATA%\danqing-log\config.toml`)。
     ///
     /// **测试必须给临时路径** —— 见 [`Self::save_config`] 里那条 `#[cfg(test)]` 的
-    /// 硬拦。这不是洁癖: `save_to` 是**整文件覆盖写**, 而 `load_from` 对认不出的
+    /// 硬拦。这不是洁癖：`save_to` 是**整文件覆盖写**, 而 `load_from` 对认不出的
     /// `mode` 会取值域默认 (light) —— 一次 `cargo test` 就能把用户的主题**改掉**,
     /// 并抹掉手写注释。
     cfg_path: Option<std::path::PathBuf>,
     /// 设置卡当前页签**下标** —— 序号含义见 `settings.rs` 里 `.tab()` 处 (**唯一真身**,
-    /// 别在这里另列一份, 加页签时会漂)。越界值无需在此防御: 框架 `Tabs` 自行钳制
+    /// 别在这里另列一份，加页签时会漂)。越界值无需在此防御：框架 `Tabs` 自行钳制
     /// (`clamp_active`), 且 `on_change` 只会回传合法下标。
-    /// 留在应用状态里: 重开卡片停在上次那页。
+    /// 留在应用状态里：重开卡片停在上次那页。
     settings_tab: usize,
     /// 更新角标谓词的测试注入位 (`Some` = 覆写; 生产恒 `None`, 闭包现查
     /// `app_update::hint()`)。测试两态注入不碰全局 publish —— 构造注入惯例
@@ -316,17 +317,17 @@ pub(crate) struct LogApp {
     /// 激活动作即时翻转。免费层下全功能行为与 v1.0 逐点一致 (暗发)。
     entitlement: Entitlement,
     /// 验签公钥。生产 = `license::PRODUCT_PUBKEY` 常量; 测试可注入 (公钥占位
-    /// 全零时任何 key 都验不过, 没有注入就没法测激活路径)。
+    /// 全零时任何 key 都验不过，没有注入就没法测激活路径)。
     license_pubkey: [u8; 32],
     /// 商店版启动授权查询 (T5; AsyncJob 模式与 search/levels 同源)。
     store_license_job: AsyncJob<Entitlement>,
     /// 商店版购买流程 (T5)。
     purchase_job: AsyncJob<store_license::PurchaseOutcome>,
-    /// 「许可」页 key 输入框的内容镜像 (widget 自持编辑器, 这里随 on_change 同步)。
+    /// 「许可」页 key 输入框的内容镜像 (widget 自持编辑器，这里随 on_change 同步)。
     license_key_input: String,
-    /// 激活结果反馈 (显示在「许可」页内 —— 底栏 notice 会被模态卡遮住, 看不见)。
+    /// 激活结果反馈 (显示在「许可」页内 —— 底栏 notice 会被模态卡遮住，看不见)。
     license_feedback: Option<(String, NoticeKind)>,
-    /// 统一升级提示 (T7): 免费用户触发付费功能时弹出, 值为被拦的功能。
+    /// 统一升级提示 (T7): 免费用户触发付费功能时弹出，值为被拦的功能。
     upgrade_prompt: Option<Feature>,
     /// 商店购买是否在途 (评审 Required: pomodoro 成稿的防重入移植 ——
     /// 在途时忽略再次发起; AsyncJob 代次语义下重复 launch 会让晚到的旧轮
@@ -348,9 +349,9 @@ pub(crate) struct LogApp {
     /// 值输入框清空代次 (框架 `TextInput::bind_clear` 消费): 提交/关弹层时 +1。
     picker_clear_rev: u64,
     /// 当前路径的命名会话 (SPEC-v1x-workspace-sessions T2): 随
-    /// `load_state_for_current_file` 换路径整片替换, 变更即落 `state.json`。
+    /// `load_state_for_current_file` 换路径整片替换，变更即落 `state.json`。
     sessions: Vec<danqing_log::columns::SessionEntry>,
-    /// 会话弹层最近点选名 (「删除」指针, T3; 应用即记选中)。换文件清。
+    /// 会话弹层最近点选名 (「删除」指针，T3; 应用即记选中)。换文件清。
     session_selected: Option<String>,
     /// 合并源管理弹层开合 (T4; 与弹层族互斥并入 `close_popovers`/`popover_open`)。
     merge_menu_open: bool,
@@ -363,14 +364,14 @@ pub(crate) struct LogApp {
     /// 命名输入清空代次 (`bind_clear` 消费): 开/关/保存/应用时 +1。
     session_clear_rev: u64,
     /// key 输入框清空代次 (框架 `TextInput::bind_clear` 消费): 激活成功时 +1,
-    ///  widget 侧把明文 key 清掉 (安全评审: 激活后 key 不该继续裸奔在卡里)。
+    ///  widget 侧把明文 key 清掉 (安全评审：激活后 key 不该继续裸奔在卡里)。
     license_clear_rev: u64,
-    /// 字段分析后台作业 (腿二; AsyncJob 代次语义在此正是想要的: 重跑作废旧轮
-    /// —— 与购买防重入那次的「不可丢」相反, 见 plan 风险表的对照注)。
+    /// 字段分析后台作业 (腿二; AsyncJob 代次语义在此正是想要的：重跑作废旧轮
+    /// —— 与购买防重入那次的「不可丢」相反，见 plan 风险表的对照注)。
     analysis_job: AsyncJob<danqing_log::analysis::Analysis>,
     /// 最近一次分析结果 (None = 选择器态)。
     analysis_result: Option<danqing_log::analysis::Analysis>,
-    /// 结果所基于的过滤串快照 (D8: 过滤变了不自动重跑, 标「基于旧过滤」)。
+    /// 结果所基于的过滤串快照 (D8: 过滤变了不自动重跑，标「基于旧过滤」)。
     analysis_filter_src: String,
     /// 分析在途 (面板标题旁显示「分析中…」)。
     analysis_running: bool,
@@ -380,28 +381,29 @@ pub(crate) struct LogApp {
     /// 合并工作区状态 bundle (None = 从未进过合并)。SPEC-v1x-merge-timeline D4:
     /// 与 Single 字段并列互不动 —— 退出合并回 Single 时单文件现场原样还在。
     merge: Option<danqing_log::merge_view::MergeState>,
-    /// 工作区模式 (D4; 与 ViewMode 正交, 见枚举注释)。
+    /// 工作区模式 (D4; 与 ViewMode 正交，见枚举注释)。
     workspace: Workspace,
-    /// 归并后台作业 (AsyncJob 同款先例: launch 起线程, tick 拾取)。
+    /// 归并后台作业 (AsyncJob 同款先例：launch 起线程，tick 拾取)。
     merge_job: AsyncJob<danqing_log::merge_view::MergeOutcome>,
-    /// 归并作业在途标记 (T7): AsyncJob 无 in-flight 查询, poll_growth_merge
+    /// 归并作业在途标记 (T7): AsyncJob 无 in-flight 查询，poll_growth_merge
     /// 的「重归并在途不叠加」门禁靠它 (launch 置位 / pickup 清除)。
     merge_job_live: bool,
-    /// 合并会话恢复载荷 (T8): apply_session (合并组) 挂上, 交卷
+    /// 合并会话恢复载荷 (T8): apply_session (合并组) 挂上，交卷
     /// (apply_merge_outcome) 套回保存的源时间参数/显隐; start_merge /
-    /// rebuild_merge 清理 (用户另起/改源归并 = 旧载荷作废, 防错嫁新归并)。
+    /// rebuild_merge 清理 (用户另起/改源归并 = 旧载荷作废，防错嫁新归并)。
     pending_merge_apply: Option<danqing_log::merge_view::MergeGroup>,
-    /// 追踪过滤后台作业 (腿 E/T6): per-source run_filter 全源并行在线程内串行,
-    /// tick 拾取落地; 重建/退出合并即 invalidate (R5 族: 在途不得晚到复活)。
+    /// 追踪过滤后台作业 (腿 E/T6): per-source run_filter 全源并行在线程内串行，
+    /// tick 拾取落地; 重建/退出合并即 invalidate (R5 族：在途不得晚到复活)。
     trace_job: AsyncJob<danqing_log::merge_view::TraceOutcome>,
 }
 
-/// 底栏提示的级别 (2026-09-14 实机 M0 P27): 警示与提示**同屏可辨**。
+/// 提示级别 = **两条呈现通道的分派键** (SPEC-notice-visibility D4, 2026-09-28):
+/// Warn 的呈现位是 toast 浮层，Info 在底栏 —— 两者不「同屏」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoticeKind {
-    /// 警示 (打开失败/轮转/选区超限) —— 用 `danger()` 画。
+    /// 警示 (打开失败/轮转/选区超限) —— toast 浮层画 (`danger()` 左色条)。
     Warn,
-    /// 提示 (复制回执等) —— 用 `text_secondary()` 画。
+    /// 提示 (复制回执等) —— 底栏画：`text_primary()` 字 + `surface_variant` 衬底。
     Info,
 }
 
@@ -410,13 +412,13 @@ pub(crate) enum Msg {
     /// 滚轮/键盘滚动 N 显示行 (负 = 向上)。
     ScrollRows(f64),
     /// **绝对**滚到某显示行 (T17 滚动条拖拽)。与 `ScrollRows` 的两点不同都是
-    /// 有意的: ① 它是绝对定位, 拖拽是「拇指在哪内容就在哪」而不是增量;
+    /// 有意的：① 它是绝对定位，拖拽是「拇指在哪内容就在哪」而不是增量;
     /// ② 它**不动 `selected`** —— 抓滚动条是「看」不是「选」, 见 todo T17 不变量 ③。
     ///
-    /// `at_bottom` = 目标就在**条能被拖到的最底**。它存在只为一个理由: 跟随态下
-    /// app 的 `top_row` 用 `count-1` 口径, 而条能表达的最大值是 `count-可见行数`
-    /// —— 两者不等, 直接比 `top < top_row` 会把「在底部碰一下条」误判成「向上看」
-    /// 而**静默脱掉 FOLLOW** (T17 review 抓出来的)。带上这一位, 判断才有据可依。
+    /// `at_bottom` = 目标就在**条能被拖到的最底**。它存在只为一个理由：跟随态下
+    /// app 的 `top_row` 用 `count-1` 口径，而条能表达的最大值是 `count-可见行数`
+    /// —— 两者不等，直接比 `top < top_row` 会把「在底部碰一下条」误判成「向上看」
+    /// 而**静默脱掉 FOLLOW** (T17 review 抓出来的)。带上这一位，判断才有据可依。
     ScrollTo {
         top: f64,
         at_bottom: bool,
@@ -447,7 +449,7 @@ pub(crate) enum Msg {
     /// 表格/原始互切 (JSONL 检出才可用; 栏聚焦时经 app_key_filter 前置仍生效)。
     ToggleMode,
     // ---- level-histogram 侧栏 ----
-    /// 点侧栏柱条: 套用该桶的过滤子句; 已是当前生效项则清除 (切换语义)。
+    /// 点侧栏柱条：套用该桶的过滤子句; 已是当前生效项则清除 (切换语义)。
     ApplyLevelFilter(Level),
     /// `Ctrl+L`: 侧栏显隐 (落 config.toml)。
     ToggleHistogram,
@@ -461,13 +463,13 @@ pub(crate) enum Msg {
     /// 更新动作 (版本行按钮): 按轨道分派 —— GitHub 开发布页 / 商店拉起系统更新
     /// (语义收敛在 `app_update::perform_action`)。
     PerformUpdateAction,
-    /// 「许可」页 key 输入框内容变化 (镜像进应用状态, 激活按钮读它)。
+    /// 「许可」页 key 输入框内容变化 (镜像进应用状态，激活按钮读它)。
     LicenseKeyInput(String),
     /// 「许可」页点「激活」按钮 (读输入镜像走激活)。
     ActivateLicenseClicked,
-    /// 「获取付费层」(T5): 商店版拉购买对话框, 便携版开购买页。
+    /// 「获取付费层」(T5): 商店版拉购买对话框，便携版开购买页。
     PurchasePaidLayer,
-    /// 免费用户触发付费功能 → 统一升级提示 (T7; 付费态不发, 两道闸)。
+    /// 免费用户触发付费功能 → 统一升级提示 (T7; 付费态不发，两道闸)。
     ShowUpgradePrompt(Feature),
     /// 关闭升级提示。
     CloseUpgradePrompt,
@@ -475,53 +477,53 @@ pub(crate) enum Msg {
     UpgradeGotoActivate,
     /// 升级提示的「获取付费层」: 关提示 → 走购买 (与许可页按钮同源)。
     UpgradePurchase,
-    /// 点分析面板的字段行: 分析该字段 (门控点位, D5)。
+    /// 点分析面板的字段行：分析该字段 (门控点位，D5)。
     AnalyzeField(usize),
     /// 结果视图「← 换个字段」: 清结果回选择器。
     AnalysisBack,
     /// 底栏「导出…」/ `Ctrl+E` (SPEC-v1x-export D7): 作业态点 = 取消;
-    /// 否则门控 (免费态弹升级提示, **保存对话框之前**) → 开格式菜单。
+    /// 否则门控 (免费态弹升级提示，**保存对话框之前**) → 开格式菜单。
     ExportEntryClicked,
     /// 格式菜单选中。
     ExportFormatChosen(ExportPick),
     /// 关格式菜单 (scrim 点击 / Esc)。
     CloseExportMenu,
     // ---- 列配置三件套 (SPEC-v1x-table-column-config T4) ----
-    /// 列宽拖拽提交 (抬起落账): 手动宽覆盖, 落 `state.json` (D1/D4)。
+    /// 列宽拖拽提交 (抬起落账): 手动宽覆盖，落 `state.json` (D1/D4)。
     ColumnWidthSet(String, f32),
-    /// 双击手柄恢复采样宽: 删手动宽覆盖。
+    /// 双击手柄恢复采样宽：删手动宽覆盖。
     ColumnWidthClear(String),
-    /// 表头拖拽换位落点: `name` 移到 `before` 之前 (`None` = 排尾;
+    /// 表头拖拽换位落点：`name` 移到 `before` 之前 (`None` = 排尾;
     /// `before == name` = 落点即原位无操作)。
     ColumnMoveBefore(String, Option<String>),
-    /// 表头「列…」按钮 / 表头右键: 开列管理弹层 (与导出菜单互斥, D3)。
+    /// 表头「列…」按钮 / 表头右键：开列管理弹层 (与导出菜单互斥，D3)。
     OpenColMenu,
     /// 关列管理弹层 (scrim 点击 / Esc)。
     CloseColMenu,
-    /// 列管理开关行: 切换该列显隐 (≥1 可见守卫在应用层, D6)。
+    /// 列管理开关行：切换该列显隐 (≥1 可见守卫在应用层，D6)。
     ToggleColumn(String),
     /// 「恢复默认」: 列摆法回首见序 + 全显 + 采样宽 (D3)。
     ResetColumns,
-    /// 「字段…」按钮: 开字段查询弹层 (与 col_menu/export_menu 互斥, D1)。
+    /// 「字段…」按钮：开字段查询弹层 (与 col_menu/export_menu 互斥，D1)。
     OpenPicker,
     /// 关字段查询弹层 (scrim 点击 / Esc; 不提交)。
     ClosePicker,
-    /// 点字段行: 记选中字段 (RowList 载荷 = 列名)。
+    /// 点字段行：记选中字段 (RowList 载荷 = 列名)。
     PickPickerField(String),
-    /// 点算符行: 记选中算符 (六钮常显, Open Q①)。
+    /// 点算符行：记选中算符 (六钮常显，Open Q①)。
     PickPickerOp(jsonl::Op),
-    /// 保存/覆盖命名会话 (命名输入 Enter /「保存当前」同路, T2)。
+    /// 保存/覆盖命名会话 (命名输入 Enter /「保存当前」同路，T2)。
     SaveSession(String),
-    /// 应用命名会话 (点行 = 应用并记选中, T2/T3)。
+    /// 应用命名会话 (点行 = 应用并记选中，T2/T3)。
     ApplySession(String),
-    /// 删除**选中**会话 (「删除」钮; 无确认, Open Q4; 无选中 = 提示)。
+    /// 删除**选中**会话 (「删除」钮; 无确认，Open Q4; 无选中 = 提示)。
     DeleteSelectedSession,
     /// 开命名会话弹层 (状态栏「会话」入口; D4 门控点位 = 入口)。
     OpenSessionMenu,
     /// 关命名会话弹层 (Esc/scrim)。
     CloseSessionMenu,
-    /// 表单提交 (值输入 Enter / 「过滤」钮, `PickerInput` 持有者内同路):
-    /// 值随信 (评审 R3: 不设镜像, 镜像有 set_text/clear 不回 on_change 的脱钩窗),
+    /// 表单提交 (值输入 Enter / 「过滤」钮，`PickerInput` 持有者内同路):
+    /// 值随信 (评审 R3: 不设镜像，镜像有 set_text/clear 不回 on_change 的脱钩窗),
     /// 拼子句 → 空格追加 → `apply_filter` (D1/D3)。
     PickerSubmit(String),
     /// Ctrl+O / 拖拽文件：打开新文件。
@@ -531,34 +533,34 @@ pub(crate) enum Msg {
     OpenMergeMenu,
     /// 关合并源管理弹层 (Esc/scrim)。
     CloseMergeMenu,
-    /// 「加源…」: 开系统文件对话框 (UI 层, 测试不发 —— 家法: 测试不触真实桌面),
+    /// 「加源…」: 开系统文件对话框 (UI 层，测试不发 —— 家法：测试不触真实桌面),
     /// 选出后发 [`Msg::MergeSourcePicked`]。
     PickMergeSource,
     /// 对话框选定追加源 (payload = 路径; 也供测试直注): 未合并 → 以此起并;
     /// 已合并 → 追加重归并。**动作兜底闸** (两道闸第二道) 在臂内。
     MergeSourcePicked(PathBuf),
-    /// 「移除」: 移除**选中**源 (指针语义, DeleteSelectedSession 同款) → 重归并;
+    /// 「移除」: 移除**选中**源 (指针语义，DeleteSelectedSession 同款) → 重归并;
     /// 减到不足两源 = 退出合并 (D7 下限语义)。
     RemoveSelectedMergeSource,
-    /// 点源行: 切显隐 + 记选中 (payload = 路径; 「点行 = 动作并记选中」对齐
+    /// 点源行：切显隐 + 记选中 (payload = 路径; 「点行 = 动作并记选中」对齐
     /// ApplySession 先例)。显隐 = 掩码重建 (源序号不漂移), 不重跑提取。
     ToggleMergeSource(String),
-    /// 弹层「退出合并 / 返回合并」一钮双态 (D4 互不丢: 退出 bundle 保留,
+    /// 弹层「退出合并 / 返回合并」一钮双态 (D4 互不丢：退出 bundle 保留，
     /// 返回不重建; 无合并 = 提示)。
     ToggleMergeWorkspace,
     /// T5 选中源偏移微调 (快捷档 ±1s/±1min/±1h; 值 = **增量** ms)。
     NudgeMergeOffset(i64),
     /// T5 选中源偏移手输 (绝对值 ms; ±ms 粒度)。
     SetMergeOffset(String),
-    /// T5 选中源时区手输 (±hh:mm 或小时数; 无 tz 时间戳按它解释, 腿 D)。
+    /// T5 选中源时区手输 (±hh:mm 或小时数; 无 tz 时间戳按它解释，腿 D)。
     SetMergeTz(String),
     /// 启动合并 (merge-timeline 腿一 T3): 源列表 = 当前文件 (主源) + 追加源。
-    /// 构造点 = 弹层加源首并 (add_merge_source); D6 两道闸在入口层, 不在作业层。
+    /// 构造点 = 弹层加源首并 (add_merge_source); D6 两道闸在入口层，不在作业层。
     StartMerge(Vec<PathBuf>),
-    /// 退出合并回单文件工作区 (MergeState 保留, 再进不重建, D4 互不丢状态)。
+    /// 退出合并回单文件工作区 (MergeState 保留，再进不重建，D4 互不丢状态)。
     /// 构造点 = 弹层「退出合并」(ToggleMergeWorkspace)。
     ExitMerge,
-    /// T6 (腿 E): 追踪选中值 —— view 出选区键 (源, 文件行, 字节区间),
+    /// T6 (腿 E): 追踪选中值 —— view 出选区键 (源，文件行，字节区间),
     /// 值提取 (JSONL 放大字段值 / .log 原文) + per-source 过滤在应用层。
     TraceValue {
         src: u32,
@@ -566,17 +568,21 @@ pub(crate) enum Msg {
         lo: usize,
         hi: usize,
     },
-    /// T6: 清除追踪过滤 (Esc 升级序列末级: 选区 → 追踪 → 清焦)。
+    /// T6: 清除追踪过滤 (Esc 升级序列末级：选区 → 追踪 → 清焦)。
     ClearTrace,
-    /// 底栏一次性提示 (选区超限未复制等, 组件层 → 应用层 notice 通道)。
+    /// 底栏一次性提示 (选区超限未复制等，组件层 → 应用层 notice 通道)。
     ///
-    /// **级别语义** (2026-09-14 实机 M0 P27): `NoticeKind::Warn` = 警示
-    /// (打开失败/轮转/选区超限), 用 `danger()` 画; `NoticeKind::Info` = 提示
-    /// (复制回执等), 用 `text_secondary()` 画 —— 两者同屏时**可辨**。
+    /// **级别语义与呈现分派** (SPEC-notice-visibility D4, 2026-09-28):
+    /// `NoticeKind::Warn` = 警示 (打开失败/轮转/选区超限) → **toast 浮层**
+    /// (视野内，`danger()` 色条); `NoticeKind::Info` = 提示 (复制回执等) →
+    /// **底栏** (`text_primary()` + `surface_variant` 衬底)。分派在 view 层，
+    /// 本消息只进通道不挑呈现位。
     Notice(String, NoticeKind),
+    /// 点掉 toast 浮层 (SPEC-notice-visibility 腿 A): 与到点消退同途清 notice。
+    DismissNotice,
     // ---- 主题下拉 ----
     /// 通过下拉选择器选择主题 (索引)。
-    /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管, 不再经应用消息。
+    /// 展开/收起/键盘导航/点外关闭均由 `Dropdown` 自管，不再经应用消息。
     SelectTheme(usize),
     /// 退出应用 (托盘菜单)。
     Quit,
@@ -585,12 +591,12 @@ pub(crate) enum Msg {
 }
 
 impl LogApp {
-    /// 空态骨架 (run() 启动与测试夹具共享, 字段只许有一份真身)。
+    /// 空态骨架 (run() 启动与测试夹具共享，字段只许有一份真身)。
     fn new_empty() -> Self {
         Self::new_empty_at(None)
     }
 
-    /// 同上, 但可指定配置路径 (仅测试用; 见 `cfg_path` 字段)。
+    /// 同上，但可指定配置路径 (仅测试用; 见 `cfg_path` 字段)。
     fn new_empty_at(cfg_path: Option<std::path::PathBuf>) -> Self {
         let cfg = match &cfg_path {
             Some(p) => config::Config::load_from(p),
@@ -598,7 +604,7 @@ impl LogApp {
         };
         // 测试构建一律 Free 起手且不读真实 license 文件 (hermetic);
         // 真实加载只在非 test 构建的生产路径 (见 initial_entitlement)。
-        // T5 占位: 商店版 (is_packaged) 授权查询在 T5 接, 当前打包态也走这里。
+        // T5 占位：商店版 (is_packaged) 授权查询在 T5 接，当前打包态也走这里。
         let entitlement = Self::initial_entitlement(&cfg_path);
         Self {
             cfg_path,
@@ -688,7 +694,7 @@ impl LogApp {
     }
 
     /// 启动授权判定 (D4: 失效只以启动时判定)。测试构建恒 Free —— 读真实
-    /// license 文件 = 测试依赖用户机器状态, 与 save_config 的硬拦同一个理由。
+    /// license 文件 = 测试依赖用户机器状态，与 save_config 的硬拦同一个理由。
     fn initial_entitlement(cfg_path: &Option<std::path::PathBuf>) -> Entitlement {
         #[cfg(test)]
         {
@@ -702,7 +708,7 @@ impl LogApp {
         }
     }
 
-    /// 采纳一份产物带来的计数口径: 列名与据此生成的点选子句表。
+    /// 采纳一份产物带来的计数口径：列名与据此生成的点选子句表。
     ///
     /// 抽成一处而非在 `apply_fresh` / `apply_rebuild` 各写一遍 —— 两处的写法
     /// 必须永远一致 (口径与子句表不同步 = 点某行筛到另一行), 重复即隐患。
@@ -729,11 +735,11 @@ impl LogApp {
             .launch(move || levels::counts_for(file, column.as_deref()));
     }
 
-    /// 计数作业交付: 与快照对账后换入计数与子句表。
+    /// 计数作业交付：与快照对账后换入计数与子句表。
     ///
     /// 作业在算的时候文件可能又增长了 —— 此时**不能重起作业** (持续增长的 tail
     /// 会永远算不完), 而是用 `update_for_append` 把快照之后的那几行按「重叠一行」
-    /// 补上。只数增量, 很便宜。
+    /// 补上。只数增量，很便宜。
     fn pickup_levels_job(&mut self) {
         let Some(out) = self.levels_job.poll() else {
             return;
@@ -759,7 +765,7 @@ impl LogApp {
 
     /// 把当前设置写回 `config.toml`。
     ///
-    /// 必须走整文件写入 —— [`config::Config`] 的两个键同源, 分头写会让
+    /// 必须走整文件写入 —— [`config::Config`] 的两个键同源，分头写会让
     /// 「改主题」顺手抹掉侧栏开关 (config.rs 的 `round_trip_preserves_both_keys`
     /// 钉着这条)。
     fn save_config(&self) {
@@ -769,8 +775,8 @@ impl LogApp {
         };
         match &self.cfg_path {
             Some(p) => cfg.save_to(p),
-            // **测试里不许落到真实配置**: 这条不是洁癖, 是实测过的坑 ——
-            // 本批的 T20 单测走 `update(Msg::ToggleHistogram)` → 这里 → 真实路径,
+            // **测试里不许落到真实配置**: 这条不是洁癖，是实测过的坑 ——
+            // 本批的 T20 单测走 `update(Msg::ToggleHistogram)` → 这里 → 真实路径，
             // 而 `save_to` 是**整文件覆盖写**、`load_from` 对认不出的 `mode` 取默认
             // (light): 一次 `cargo test` 就能把用户的主题改掉、手写注释抹掉。
             // 与其靠「下一个写测试的人记得」, 不如让它**写不出去**。
@@ -783,8 +789,8 @@ impl LogApp {
         }
     }
 
-    /// license 文件路径: 生产 = 用户真实路径; 测试 = 注入配置路径的同名邻居
-    /// (与 cfg_path 同源注入 —— 测试永不碰真实 license, 与 save_config 同规:
+    /// license 文件路径：生产 = 用户真实路径; 测试 = 注入配置路径的同名邻居
+    /// (与 cfg_path 同源注入 —— 测试永不碰真实 license, 与 save_config 同规：
     /// 与其靠「下一个写测试的人记得」, 不如让它**写不出去**)。
     fn license_path(&self) -> std::path::PathBuf {
         match &self.cfg_path {
@@ -799,8 +805,8 @@ impl LogApp {
     }
 
     /// 状态账本路径 (`state.json`): 生产 = config 目录独立文件 (license.key 同目录
-    /// 先例, D4); 测试 = 注入配置路径的邻居 + 无注入 panic (与 cfg_path/license_path
-    /// 同规: 「测试不得写真实配置」家法的封法)。2026-09-24 随账本改名一次到位
+    /// 先例，D4); 测试 = 注入配置路径的邻居 + 无注入 panic (与 cfg_path/license_path
+    /// 同规：「测试不得写真实配置」家法的封法)。2026-09-24 随账本改名一次到位
     /// (bookmark-persist 既定裁定)。
     fn state_path(&self) -> std::path::PathBuf {
         match &self.cfg_path {
@@ -814,10 +820,10 @@ impl LogApp {
         }
     }
 
-    /// 旧名账本路径 (只读迁移源, SPEC-v1x-workspace-sessions D3): 与
+    /// 旧名账本路径 (只读迁移源，SPEC-v1x-workspace-sessions D3): 与
     /// [`Self::state_path`] **同分支派生** —— 测试注入是 `with_extension` 邻居派生
     /// (`x.state.json` ↔ `x.columns.json`), 生产是整名兄弟 (`state.json` ↔
-    /// `columns.json`), 两种方案没有统一表达式, 分支配对是唯一不歪的写法。
+    /// `columns.json`), 两种方案没有统一表达式，分支配对是唯一不歪的写法。
     fn legacy_state_path(&self) -> std::path::PathBuf {
         match &self.cfg_path {
             Some(p) => p.with_extension("columns.json"),
@@ -833,9 +839,9 @@ impl LogApp {
     /// 载入状态账本 (**读旧写新迁移**, SPEC-v1x-workspace-sessions D3): 新名
     /// `state.json` **可辨**才新名优先; 新名缺失/空/坏/全废 → 回落旧名
     /// `columns.json`（与 [`Self::backup_if_corrupt`] 同一「可辨」谓词——评审
-    /// M2: 读/备判据不对称会让坏新名 + 旧名有货时, save_state 先挪新名、再读
-    /// 旧名、再拿空内存覆盖旧名本路径切片 = 家族 Critical 复发）。落盘只写新名,
-    /// 成功后旧名退役（一次性, 见 [`Self::save_state`]）。
+    /// M2: 读/备判据不对称会让坏新名 + 旧名有货时，save_state 先挪新名、再读
+    /// 旧名、再拿空内存覆盖旧名本路径切片 = 家族 Critical 复发）。落盘只写新名，
+    /// 成功后旧名退役（一次性，见 [`Self::save_state`]）。
     fn load_state_account(&self) -> danqing_log::columns::ColumnFiles {
         let new_acc = danqing_log::columns::ColumnFiles::load_from(&self.state_path());
         if new_acc.is_recognizable() {
@@ -853,7 +859,7 @@ impl LogApp {
             Some(e) => {
                 // 通路段「不读」(gate-trio G2/G3): 免费态列配置段/书签段**不读**
                 // —— 默认列摆法 (v1.0 行为) / 书签不跨重启恢复 (会话内照用)。
-                // 读侧拦住, 磁盘上的付费期数据原样躺着 (数据永在, 不删不改)。
+                // 读侧拦住，磁盘上的付费期数据原样躺着 (数据永在，不删不改)。
                 if self.entitlement.allows(Feature::ColumnConfig) {
                     self.columns = e.config.clone();
                 } else {
@@ -872,7 +878,7 @@ impl LogApp {
             }
         }
         // 命名会话 (T2): 该路径切片整片替换 + 选中清
-        // (Open Q3: 「会话」列表只显本路径, 换文件不带旧选中)。
+        // (Open Q3: 「会话」列表只显本路径，换文件不带旧选中)。
         self.sessions = files.sessions_for_path(self.path.to_string_lossy().as_ref());
         self.session_selected = None;
         self.merge_columns();
@@ -906,7 +912,7 @@ impl LogApp {
             config: self.columns.clone(),
             expands: self.expanded.lines(),
             // T8 (SPEC-v1x-merge-timeline D4): 合并工作区保存 = 单文件侧四样
-            // (冻结现场, 属 self.path) + 合并组快照 (源/时间参数/显隐);
+            // (冻结现场，属 self.path) + 合并组快照 (源/时间参数/显隐);
             // 追踪过滤串首版不落盘 (MergeGroup 注释)。
             merge: if self.workspace == Workspace::Merge {
                 self.merge.as_ref().map(|m| m.snapshot_group())
@@ -927,10 +933,10 @@ impl LogApp {
     }
 
     /// 应用命名会话 (D1/D2): 单文件会话 = 四样全链重跑; 合并组会话 (T8) =
-    /// 先验源 (缺失明示跳过, 不足两源整体不动) → 单文件侧四样照旧 → 后台
-    /// 重开源组重建合并, 保存的源参数交卷时套回 (apply_merge_outcome)。
-    /// 应用即记选中 (「删除」指针, T3)。**书签零触碰** (Open Q1)。
-    /// 返回是否已应用 (未知名/源不足不动账, 留弹层重选)。
+    /// 先验源 (缺失明示跳过，不足两源整体不动) → 单文件侧四样照旧 → 后台
+    /// 重开源组重建合并，保存的源参数交卷时套回 (apply_merge_outcome)。
+    /// 应用即记选中 (「删除」指针，T3)。**书签零触碰** (Open Q1)。
+    /// 返回是否已应用 (未知名/源不足不动账，留弹层重选)。
     fn apply_session(&mut self, name: &str) -> bool {
         let Some(s) = self.sessions.iter().find(|s| s.name == name).cloned() else {
             self.set_notice("会话不存在".into(), NoticeKind::Warn);
@@ -938,19 +944,19 @@ impl LogApp {
         };
         if let Some(group) = s.merge.clone() {
             // 先验源 (T8 验收 g): 缺失/暂不可读明示跳过; 现存不足两个 =
-            // 整体不应用 (零副作用, 会话留着, 修源后重试)。
+            // 整体不应用 (零副作用，会话留着，修源后重试)。
             let mut paths: Vec<PathBuf> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
             let mut refused = 0usize;
             for src in &group.sources {
                 let p = PathBuf::from(&src.path);
                 if paths.contains(&p) {
-                    continue; // 手造账本重复源 (载入侧已收编, 双保险)
+                    continue; // 手造账本重复源 (载入侧已收编，双保险)
                 }
-                // 设备命名空间 (\\.\PhysicalDrive0 之类) 不是日志: 拒收明示。
-                // 账本路径本身是「用户自己的文件」= 已信任假设 (含 UNC 网络盘:
+                // 设备命名空间 (\\.\PhysicalDrive0 之类) 不是日志：拒收明示。
+                // 账本路径本身是「用户自己的文件」= 已信任假设 (含 UNC 网络盘：
                 // 那可能是用户真在看的共享日志), 但设备命名空间会把原始设备
-                // 当普通文件整个映射 —— 行为不可预期, 一律不认 (安全审计同条)。
+                // 当普通文件整个映射 —— 行为不可预期，一律不认 (安全审计同条)。
                 if src.path.starts_with(r"\\.\") {
                     refused += 1;
                     continue;
@@ -999,7 +1005,7 @@ impl LogApp {
             self.set_notice(format!("恢复合并会话「{name}」…{skip}"), NoticeKind::Info);
             return true;
         }
-        // 单文件会话: 合并中应用 = 先切回 Single (合并 bundle 保留, D4 不丢)。
+        // 单文件会话：合并中应用 = 先切回 Single (合并 bundle 保留，D4 不丢)。
         // 离场同样作废 (评审 C1: 否则旧命中表会在下次进合并时落地)。
         self.discard_trace_job();
         self.workspace = Workspace::Single;
@@ -1009,15 +1015,15 @@ impl LogApp {
 
     /// 单文件侧四样应用 (D1/D2): ①列换入**写穿** per-file 条目 ②过滤/搜索走
     /// 既有全链重跑 (查询串 = 真相重建) ③展开重建 (越界/不可展开剔除) ④回顶。
-    /// 单文件会话与合并组会话共用 (T8 拆出, 行为零变化)。
+    /// 单文件会话与合并组会话共用 (T8 拆出，行为零变化)。
     fn apply_session_payload(&mut self, s: &danqing_log::columns::SessionEntry) {
         self.columns = s.config.clone();
         self.merge_columns();
-        self.save_state(); // 写穿 (接缝定案: 会话应用 = 写穿 per-file 条目)
+        self.save_state(); // 写穿 (接缝定案：会话应用 = 写穿 per-file 条目)
         self.apply_filter(s.filter.clone());
         // 搜索串先验正则 (评审 M8): 跨编码/手造会话的搜索串可能在当前文件上
         // 正则无效 (如 GBK 下合法的 `(` 到 UTF-8 是残括号) —— 失败则**显式清空**
-        // 并说清, 四样必须「已应用或已显式清空」, 不许 3/4 写穿后谎称成功。
+        // 并说清，四样必须「已应用或已显式清空」, 不许 3/4 写穿后谎称成功。
         let search_usable = s.search.is_empty()
             || regex::bytes::Regex::new(&build_search_pattern(self.file.encoding(), &s.search))
                 .is_ok();
@@ -1026,7 +1032,7 @@ impl LogApp {
         } else {
             self.clear_search();
             if !s.search.is_empty() {
-                self.set_notice("会话搜索串正则无效, 已清空搜索".into(), NoticeKind::Warn);
+                self.set_notice("会话搜索串正则无效，已清空搜索".into(), NoticeKind::Warn);
             }
         }
         self.rebuild_expands(&s.expands);
@@ -1035,7 +1041,7 @@ impl LogApp {
         self.session_selected = Some(s.name.clone());
     }
 
-    /// 删除命名会话 (Open Q4: 无确认, 说清即走 —— 快照非唯一记忆, 重存即可)。
+    /// 删除命名会话 (Open Q4: 无确认，说清即走 —— 快照非唯一记忆，重存即可)。
     fn delete_session(&mut self, name: &str) {
         // 指针随名清 (评审 M9): 名不存在 (外部改账/收编丢条) 也清 —— 免得
         // 「删除」一直对着幽灵名反复「会话不存在」。
@@ -1087,7 +1093,7 @@ impl LogApp {
             .unwrap_or_default()
     }
 
-    /// 保证列配置与当前 schema 对账 (幂等, ≤16 列): 提交/落盘的前置 (D4)。
+    /// 保证列配置与当前 schema 对账 (幂等，≤16 列): 提交/落盘的前置 (D4)。
     fn merge_columns(&mut self) {
         if let Some(s) = &self.schema {
             let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
@@ -1104,7 +1110,7 @@ impl LogApp {
     }
 
     /// 关尽弹层族 (列管理 / 导出格式 / 字段查询 / 命名会话) —— 互斥「开一关二」、
-    /// 换文件/重建、开设置/升级去激活同纪律的**单一收口** (各处各写一份漏过项:
+    /// 换文件/重建、开设置/升级去激活同纪律的**单一收口** (各处各写一份漏过项：
     /// 评审 R5 双开劫 Enter / R6 门禁漏 picker)。
     fn close_popovers(&mut self) {
         self.col_menu_open = false;
@@ -1153,9 +1159,9 @@ impl LogApp {
         false
     }
 
-    /// 合并动作门 (两道闸, D6): 免费态弹统一升级提示并拦下动作。
+    /// 合并动作门 (两道闸，D6): 免费态弹统一升级提示并拦下动作。
     /// 入口闸在 `OpenMergeMenu` 臂; 本闸兜住加源/减源/显隐三个动作
-    /// (会话 session_gate 同构 —— 门控点位在动作层, 不在作业层)。
+    /// (会话 session_gate 同构 —— 门控点位在动作层，不在作业层)。
     fn merge_gate(&mut self) -> bool {
         if self.entitlement.allows(Feature::MergeTimeline) {
             return true;
@@ -1164,7 +1170,7 @@ impl LogApp {
         false
     }
 
-    /// 会话动作门 (两道闸第二道, D4): 免费态弹统一升级提示并拦下动作。
+    /// 会话动作门 (两道闸第二道，D4): 免费态弹统一升级提示并拦下动作。
     /// **数据永在**: 账本读写不走这道门 (降级锁动作不毁数据)。
     fn session_gate(&mut self) -> bool {
         if self.entitlement.allows(Feature::WorkspaceSessions) {
@@ -1183,7 +1189,7 @@ impl LogApp {
             return true;
         };
         // 损坏 = 非空文件却给不出**可辨**账本 (评审 M1: 判据必须认 sessions 段 ——
-        // 「files 坏条 + sessions 完好」是丢段不丢账的合法容错, 不许整账判损
+        // 「files 坏条 + sessions 完好」是丢段不丢账的合法容错，不许整账判损
         // 把他会话 rename 进 .bak 丢出活跃账本)。判据与 `load_state_account`
         // 回落同源 (`is_recognizable`)。
         if bytes.is_empty()
@@ -1197,14 +1203,14 @@ impl LogApp {
             return false;
         }
         self.set_notice(
-            "state.json 已损坏, 原文件已备份为 state.json.bak".into(),
+            "state.json 已损坏，原文件已备份为 state.json.bak".into(),
             NoticeKind::Warn,
         );
         true
     }
 
     /// 记忆状态落盘 (D2/D4): `state.json` per-路径条目 (列摆法 + 书签 + 命名会话), 变更即写
-    /// (save_config 同哲学)。路径 key = `to_string_lossy` exact (已知局限: 同文件
+    /// (save_config 同哲学)。路径 key = `to_string_lossy` exact (已知局限：同文件
     /// 不同路径写法算两条)。返回是否落盘成功 —— **toggle 据此不许说谎**
     /// (评审 R①: 落盘失败还报「已添加」= 成功判据 1 静默违约)。
     fn save_state(&mut self) -> bool {
@@ -1219,8 +1225,8 @@ impl LogApp {
         let mut files = self.load_state_account();
         let now = now_secs();
         // 通路段「不写」(gate-trio G2/G3): 免费态两段**取磁盘原值**写回 ——
-        // 免费期的运行态不上账, 付费期已写的原样保留 (数据永在, 读改写不许
-        // 把这两段改掉)。列配置与书签分门各判, 互不牵连。
+        // 免费期的运行态不上账，付费期已写的原样保留 (数据永在，读改写不许
+        // 把这两段改掉)。列配置与书签分门各判，互不牵连。
         let prev = files
             .get_entry(self.path.to_string_lossy().as_ref())
             .cloned();
@@ -1230,7 +1236,7 @@ impl LogApp {
             prev.as_ref().map(|e| e.config.clone()).unwrap_or_default()
         };
         let bookmarks = if self.entitlement.allows(Feature::BookmarkPersist) {
-            // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式, 脏行号不得出内存)
+            // 书签按当前行数过滤再落盘 (评审 R1: 与 load 同式，脏行号不得出内存)
             self.bookmarks
                 .iter()
                 .copied()
@@ -1260,7 +1266,7 @@ impl LogApp {
         match files.save_to(&path) {
             Ok(()) => {
                 // 迁移**一次性** (D3, 评审 M2): 新账落成后旧名退役 —— rename
-                // 不删 (数据不毁), 但从此读侧只可能命中可辨新账, 双名稳态
+                // 不删 (数据不毁), 但从此读侧只可能命中可辨新账，双名稳态
                 // 消灭 (双名并存 + 新名再坏 = 会把陈旧旧账当恢复源)。
                 let legacy = self.legacy_state_path();
                 if legacy.exists() {
@@ -1272,13 +1278,13 @@ impl LogApp {
                 true
             }
             Err(e) => {
-                log::warn!("记忆状态落盘失败: {e}");
+                log::warn!("记忆状态落盘失败：{e}");
                 false
             }
         }
     }
 
-    /// 激活付费层 (SPEC-v1x-licensing D4): 校验通过即**即时**翻转授权状态,
+    /// 激活付费层 (SPEC-v1x-licensing D4): 校验通过即**即时**翻转授权状态，
     /// 不要求重启; 落盘失败时状态照样翻转、只警示「重启后需重新激活」。
     /// 反馈落在「许可」页内 (`license_feedback`) —— 底栏 notice 会被模态卡遮住。
     fn activate_license(&mut self, key: String) {
@@ -1291,8 +1297,8 @@ impl LogApp {
                 self.entitlement = Entitlement::Paid {
                     source: PaidSource::License(payload),
                 };
-                // 激活成功 = key 已落盘, 输入框里的明文清掉 (安全评审: key 是
-                // 用户资产, 不该留在卡面上; rev 驱动 widget 侧清空, 见
+                // 激活成功 = key 已落盘，输入框里的明文清掉 (安全评审：key 是
+                // 用户资产，不该留在卡面上; rev 驱动 widget 侧清空，见
                 // 设置卡 key_input_box 的 bind_clear)。Persist 分支保留原文
                 // (用户可能要重试复制)。
                 self.license_key_input.clear();
@@ -1302,7 +1308,7 @@ impl LogApp {
             }
             Err(license::ActivateError::Persist(detail)) => {
                 // key 是真的但没落盘 —— 照样激活本次会话 (D4 即时生效),
-                // 重新验一次拿载荷 (verify_key 是纯函数, 成本可忽略)。
+                // 重新验一次拿载荷 (verify_key 是纯函数，成本可忽略)。
                 if let Ok(payload) = license::verify_key(&key, &self.license_pubkey) {
                     self.entitlement = Entitlement::Paid {
                         source: PaidSource::License(payload),
@@ -1330,8 +1336,8 @@ impl LogApp {
         }
     }
 
-    /// 字段分析入口 (腿二, D5 门控点位): 免费态弹升级提示且**不发起扫描**;
-    /// 付费态带 (文件, 字段名, 过滤行集快照) 进 worker。
+    /// 字段分析入口 (腿二，D5 门控点位): 免费态弹升级提示且**不发起扫描**;
+    /// 付费态带 (文件，字段名，过滤行集快照) 进 worker。
     fn analyze_field(&mut self, idx: usize) {
         if !self.entitlement.allows(Feature::FieldAnalytics) {
             self.update(Msg::ShowUpgradePrompt(Feature::FieldAnalytics));
@@ -1345,7 +1351,7 @@ impl LogApp {
         let file = Arc::clone(&self.file);
         let rows = self.filtered.clone();
         // 快照串必须与行集同源 (评审 R5): `filter_applied` 在作业在途窗口里
-        // 已是新串而行集还是旧的 —— 读落账串, 保证「作用域标注说的过滤」
+        // 已是新串而行集还是旧的 —— 读落账串，保证「作用域标注说的过滤」
         // 就是「实际跑了的行集」的产出者; 新过滤落账后 stale 标注自然出现。
         self.analysis_filter_src = self.filter_landed.clone();
         self.analysis_running = true;
@@ -1355,8 +1361,8 @@ impl LogApp {
         });
     }
 
-    /// 导出入口 (SPEC-v1x-export D6/D7): 作业态点 = 取消 (单作业, 同一按钮);
-    /// 否则门控 —— 免费态弹统一升级提示, **保存对话框之前** (先让人选完路径再
+    /// 导出入口 (SPEC-v1x-export D6/D7): 作业态点 = 取消 (单作业，同一按钮);
+    /// 否则门控 —— 免费态弹统一升级提示，**保存对话框之前** (先让人选完路径再
     /// 告诉他不能存是最坏的顺序)。付费态开格式小菜单。
     fn export_entry_clicked(&mut self) {
         if self.export_job.is_running() {
@@ -1374,36 +1380,36 @@ impl LogApp {
         // 过滤计算中导出 = 静默拿到上一份行集 (首筛在途 = 全文件);
         // 搜索命中被导航表封顶 = 静默截断交付物 (对账事故) —— 都挡在格式菜单之前。
         if self.filter_pending {
-            self.set_notice("过滤计算中, 请稍候再导出".into(), NoticeKind::Info);
+            self.set_notice("过滤计算中，请稍候再导出".into(), NoticeKind::Warn);
             return;
         }
         if let Some(nav) = &self.search {
             if (nav.hits().len() as u64) < nav.total() {
                 self.set_notice(
-                    "搜索命中超过 100 万, 导航表已封顶 —— 请收窄搜索后再导出".into(),
+                    "搜索命中超过 100 万，导航表已封顶 —— 请收窄搜索后再导出".into(),
                     NoticeKind::Warn,
                 );
                 return;
             }
         }
         if !self.has_file {
-            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
+            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Warn);
             return;
         }
         if !self.entitlement.allows(Feature::Export) {
             self.update(Msg::ShowUpgradePrompt(Feature::Export));
             return;
         }
-        self.close_popovers(); // 互斥 (D3/D1): 开一关二, 双 scrim 不叠
+        self.close_popovers(); // 互斥 (D3/D1): 开一关二，双 scrim 不叠
         self.export_menu_open = true;
     }
 
     /// 格式菜单选定 → 保存对话框 (D8) → 启动作业。
-    /// 明文非 JSONL 时美化/CSV **服务端同款守门** (菜单收口是 UI 层, 点到了也不放行)。
+    /// 明文非 JSONL 时美化/CSV **服务端同款守门** (菜单收口是 UI 层，点到了也不放行)。
     fn begin_export(&mut self, pick: ExportPick) {
         self.export_menu_open = false;
         if pick != ExportPick::Raw && self.schema.is_none() {
-            self.set_notice("本文件非 JSONL, 仅可导出原始行".into(), NoticeKind::Info);
+            self.set_notice("本文件非 JSONL, 仅可导出原始行".into(), NoticeKind::Warn);
             return;
         }
         let Some((stem, scope, ext)) = self.export_name_parts(pick) else {
@@ -1416,12 +1422,12 @@ impl LogApp {
             .set_file_name(&default_name)
             .save_file()
         else {
-            return; // 对话框取消: 零副作用
+            return; // 对话框取消：零副作用
         };
         self.launch_export(path, pick);
     }
 
-    /// 文件名三段: stem / scope 中缀 / 扩展名 —— 口径真身在
+    /// 文件名三段：stem / scope 中缀 / 扩展名 —— 口径真身在
     /// [`export::scope_suffix`] / [`export::ext_for`], 这里只备料。
     fn export_name_parts(&self, pick: ExportPick) -> Option<(String, &'static str, String)> {
         let stem = self.path.file_stem()?.to_string_lossy().into_owned();
@@ -1480,10 +1486,10 @@ impl LogApp {
                 self.set_notice(msg, NoticeKind::Info);
             }
             ExportEnd::Cancelled { .. } => {
-                self.set_notice("导出已取消, 半成品已删除".into(), NoticeKind::Info);
+                self.set_notice("导出已取消，半成品已删除".into(), NoticeKind::Info);
             }
             ExportEnd::Failed { error } => {
-                self.set_notice(format!("导出失败: {error}"), NoticeKind::Warn);
+                self.set_notice(format!("导出失败：{error}"), NoticeKind::Warn);
             }
         }
     }
@@ -1498,7 +1504,7 @@ impl LogApp {
 
     /// 购买结果回来了 (T5)。成功即永久解锁 (买断); 取消/失败只反馈。
     /// 反馈落 `license_feedback` 而非底栏 notice —— 购买从设置卡/升级提示
-    /// 发起, 卡开着时底栏被模态遮住 (评审 Required; 与激活反馈同通道)。
+    /// 发起，卡开着时底栏被模态遮住 (评审 Required; 与激活反馈同通道)。
     fn adopt_purchase_outcome(&mut self, outcome: store_license::PurchaseOutcome) {
         self.purchase_in_flight = false;
         match outcome {
@@ -1522,11 +1528,11 @@ impl LogApp {
     }
 
     /// 「获取付费层」(T5 机制层; UI 点位在 T6)。商店版拉起购买对话框
-    /// (后台线程, 结果走 tick 拾取); 便携版开购买页 —— `PURCHASE_URL`
-    /// 未回填时给提示, 不打开死链接 (D8; 该分支在两个入口都被
-    /// `show_purchase_button` 提前隐藏时实际不可达, 留作防御)。
+    /// (后台线程，结果走 tick 拾取); 便携版开购买页 —— `PURCHASE_URL`
+    /// 未回填时给提示，不打开死链接 (D8; 该分支在两个入口都被
+    /// `show_purchase_button` 提前隐藏时实际不可达，留作防御)。
     fn purchase_paid_layer(&mut self) {
-        // 已是付费层: 不进购买流程 (评审 Optional —— 商店版已购再点会拿到
+        // 已是付费层：不进购买流程 (评审 Optional —— 商店版已购再点会拿到
         // AlreadyPurchased 然后弹「感谢支持」, 措辞错位)。
         if matches!(self.entitlement, Entitlement::Paid { .. }) {
             self.license_feedback =
@@ -1535,7 +1541,7 @@ impl LogApp {
         }
         if danqing::platform::is_packaged() {
             // 防重入 (评审 Required; pomodoro 的 PURCHASE_STATE CAS 在此处等价):
-            // 在途时忽略再次发起 —— 重复 launch 会拉多个系统购买框, 且晚到的
+            // 在途时忽略再次发起 —— 重复 launch 会拉多个系统购买框，且晚到的
             // 旧代次结果覆盖新代次后被 poll 丢弃 = 付了钱会话内无感知。
             if !self.try_begin_purchase() {
                 self.license_feedback = Some(("购买正在进行中…".to_string(), NoticeKind::Info));
@@ -1552,13 +1558,13 @@ impl LogApp {
                 }
                 None => self.set_notice(
                     "购买页即将上线；已有 key 请直接在设置卡「许可」页激活".to_string(),
-                    NoticeKind::Info,
+                    NoticeKind::Warn,
                 ),
             }
         }
     }
 
-    /// 购买发起闸 (纯状态, 可测): 在途 → false; 空闲 → 置位 + true。
+    /// 购买发起闸 (纯状态，可测): 在途 → false; 空闲 → 置位 + true。
     /// 结果回来 (`adopt_purchase_outcome`) 复位。
     fn try_begin_purchase(&mut self) -> bool {
         if self.purchase_in_flight {
@@ -1590,7 +1596,7 @@ impl LogApp {
 
     /// 显示行数：文件行数 + 展开子行数。
     /// Merge 工作区 = 合并时间线行数 (T3: 合并内暂无展开子行 —— 嵌套展开待
-    /// 并集列 (T4) 波再裁, spec 实现记收录)。
+    /// 并集列 (T4) 波再裁，spec 实现记收录)。
     fn display_count(&self) -> u64 {
         if let Some(m) = self.merge_active() {
             return m.row_count();
@@ -1609,7 +1615,7 @@ impl LogApp {
         }
     }
 
-    /// 同上, 可变。
+    /// 同上，可变。
     fn merge_active_mut(&mut self) -> Option<&mut danqing_log::merge_view::MergeState> {
         if self.workspace == Workspace::Merge {
             self.merge.as_mut()
@@ -1717,10 +1723,10 @@ impl LogApp {
     // ---- merge-timeline 腿一 (T3): 合并生命周期 ----
 
     /// 启动合并 (T3 内部直驱通路; 可见入口 + Feature::MergeTimeline 门控在 T4)。
-    /// 源列表 = 当前文件 (主源, D4) + 追加源 (去重); 归并进后台作业。
+    /// 源列表 = 当前文件 (主源，D4) + 追加源 (去重); 归并进后台作业。
     fn start_merge(&mut self, extra: Vec<PathBuf>) {
         if self.workspace == Workspace::Merge {
-            return; // 已在合并: 源增删走源管理弹层 (T4), 本通路不叠加
+            return; // 已在合并：源增删走源管理弹层 (T4), 本通路不叠加
         }
         let mut paths: Vec<PathBuf> = Vec::new();
         if self.has_file {
@@ -1742,7 +1748,7 @@ impl LogApp {
             self.set_notice(Self::merge_cap_notice(), NoticeKind::Warn);
             return;
         }
-        // cancel 插桩在源间 (build_merge 内); UI 侧作废走 AsyncJob 代次, 不设显式取消钮 (T3)。
+        // cancel 插桩在源间 (build_merge 内); UI 侧作废走 AsyncJob 代次，不设显式取消钮 (T3)。
         // T8: 用户另起归并 = 作废旧会话恢复载荷 (防错嫁到新归并)。
         self.pending_merge_apply = None;
         self.merge_job_live = true;
@@ -1758,7 +1764,7 @@ impl LogApp {
 
     /// 归并作业拾取 (tick 每帧)。**交付才清在途标记** —— 摘「先清后 poll」:
     /// 首帧 poll 空转就把 live 清了 = 「重归并在途不叠加」门禁在飞行中提前
-    /// 开门 (T7 遗留错形, T8 测试撞出: pump 首拾取即返回, 作业还在飞)。
+    /// 开门 (T7 遗留错形，T8 测试撞出：pump 首拾取即返回，作业还在飞)。
     fn pickup_merge_job(&mut self) {
         let Some(out) = self.merge_job.poll() else {
             return;
@@ -1777,7 +1783,7 @@ impl LogApp {
             };
             let mut paths: Vec<PathBuf> = m.sources.iter().map(|s| s.path.clone()).collect();
             if paths.contains(&path) {
-                self.set_notice("该源已在合并中".into(), NoticeKind::Info);
+                self.set_notice("该源已在合并中".into(), NoticeKind::Warn);
                 return;
             }
             if paths.len() >= danqing_log::merge_view::MAX_SOURCES {
@@ -1792,14 +1798,14 @@ impl LogApp {
     }
 
     /// 减源 (弹层「移除」作用选中源; 指针语义): 重归并; 不足两源 = 退出合并
-    /// (保 bundle —— 再「加源」回来时 carry 能找回旧书签, D4 不丢)。
+    /// (保 bundle —— 再「加源」回来时 carry 能找回旧书签，D4 不丢)。
     fn remove_selected_merge_source(&mut self) {
         let Some(sel) = self.merge_source_selected.clone() else {
-            self.set_notice("先点选源再移除".into(), NoticeKind::Info);
+            self.set_notice("先点选源再移除".into(), NoticeKind::Warn);
             return;
         };
         let Some(m) = self.merge.as_ref() else {
-            self.set_notice("当前没有合并".into(), NoticeKind::Info);
+            self.set_notice("当前没有合并".into(), NoticeKind::Warn);
             return;
         };
         let paths: Vec<PathBuf> = m
@@ -1809,12 +1815,12 @@ impl LogApp {
             .filter(|p| p.as_path() != std::path::Path::new(&sel))
             .collect();
         if paths.len() < 2 {
-            // 源减到不足两源: 合并失去意义 → 退出 (bundle 保留)
+            // 源减到不足两源：合并失去意义 → 退出 (bundle 保留)
             self.merge_source_selected = None;
             if self.workspace == Workspace::Merge {
                 self.update(Msg::ExitMerge);
             }
-            self.set_notice("源不足两个, 已退出合并".into(), NoticeKind::Info);
+            self.set_notice("源不足两个，已退出合并".into(), NoticeKind::Warn);
             return;
         }
         self.merge_source_selected = None;
@@ -1823,14 +1829,14 @@ impl LogApp {
 
     /// 改**选中**源的时间参数 (T5 腿 D): 偏移/时区在解析边界单源施加 ——
     /// 只重提该源时间戳 + 重归并 (文件行索引不动)。无选中 = 提示 (指针语义)。
-    /// 变换给出 (新偏移, 新时区); None 臂 = 该参数不动。
+    /// 变换给出 (新偏移，新时区); None 臂 = 该参数不动。
     fn edit_source_time(&mut self, f: impl FnOnce(i64, i64) -> (Option<i64>, Option<i64>)) {
         let Some(sel) = self.merge_source_selected.clone() else {
-            self.set_notice("先点选源再改时间参数".into(), NoticeKind::Info);
+            self.set_notice("先点选源再改时间参数".into(), NoticeKind::Warn);
             return;
         };
         let Some(m) = self.merge.as_mut() else {
-            self.set_notice("当前没有合并".into(), NoticeKind::Info);
+            self.set_notice("当前没有合并".into(), NoticeKind::Warn);
             return;
         };
         let Some(src) = m
@@ -1838,7 +1844,7 @@ impl LogApp {
             .iter()
             .position(|s| s.path.as_path() == std::path::Path::new(&sel))
         else {
-            self.set_notice("选中源已不在合并中".into(), NoticeKind::Info);
+            self.set_notice("选中源已不在合并中".into(), NoticeKind::Warn);
             return;
         };
         let (off, tz) = (m.sources[src].offset_ms, m.sources[src].tz_offset_ms);
@@ -1874,8 +1880,8 @@ impl LogApp {
 
     // ---- 腿 E (T6): req_id 追踪 ----
 
-    /// 追踪选中值: 值提取 (JSONL 行落在字符串字面量内 → 放大整个字段值;
-    /// 否则选区原文, .log 同款) → **单条 Bare 子句** (不经 parse_query, 见
+    /// 追踪选中值：值提取 (JSONL 行落在字符串字面量内 → 放大整个字段值;
+    /// 否则选区原文，.log 同款) → **单条 Bare 子句** (不经 parse_query, 见
     /// `trace_clause` 注释) → per-source run_filter 后台作业。
     fn start_trace(&mut self, src: u32, line: u32, lo: usize, hi: usize) {
         let (value, files) = {
@@ -1886,12 +1892,12 @@ impl LogApp {
             // 下面两条 = 拓扑在「手势 → 落地」之间变过 (加/减源/换文件)。**出声**
             // (P24: 不许静默吞动作), 不猜用户想追哪一行。
             let Some(source) = m.sources.get(src as usize) else {
-                self.set_notice("合并源已变化, 请重新选中再追踪".into(), NoticeKind::Warn);
+                self.set_notice("合并源已变化，请重新选中再追踪".into(), NoticeKind::Warn);
                 return;
             };
             let text = danqing_log::merge_view::row_text(&source.file, line);
             let Some(sel) = text.get(lo..hi) else {
-                self.set_notice("该行内容已变化, 请重新选中再追踪".into(), NoticeKind::Warn);
+                self.set_notice("该行内容已变化，请重新选中再追踪".into(), NoticeKind::Warn);
                 return;
             };
             let value: &str =
@@ -1906,7 +1912,7 @@ impl LogApp {
             if value.trim().is_empty() {
                 self.set_notice(
                     "追踪值为空 —— 双击或框选消息里的追踪值 (如 req_id)".into(),
-                    NoticeKind::Info,
+                    NoticeKind::Warn,
                 );
                 return;
             }
@@ -1929,15 +1935,15 @@ impl LogApp {
         self.set_notice(format!("追踪 \"{value}\" 中…"), NoticeKind::Info);
     }
 
-    /// 源上限拒绝文案 (D7 同一句话, 两个入口: 起并 / 加源) —— 收口一处,
+    /// 源上限拒绝文案 (D7 同一句话，两个入口：起并 / 加源) —— 收口一处，
     /// 免得上限改了只改一处; 上限值本身仍取 `merge_view::MAX_SOURCES` 真身。
     fn merge_cap_notice() -> String {
         format!("合并源上限 {} 个", danqing_log::merge_view::MAX_SOURCES)
     }
 
     /// **在途追踪作废** (R5 族唯一收口): 命中表按「某时刻的源集合」编号 ——
-    /// 源集合变 (加/减源/换工作区/显隐/时间参数) 或工作区离场后, 旧表对新状态
-    /// 就是错账: 轻则把命中贴到别源, 重则按 `src` 索引越界 (release=abort)。
+    /// 源集合变 (加/减源/换工作区/显隐/时间参数) 或工作区离场后，旧表对新状态
+    /// 就是错账：轻则把命中贴到别源，重则按 `src` 索引越界 (release=abort)。
     /// 所有「集合/参数/工作区变了」的路径都必须调它; `apply_trace_outcome` 另有
     /// 到点校验兜底 (评审 C1 双保险)。
     fn discard_trace_job(&mut self) {
@@ -1952,16 +1958,16 @@ impl LogApp {
             return; // 已退出合并 → 丢 (R5 族)
         };
         // 源集合不符 = 换过源 (在途窗口里加/减源或换过工作区) → 命中表按旧序号
-        // 编号, 用了就是越界/错贴。丢弃并**出声** (评审 C1; P24: 不许静默)。
+        // 编号，用了就是越界/错贴。丢弃并**出声** (评审 C1; P24: 不许静默)。
         if out.hits.len() != m.sources.len() {
             self.set_notice(
-                "合并源已变化, 本次追踪作废 (请重新追踪)".into(),
+                "合并源已变化，本次追踪作废 (请重新追踪)".into(),
                 NoticeKind::Warn,
             );
             return;
         }
-        // T7 缝: 在途窗口内源可能已追加 —— 扫描快照行数 < 当前行数的源,
-        // 缺口 [scanned-1, 当前) 增量补滤 (退一行 = 末行补全改判同区间,
+        // T7 缝：在途窗口内源可能已追加 —— 扫描快照行数 < 当前行数的源，
+        // 缺口 [scanned-1, 当前) 增量补滤 (退一行 = 末行补全改判同区间，
         // 摘/补对称同 apply_appended 纪律), 不许追踪永久缺那窗里进来的行。
         let mut hits = out.hits;
         for (i, s) in m.sources.iter().enumerate() {
@@ -1994,10 +2000,10 @@ impl LogApp {
         self.refresh_status();
     }
 
-    /// 归并交卷换入: 建 MergeState + 切 Merge 工作区 + 拒收源明示 (SPEC D2);
-    /// 旧 bundle 在场 = carry 保书签/显隐/选中 (加减源重建不丢, D4)。
+    /// 归并交卷换入：建 MergeState + 切 Merge 工作区 + 拒收源明示 (SPEC D2);
+    /// 旧 bundle 在场 = carry 保书签/显隐/选中 (加减源重建不丢，D4)。
     fn apply_merge_outcome(&mut self, out: danqing_log::merge_view::MergeOutcome) {
-        // 源集合整体换入的唯一落地点 (评审 C1: 不在此作废, 旧命中表必越界)
+        // 源集合整体换入的唯一落地点 (评审 C1: 不在此作废，旧命中表必越界)
         self.discard_trace_job();
         let rejected = out.rejected.len();
         let n_sources = out.sources.len();
@@ -2009,7 +2015,7 @@ impl LogApp {
             danqing_log::merge_view::carry_view_state(old, &mut fresh);
         }
         // T8: 会话恢复载荷殿后 (carry 先跑 = 书签/展开零触碰, 载荷后跑 =
-        // 显隐以保存值为准)。返回有变化的源数 (0 = 全同, 零打扰)。
+        // 显隐以保存值为准)。返回有变化的源数 (0 = 全同，零打扰)。
         let restored = match self.pending_merge_apply.take() {
             Some(saved) => fresh.apply_saved_params(&saved),
             None => 0,
@@ -2023,7 +2029,7 @@ impl LogApp {
             );
         } else if restored > 0 {
             self.set_notice(
-                format!("合并会话参数已套回 ({restored} 源, {n_sources} 源 {rows} 行)"),
+                format!("合并会话参数已套回 ({restored} 源，{n_sources} 源 {rows} 行)"),
                 NoticeKind::Info,
             );
         }
@@ -2034,7 +2040,7 @@ impl LogApp {
     /// 增长检测 (live-tail): 文件变长 → `append_from` 增量; 缩容/轮转 → 全量重建。
     fn poll_growth(&mut self) {
         if self.workspace == Workspace::Merge {
-            // T7 (腿 F): 合并期间单文件 tail 仍冻结 (app.file 不动, 退出后追平
+            // T7 (腿 F): 合并期间单文件 tail 仍冻结 (app.file 不动，退出后追平
             // 零残留), 但**合并源各自轮询合流** —— 见 poll_growth_merge。
             self.poll_growth_merge();
             return;
@@ -2058,9 +2064,9 @@ impl LogApp {
         } else if cur.len > known.len {
             let delta = cur.len - known.len;
             if delta >= APPEND_SYNC_MAX_BYTES {
-                // 巨量追平 (久未轮询后的追平, 如隐藏期间暴涨): 转 worker,
+                // 巨量追平 (久未轮询后的追平，如隐藏期间暴涨): 转 worker,
                 // 旧快照保持可见可滚 + 底栏「追平中」; 在途期间本函数被门禁 (D3)。
-                // 过滤激活时子句随行 (review R2): 增量过滤随 worker 下沉,
+                // 过滤激活时子句随行 (review R2): 增量过滤随 worker 下沉，
                 // 落点只合并不扫描 —— 否则 GB 级追平的过滤成本回到 UI 线程。
                 let old = Arc::clone(&self.file);
                 let filter = if !self.filter_applied.is_empty() && self.filtered.is_some() {
@@ -2078,7 +2084,7 @@ impl LogApp {
                 self.refresh_status();
                 return;
             }
-            // 同文件常态增长：同步增量追加 (新字节在页缓存, 毫秒级)
+            // 同文件常态增长：同步增量追加 (新字节在页缓存，毫秒级)
             match LogFile::append_from(&self.file, &self.path) {
                 Ok(new) => self.apply_appended(new, None),
                 Err(e) => log::warn!("tail 追加失败：{e:#}"),
@@ -2091,16 +2097,16 @@ impl LogApp {
 
     /// 合并工作区的 live-tail (腿 F/T7): **per-source** stat 轮询 ——
     ///
-    /// - 未变: 跳过; 读取失败: 断流标记 (单源断流不拖垮全局, 弹层/底栏明示);
-    /// - 增长: 小增量同步合流 (`MergeState::append_source`); 巨量追平 /
+    /// - 未变：跳过; 读取失败：断流标记 (单源断流不拖垮全局，弹层/底栏明示);
+    /// - 增长：小增量同步合流 (`MergeState::append_source`); 巨量追平 /
     ///   UTF-16 副本增量不适用 → 全量重归并 (worker, 旧 bundle 保持可见);
     /// - 轮转/缩容 (head 变 / len 缩): 全量重归并 (单文件 rebuild_file 同族)。
     ///
-    /// 门禁与单文件同款: 重归并在途不叠加 (D3 同族); trace 在途不挡追加
-    /// (落地时缺口补滤对账, 见 apply_trace_outcome)。
+    /// 门禁与单文件同款：重归并在途不叠加 (D3 同族); trace 在途不挡追加
+    /// (落地时缺口补滤对账，见 apply_trace_outcome)。
     fn poll_growth_merge(&mut self) {
         if self.merge_job_live {
-            return; // 重归并在途不叠加 (打开/重建期间 stat 必过期, 下轮再来)
+            return; // 重归并在途不叠加 (打开/重建期间 stat 必过期，下轮再来)
         }
         enum MergeTailAct {
             Append(u32, LogFile),
@@ -2132,11 +2138,11 @@ impl LogApp {
                 }
                 if cur.head != known.head || cur.len < known.len {
                     acts.push(MergeTailAct::Rotate(s.name().to_string()));
-                    break; // 一次重建覆盖全部, 不用再扫
+                    break; // 一次重建覆盖全部，不用再扫
                 }
                 let delta = cur.len - known.len;
-                // 巨量追平 / UTF-16 转码副本 (增量不适用, append_from 会退全量
-                // 且转码整文件 —— 那是 worker 的活, 不在 UI 线程付): 全量重归并
+                // 巨量追平 / UTF-16 转码副本 (增量不适用，append_from 会退全量
+                // 且转码整文件 —— 那是 worker 的活，不在 UI 线程付): 全量重归并
                 let utf16 = matches!(
                     s.file.encoding(),
                     danqing::encoding::Encoding::Utf16Le | danqing::encoding::Encoding::Utf16Be
@@ -2148,24 +2154,24 @@ impl LogApp {
                 match LogFile::append_from(&s.file, &s.path) {
                     Ok(new) => {
                         let grew = new.line_count() > s.file.line_count();
-                        // 行数没长也可能有事: 旧末行被追加**补全** (写了一半的行
-                        // 续完) —— 内容/ts 都改判, 不落地会一直显示残行。
+                        // 行数没长也可能有事：旧末行被追加**补全** (写了一半的行
+                        // 续完) —— 内容/ts 都改判，不落地会一直显示残行。
                         let tail_completed = !grew && {
                             let oc = s.file.line_count();
                             oc > 0 && new.line(oc - 1) != s.file.line(oc - 1)
                         };
                         let new_rows = new.line_count().saturating_sub(s.file.line_count());
                         if new_rows > MERGE_SYNC_MAX_ROWS {
-                            // 大批: 交 worker 全量重归并 (加数 + 一键) —— 增量合流
-                            // 的代价 ∝ 批行数 + 回找深度, 大批不该在 UI 线程付
-                            // (T9 实测: 引擎整批单遍后仍随批行数线性长)。
+                            // 大批：交 worker 全量重归并 (加数 + 一键) —— 增量合流
+                            // 的代价 ∝ 批行数 + 回找深度，大批不该在 UI 线程付
+                            // (T9 实测：引擎整批单遍后仍随批行数线性长)。
                             acts.push(MergeTailAct::Rotate(s.name().to_string()));
                             break;
                         }
                         if grew || tail_completed {
                             acts.push(MergeTailAct::Append(i as u32, new));
                         }
-                        // 否则: 半行在写中, 下轮再说
+                        // 否则：半行在写中，下轮再说
                     }
                     Err(_) => {
                         if !s.stale {
@@ -2196,7 +2202,7 @@ impl LogApp {
                         format!("源 {name} 已轮转/截断, 重归并中…"),
                         NoticeKind::Warn,
                     );
-                    return; // rebuild_merge 自带提示与状态, 余下动作下轮再扫
+                    return; // rebuild_merge 自带提示与状态，余下动作下轮再扫
                 }
             }
         }
@@ -2205,7 +2211,7 @@ impl LogApp {
         }
     }
 
-    /// 缩容/轮转: 异步全量重建 (旧快照保持可见可滚, spec 裁决);
+    /// 缩容/轮转: 异步全量重建 (旧快照保持可见可滚，spec 裁决);
     /// pickup 走 [`Self::apply_rebuild`] 重置链。
     fn rebuild_file(&mut self) {
         let path = self.path.clone();
@@ -2214,8 +2220,8 @@ impl LogApp {
     }
 
     /// Rebuild 换入 (worker 交卷): 清失效状态 (书签越界丢弃) + 状态提示
-    /// (原 rebuild_file 重置链; base_status 换新打开统计 —— 同步时代留旧串,
-    /// 轮转后底栏数字失真, 异步化顺带修正)。
+    /// (原 rebuild_file 重置链; base_status 换新打开统计 —— 同步时代留旧串，
+    /// 轮转后底栏数字失真，异步化顺带修正)。
     fn apply_rebuild(&mut self, path: &Path, out: OpenOutcome) {
         // review C1: 旧内容上的在途 filter/search 结果不得贴到新内容
         self.filter_job.invalidate();
@@ -2241,7 +2247,7 @@ impl LogApp {
         };
         // 弹层是旧内容语境 (评审 R4: 列集可能整体换) —— 与 apply_fresh 同纪律关尽
         self.close_popovers();
-        // 列配置对账 (评审 C4, apply_fresh 同纪律): 同路径不重读盘, 但 schema 可能
+        // 列配置对账 (评审 C4, apply_fresh 同纪律): 同路径不重读盘，但 schema 可能
         // 换了列集 —— merge 收敛失配序/隐/宽 + ≥1 可见兜底 (C2 在 merge 内收口)。
         self.merge_columns();
         self.base_status = base_status;
@@ -2250,7 +2256,7 @@ impl LogApp {
         self.filter_applied.clear();
         self.filter_landed.clear();
         self.filter_pending = false;
-        // 换文件/重建 = 分析结果作废 (D8 后半句: 文件语境没了);
+        // 换文件/重建 = 分析结果作废 (D8 后半句：文件语境没了);
         // 在途作业作废 —— 旧文件的分析结果不得贴到新文件 (async-open C1 同款纪律)
         self.analysis_result = None;
         self.analysis_filter_src.clear();
@@ -2271,13 +2277,13 @@ impl LogApp {
     /// 热替换文件 (Ctrl+O / 拖拽): 异步管道发起 (在途旧 job 被 drop = 取消);
     /// 旧视图保持至 worker 交卷 (spec 裁决 A), 换入走 [`Self::apply_fresh`]。
     fn reload_file(&mut self, new_path: PathBuf) {
-        // D4 切换语义: 打开新文件 = 回单文件工作区 (合并 bundle 保留, 不丢)。
+        // D4 切换语义：打开新文件 = 回单文件工作区 (合并 bundle 保留，不丢)。
         self.workspace = Workspace::Single;
         self.open_job = Some(OpenJob::launch(OpenKind::Fresh, &new_path));
         self.refresh_status();
     }
 
-    /// Fresh 换入 (worker 交卷): 全部状态重建, 窗口不重建 (原 reload_file 重置链)。
+    /// Fresh 换入 (worker 交卷): 全部状态重建，窗口不重建 (原 reload_file 重置链)。
     fn apply_fresh(&mut self, new_path: PathBuf, out: OpenOutcome) {
         // review C1: 旧文件上的在途 filter/search 结果不得贴到新文件
         self.filter_job.invalidate();
@@ -2285,7 +2291,7 @@ impl LogApp {
         // SPEC-v1x-export D2: 换文件同纪律 —— 在途导出作废 (worker 删半成品收尾)
         self.export_job.invalidate();
         // 弹层族同灭 (review R4 + D1): 弹层是旧文件语境的 —— async-open 在途
-        // 开着菜单, 落地后点格式会导出的是**新**文件, 一起作废。
+        // 开着菜单，落地后点格式会导出的是**新**文件，一起作废。
         self.close_popovers();
         let OpenOutcome {
             file: new_file,
@@ -2340,18 +2346,18 @@ impl LogApp {
         self.search_query.clear();
         self.search_pattern = None;
         self.search_elapsed = None;
-        // 书签不在这清: `load_state_for_current_file` 是**替换**语义 (D2) ——
+        // 书签不在这清：`load_state_for_current_file` 是**替换**语义 (D2) ——
         // 记忆恢复或清空都在那一处发生; 这里再 clear 会把刚载入的记忆清掉
-        // (plan 核实⑤次序陷阱, 锁 `bookmarks_are_per_path_and_apply_fresh_replaces_with_memory`)。
+        // (plan 核实⑤次序陷阱，锁 `bookmarks_are_per_path_and_apply_fresh_replaces_with_memory`)。
         self.expanded = ExpandMap::new();
         self.sub_rows.clear();
         self.follow = false;
         self.notice = None;
         self.notice_until = None;
-        // **把焦点送进列表** (T14 之后高亮只在持焦时画): 不送的话, 打开文件看到的
+        // **把焦点送进列表** (T14 之后高亮只在持焦时画): 不送的话，打开文件看到的
         // 是「一行都没选中」, 而按 ↑↓ 只动底栏行号、屏上什么都不动 —— 正是本模块
-        // 自己那条判据要消灭的「按了没反应」。只在 **Fresh** (换了文件) 时送:
-        // rebuild/append 走的是 `apply_rebuild`/`apply_appended`, 不动焦点, 免得
+        // 自己那条判据要消灭的「按了没反应」。只在 **Fresh** (换了文件) 时送：
+        // rebuild/append 走的是 `apply_rebuild`/`apply_appended`, 不动焦点，免得
         // 轮转或追长时把正在栏里打字的用户拽走。
         self.focus_target = Some("log-view");
         self.refresh_status();
@@ -2359,25 +2365,25 @@ impl LogApp {
 
     /// Append 换入 (同步小追加 / 追平 worker 交卷同链): 增量过滤 + follow 滚底。
     /// `worker_hits` = worker 已算好的增量命中 (review R2: 巨量追平过滤下沉);
-    /// None = 本地扫 (同步小追加, 毫秒级)。
+    /// None = 本地扫 (同步小追加，毫秒级)。
     fn apply_appended(&mut self, new: LogFile, worker_hits: Option<Vec<u64>>) {
         let old_line_count = self.file.line_count();
         // 重算起点**退一行**: 旧快照末行可能以无换行结尾、被本次追加补全改判
-        // (review R1)。计数与过滤必须同起点同区间, 否则柱条数字与筛选结果
-        // 当场分岔 —— 即 D2 红线破裂, 而这正是 review 前两侧同步漂移掩盖掉的那个形态。
+        // (review R1)。计数与过滤必须同起点同区间，否则柱条数字与筛选结果
+        // 当场分岔 —— 即 D2 红线破裂，而这正是 review 前两侧同步漂移掩盖掉的那个形态。
         //
-        // 这里与 worker 各自独立算出同一个 `from` (worker 用发起时的旧行数, 这里用
+        // 这里与 worker 各自独立算出同一个 `from` (worker 用发起时的旧行数，这里用
         // 落地时的) —— 二者能相等，靠的是 `poll_growth` 开头的 `open_job.is_some()`
-        // 门禁: 在途期间不叠加任何 tail 动作, 故 `self.file` 不会在 launch 与落地
-        // 之间被别的追加换掉。**若将来允许并发追加, 这个摘/补对称会静默失效**
+        // 门禁：在途期间不叠加任何 tail 动作，故 `self.file` 不会在 launch 与落地
+        // 之间被别的追加换掉。**若将来允许并发追加，这个摘/补对称会静默失效**
         // (摘多了漏行、摘少了重计), 届时须把 `from` 随产物一起交回来。
         let from = old_line_count.saturating_sub(1);
-        // 计数: 已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量, 便宜),
+        // 计数：已就绪 → 在 UI 线程做「重叠一行」的绝对量更新 (KB 级增量，便宜),
         // **先算再换入** (update_for_append 需要旧快照)。
         //
         // 未就绪 → **什么都不做**: 计数作业交付时会拿它自己的快照与当时的文件
-        // 对账 (见 `pickup_levels_job`)。这里若重起作业, 一个持续增长的 tail
-        // 会把计数一遍遍从头来过 —— 永远算不完, 侧栏永远挂在「…」。
+        // 对账 (见 `pickup_levels_job`)。这里若重起作业，一个持续增长的 tail
+        // 会把计数一遍遍从头来过 —— 永远算不完，侧栏永远挂在「…」。
         let recomputed = (!self.levels_pending).then(|| {
             levels::update_for_append(
                 &self.file,
@@ -2390,7 +2396,7 @@ impl LogApp {
         if let Some(c) = recomputed {
             self.level_counts = Arc::new(c);
         }
-        // 过滤: 先摘掉将被重算区间的旧命中, 再合并新命中 (否则重叠行出现两次)
+        // 过滤：先摘掉将被重算区间的旧命中，再合并新命中 (否则重叠行出现两次)
         self.drop_filter_hits_from(from);
         match worker_hits {
             Some(hits) => self.merge_filter_hits(hits),
@@ -2413,8 +2419,8 @@ impl LogApp {
         match res {
             Ok(out) => {
                 // 落地耗时 (自发起): 与 worker 的 `perf open_phases` 对照 ——
-                // 两者相减即「交付 + 拾取」的延迟; 若落地很快而用户仍等很久,
-                // 瓶颈就在落地之后的渲染, 不在这条管道。
+                // 两者相减即「交付 + 拾取」的延迟; 若落地很快而用户仍等很久，
+                // 瓶颈就在落地之后的渲染，不在这条管道。
                 log::info!(
                     "perf open_landed: {:?} 自发起 (kind={:?})",
                     job.elapsed_since_launch(),
@@ -2425,7 +2431,7 @@ impl LogApp {
                     OpenKind::Rebuild => self.apply_rebuild(job.path(), out),
                     OpenKind::Append => {
                         if out.rebuilt {
-                            // 追加退化全量重建 (UTF-16/缩容, review R3): 走 rebuild 重置链
+                            // 追加退化全量重建 (UTF-16/缩容，review R3): 走 rebuild 重置链
                             self.apply_rebuild(job.path(), out);
                         } else {
                             let OpenOutcome {
@@ -2439,9 +2445,9 @@ impl LogApp {
                 }
             }
             Err(e) => {
-                // 「索引已取消」= 主动取消, 静默; 失败语义按 kind 分流 (保旧行为):
-                // Fresh 失败 notice + 留空态/旧视图; Rebuild/Append 静默,
-                // 文件仍过期, 下轮 250ms poll 自然驱动重试。
+                // 「索引已取消」= 主动取消，静默; 失败语义按 kind 分流 (保旧行为):
+                // Fresh 失败 notice + 留空态/旧视图; Rebuild/Append 静默，
+                // 文件仍过期，下轮 250ms poll 自然驱动重试。
                 if !e.to_string().contains(INDEX_CANCELLED) {
                     match job.kind() {
                         OpenKind::Fresh => {
@@ -2466,12 +2472,12 @@ impl LogApp {
         }
     }
 
-    /// 点侧栏柱条: 套用该桶的过滤子句 (复用既有过滤通路, 零新语法);
+    /// 点侧栏柱条：套用该桶的过滤子句 (复用既有过滤通路，零新语法);
     /// 点的已是当前生效项 → 清除 (切换语义)。
     ///
-    /// 子句来自 `level_queries` —— 它是**按当前文件的级别类列**生成的,
+    /// 子句来自 `level_queries` —— 它是**按当前文件的级别类列**生成的，
     /// 不是写死的 `level=X`: 列名可能是 severity/lvl, 值可能是 WARNING。
-    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE / 明文模式) 在侧栏侧已挡,
+    /// 无子句的桶 (`其他` / 合并的 DEBUG+TRACE / 明文模式) 在侧栏侧已挡，
     /// 此处再兜一层 —— 消息源不止一处时不会漏。
     fn apply_level_filter(&mut self, level: Level) {
         let Some(q) = self.level_queries[level as usize].clone() else {
@@ -2489,7 +2495,7 @@ impl LogApp {
         if self.filter_applied.is_empty() {
             return;
         }
-        // 过滤在途窗口禁行 (R5 族): 此刻 `filtered` 还是旧串的行集,
+        // 过滤在途窗口禁行 (R5 族): 此刻 `filtered` 还是旧串的行集，
         // 把新串的增量命中合进去是错账 —— 在途的全程重跑本就会覆盖追加行。
         if self.filter_pending {
             return;
@@ -2502,10 +2508,10 @@ impl LogApp {
         self.merge_filter_hits(new_hits);
     }
 
-    /// 摘掉过滤表中 `>= from` 的旧命中 —— 它们落在本次重算区间内, 会被重新跑出来。
+    /// 摘掉过滤表中 `>= from` 的旧命中 —— 它们落在本次重算区间内，会被重新跑出来。
     ///
     /// 必须与 [`Self::append_filter_hits`] 的起点**同一个 `from`**: 重叠行若只摘不补
-    /// 就漏, 只补不摘就重, 两种都让底栏行数与侧栏柱条一起偏 (且一起偏就意味着
+    /// 就漏，只补不摘就重，两种都让底栏行数与侧栏柱条一起偏 (且一起偏就意味着
     /// D2 的对照检查看不出来)。
     fn drop_filter_hits_from(&mut self, from: u64) {
         if self.filter_pending {
@@ -2517,14 +2523,14 @@ impl LogApp {
         // 表按行号升序 (过滤产出即有序), 故二分找到第一个 >= from 的位置
         let keep = existing.partition_point(|&l| l < from);
         if keep == existing.len() {
-            return; // 无命中落在重算区间, 无需摘
+            return; // 无命中落在重算区间，无需摘
         }
         let mut kept = existing.as_ref()[..keep].to_vec();
         kept.shrink_to_fit();
         self.filtered = Some(Arc::new(kept));
     }
 
-    /// 合并增量命中进过滤表 (本地扫描与 worker 下沉共用合并半段, review R2)。
+    /// 合并增量命中进过滤表 (本地扫描与 worker 下沉共用合并半段，review R2)。
     fn merge_filter_hits(&mut self, new_hits: Vec<u64>) {
         if new_hits.is_empty() {
             return;
@@ -2538,7 +2544,7 @@ impl LogApp {
     }
 
     /// 合成底栏状态：base + 模式 + 过滤 + 搜索。job 在途时整行被 loading 覆盖。
-    /// loading 显示三元 (底栏动词, 文件名, 进度细节): job 在途才有。
+    /// loading 显示三元 (底栏动词，文件名，进度细节): job 在途才有。
     /// refresh_status 的整行覆盖源 (计算与 mutation 分离)。
     fn loading_parts(&self) -> Option<(&'static str, String, String)> {
         let job = self.open_job.as_ref()?;
@@ -2549,8 +2555,8 @@ impl LogApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // 索引之后的阶段 (列发现 / 级别计数) 没有细粒度字节进度 —— 继续显示百分比
-        // 就会卡在 99% 不动, 用户看到的等待于是和状态栏那个「索引 N ms」对不上
-        // (2026-09-12 用户反馈)。如实报阶段名, 把这段等待显性化。
+        // 就会卡在 99% 不动，用户看到的等待于是和状态栏那个「索引 N ms」对不上
+        // (2026-09-12 用户反馈)。如实报阶段名，把这段等待显性化。
         if let Some(phase) = job.phase_name() {
             return Some((phase, name, "…".to_string()));
         }
@@ -2559,12 +2565,12 @@ impl LogApp {
             OpenKind::Rebuild => "重建中",
             OpenKind::Append => "追平中",
         };
-        // done==0 = 刚发起或 UTF-16 读取/转码段 (无细粒度钩子, 见 plan D2)
+        // done==0 = 刚发起或 UTF-16 读取/转码段 (无细粒度钩子，见 plan D2)
         let detail = if done == 0 {
             "读取中…".to_string()
         } else if let Some(pct) = (done * 100).checked_div(total) {
             // 封顶 99: 在途分子可超分母 (索引期间文件增长 / UTF-16 转码口径),
-            // 完成时 loading 分支随 job 消失, 永远看不到 100 (review O1)
+            // 完成时 loading 分支随 job 消失，永远看不到 100 (review O1)
             format!("{}% · {}/{} MiB", pct.min(99), done >> 20, total >> 20)
         } else {
             "…".to_string()
@@ -2574,11 +2580,11 @@ impl LogApp {
 
     /// 置一条底栏提示 —— **notice 的唯一入口** (T18)。
     ///
-    /// 自带消退期限 (Q3 裁的「自动消退」): 提示是**对刚才那个动作**的回答,
-    /// 一直赖在底栏会变成噪声, 还会让「底栏读数」这件事失去可信度。
+    /// 自带消退期限 (Q3 裁的「自动消退」): 提示是**对刚才那个动作**的回答，
+    /// 一直赖在底栏会变成噪声，还会让「底栏读数」这件事失去可信度。
     ///
     /// **`NOTICE_TTL` 是待实机核对的估值**: spec 说「具体时长 build 时**实测定**,
-    /// 不估算」, 而本机跑不了真机走查 —— 故先取一个, 并挂进矩阵 §6 的核对单
+    /// 不估算」, 而本机跑不了真机走查 —— 故先取一个，并挂进矩阵 §6 的核对单
     /// (实机那轮把「太短没看见 / 太长碍事」两个方向都试一次)。
     fn set_notice(&mut self, text: String, kind: NoticeKind) {
         self.notice = Some((text, kind));
@@ -2586,37 +2592,45 @@ impl LogApp {
         self.refresh_status();
     }
 
+    /// 清 notice (toast 点掉 / 到点消退同途 —— 单点收口，SPEC-notice-visibility T1)。
+    /// 清完必须刷底栏 (家族病史⑤: set_notice/refresh_status 次序陷阱)。
+    /// apply_fresh 里那组清置**不调它** —— 那处嵌在更大的清置序列里，序列尾
+    /// 已有一次 refresh_status, 不必多刷。
+    fn dismiss_notice(&mut self) {
+        self.notice = None;
+        self.notice_until = None;
+        self.refresh_status();
+    }
+
     /// notice 到点即消退 (T18/Q3)。抽成独立方法是为了**可测**: `tick` 要
     /// `AnimationCtx`, 而本方法不必。
     fn expire_notice(&mut self) {
         if self.notice_until.is_some_and(|t| Instant::now() >= t) {
-            self.notice = None;
-            self.notice_until = None;
-            self.refresh_status();
+            self.dismiss_notice();
         }
     }
 
     fn refresh_status(&mut self) {
         // 合并工作区 (腿一 T3): 底栏报合并口径 (源数/行数/跟随/书签),
-        // 不拼单文件行数 —— 单文件 base_status 在合并期间保持冻结, 退出即还原。
+        // 不拼单文件行数 —— 单文件 base_status 在合并期间保持冻结，退出即还原。
         if let Some(m) = self.merge_active() {
-            // 追踪态 (T6): 行数口径 = 过滤后命中数, 值与清除路径常驻明示
-            // (无过滤栏的合并视图里, 底栏是「当前有过滤在生效」的唯一去处)。
+            // 追踪态 (T6): 行数口径 = 过滤后命中数，值与清除路径常驻明示
+            // (无过滤栏的合并视图里，底栏是「当前有过滤在生效」的唯一去处)。
             let mut s = if let Some(v) = &m.trace {
                 format!(
-                    "合并: {} 源 · 追踪 \"{}\" → {} 行 (Esc 清除)",
+                    "合并：{} 源 · 追踪 \"{}\" → {} 行 (Esc 清除)",
                     m.sources.len(),
                     v,
                     m.row_count()
                 )
             } else {
-                format!("合并: {} 源 · {} 行", m.sources.len(), m.row_count())
+                format!("合并：{} 源 · {} 行", m.sources.len(), m.row_count())
             };
             if m.follow {
                 s.push_str(" · 跟随");
             }
             // T7: 断流源计数常驻 (弹层行内也有标记) —— 「这条时间线有一部分
-            // 不再更新」必须随时可见, 否则用户拿旧行当实时。
+            // 不再更新」必须随时可见，否则用户拿旧行当实时。
             let stale = m.sources.iter().filter(|s| s.stale).count();
             if stale > 0 {
                 s.push_str(&format!(" · 断流 {stale} 源"));
@@ -2629,7 +2643,7 @@ impl LogApp {
         }
         if let Some((verb, name, detail)) = self.loading_parts() {
             self.set_status(format!("{verb} {name} · {detail}"));
-            // 无旧文件才上占位文案 (有旧文件: 列表照画, 进度只上底栏)
+            // 无旧文件才上占位文案 (有旧文件：列表照画，进度只上底栏)
             self.loading_label = if self.has_file {
                 None
             } else {
@@ -2683,22 +2697,22 @@ impl LogApp {
         if self.follow {
             s.push_str(" · FOLLOW");
         }
-        // notice **不进这个串** —— 它是第二条通道, 由 `LogView::paint` 单独取色单独
-        // 落笔 (T11)。此前把它拼进来, 结果是同一句话被画两遍 (串尾一遍、notice 段
+        // notice **不进这个串** —— 它是第二条通道，由 `LogView::paint` 单独取色单独
+        // 落笔 (T11)。此前把它拼进来，结果是同一句话被画两遍 (串尾一遍、notice 段
         // 又一遍), 而且「警示色」和「常态色」压在同一个字符串上根本没处分。
         self.set_status(s);
     }
 
-    /// 写底栏**常态**信息 —— 顺手清掉错误态 (错误是**这一句**的属性, 换句就没了)。
+    /// 写底栏**常态**信息 —— 顺手清掉错误态 (错误是**这一句**的属性，换句就没了)。
     fn set_status(&mut self, s: String) {
         self.status = s;
         self.status_error = false;
     }
 
-    /// 写底栏**错误** —— **常驻红, 不消退**。
+    /// 写底栏**错误** —— **常驻红，不消退**。
     ///
     /// P27 的收口 (2026-09-15 用户裁定「后者」): 「正则无效」这类错误**不走
-    /// notice 通道** —— notice 有 4 秒消退期, 而它是「你刚按的那下没生效」,
+    /// notice 通道** —— notice 有 4 秒消退期，而它是「你刚按的那下没生效」,
     /// 不该自己消失。判据是 P27 原文那句「**错误在视觉上不存在**」: 修之前它与
     /// 打开耗时/过滤统计同色同字号, 只有读文字才知道出错了。
     fn set_status_error(&mut self, s: String) {
@@ -2708,12 +2722,12 @@ impl LogApp {
 
     /// 解析过滤查询 —— **全应用唯一的过滤解析入口** (parse + 键名规范化)。
     ///
-    /// 三处调用点 (应用过滤 / 巨量追平作业 / live-tail 重滤) 必须都走这里:
-    /// 键名规范化 (`LEVEL=ERROR` → `level=ERROR`) 只做在一处, 同一个查询串在不同
+    /// 三处调用点 (应用过滤 / 巨量追平作业 / live-tail 重滤) 必须都走这里：
+    /// 键名规范化 (`LEVEL=ERROR` → `level=ERROR`) 只做在一处，同一个查询串在不同
     /// 路径上就会得到不同命中集 —— 而增量与全量不一致只在「开着过滤又赶上追加」
-    /// 时才现形, 是最难查的一类差异 (D2 红线同款理由)。
+    /// 时才现形，是最难查的一类差异 (D2 红线同款理由)。
     ///
-    /// `.log` 文件 schema 为 None → 跳过规范化, 行为与从前一字不差。
+    /// `.log` 文件 schema 为 None → 跳过规范化，行为与从前一字不差。
     fn parse_filter(&self, query: &str) -> Vec<jsonl::Clause> {
         let mut clauses = jsonl::parse_query(query);
         if let Some(schema) = self.schema.as_deref() {
@@ -2727,8 +2741,8 @@ impl LogApp {
         self.filter_applied = query.clone();
         self.filter_clear_rev += 1; // 应用后清空输入框 (显示"已应用"占位)
         if query.is_empty() {
-            // 回全量同步生效 —— 顺手作废旧一轮在途过滤: 它晚到会覆盖掉
-            // 这里的 None (评审 R5 同族: 在途窗口内行集与过滤串脱钩)。
+            // 回全量同步生效 —— 顺手作废旧一轮在途过滤：它晚到会覆盖掉
+            // 这里的 None (评审 R5 同族：在途窗口内行集与过滤串脱钩)。
             self.filter_job.invalidate();
             self.filter_pending = false;
             self.filtered = None;
@@ -2784,7 +2798,7 @@ impl LogApp {
     /// 聚焦搜索栏 (`/` 原始模式 / Ctrl+F 任意模式)。
     ///
     /// **T21 (P39): 不再「聚焦即干净开始」**。Ctrl+F 是「回到搜索框」的**反射键**,
-    /// 而原实现每次都把已输入未应用的草稿清掉 —— 反射键不该销毁工作。现在:
+    /// 而原实现每次都把已输入未应用的草稿清掉 —— 反射键不该销毁工作。现在：
     /// 没持焦 → 聚焦 (草稿原样留着); 已持焦 → 全选 (直接覆写)。
     /// 清空仍归 Esc, 那条路径没动。
     fn open_search(&mut self) {
@@ -2795,7 +2809,7 @@ impl LogApp {
 
     /// Esc (搜索): 清搜索态，栏保持可见 (搜索栏始终显示，不可隐藏)。
     fn clear_search(&mut self) {
-        // 在途搜索一并作废 (`clear_filter` 同规, 评审 M7): 不作废的话, 清空/
+        // 在途搜索一并作废 (`clear_filter` 同规，评审 M7): 不作废的话，清空/
         // 应用空搜索会话后旧搜索结果会经 tick 拾取复活 —— spec「代次拒旧护在途」
         // 的搜索侧半边。
         self.search_job.invalidate();
@@ -2862,18 +2876,18 @@ impl LogApp {
     /// 状态栏补动作反馈 —— 此前只有行号变金一个信号，用户按完不知道成没成;
     /// 计数由 `refresh_status` 的常驻「书签 N」段承担，这里只缀动作。
     /// **幽灵行号守卫** (评审 R1): `line_at` 的 `unwrap_or((0,0))` 会把空文件/
-    /// 过滤 0 命中/越界选中塌成「行 0」—— 落盘即跨会话污染, 无有效显示行 =
+    /// 过滤 0 命中/越界选中塌成「行 0」—— 落盘即跨会话污染，无有效显示行 =
     /// 拒绝 + 说清 + 零变更。**上限守卫** (D3): 满
     /// [`danqing_log::columns::MAX_BOOKMARKS`] 拒绝新增 + 说清 + 零变更
     /// (删除照常 —— 守卫不得堵死腾位路径)。增删成功即落盘 (D2), 落盘失败
     /// **不许说谎** (评审 R①)。
     fn toggle_bookmark(&mut self) {
-        // 合并工作区: 书签打在 (源, 文件行) pack 键上, 进 merge bundle ——
+        // 合并工作区：书签打在 (源，文件行) pack 键上，进 merge bundle ——
         // 单文件书签集与 state.json 通路**零触碰** (D4); 合并书签的持久化
         // 随会话载荷走 (T8), T3 会话内有效。
         if let Some(m) = self.merge_active_mut() {
             let Some(row) = m.row_at(m.selected) else {
-                self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Info);
+                self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Warn);
                 return;
             };
             match m.toggle_bookmark(row.src, row.line, danqing_log::columns::MAX_BOOKMARKS) {
@@ -2892,7 +2906,7 @@ impl LogApp {
         let Some((line, _)) =
             expand::file_line_at(self.cur_selected(), self.lines(), &self.expanded)
         else {
-            self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Info);
+            self.set_notice("当前无有效行可夹书签".into(), NoticeKind::Warn);
             return;
         };
         let added = if self.bookmarks.remove(&line) {
@@ -2912,9 +2926,9 @@ impl LogApp {
         };
         let saved = self.save_state();
         // **次序陷阱**: `set_notice` 内含 `refresh_status` 会重建 status ——
-        // 必须先 notice 再 push 后缀, 否则「(未落盘)」被重建冲掉 (评审 R①锁伺候)。
+        // 必须先 notice 再 push 后缀，否则「(未落盘)」被重建冲掉 (评审 R①锁伺候)。
         if !saved {
-            self.set_notice("书签已改但落盘失败, 重启可能丢失".into(), NoticeKind::Warn);
+            self.set_notice("书签已改但落盘失败，重启可能丢失".into(), NoticeKind::Warn);
         } else {
             self.refresh_status();
         }
@@ -2928,10 +2942,10 @@ impl LogApp {
 
     /// `'` / Ctrl+G: 跳下一书签 (严格大于当前行，环绕)。状态栏报位次 `书签 i/N`。
     fn goto_next_bookmark(&mut self) {
-        // 合并工作区: 按时间线位置序找下一个 (环绕), 位次报底栏。
+        // 合并工作区：按时间线位置序找下一个 (环绕), 位次报底栏。
         if let Some(m) = self.merge_active_mut() {
             let Some((pos, rank, total)) = m.next_bookmark_pos() else {
-                self.set_notice("没有书签 ('b' 夹在当前行)".into(), NoticeKind::Info);
+                self.set_notice("没有书签 ('b' 夹在当前行)".into(), NoticeKind::Warn);
                 return;
             };
             m.selected = pos;
@@ -2942,19 +2956,19 @@ impl LogApp {
         if let Some(line) = next_bookmark(&self.bookmarks, self.file_line_of(self.cur_selected())) {
             self.jump_to_file_line(line);
             self.refresh_status();
-            // line 必在集合内: 位次 = 比它小的书签数 + 1
+            // line 必在集合内：位次 = 比它小的书签数 + 1
             let i = self.bookmarks.range(..line).count() + 1;
             let n = self.bookmarks.len();
             self.status.push_str(&format!(" · 书签 {i}/{n}"));
         } else {
             // M3 (P25): 无书签时 Ctrl+G 按了没反应 —— 说清为什么。
-            self.set_notice("尚无书签 (b 添加)".into(), NoticeKind::Info);
+            self.set_notice("尚无书签 (b 添加)".into(), NoticeKind::Warn);
         }
     }
 }
 
-/// 拼查询子句 (SPEC-v1x-field-picker-ui D1): 字段+算符+值 → 语法串 ——
-/// `parse_query` 的逆向壳, **不造新语法** (前缀 = `=` + 值尾 `*`, `jsonl::
+/// 拼查询子句 (SPEC-v1x-field-picker-ui D1): 字段 + 算符 + 值 → 语法串 ——
+/// `parse_query` 的逆向壳，**不造新语法** (前缀 = `=` + 值尾 `*`, `jsonl::
 /// parse_clause` 现语义)。拒收面见 [`clause_reject_notice`] (判据同源)。
 fn build_clause(field: &str, op: jsonl::Op, value: &str) -> Option<String> {
     if clause_reject_notice(field, op, value).is_some() {
@@ -2976,9 +2990,9 @@ fn build_clause(field: &str, op: jsonl::Op, value: &str) -> Option<String> {
 ///
 /// **拒收面必须盖住 parse 破坏面** (评审 Critical, 双路并账): `parse_query` =
 /// 空白分 token + `split_operator` 长算符首次出现切分 + Eq 值尾 `*` 改写 Prefix ——
-/// 凡会被它**改写语义**的输入一律拒收, 不静默拼出另一条查询:
-/// - 字段: 空 / 含空白 / 含 `.` (扁平键被拆嵌套 = 0 命中面) / 含 `=< >` (算符逃逸)
-/// - 值: 空 / 含空白 / 含 `<` `>` (算符切分逃逸, 泛型/比较片段常见) /
+/// 凡会被它**改写语义**的输入一律拒收，不静默拼出另一条查询：
+/// - 字段：空 / 含空白 / 含 `.` (扁平键被拆嵌套 = 0 命中面) / 含 `=< >` (算符逃逸)
+/// - 值：空 / 含空白 / 含 `<` `>` (算符切分逃逸，泛型/比较片段常见) /
 ///   **前导 `=`** (与 `>`/`<` 算符拼出双字符算符) / Eq 尾 `*` (被偷换前缀) /
 ///   Prefix 含 `*` (双重编码)
 fn clause_reject_notice(field: &str, op: jsonl::Op, value: &str) -> Option<&'static str> {
@@ -2997,7 +3011,7 @@ fn clause_reject_notice(field: &str, op: jsonl::Op, value: &str) -> Option<&'sta
     if !field_reserved && !value_reserved && !star_abuse && !field.is_empty() && !value.is_empty() {
         return None;
     }
-    // 文案分类 (优先级 = 最可能的用户本意在前; 判据不变, 只管说哪句)
+    // 文案分类 (优先级 = 最可能的用户本意在前; 判据不变，只管说哪句)
     Some(if field_reserved {
         "该列名含保留字符 (空格 . = < >), 暂不支持点选查询"
     } else if op == jsonl::Op::Eq && value.ends_with('*') {
@@ -3005,7 +3019,7 @@ fn clause_reject_notice(field: &str, op: jsonl::Op, value: &str) -> Option<&'sta
     } else if op == jsonl::Op::Prefix && value.contains('*') {
         "前缀值不能再含 *"
     } else {
-        "值不能为空, 且不能含空格 / < / > 或以 = 开头"
+        "值不能为空，且不能含空格 / < / > 或以 = 开头"
     })
 }
 
@@ -3025,11 +3039,11 @@ pub(crate) fn next_bookmark(set: &std::collections::BTreeSet<u64>, current: u64)
 /// `ERROR|FATAL` 之类交替正则静默失效 (review 当场抓住的回归)。
 fn build_search_pattern(enc: Encoding, query: &str) -> String {
     // 两分支一律 `(?i)` 前缀 (2026-09-15, spec D2/D3): 默认大小写不敏感。
-    // UTF-8 用 `(?i)` 而非 `(?i-u)` —— 查询是用户的裸正则, `(?-u)` 会顺带把
-    // `\w`/`\d`/`\b` 降级成 ASCII 语义, 与大小写无关的行为不该被本模块改掉。
-    // 逃逸舱零代码: 用户写 `(?-i)` 即局部恢复敏感 (组内 flag 覆盖, 有测试锁)。
-    // 非 UTF-8 分支同理套在字节字面量外 —— `(?i)` 对 `(?-u)\xNN` 折叠成立, 已用
-    // 真 GBK 文件实测 (7884 命中行, 与手工 [eE] 展开逐字节一致)。
+    // UTF-8 用 `(?i)` 而非 `(?i-u)` —— 查询是用户的裸正则，`(?-u)` 会顺带把
+    // `\w`/`\d`/`\b` 降级成 ASCII 语义，与大小写无关的行为不该被本模块改掉。
+    // 逃逸舱零代码：用户写 `(?-i)` 即局部恢复敏感 (组内 flag 覆盖，有测试锁)。
+    // 非 UTF-8 分支同理套在字节字面量外 —— `(?i)` 对 `(?-u)\xNN` 折叠成立，已用
+    // 真 GBK 文件实测 (7884 命中行，与手工 [eE] 展开逐字节一致)。
     if enc == Encoding::Utf8 {
         format!("(?i){query}")
     } else {
@@ -3048,14 +3062,14 @@ fn clamp_top(top: f64, line_count: u64) -> f64 {
 
 /// 滚轮 delta → 要滚的显示行数 (**单一换算点**, T17)。
 ///
-/// 三处滚轮 (内容区 LogView / 未认领的滚轮 / 将来任何新入口) 必须走同一支,
+/// 三处滚轮 (内容区 LogView / 未认领的滚轮 / 将来任何新入口) 必须走同一支，
 /// 否则「在侧栏滚」与「在列表上滚」手感会不一样 —— 而 P30 补的正是这两处的
 /// **一致性**, 各写一份等于把刚修好的东西再拆开。
 ///
 /// **框架不归一 delta** (普查 G10): `window/event.rs:150-154` 把 `LineDelta`
-/// (行数, 通常 ±1..3) 与 `PixelDelta` (像素, 精确触控板可达 ±100) 抹平成同一个
-/// `f32`, 下游**无从分辨**。按行数档取 3 倍再夹一个**每次事件**的上界: 不夹的话
-/// 触控板一次能跳几百行。夹的是单次事件, 不是总量, 连续滚不受影响。
+/// (行数，通常 ±1..3) 与 `PixelDelta` (像素，精确触控板可达 ±100) 抹平成同一个
+/// `f32`, 下游**无从分辨**。按行数档取 3 倍再夹一个**每次事件**的上界：不夹的话
+/// 触控板一次能跳几百行。夹的是单次事件，不是总量，连续滚不受影响。
 fn wheel_rows(delta_y: f32) -> f64 {
     (-f64::from(delta_y) * 3.0).clamp(-WHEEL_MAX_ROWS, WHEEL_MAX_ROWS)
 }
@@ -3103,17 +3117,17 @@ impl App for LogApp {
                 }
             }
             Msg::OpenColMenu => {
-                // G2 门控点位 = 入口 (免费态弹升级对话框, 手势起点另有拦截)
+                // G2 门控点位 = 入口 (免费态弹升级对话框，手势起点另有拦截)
                 if !self.column_gate() {
                     return;
                 }
-                self.close_popovers(); // 互斥 (D3): 双 scrim 不叠, 开一关二
+                self.close_popovers(); // 互斥 (D3): 双 scrim 不叠，开一关二
                 self.col_menu_open = true;
             }
             Msg::CloseColMenu => self.col_menu_open = false,
             Msg::OpenPicker => {
                 // G4 门控点位 = 「字段…」按钮 (免费态弹升级对话框; 手输迷你语法
-                // 不经此臂, 照用)
+                // 不经此臂，照用)
                 if !self.picker_gate() {
                     return;
                 }
@@ -3123,7 +3137,7 @@ impl App for LogApp {
                 self.settings_open = false;
                 self.picker_open = true;
                 self.reset_picker_draft();
-                // 开弹层直接打字进值框 (评审 R8: 点按钮会清焦, 送回值框)
+                // 开弹层直接打字进值框 (评审 R8: 点按钮会清焦，送回值框)
                 self.focus_target = Some("picker-value");
             }
             Msg::ClosePicker => {
@@ -3134,7 +3148,7 @@ impl App for LogApp {
             Msg::PickPickerOp(op) => self.picker_op = op,
             Msg::PickerSubmit(value) => {
                 let Some(field) = self.picker_field.clone() else {
-                    self.set_notice("先点选字段".into(), NoticeKind::Info);
+                    self.set_notice("先点选字段".into(), NoticeKind::Warn);
                     return;
                 };
                 let Some(clause) = build_clause(&field, self.picker_op, &value) else {
@@ -3157,7 +3171,7 @@ impl App for LogApp {
             }
             // ---- 命名工作台会话 (SPEC-v1x-workspace-sessions) ----
             Msg::OpenSessionMenu => {
-                // 门控 (D4, 两道闸第一道): 免费态入口 → 升级提示, 弹层不开
+                // 门控 (D4, 两道闸第一道): 免费态入口 → 升级提示，弹层不开
                 if !self.session_gate() {
                     return;
                 }
@@ -3165,7 +3179,7 @@ impl App for LogApp {
                 self.settings_open = false;
                 self.session_menu_open = true;
                 self.session_clear_rev += 1;
-                // 开弹层直接打字命名 (评审 R8 同纪律: 送焦值框)
+                // 开弹层直接打字命名 (评审 R8 同纪律：送焦值框)
                 self.focus_target = Some("session-name");
             }
             Msg::CloseSessionMenu => {
@@ -3189,7 +3203,7 @@ impl App for LogApp {
                 if self.session_gate() {
                     match self.session_selected.clone() {
                         Some(n) => self.delete_session(&n),
-                        None => self.set_notice("先点选会话再删".into(), NoticeKind::Info),
+                        None => self.set_notice("先点选会话再删".into(), NoticeKind::Warn),
                     }
                 }
             }
@@ -3200,8 +3214,8 @@ impl App for LogApp {
                     return;
                 }
                 if !self.has_file {
-                    // 合并以当前文件为主源 (D4): 空态没主源, 说清再拦
-                    self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
+                    // 合并以当前文件为主源 (D4): 空态没主源，说清再拦
+                    self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Warn);
                     return;
                 }
                 self.close_popovers();
@@ -3214,8 +3228,8 @@ impl App for LogApp {
                 self.merge_clear_rev += 1; // 关清草稿 (session 同纪律)
             }
             Msg::PickMergeSource => {
-                // 「加源…」: 系统对话框 (UI 层 —— 测试走 MergeSourcePicked 直注,
-                // 家法: 测试不触真实桌面)。**门在对话框之前**: 免费态连框都不该开。
+                // 「加源…」: 系统对话框 (UI 层 —— 测试走 MergeSourcePicked 直注，
+                // 家法：测试不触真实桌面)。**门在对话框之前**: 免费态连框都不该开。
                 if !self.merge_gate() {
                     return;
                 }
@@ -3241,7 +3255,7 @@ impl App for LogApp {
                     return;
                 }
                 // 「点行 = 动作并记选中」(ApplySession 先例): 记指针给「移除」;
-                // 合并中才谈显隐 (未合并无掩码对象, 只选中)。
+                // 合并中才谈显隐 (未合并无掩码对象，只选中)。
                 self.merge_source_selected = Some(path.clone());
                 if self.workspace == Workspace::Merge {
                     if let Some(m) = self.merge.as_mut() {
@@ -3278,17 +3292,17 @@ impl App for LogApp {
                     match danqing_log::merge_view::parse_tz_ms(raw.trim()) {
                         Some(v) => self.edit_source_time(|o, _| (Some(o), Some(v))),
                         None => self.set_notice(
-                            "时区格式: ±hh:mm 或 小时数 (如 +08:00 / 8)".into(),
+                            "时区格式：±hh:mm 或 小时数 (如 +08:00 / 8)".into(),
                             NoticeKind::Warn,
                         ),
                     }
                 }
             }
             Msg::ToggleMergeWorkspace => {
-                // 「退出合并」/「返回合并」一个钮 (label 随态, 见 settings 卡):
-                // 退出 = 回单文件 (bundle 保留, D4 不丢); 返回 = 再进**不重建**。
+                // 「退出合并」/「返回合并」一个钮 (label 随态，见 settings 卡):
+                // 退出 = 回单文件 (bundle 保留，D4 不丢); 返回 = 再进**不重建**。
                 if self.merge.is_none() {
-                    self.set_notice("当前没有合并".into(), NoticeKind::Info);
+                    self.set_notice("当前没有合并".into(), NoticeKind::Warn);
                 } else if self.workspace == Workspace::Merge {
                     self.update(Msg::ExitMerge);
                 } else {
@@ -3300,7 +3314,7 @@ impl App for LogApp {
             Msg::ToggleColumn(name) => {
                 self.merge_columns();
                 if !self.columns.order.contains(&name) {
-                    return; // 未知列 (陈旧弹层快照): 零动作零提示, 不误报守卫文案
+                    return; // 未知列 (陈旧弹层快照): 零动作零提示，不误报守卫文案
                 }
                 if !self.columns.toggle_hidden(&name) {
                     // D6: ≥1 可见列守卫 —— 关最后一可见列拒绝并提示 (零变更不写)
@@ -3328,9 +3342,9 @@ impl App for LogApp {
                 self.set_selected(self.cur_top() as u64);
             }
             Msg::ScrollTo { top, at_bottom } => {
-                // 往回(上)拖 = 想回头看 → 停止跟随 (与滚轮同规, 别把用户拽回底部)。
-                // **拖到条底不算往回** —— 见枚举上的注释: 跟随态的 `top_row` 比条能
-                // 表达的底还大, 不排除这一格就会「在底部碰一下条 → FOLLOW 没了」。
+                // 往回 (上) 拖 = 想回头看 → 停止跟随 (与滚轮同规，别把用户拽回底部)。
+                // **拖到条底不算往回** —— 见枚举上的注释：跟随态的 `top_row` 比条能
+                // 表达的底还大，不排除这一格就会「在底部碰一下条 → FOLLOW 没了」。
                 if !at_bottom && top < self.cur_top() && self.follow {
                     self.follow = false;
                     self.refresh_status();
@@ -3377,7 +3391,7 @@ impl App for LogApp {
             }
             // ---- S2–S4 设置卡 ----
             Msg::OpenSettings => {
-                // 互斥 (评审 R5): 托盘等入口无模态屏障, 开设置先关弹层族 ——
+                // 互斥 (评审 R5): 托盘等入口无模态屏障，开设置先关弹层族 ——
                 // 双开时 Enter 会被劫到 PickerSubmit (原「互斥保证」前提不成立)
                 self.close_popovers();
                 self.settings_open = true;
@@ -3398,7 +3412,7 @@ impl App for LogApp {
             }
             Msg::LicenseKeyInput(s) => {
                 self.license_key_input = s;
-                // 继续输入 = 在改上一份答案, 旧反馈作废
+                // 继续输入 = 在改上一份答案，旧反馈作废
                 self.license_feedback = None;
             }
             Msg::ActivateLicenseClicked => {
@@ -3407,7 +3421,7 @@ impl App for LogApp {
             }
             Msg::PurchasePaidLayer => self.purchase_paid_layer(),
             Msg::ShowUpgradePrompt(f) => {
-                // 付费态不出现 (spec 成功判据): 门控点位先查 `allows` 再发,
+                // 付费态不出现 (spec 成功判据): 门控点位先查 `allows` 再发，
                 // 这里再兜一道 —— 两道都守着「付费用户永远看不到升级提示」。
                 if !self.entitlement.allows(f) {
                     self.upgrade_prompt = Some(f);
@@ -3450,10 +3464,11 @@ impl App for LogApp {
                 }
             }
             Msg::Notice(text, kind) => self.set_notice(text, kind),
+            Msg::DismissNotice => self.dismiss_notice(),
             Msg::SelectTheme(idx) => {
                 self.theme = config::AppTheme::from_index(idx);
                 // 通知窗口换底色。**这一步此前从缺** —— 于是切主题后标题栏那条
-                // (透出的清屏色) 纹丝不动, 只有内容区变了色。
+                // (透出的清屏色) 纹丝不动，只有内容区变了色。
                 if let Some(sender) = &self.window_sender {
                     sender.set_clear_color(window_clear_color(self.theme));
                 }
@@ -3474,7 +3489,7 @@ impl App for LogApp {
         //
         // 侧栏做成 LogView 的 **sibling** (weight 0 = 取自身 layout 的固定宽),
         // 而非塞进 LogView 内部 —— 后者要改它的 gutter/x 偏移/命中测试/横滚范围
-        // 一整套坐标数学, sibling 方案下 LogView 只是拿到一个更窄的 area。
+        // 一整套坐标数学，sibling 方案下 LogView 只是拿到一个更窄的 area。
         node(
             Stack::new()
                 .child(
@@ -3484,7 +3499,7 @@ impl App for LogApp {
                             Row::new()
                                 .fill(
                                     // 侧栏 = 直方图 (吃剩余高度) + 字段分析区
-                                    // (自然高, 无 schema 时归零坍缩)。宽度折叠
+                                    // (自然高，无 schema 时归零坍缩)。宽度折叠
                                     // 判定 (Ctrl+L / 窄窗) 归容器 —— 只有 Row 的
                                     // 直接子项拿得到整个 Row 的可用宽 (sidebar.rs)。
                                     sidebar::Sidebar::new(
@@ -3504,21 +3519,25 @@ impl App for LogApp {
                 .child(settings::col_menu_overlay(self.theme))
                 .child(settings::picker_overlay(self.theme))
                 .child(settings::session_menu_overlay(self.theme))
-                .child(settings::merge_menu_overlay(self.theme)),
+                .child(settings::merge_menu_overlay(self.theme))
+                // toast 挂 Stack 末位 (SPEC-notice-visibility 腿 A): 框架反序分发事件
+                // (`stack.rs` rev) = 最先收点击，后画 = 最上层 —— 模态弹层开着时
+                // Warn 浮层仍可见可点。非模态：不进 popover_open/close_popovers/Esc 表。
+                .child(toast::Toast::new()),
         )
     }
 
     fn event(&mut self, event: &Event) {
         // P30 (T17): **未认领的滚轮**转给列表滚动。
         //
-        // 框架按点子命中分发滚轮、不向父级回落, 所以指针停在侧栏/过滤栏上时,
+        // 框架按点子命中分发滚轮、不向父级回落，所以指针停在侧栏/过滤栏上时，
         // 日志区根本收不到 —— 用户必须把指针挪回内容区才滚得动。这里补的是
-        // 另一半: 凡是**没有组件认领**的滚轮 (侧栏、过滤栏、标题栏、行外空白)
+        // 另一半：凡是**没有组件认领**的滚轮 (侧栏、过滤栏、标题栏、行外空白)
         // 一律滚列表。**不需要位置数学**: 指针在日志区上时 LogView 已经
-        // `Consumed` 了, 能走到这里的本来就不是它。
+        // `Consumed` 了，能走到这里的本来就不是它。
         if let Event::MouseWheel { delta, .. } = event {
-            // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡, 不许滚卡后的日志
-            // (判据与键盘门禁同源: settings + 弹层族, [`Self::popover_open`])。
+            // 模态不穿透 (与 T16 同一条纪律): 卡开着时滚轮只属于卡，不许滚卡后的日志
+            // (判据与键盘门禁同源：settings + 弹层族，[`Self::popover_open`])。
             if !self.settings_open && !self.popover_open() && self.has_file {
                 let rows = wheel_rows(delta.1);
                 if rows != 0.0 {
@@ -3537,27 +3556,27 @@ impl App for LogApp {
         else {
             return;
         };
-        // 设置卡打开 = 模态: Esc 关卡 (S3), 其余键一律吞掉 —— 卡底下的日志区
-        // 不该响应键盘 (2026-09-14 用户实机: 卡内主题下拉未持焦时 ↑↓ 滚动了
+        // 设置卡打开 = 模态：Esc 关卡 (S3), 其余键一律吞掉 —— 卡底下的日志区
+        // 不该响应键盘 (2026-09-14 用户实机：卡内主题下拉未持焦时 ↑↓ 滚动了
         // 底层日志)。卡内控件经焦点路由自行消费、到不了这里; 能到这里的都是
-        // 无人认领的键。(Ctrl+O/Ctrl+L 走 app_key_filter 前置, 不在此门禁内。)
+        // 无人认领的键。(Ctrl+O/Ctrl+L 走 app_key_filter 前置，不在此门禁内。)
         if self.settings_open {
             if let Some(msg) = settings::handle_settings_key(key) {
                 self.update(msg);
             }
             return;
         }
-        // 弹层模态 (评审 R6, 与滚轮守卫同源): 弹层族开着时, 无人认领的导航键
+        // 弹层模态 (评审 R6, 与滚轮守卫同源): 弹层族开着时，无人认领的导航键
         // (↑↓/Space/Home/End/Page*) 不许穿到弹层后滚日志 —— 2026-09-14 设置卡
         // 同款漏洞的守卫扩展面。卡内控件经焦点路由自行消费。
         if self.popover_open() {
             return;
         }
-        // 空态门禁: 仅 Ctrl+O (app_key_filter 前置, 不经此处) 与设置可用, 其余键无文件无意义
+        // 空态门禁：仅 Ctrl+O (app_key_filter 前置，不经此处) 与设置可用，其余键无文件无意义
         if !self.has_file {
             // M3 (2026-09-14 实机 M0 P26): 空态按键被吞时**说清为什么** ——
-            // 原先 `return` 静默, 用户按 Ctrl+F/方向键毫无反应。
-            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Info);
+            // 原先 `return` 静默，用户按 Ctrl+F/方向键毫无反应。
+            self.set_notice("尚未打开文件 (Ctrl+O 打开)".into(), NoticeKind::Warn);
             return;
         }
         // Ctrl 组合全局快捷键 (栏聚焦时键进 TextInput, 不达此处; 无焦点时这些仍工作)。
@@ -3577,14 +3596,14 @@ impl App for LogApp {
                         self.update(Msg::ToggleMode);
                     } else {
                         // M3 (P23): Ctrl+T 无 JSONL 时**说清为什么** —— 原先静默。
-                        self.set_notice("本文件非 JSONL, 无表格模式".into(), NoticeKind::Info);
+                        self.set_notice("本文件非 JSONL, 无表格模式".into(), NoticeKind::Warn);
                     }
                     return;
                 }
                 if s.eq_ignore_ascii_case("a") {
                     // M3 (P34): Ctrl+A 被吞 —— 说清为什么 (行多选已裁挂 v1.x,
                     // 见 docs/ROADMAP-v1x.md §四)。
-                    self.set_notice("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Info);
+                    self.set_notice("行多选未实现 (v1.x 待裁)".into(), NoticeKind::Warn);
                     return;
                 }
                 if s.eq_ignore_ascii_case("r") {
@@ -3592,12 +3611,12 @@ impl App for LogApp {
                     // 组件侧); 到这里的 = 单文件态或未持焦 —— 说清为什么 (P24)。
                     match self.workspace {
                         Workspace::Merge => self.set_notice(
-                            "先双击/框选消息里的追踪值, 再按 Ctrl+R".into(),
-                            NoticeKind::Info,
+                            "先双击/框选消息里的追踪值，再按 Ctrl+R".into(),
+                            NoticeKind::Warn,
                         ),
                         Workspace::Single => self.set_notice(
                             "追踪跨源值在合并视图可用 (底栏「合并…」/Ctrl+M)".into(),
-                            NoticeKind::Info,
+                            NoticeKind::Warn,
                         ),
                     }
                     return;
@@ -3617,11 +3636,11 @@ impl App for LogApp {
                         return;
                     }
                     "/" => {
-                        // 合并态: 搜索栏属后续波次 (T3 边界清单) —— 说清, 不静默
+                        // 合并态：搜索栏属后续波次 (T3 边界清单) —— 说清，不静默
                         // (P24); 顺带指路已接通的跨源追踪。
                         self.set_notice(
-                            "合并视图暂无搜索栏; 跨源追踪: 框选消息后按 Ctrl+R".into(),
-                            NoticeKind::Info,
+                            "合并视图暂无搜索栏; 跨源追踪：框选消息后按 Ctrl+R".into(),
+                            NoticeKind::Warn,
                         );
                         return;
                     }
@@ -3653,7 +3672,7 @@ impl App for LogApp {
                     self.toggle_expand(file_line);
                 } else {
                     // M3 (P24): → 在已展开行上按了没反应 —— 说清为什么。
-                    self.set_notice("本行已展开".into(), NoticeKind::Info);
+                    self.set_notice("本行已展开".into(), NoticeKind::Warn);
                 }
             }
             Key::Named(NamedKey::ArrowLeft)
@@ -3664,7 +3683,7 @@ impl App for LogApp {
                     self.toggle_expand(file_line);
                 } else {
                     // M3 (P24): ← 在未展开行上按了没反应 —— 说清为什么。
-                    self.set_notice("本行未展开".into(), NoticeKind::Info);
+                    self.set_notice("本行未展开".into(), NoticeKind::Warn);
                 }
             }
             Key::Named(NamedKey::PageUp) => self.update(Msg::ScrollRows(-PAGE_ROWS)),
@@ -3699,33 +3718,33 @@ impl App for LogApp {
                 // 优先」的次序一致; 组件自身的 Esc 折叠只在该路径之外可达。
                 return Some(Msg::CloseSettings);
             }
-            // Esc 次序: 升级提示 > 设置卡 > **合并源管理** > 命名会话 > 字段查询 >
-            // 列管理 > 导出格式菜单 > 栏 (merge-timeline T4 插层, 会话插层同规)
+            // Esc 次序：升级提示 > 设置卡 > **合并源管理** > 命名会话 > 字段查询 >
+            // 列管理 > 导出格式菜单 > 栏 (merge-timeline T4 插层，会话插层同规)
             if self.merge_menu_open {
                 return Some(Msg::CloseMergeMenu);
             }
-            // Esc 次序: 升级提示 > 设置卡 > **命名会话** > 字段查询 > 列管理 >
+            // Esc 次序：升级提示 > 设置卡 > **命名会话** > 字段查询 > 列管理 >
             // 导出格式菜单 > 栏 (SPEC-v1x-workspace-sessions 插层)
             if self.session_menu_open {
                 return Some(Msg::CloseSessionMenu);
             }
-            // Esc 次序: 升级提示 > 设置卡 > **字段查询** > 列管理 > 导出格式菜单 > 栏
+            // Esc 次序：升级提示 > 设置卡 > **字段查询** > 列管理 > 导出格式菜单 > 栏
             // (SPEC-v1x-field-picker-ui D1 插层)
             if self.picker_open {
                 return Some(Msg::ClosePicker);
             }
-            // Esc 次序: 升级提示 > 设置卡 > **列管理** > 导出格式菜单 > 栏
+            // Esc 次序：升级提示 > 设置卡 > **列管理** > 导出格式菜单 > 栏
             // (SPEC-v1x-table-column-config D3 插层)
             if self.col_menu_open {
                 return Some(Msg::CloseColMenu);
             }
-            // Esc 次序: 升级提示 > 设置卡 > **导出格式菜单** > 栏 (SPEC-v1x-export)
+            // Esc 次序：升级提示 > 设置卡 > **导出格式菜单** > 栏 (SPEC-v1x-export)
             if self.export_menu_open {
                 return Some(Msg::CloseExportMenu);
             }
         }
         // (评审 R7: 全局 Enter 拦截已撤 —— 会把算符钮的 Enter 激活劫成提交。
-        // 提交归 `PickerInput` 持有者内收口: 值框持焦时 Enter / 「过滤」钮同路。)
+        // 提交归 `PickerInput` 持有者内收口：值框持焦时 Enter / 「过滤」钮同路。)
         let Event::Key {
             key,
             pressed: true,
@@ -3738,24 +3757,24 @@ impl App for LogApp {
         let Key::Character(s) = key else {
             return None;
         };
-        // 模态守卫 (T16/P32): 设置卡或升级提示开着时, 全局键**不得穿透到卡后**。
-        // 原先三个后果: Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
+        // 模态守卫 (T16/P32): 设置卡或升级提示开着时，全局键**不得穿透到卡后**。
+        // 原先三个后果：Ctrl+O 在卡片**之上**弹系统文件对话框; Ctrl+F 把焦点按
         // id 送到卡后**看不见的**输入框 (此后打的字全进它); Ctrl+L 把卡后的侧栏
         // 显隐掉。框架的 `app_key_filter` 是应用回调、在模态判定之前无条件跑
         // (`handler.rs:434-441`), 所以这个守卫只能加在产品侧。
         //
-        // **位置很要紧: 必须在「ctrl + 字符」筛选之后**。框架在这一函数返回
+        // **位置很要紧：必须在「ctrl + 字符」筛选之后**。框架在这一函数返回
         // `Some` 时**直接 return, 不再走焦点分发** (`handler.rs:436-441`), 而卡内
         // 控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠焦点分发收键 —— 守卫若放在函数
-        // 入口, 卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
+        // 入口，卡内键盘会**全死**: 下拉导航不动、开关切不了、Enter 关不掉卡。
         // 本批第一版正是那么写的 (见测试里的反向对照), 被 review 抓出来。
-        // (T7 扩展: 升级提示同享此守卫 —— 它是第二个模态层。)
+        // (T7 扩展：升级提示同享此守卫 —— 它是第二个模态层。)
         if self.settings_open || self.upgrade_prompt.is_some() || self.popover_open() {
             // **剪辑组合键必须放行** (评审 Critical, 2026-09-19): 框架的剪贴板
-            // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里, 这里吞掉 =
+            // 路由 (handler.rs:471 → Event::Paste) 活在焦点分发里，这里吞掉 =
             // 许可页输入框没法 Ctrl+V 粘贴 key —— 而粘贴是 200+ 字符 key 的
-            // 唯一现实输入方式。放行后若焦点在卡后, 剪辑键落卡后 —— 与普通字符
-            // 今天的既有暴露面相同, 不因此更坏。
+            // 唯一现实输入方式。放行后若焦点在卡后，剪辑键落卡后 —— 与普通字符
+            // 今天的既有暴露面相同，不因此更坏。
             if matches!(
                 s.to_ascii_lowercase().as_str(),
                 "c" | "x" | "v" | "a" | "z" | "y"
@@ -3770,7 +3789,7 @@ impl App for LogApp {
         if s.eq_ignore_ascii_case("t") && self.schema.is_some() {
             return Some(Msg::ToggleMode);
         }
-        // Ctrl+L 侧栏显隐: 走前置过滤而非 event(), 故栏聚焦时也生效 (与 Ctrl+T 同级)
+        // Ctrl+L 侧栏显隐：走前置过滤而非 event(), 故栏聚焦时也生效 (与 Ctrl+T 同级)
         if s.eq_ignore_ascii_case("l") {
             return Some(Msg::ToggleHistogram);
         }
@@ -3781,18 +3800,18 @@ impl App for LogApp {
             }
             return Some(Msg::Noop); // 取消：吞掉事件，不触发副作用
         }
-        // Ctrl+E 导出 (SPEC-v1x-export D7): 与底栏按钮同消息, 门控/取消在应用层
+        // Ctrl+E 导出 (SPEC-v1x-export D7): 与底栏按钮同消息，门控/取消在应用层
         if s.eq_ignore_ascii_case("e") {
             return Some(Msg::ExportEntryClicked);
         }
-        // Ctrl+M 合并 (SPEC-v1x-merge-timeline D6): 与底栏「合并…」同消息, 门控在应用层
+        // Ctrl+M 合并 (SPEC-v1x-merge-timeline D6): 与底栏「合并…」同消息，门控在应用层
         if s.eq_ignore_ascii_case("m") {
             return Some(Msg::OpenMergeMenu);
         }
         None
     }
 
-    /// LogView 持焦后, 焦点组件未消费的键回退应用层 (danqing opt-in):
+    /// LogView 持焦后，焦点组件未消费的键回退应用层 (danqing opt-in):
     /// 点击日志区后 j/k/翻页/`/`/b 等应用级导航不失灵 (text-selection T4)。
     /// TextInput 栏持焦时其已消费的键不会重复到达 (引擎保证)。
     fn propagate_unhandled_keys(&self) -> bool {
@@ -3901,11 +3920,11 @@ fn status_text(path: &Path, file: &LogFile) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // 报**打开总墙钟**在先, 行索引在后。
+    // 报**打开总墙钟**在先，行索引在后。
     //
     // 原来只报「索引 N ms」, 而它不含 UTF-16 的读整文件 + 转码 —— 实测 100 MiB
     // UTF-16LE: 报「索引 7 ms」而实际 open 200 ms (**13 倍**), GB 级按比例是秒级。
-    // 「数字和视觉不符」的这类反馈, 根子就是报了个不等于等待时间的数字。
+    // 「数字和视觉不符」的这类反馈，根子就是报了个不等于等待时间的数字。
     let mut load = format!("打开 {} ms", s.open.as_millis());
     if s.preprocess > Duration::ZERO {
         load.push_str(&format!(" (转码 {} ms)", s.preprocess.as_millis()));
@@ -3923,7 +3942,7 @@ fn status_text(path: &Path, file: &LogFile) -> String {
 
 fn main() {
     danqing::log::init_log();
-    // 路径参数可选: 无参进空态 (Ctrl+O 打开), 带参直接打开。
+    // 路径参数可选：无参进空态 (Ctrl+O 打开), 带参直接打开。
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     if let Err(e) = run(path.as_deref()) {
         log::error!("启动失败：{e:#}");
@@ -3936,9 +3955,9 @@ fn run(path: Option<&Path>) -> Result<()> {
     // 启动后台更新检查 (24h TTL 缓存，静默)。
     app_update::init();
     // 一律空态骨架开局 (async-open): 带文件启动只发起 OpenJob 便立刻 run_app,
-    // 窗口按 GPU 速度出现, 索引在 worker 后台跑 (spec 判据: ≤ 无文件启动 +200ms)。
+    // 窗口按 GPU 速度出现，索引在 worker 后台跑 (spec 判据：≤ 无文件启动 +200ms)。
     let mut app = LogApp::new_empty();
-    // 商店版 (MSIX 打包): 后台查授权 (broker 进程外调用可能耗时, 不堵窗口出现)。
+    // 商店版 (MSIX 打包): 后台查授权 (broker 进程外调用可能耗时，不堵窗口出现)。
     // 便携版授权在构造时已从 license.key 加载 (initial_entitlement), 不走这里。
     if danqing::platform::is_packaged() {
         app.store_license_job
@@ -3951,11 +3970,11 @@ fn run(path: Option<&Path>) -> Result<()> {
     let config = WindowConfig {
         title: "丹青日志 LogLens".to_string(),
         size: Size::new(1100.0, 760.0),
-        // 清屏色随配置里的主题 —— 此前写死浅色, 存暗色配置启动也开在白底上
-        // (app 在上一行已从配置读出主题, 只是当时没人问它)。
+        // 清屏色随配置里的主题 —— 此前写死浅色，存暗色配置启动也开在白底上
+        // (app 在上一行已从配置读出主题，只是当时没人问它)。
         clear_color: window_clear_color(app.theme),
         logo_name: "log".into(),
-        maximized: true, // 日志查看器主战场是全屏阅读: 初始最大化
+        maximized: true, // 日志查看器主战场是全屏阅读：初始最大化
         hotkeys: vec![], // 显式置空：不继承番茄钟默认热键 (danqing WindowConfig 注释)
         ..Default::default()
     };
@@ -3969,7 +3988,7 @@ mod tests {
 
     // ─── v1x-licensing T4: 便携版激活接线 ───
 
-    /// 测试密钥对 (与 license.rs 的测试密钥对无关 —— 各测试域各自独立,
+    /// 测试密钥对 (与 license.rs 的测试密钥对无关 —— 各测试域各自独立，
     /// 谁也不是产品公钥)。
     fn test_sign(payload_json: &str) -> (String, [u8; 32]) {
         use base64::Engine as _;
@@ -3986,7 +4005,7 @@ mod tests {
 
     const LICENSE_PAYLOAD: &str = r#"{"v":1,"product":"danqing-log","tier":"personal","email":"t@e.st","issued_at":"1760000000","nonce":"ab"}"#;
 
-    /// 注入用临时配置路径 (license 落点在它的同名邻居; 并行 flake 教训: 带 pid)。
+    /// 注入用临时配置路径 (license 落点在它的同名邻居; 并行 flake 教训：带 pid)。
     fn temp_cfg_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "danqing-log-app-lic-{}-{tag}.toml",
@@ -3998,7 +4017,7 @@ mod tests {
     fn column_msgs_mutate_and_persist_state_account() {
         let cfg = temp_cfg_path("cols-msg");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4064,7 +4083,7 @@ mod tests {
         )
         .unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4090,7 +4109,7 @@ mod tests {
             1,
             "sessions 迁移保真"
         );
-        // 新名在 → 新名优先: 旧名再动不进视野
+        // 新名在 → 新名优先：旧名再动不进视野
         std::fs::write(&legacy, b"{ not json").unwrap();
         app.load_state_for_current_file();
         assert_eq!(app.columns.order, vec!["a".to_string(), "b".to_string()]);
@@ -4133,28 +4152,32 @@ mod tests {
             }],
         }));
         app.load_state_for_current_file();
-        // 调好工作台: 摆列 + 过滤/搜索串 + 展开 0 号行; 书签在场 (零触碰判据)
+        // 调好工作台：摆列 + 过滤/搜索串 + 展开 0 号行; 书签在场 (零触碰判据)
         app.update(Msg::ColumnWidthSet("level".into(), 200.0));
         app.filter_applied = "level=ERROR".into();
         app.search_query = "plain".into();
         app.toggle_expand(0);
         app.bookmarks.insert(2);
         let bookmarks_before = app.bookmarks.clone();
-        app.update(Msg::SaveSession("排障A".into()));
+        app.update(Msg::SaveSession("排障 A".into()));
         assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.sessions[0].name, "排障A");
+        assert_eq!(app.sessions[0].name, "排障 A");
         assert_eq!(app.sessions[0].expands, vec![0], "快照 = 展开行号表");
         // 破坏现场后应用 = 四样回来
         app.update(Msg::ColumnWidthClear("level".into()));
         app.filter_applied.clear();
         app.search_query.clear();
         app.toggle_expand(0);
-        app.update(Msg::ApplySession("排障A".into()));
+        app.update(Msg::ApplySession("排障 A".into()));
         assert_eq!(app.filter_applied, "level=ERROR", "过滤串回来");
         assert_eq!(app.search_query, "plain", "搜索串回来");
         assert_eq!(app.columns.widths.get("level"), Some(&200.0), "列摆法回来");
         assert!(app.expanded.is_expanded(0), "展开重建");
-        assert_eq!(app.session_selected.as_deref(), Some("排障A"), "应用记选中");
+        assert_eq!(
+            app.session_selected.as_deref(),
+            Some("排障 A"),
+            "应用记选中"
+        );
         assert_eq!(app.bookmarks, bookmarks_before, "书签零触碰 (Open Q1)");
         // 写穿实证 (摘写穿 = 本断言红): files 段条目 = 会话列摆法
         let saved = danqing_log::columns::ColumnFiles::load_from(&cfg.with_extension("state.json"));
@@ -4165,7 +4188,7 @@ mod tests {
             Some(&200.0),
             "应用写穿 per-file 条目"
         );
-        // 换路径 = 切片替换 + 清选中 (他路径列表只显自己的, Open Q3)
+        // 换路径 = 切片替换 + 清选中 (他路径列表只显自己的，Open Q3)
         app.path = std::path::PathBuf::from("C:\\logs\\other.log");
         app.load_state_for_current_file();
         assert!(app.sessions.is_empty(), "换路径 = 该路径的会话");
@@ -4207,7 +4230,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// D6 守卫: 空名拒绝 / 满 32 拒绝 (新名才计数) / 同名覆盖不算新增 /
+    /// D6 守卫：空名拒绝 / 满 32 拒绝 (新名才计数) / 同名覆盖不算新增 /
     /// 删除后再存; 未知名三动作说清不动账。
     #[test]
     fn session_save_rejects_empty_and_full_cap_and_overwrites() {
@@ -4302,7 +4325,7 @@ mod tests {
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\g.log");
         app.file = Arc::new(LogFile::open(&p).unwrap());
-        // 免费态: 入口被拦, 弹层不开
+        // 免费态：入口被拦，弹层不开
         app.update(Msg::OpenSessionMenu);
         assert_eq!(
             app.upgrade_prompt,
@@ -4310,13 +4333,13 @@ mod tests {
             "免费态入口 = 升级提示"
         );
         assert!(!app.session_menu_open, "免费态不得开弹层");
-        // 免费态: 三动作兜底闸全拦 (账本零变化)
+        // 免费态：三动作兜底闸全拦 (账本零变化)
         app.update(Msg::SaveSession("s".into()));
         app.update(Msg::ApplySession("s".into()));
         app.update(Msg::DeleteSelectedSession);
         assert!(app.sessions.is_empty(), "免费态动作零落账");
         assert!(!cfg.with_extension("state.json").exists(), "免费态零落盘");
-        // 付费态: 放行; 全程永不触发升级提示 (两道闸锁)
+        // 付费态：放行; 全程永不触发升级提示 (两道闸锁)
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -4335,7 +4358,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 弹层族第四员全套: Esc 次序首插 / 与弹层族互斥 / 模态门禁 (导航键+滚轮
+    /// 弹层族第四员全套：Esc 次序首插 / 与弹层族互斥 / 模态门禁 (导航键 + 滚轮
     /// 不穿) / 关弹层清草稿 (session_clear_rev)。
     #[test]
     fn session_menu_esc_mutex_modal_and_draft_clear() {
@@ -4348,7 +4371,7 @@ mod tests {
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\w.log");
         app.file = Arc::new(LogFile::open(&p).unwrap());
-        // Esc 次序: 会话先于 picker/col (D5 插层)
+        // Esc 次序：会话先于 picker/col (D5 插层)
         app.session_menu_open = true;
         app.picker_open = true;
         let esc = Event::Key {
@@ -4362,7 +4385,7 @@ mod tests {
             app.app_key_filter(&esc),
             Some(Msg::CloseSessionMenu)
         ));
-        // 互斥: 开 picker 关会话; 开会话关弹层族
+        // 互斥：开 picker 关会话; 开会话关弹层族
         app.session_menu_open = false;
         app.picker_open = true;
         app.col_menu_open = true;
@@ -4370,8 +4393,8 @@ mod tests {
         app.update(Msg::OpenSessionMenu);
         assert!(app.session_menu_open && !app.picker_open && !app.col_menu_open);
         assert!(app.session_clear_rev > rev, "开弹层清命名草稿");
-        // 模态门禁: 会话开时 ↓/滚轮不穿到日志 (滚轮用**可动**位: top_row=0 时
-        // 向上滚会被钳回 0 —— 家族⑥假绿, 评审 M5 抓出后改真锁)
+        // 模态门禁：会话开时 ↓/滚轮不穿到日志 (滚轮用**可动**位：top_row=0 时
+        // 向上滚会被钳回 0 —— 家族⑥假绿，评审 M5 抓出后改真锁)
         app.top_row = 5.0;
         app.event(&Event::Key {
             key: Key::Named(NamedKey::ArrowDown),
@@ -4395,7 +4418,7 @@ mod tests {
         app.update(Msg::CloseSessionMenu);
         assert!(!app.session_menu_open);
         assert!(app.session_clear_rev > rev, "关弹层清命名草稿");
-        // 互斥关也清草稿 (评审 M12: close_popovers 随关走, 不靠下次开兜)
+        // 互斥关也清草稿 (评审 M12: close_popovers 随关走，不靠下次开兜)
         app.update(Msg::OpenSessionMenu);
         let rev = app.session_clear_rev;
         app.update(Msg::OpenPicker);
@@ -4405,7 +4428,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 评审 M1/M2: 损坏判据认 sessions 段 (sessions-only = 可辨, 不备份不丢他会话);
+    /// 评审 M1/M2: 损坏判据认 sessions 段 (sessions-only = 可辨，不备份不丢他会话);
     /// 空/坏新名回落旧名 (读备判据同源); 保存后旧记忆写回 + 旧名**退役一次性**。
     #[test]
     fn state_account_recognizes_sessions_and_falls_back_then_retires_legacy() {
@@ -4429,7 +4452,7 @@ mod tests {
         )
         .unwrap();
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4446,7 +4469,7 @@ mod tests {
             "他路径会话不丢"
         );
         std::fs::remove_file(&newp).ok();
-        // M2: 旧名有货 + 新名空 → 回落旧名; 保存后记忆写回新名, 旧名退役
+        // M2: 旧名有货 + 新名空 → 回落旧名; 保存后记忆写回新名，旧名退役
         std::fs::write(
             &legacy,
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -4461,9 +4484,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(&newp, b"").unwrap(); // 空新名: 不许挡死迁移 (M2)
+        std::fs::write(&newp, b"").unwrap(); // 空新名：不许挡死迁移 (M2)
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 同上: 迁移/回落实验跑在付费态 (断言不动)
+        // 同上：迁移/回落实验跑在付费态 (断言不动)
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -4477,10 +4500,10 @@ mod tests {
         let acc = danqing_log::columns::ColumnFiles::load_from(&newp);
         assert!(
             acc.get_entry(path_str).unwrap().config.is_hidden("a"),
-            "旧记忆写回新账, 不被空内存覆盖"
+            "旧记忆写回新账，不被空内存覆盖"
         );
         assert_eq!(acc.sessions_for_path(path_str).len(), 1, "旧会话写回");
-        assert!(retired.exists() && !legacy.exists(), "迁移一次性: 旧名退役");
+        assert!(retired.exists() && !legacy.exists(), "迁移一次性：旧名退役");
         std::fs::remove_file(&legacy).ok();
         std::fs::remove_file(&newp).ok();
         std::fs::remove_file(&bak).ok();
@@ -4490,7 +4513,7 @@ mod tests {
     }
 
     /// 评审 M7: `clear_search` 作废在途搜索 (`clear_filter` 同规) —— 清空/
-    /// 空搜索会话应用后, 旧搜索不得经 tick 拾取复活。
+    /// 空搜索会话应用后，旧搜索不得经 tick 拾取复活。
     #[test]
     fn clear_search_kills_pending_search_job() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("sclr")));
@@ -4514,7 +4537,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 评审 M8: 会话搜索串正则无效 (跨编码/手造) → **显式清空** + 说清,
+    /// 评审 M8: 会话搜索串正则无效 (跨编码/手造) → **显式清空** + 说清，
     /// 其余三样照常应用 —— 四样必须「已应用或已显式清空」, 不许 3/4 谎报成功。
     #[test]
     fn apply_session_with_invalid_search_explicitly_clears() {
@@ -4570,7 +4593,7 @@ mod tests {
     fn col_menu_toggle_reset_guard_and_persist() {
         let cfg = temp_cfg_path("cols-menu");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4589,7 +4612,7 @@ mod tests {
                 },
             ],
         }));
-        // 互斥: 开列管理关导出菜单, 反之亦然
+        // 互斥：开列管理关导出菜单，反之亦然
         app.export_menu_open = true;
         app.update(Msg::OpenColMenu);
         assert!(app.col_menu_open && !app.export_menu_open);
@@ -4621,7 +4644,7 @@ mod tests {
     fn apply_fresh_loads_per_path_memory_and_closes_col_menu() {
         let cfg = temp_cfg_path("cols-fresh");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4729,7 +4752,7 @@ mod tests {
         std::fs::remove_file(temp_cfg_path("cols-modal")).ok();
     }
 
-    /// T5/D5 回归锁: **显示配置不影响交付物** —— 摆列/隐藏后 CSV 列仍 schema 首见序全列。
+    /// T5/D5 回归锁：**显示配置不影响交付物** —— 摆列/隐藏后 CSV 列仍 schema 首见序全列。
     #[test]
     fn csv_columns_ignore_column_config() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("cols-csv")));
@@ -4760,7 +4783,7 @@ mod tests {
 
     // ---- 评审修复锁 (2026-09-23 双路评审并账) ----
 
-    /// 评审 C4: `apply_rebuild` 也须对账列配置 —— 轮转/截断后 schema 可能整体换,
+    /// 评审 C4: `apply_rebuild` 也须对账列配置 —— 轮转/截断后 schema 可能整体换，
     /// 旧摆法不 merge 会残留失配序 (含 C2 的 0 列面); 与 `apply_fresh` 同纪律。
     #[test]
     fn apply_rebuild_merges_column_config_with_new_schema() {
@@ -4784,7 +4807,7 @@ mod tests {
                 },
             ],
         }));
-        // 摆法: 藏 a、b, 只留 c 可见 (落盘形态同款的脏态)
+        // 摆法：藏 a、b, 只留 c 可见 (落盘形态同款的脏态)
         app.update(Msg::ToggleColumn("a".into()));
         app.update(Msg::ToggleColumn("b".into()));
         assert_eq!(app.columns.visible_names().collect::<Vec<_>>(), vec!["c"]);
@@ -4838,7 +4861,7 @@ mod tests {
             }],
         }));
         app.update(Msg::ToggleColumn("ghost".into()));
-        assert!(app.notice.is_none(), "未知列零动作, 不得报守卫文案");
+        assert!(app.notice.is_none(), "未知列零动作，不得报守卫文案");
         std::fs::remove_file(cfg.with_extension("state.json")).ok();
         std::fs::remove_file(&cfg).ok();
     }
@@ -4856,7 +4879,7 @@ mod tests {
         let p = temp_log(b"l0\nl1\nl2\n");
         app.file = Arc::new(LogFile::open(&p).unwrap());
         // 「增即落盘」是**付费通路**语义 (gate-trio G3 书签持久化已收付费):
-        // 本锁验的是持久化, 按注入惯例注付费态; 断言不动。
+        // 本锁验的是持久化，按注入惯例注付费态; 断言不动。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -4876,7 +4899,7 @@ mod tests {
         app.bookmarks.clear();
         app.load_state_for_current_file();
         assert!(app.bookmarks.contains(&1), "重读恢复");
-        // 再点 = 去掉, 同步落盘
+        // 再点 = 去掉，同步落盘
         app.selected = 1;
         app.toggle_bookmark();
         assert!(!app.bookmarks.contains(&1), "toggle 去掉");
@@ -4894,12 +4917,12 @@ mod tests {
 
     /// per-路径隔离 (T2②) + apply_fresh 全链 (T2⑤, plan 核实⑤次序陷阱防漏锁):
     /// 换文件 = 载入**替换**语义 —— A 的书签不带进 B, B 的记忆恢复
-    /// (若 `bookmarks.clear()` 留在载入之后, 这里会得到空集)。
+    /// (若 `bookmarks.clear()` 留在载入之后，这里会得到空集)。
     #[test]
     fn bookmarks_are_per_path_and_apply_fresh_replaces_with_memory() {
         let cfg = temp_cfg_path("bm-path");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4948,7 +4971,7 @@ mod tests {
     fn load_state_drops_out_of_bounds_bookmarks() {
         let cfg = temp_cfg_path("bm-oob");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -4970,7 +4993,7 @@ mod tests {
         assert_eq!(
             app.bookmarks.iter().copied().collect::<Vec<_>>(),
             vec![0],
-            "5/99 越界剔除, 0 保留"
+            "5/99 越界剔除，0 保留"
         );
         let on_disk = danqing_log::columns::ColumnFiles::load_from(&cols);
         assert_eq!(
@@ -4987,14 +5010,14 @@ mod tests {
 
     /// 上限守卫 (T2④, D3): 满 `MAX_BOOKMARKS` 拒绝新增 + 说清为什么 + 零变更;
     /// **删除照常**（满员时 toggle 已有书签仍须能删 —— 评审 R②: 别让守卫顺序
-    /// 把「腾空位」的唯一路径堵死）; 去掉一个又能加。全走 toggle 行为, 不直改集合。
+    /// 把「腾空位」的唯一路径堵死）; 去掉一个又能加。全走 toggle 行为，不直改集合。
     #[test]
     fn toggle_bookmark_refuses_at_cap_with_notice() {
         let cfg = temp_cfg_path("bm-cap");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:\\logs\\cap.log");
-        // 257 行真夹具 (行号 0..=256): 前 256 行全夹满, 第 257 行是空位行
+        // 257 行真夹具 (行号 0..=256): 前 256 行全夹满，第 257 行是空位行
         let content: String = (0..257).map(|i| format!("l{i}\n")).collect();
         let p = temp_log(content.as_bytes());
         app.file = Arc::new(LogFile::open(&p).unwrap());
@@ -5003,7 +5026,7 @@ mod tests {
             app.toggle_bookmark();
         }
         assert_eq!(app.bookmarks.len(), danqing_log::columns::MAX_BOOKMARKS);
-        // 满员: 新增拒绝零变更
+        // 满员：新增拒绝零变更
         app.selected = 256;
         app.toggle_bookmark();
         assert_eq!(
@@ -5070,7 +5093,7 @@ mod tests {
         let cfg = temp_cfg_path("bm-corrupt-save");
         let cols = cfg.with_extension("state.json");
         let bak = cfg.with_extension("state.json.bak");
-        // 先造一份 64 条真实记忆, 再把文件打成坏 JSON (字节里仍含全部路径)
+        // 先造一份 64 条真实记忆，再把文件打成坏 JSON (字节里仍含全部路径)
         let mut files = danqing_log::columns::ColumnFiles::default();
         for i in 0..danqing_log::columns::FILE_CAP {
             files.put(danqing_log::columns::FileEntry {
@@ -5119,7 +5142,7 @@ mod tests {
         app.selected = 0;
         app.toggle_bookmark();
         assert!(app.bookmarks.is_empty(), "空文件不夹幽灵行 0");
-        // 过滤 0 命中: 3 行文件全被滤掉
+        // 过滤 0 命中：3 行文件全被滤掉
         let p2 = temp_log(b"a\nb\nc\n");
         app.file = Arc::new(LogFile::open(&p2).unwrap());
         app.filtered = Some(Arc::new(Vec::new()));
@@ -5149,7 +5172,7 @@ mod tests {
     fn toggle_says_truth_when_save_fails() {
         let cfg = temp_cfg_path("bm-savefail");
         let cols = cfg.with_extension("state.json");
-        // 开头防御性清理 + 结尾整树删 (见末行注): 本用例历史上会**泄漏**占位目录,
+        // 开头防御性清理 + 结尾整树删 (见末行注): 本用例历史上会**泄漏**占位目录，
         // 下一次同 pid 复用时 `create_dir` 撞 AlreadyExists → flaky (2026-09-28 抓到)。
         std::fs::remove_dir_all(&cols).ok();
         std::fs::create_dir(&cols).unwrap(); // 非空目录占住落盘路径 → rename 必败
@@ -5170,8 +5193,8 @@ mod tests {
             "落盘失败须提示"
         );
         // `remove_dir` 删不掉**非空**目录 (里面有 sentinel) → 静默 `.ok()` 把它
-        // 永久留在 temp: 等 pid 被复用, 下次开头的 create_dir 就撞 AlreadyExists。
-        // 用整树删 (flaky 根因, 2026-09-28 抓到)。
+        // 永久留在 temp: 等 pid 被复用，下次开头的 create_dir 就撞 AlreadyExists。
+        // 用整树删 (flaky 根因，2026-09-28 抓到)。
         std::fs::remove_dir_all(&cols).ok();
         std::fs::remove_file(&cfg).ok();
         std::fs::remove_file(&p).ok();
@@ -5180,7 +5203,7 @@ mod tests {
     // ---- T1: 拼子句 + picker 状态链 (SPEC-v1x-field-picker-ui D1/D3) ----
 
     /// 拼子句 6 算符 → `parse_query` roundtrip 全等 (语法面零发明);
-    /// 前缀 = `=` + 值尾 `*` (parse_clause 现语义: 值去星收 Prefix)。
+    /// 前缀 = `=` + 值尾 `*` (parse_clause 现语义：值去星收 Prefix)。
     #[test]
     fn build_clause_six_ops_roundtrip() {
         use danqing_log::jsonl::{self, Clause, Op};
@@ -5207,11 +5230,11 @@ mod tests {
                     assert_eq!(*got_op, op);
                     assert_eq!(got_val, value);
                 }
-                other => panic!("须是 Field 子句: {other:?}"),
+                other => panic!("须是 Field 子句：{other:?}"),
             }
         }
-        // 点路径字段已被拒收面覆盖 (评审 Critical/R1) —— 语法不支持字面点,
-        // `user.id` 走嵌套拆分是 0 命中面, 不许当「点路径」放行。
+        // 点路径字段已被拒收面覆盖 (评审 Critical/R1) —— 语法不支持字面点，
+        // `user.id` 走嵌套拆分是 0 命中面，不许当「点路径」放行。
     }
 
     /// 空值/空字段/含空白值拒绝 (D3)。
@@ -5224,12 +5247,12 @@ mod tests {
     }
 
     /// 评审 Critical (双路并账): 拼接面必须**盖住** parse 破坏面 ——
-    /// 被接受的 roundtrip 全等 (path 用 Vec 断言, 不许 join 假绿);
+    /// 被接受的 roundtrip 全等 (path 用 Vec 断言，不许 join 假绿);
     /// 会被 `parse_query` 改写语义的一律拒收 (None)。
     #[test]
     fn build_clause_rejects_anything_parse_would_rewire() {
         use danqing_log::jsonl::{self, Clause, Op};
-        // —— 拒收面: 值含算符字符 / 算符拼合 / 尾星偷换 / 字段脏字符 ——
+        // —— 拒收面：值含算符字符 / 算符拼合 / 尾星偷换 / 字段脏字符 ——
         let rejected = [
             ("a", Op::Eq, "List<String>"), // 值含 > <: 切成 a=List Lt String>
             ("a", Op::Eq, "x>y"),
@@ -5247,16 +5270,16 @@ mod tests {
         for (field, op, value) in rejected {
             assert!(
                 build_clause(field, op, value).is_none(),
-                "须拒收: {field:?} {op:?} {value:?}"
+                "须拒收：{field:?} {op:?} {value:?}"
             );
         }
-        // —— 接受面: roundtrip 全等 (path 逐段断言) ——
+        // —— 接受面：roundtrip 全等 (path 逐段断言) ——
         let accepted = [
             ("level", Op::Eq, "ERROR"),
             ("level", Op::Prefix, "ERR"),
             ("status", Op::GtEq, "500"),
-            ("msg", Op::Eq, "a=b"),  // 值内 = 切在第一个, 安全
-            ("msg", Op::Eq, "100%"), // % 无语义, 安全
+            ("msg", Op::Eq, "a=b"),  // 值内 = 切在第一个，安全
+            ("msg", Op::Eq, "100%"), // % 无语义，安全
             ("msg", Op::Eq, "a.b"),  // 值内点不拆 (拆点只在字段侧)
         ];
         for (field, op, value) in accepted {
@@ -5269,12 +5292,12 @@ mod tests {
                     op: got_op,
                     value: got_val,
                 } => {
-                    // path 逐段断言: 扁平字段名 = 单段路径 (join 会与点号键假绿)
-                    assert_eq!(path.as_slice(), [field], "字段须是单段路径: {s}");
+                    // path 逐段断言：扁平字段名 = 单段路径 (join 会与点号键假绿)
+                    assert_eq!(path.as_slice(), [field], "字段须是单段路径：{s}");
                     assert_eq!(*got_op, op, "{s}");
                     assert_eq!(got_val, value, "{s}");
                 }
-                other => panic!("须是 Field 子句: {other:?}"),
+                other => panic!("须是 Field 子句：{other:?}"),
             }
         }
     }
@@ -5285,7 +5308,7 @@ mod tests {
     fn picker_submit_appends_and_applies() {
         let cfg = temp_cfg_path("picker-submit");
         let mut app = LogApp::new_empty_at(Some(cfg.clone()));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -5298,14 +5321,14 @@ mod tests {
         app.update(Msg::PickerSubmit("ERROR".into()));
         assert!(app.notice.is_some(), "无字段说清");
         assert!(app.filter_applied.is_empty());
-        // 选字段, 空查询直提 (D3: 就是它)
+        // 选字段，空查询直提 (D3: 就是它)
         app.update(Msg::OpenPicker);
         app.update(Msg::PickPickerField("level".into()));
         app.update(Msg::PickerSubmit("ERROR".into()));
         assert_eq!(app.filter_applied, "level=ERROR", "空查询直提");
         assert!(!app.picker_open, "提交即关弹层");
         assert!(app.picker_field.is_none(), "草稿清");
-        // 再开 + 算符: 追加 AND (空格连接)
+        // 再开 + 算符：追加 AND (空格连接)
         app.update(Msg::OpenPicker);
         app.update(Msg::PickPickerField("level".into()));
         app.update(Msg::PickPickerOp(jsonl::Op::Prefix));
@@ -5314,7 +5337,7 @@ mod tests {
             app.filter_applied, "level=ERROR level=ER*",
             "有查询 = 空格连接 AND"
         );
-        // 空值拒绝: 查询不动, 弹层不关 (留着补值)
+        // 空值拒绝：查询不动，弹层不关 (留着补值)
         app.update(Msg::OpenPicker);
         app.update(Msg::PickPickerField("level".into()));
         app.update(Msg::PickerSubmit("".into()));
@@ -5329,7 +5352,7 @@ mod tests {
     #[test]
     fn picker_open_is_mutually_exclusive() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("picker-mutex")));
-        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路, 注付费态;
+        // 功能已收付费 (gate-trio G2/G3/G4): 本锁验的是付费通路，注付费态;
         // 断言不动 (既有锁不许动语义)。
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
@@ -5369,14 +5392,14 @@ mod tests {
             ctrl: false,
             alt: false,
         };
-        // Esc 次序: picker 先于 col_menu (D1 插层)
+        // Esc 次序：picker 先于 col_menu (D1 插层)
         app.picker_open = true;
         app.col_menu_open = true;
         assert!(matches!(app.app_key_filter(&esc), Some(Msg::ClosePicker)));
         // 评审 R7: 全局 Enter **不**拦截 (算符钮的 Enter 归按钮激活);
         // 提交归 PickerInput 持有者内 (其单元锁见 settings 侧)
         assert!(app.app_key_filter(&enter).is_none());
-        // 模态守卫: picker 开时全局 Ctrl 键不穿 (Ctrl+L 探针, 不碰 Ctrl+O)
+        // 模态守卫：picker 开时全局 Ctrl 键不穿 (Ctrl+L 探针，不碰 Ctrl+O)
         let ctrl_l = Event::Key {
             key: Key::Character("l".to_string()),
             pressed: true,
@@ -5460,7 +5483,7 @@ mod tests {
             alt: false,
         });
         assert_eq!(app.top_row, 0.0, "picker 开着滚轮不穿到日志");
-        // 对照: 关掉后照常滚
+        // 对照：关掉后照常滚
         app.picker_open = false;
         app.event(&Event::Key {
             key: Key::Named(NamedKey::ArrowDown),
@@ -5488,7 +5511,7 @@ mod tests {
         app.license_pubkey = pk;
         app.activate_license(key);
         assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
-        // 落盘在注入路径的同名邻居, 且重启 (重新 load) 能验回 = 持久化语义
+        // 落盘在注入路径的同名邻居，且重启 (重新 load) 能验回 = 持久化语义
         let lic = cfg.with_extension("license.key");
         let loaded = license::load_from(&lic, &pk);
         assert!(matches!(loaded, Entitlement::Paid { .. }));
@@ -5521,7 +5544,7 @@ mod tests {
             source: PaidSource::StoreAddOn,
         });
         assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
-        // 已 Paid 后, 商店侧再回 Free (例如查询失败 fail-open) 不许把人踢下来
+        // 已 Paid 后，商店侧再回 Free (例如查询失败 fail-open) 不许把人踢下来
         app.adopt_store_entitlement(Entitlement::Free);
         assert!(matches!(app.entitlement, Entitlement::Paid { .. }));
     }
@@ -5556,12 +5579,12 @@ mod tests {
                 width_chars: 1,
             }],
         }));
-        // 免费态: 弹升级提示, 不发起扫描
+        // 免费态：弹升级提示，不发起扫描
         app.update(Msg::AnalyzeField(0));
         assert_eq!(app.upgrade_prompt, Some(Feature::FieldAnalytics));
         assert_eq!(app.analysis_launches, 0, "免费态不得发起扫描");
         assert!(!app.analysis_running);
-        // 付费态: 发起并拾取
+        // 付费态：发起并拾取
         let (key, pk) = test_sign(LICENSE_PAYLOAD);
         app.license_pubkey = pk;
         app.activate_license(key);
@@ -5590,7 +5613,7 @@ mod tests {
         std::fs::remove_file(cfg.with_extension("license.key")).ok();
     }
 
-    /// 评审 R5: 过滤作业在途窗口内, `filter_applied` 是新串而 `filtered`
+    /// 评审 R5: 过滤作业在途窗口内，`filter_applied` 是新串而 `filtered`
     /// 行集还是旧的 —— 分析快照必须读**落账串** (与行集同源), 否则结果
     /// 看起来新鲜、数字其实是上一个过滤的 (stale 永 false 的静默错数)。
     #[test]
@@ -5611,17 +5634,17 @@ mod tests {
         app.filtered = Some(Arc::new(vec![0, 2]));
         app.filter_applied = "level=ERROR".to_string();
         app.filter_landed = "level=ERROR".to_string();
-        // 发起过滤 B → 在途窗口: applied=B, 行集与 landed 仍是 A
+        // 发起过滤 B → 在途窗口：applied=B, 行集与 landed 仍是 A
         app.apply_filter("status=500".to_string());
         assert!(app.filter_pending);
         assert_eq!(app.filter_applied, "status=500");
-        // 窗口内发起分析: 快照取落账串 A (与行集同源)
+        // 窗口内发起分析：快照取落账串 A (与行集同源)
         app.analyze_field(0);
         assert_eq!(
             app.analysis_filter_src, "level=ERROR",
             "分析快照必须与行集同源 (落账串), 不能读在途的新串"
         );
-        // B 落账: landed 换串 —— 之后面板的 stale 判据 (src != applied) 仍成立
+        // B 落账：landed 换串 —— 之后面板的 stale 判据 (src != applied) 仍成立
         let mut landed = false;
         for _ in 0..200 {
             if let Some(out) = app.filter_job.poll() {
@@ -5638,8 +5661,8 @@ mod tests {
         std::fs::remove_file(cfg.with_extension("license.key")).ok();
     }
 
-    /// R5 同族: Esc 清过滤 / 空查询回全量, 都得作废**在途**的过滤作业 ——
-    /// 否则它晚到把行集贴回来, 底栏显示「无过滤」而列表是过滤后的。
+    /// R5 同族：Esc 清过滤 / 空查询回全量，都得作废**在途**的过滤作业 ——
+    /// 否则它晚到把行集贴回来，底栏显示「无过滤」而列表是过滤后的。
     #[test]
     fn clear_filter_kills_pending_filter_job() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("faclr")));
@@ -5660,7 +5683,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(!resurrected, "invalidate 后在途结果必须被丢弃, poll 不出");
+        assert!(!resurrected, "invalidate 后在途结果必须被丢弃，poll 不出");
         assert!(app.filtered.is_none());
     }
 
@@ -5669,7 +5692,7 @@ mod tests {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("upg")));
         app.update(Msg::ShowUpgradePrompt(Feature::Export));
         assert_eq!(app.upgrade_prompt, Some(Feature::Export));
-        // 付费态不出现 (两道闸里的第二道): 激活后**先清掉上一个提示**再发,
+        // 付费态不出现 (两道闸里的第二道): 激活后**先清掉上一个提示**再发，
         // 提示必须不再出现
         let (key, pk) = test_sign(LICENSE_PAYLOAD);
         app.license_pubkey = pk;
@@ -5715,8 +5738,8 @@ mod tests {
 
     // ─── SPEC-v1x-export T5 (导出全链路 UI) ───
 
-    /// D6 判据: 免费态点导出 = 弹升级提示, **不开格式菜单** (保存对话框之前拦)。
-    /// 「零落盘」由构造保证: 该分支根本不走到 `launch_export`。
+    /// D6 判据：免费态点导出 = 弹升级提示，**不开格式菜单** (保存对话框之前拦)。
+    /// 「零落盘」由构造保证：该分支根本不走到 `launch_export`。
     #[test]
     fn export_entry_free_tier_prompts_upgrade_without_menu() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expgate")));
@@ -5737,7 +5760,7 @@ mod tests {
         app.update(Msg::ExportEntryClicked);
         assert!(app.export_menu_open, "付费态开格式菜单");
         assert_eq!(app.upgrade_prompt, None);
-        // 作业态 (真作业压 running): 入口点 = 取消, 不是再开菜单
+        // 作业态 (真作业压 running): 入口点 = 取消，不是再开菜单
         let p = temp_log(b"a\nb\n");
         let out = OpenOutcome {
             file: LogFile::open(&p).unwrap(),
@@ -5750,9 +5773,9 @@ mod tests {
         let dest = std::env::temp_dir().join(format!("dq-exp-cancel-{}.log", std::process::id()));
         app.launch_export(dest.clone(), ExportPick::Raw);
         assert!(app.export_job.is_running());
-        app.export_menu_open = false; // 上一段菜单已用完, 复位再测作业态
+        app.export_menu_open = false; // 上一段菜单已用完，复位再测作业态
         app.update(Msg::ExportEntryClicked);
-        assert!(!app.export_menu_open, "作业态点入口 = 取消, 不开菜单");
+        assert!(!app.export_menu_open, "作业态点入口 = 取消，不开菜单");
         // 收尾拾取 (取消或没赶上都是自洽收尾; 半成品语义由 export 单测锁)
         for _ in 0..200 {
             if app.export_job.poll().is_some() {
@@ -5764,7 +5787,7 @@ mod tests {
         std::fs::remove_file(&dest).ok();
     }
 
-    /// `Ctrl+E` 与底栏按钮同消息; 格式菜单开着时 = 模态, 不得穿透 (T16 同纪律)。
+    /// `Ctrl+E` 与底栏按钮同消息; 格式菜单开着时 = 模态，不得穿透 (T16 同纪律)。
     #[test]
     fn ctrl_e_dispatches_export_entry_and_menu_modal_eats_it() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expkey")));
@@ -5782,11 +5805,11 @@ mod tests {
         app.export_menu_open = true;
         assert!(
             matches!(app.app_key_filter(&mk("e")), Some(Msg::Noop)),
-            "格式菜单开着 = 模态, Ctrl+E 不穿透"
+            "格式菜单开着 = 模态，Ctrl+E 不穿透"
         );
     }
 
-    /// Esc 次序: 升级提示 > 设置卡 > 导出格式菜单 > 栏。
+    /// Esc 次序：升级提示 > 设置卡 > 导出格式菜单 > 栏。
     #[test]
     fn esc_closes_export_menu_after_higher_modals() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expesc")));
@@ -5810,8 +5833,8 @@ mod tests {
         );
     }
 
-    /// 明文服务端守门: 菜单收口是 UI 层, 点到了也不放行 (测试不碰真对话框 ——
-    /// 该分支在弹框**之前**返回, 故可测)。
+    /// 明文服务端守门：菜单收口是 UI 层，点到了也不放行 (测试不碰真对话框 ——
+    /// 该分支在弹框**之前**返回，故可测)。
     #[test]
     fn begin_export_rejects_pretty_csv_on_plain_file() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("expplain")));
@@ -5876,7 +5899,7 @@ mod tests {
     }
 
     /// 成功判据 4 (review R2): D1 行集口径表**四态逐格上锁** —— 修前只测了
-    /// 「JSONL+过滤」一格, 分支写反/冻结失效仍全绿。
+    /// 「JSONL+过滤」一格，分支写反/冻结失效仍全绿。
     #[test]
     fn export_line_set_covers_d1_four_states() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("d1a")));
@@ -5899,13 +5922,13 @@ mod tests {
         app.filtered = None;
         app.search = Some(SearchNav::new(Arc::new(vec![0]), 1));
         let set = app.export_line_set();
-        assert!(set.is_full(), "② JSONL 无过滤 = 全集, 搜索不改口径");
+        assert!(set.is_full(), "② JSONL 无过滤 = 全集，搜索不改口径");
 
         // ③ 明文 + 搜索生效 → 含命中的行
         app.schema = None;
         app.search = Some(SearchNav::new(Arc::new(vec![5, 2]), 2));
         let set = app.export_line_set();
-        assert!(!set.is_full(), "③ 明文+搜索 = 命中行集");
+        assert!(!set.is_full(), "③ 明文 + 搜索 = 命中行集");
         assert_eq!(set.lines(), &[2, 5]);
 
         // ④ 明文 无搜索 → 全集
@@ -5915,8 +5938,8 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// review R1 回归锁: 默认扩展名按格式分派 (原始行保源 / 美化 .json / CSV .csv) ——
-    /// 修前恒取源扩展名, `server.jsonl` 导 CSV 默认名还是 `.jsonl`。
+    /// review R1 回归锁：默认扩展名按格式分派 (原始行保源 / 美化 .json / CSV .csv) ——
+    /// 修前恒取源扩展名，`server.jsonl` 导 CSV 默认名还是 `.jsonl`。
     #[test]
     fn default_export_ext_follows_format() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("d8ext")));
@@ -5938,9 +5961,9 @@ mod tests {
         );
     }
 
-    /// review B-R1 回归锁: 搜索命中被导航表封顶 (100 万) 时**拒绝导出** ——
-    /// 静默截断交付物是对账事故 (修前: 导出前 100 万行且报「完成 N 行」)。
-    /// 走**入口消息** (闸在入口, D6 同点位) —— 别直接调 begin_export:
+    /// review B-R1 回归锁：搜索命中被导航表封顶 (100 万) 时**拒绝导出** ——
+    /// 静默截断交付物是对账事故 (修前：导出前 100 万行且报「完成 N 行」)。
+    /// 走**入口消息** (闸在入口，D6 同点位) —— 别直接调 begin_export:
     /// 那会穿到真保存对话框 (测试严禁真实桌面副作用; 本测试第一版就踩了这个)。
     #[test]
     fn capped_search_hits_refuse_export() {
@@ -5967,8 +5990,8 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// review R4 回归锁: 换文件 (apply_fresh) 必须关掉格式菜单 ——
-    /// 修前菜单残留, 落地后点格式导出的是**新**文件 (旧文件语境的菜单)。
+    /// review R4 回归锁：换文件 (apply_fresh) 必须关掉格式菜单 ——
+    /// 修前菜单残留，落地后点格式导出的是**新**文件 (旧文件语境的菜单)。
     #[test]
     fn apply_fresh_closes_export_menu() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshmenu")));
@@ -6004,7 +6027,7 @@ mod tests {
 
     // ─── 评审修复 (2026-09-19) ───
 
-    /// 评审 Critical 回归锁: 模态卡开着时 Ctrl+V 必须放行给焦点分发
+    /// 评审 Critical 回归锁：模态卡开着时 Ctrl+V 必须放行给焦点分发
     /// (否则许可页输入框没法粘贴 key = 激活主路径断裂); 其它全局键仍拦。
     #[test]
     fn modal_card_passes_clipboard_keys_but_blocks_globals() {
@@ -6029,7 +6052,7 @@ mod tests {
         assert!(matches!(app.app_key_filter(&mk("f")), Some(Msg::Noop)));
     }
 
-    /// 评审 Required: 购买防重入闸 —— 在途拒绝二次发起, 结果回来复位。
+    /// 评审 Required: 购买防重入闸 —— 在途拒绝二次发起，结果回来复位。
     #[test]
     fn purchase_in_flight_gate_blocks_reentry_and_resets() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("reentry")));
@@ -6061,14 +6084,14 @@ mod tests {
         app.purchase_paid_layer();
         assert!(
             matches!(&app.license_feedback, Some((t, _)) if t.contains("无需重复购买")),
-            "已购再点要给明确回话: {:?}",
+            "已购再点要给明确回话：{:?}",
             app.license_feedback
         );
         assert!(!app.purchase_in_flight, "已购不得发起购买");
         std::fs::remove_file(temp_cfg_path("paidagain").with_extension("license.key")).ok();
     }
 
-    /// 安全评审: 激活成功后输入镜像清空 + rev  bumped (widget 侧 bind_clear
+    /// 安全评审：激活成功后输入镜像清空 + rev  bumped (widget 侧 bind_clear
     /// 会把框内明文一并清掉)。
     #[test]
     fn successful_activation_clears_key_input() {
@@ -6085,7 +6108,7 @@ mod tests {
     }
 
     /// expand_rev (M3/T6): 实际展开/折叠才 +1; parse 失败/无嵌套不涨 ——
-    /// 守卫的触发源必须精确, 虚涨会误杀活着的选区 (LogView 侧见
+    /// 守卫的触发源必须精确，虚涨会误杀活着的选区 (LogView 侧见
     /// `sync_clears_selection_when_expand_rev_changes`)。
     #[test]
     fn toggle_expand_bumps_expand_rev_only_on_real_change() {
@@ -6113,7 +6136,7 @@ mod tests {
     /// `title_theme` 的六项必须**取自 `LogTheme`**, 不再手抄。
     ///
     /// 手抄的后果是同一个界面里出现**两套强调色**: 浅色分支的 accent 曾经是蓝
-    /// `0.18,0.35,0.60`, 而框架玉色是 `#0F766E`。六个值全部改成从 `LogTheme` 取,
+    /// `0.18,0.35,0.60`, 而框架玉色是 `#0F766E`。六个值全部改成从 `LogTheme` 取，
     /// 只剩 `backdrop_light/dark` 手写 (框架没有对应 token, 它们只服务标题栏
     /// 这一层场景)。
     #[test]
@@ -6142,16 +6165,16 @@ mod tests {
         }
     }
 
-    /// 切主题后**标题栏文字色必须跟着变** —— 它靠 `bind_theme` 每帧重取,
+    /// 切主题后**标题栏文字色必须跟着变** —— 它靠 `bind_theme` 每帧重取，
     /// 不能靠构造。
     ///
-    /// 复现的是这个缺陷: `view()` 只在启动时求值一次
+    /// 复现的是这个缺陷：`view()` 只在启动时求值一次
     /// (`danqing/src/window/mod.rs:207` 的 `let tree = app.view();`),
     /// 所以构造时烘进 `TitleBar` 的主题色**不随切换而变**, 而底色 (清屏色) 变了
     /// → 切到浅色是浅字压浅底、切到暗色是暗字压暗底。用户实机报的两个方向都成立。
     ///
-    /// **关键在「构造用一个主题、sync 用另一个」**: 两边都用同一主题的话,
-    /// 就算 `bind_theme` 掉了也照样绿 —— 那样测的是构造, 不是绑定。
+    /// **关键在「构造用一个主题、sync 用另一个」**: 两边都用同一主题的话，
+    /// 就算 `bind_theme` 掉了也照样绿 —— 那样测的是构造，不是绑定。
     #[test]
     fn title_bar_colors_follow_theme_switch() {
         use danqing::{Constraints, Point, Rect, RectBatch, TextBatch};
@@ -6171,9 +6194,9 @@ mod tests {
         let size = bar.layout(Constraints::tight(Size::new(1100.0, 40.0)), &mut texts);
         bar.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
 
-        // 期望值**从主题取**, 不写字面量: 原先这里钉的是手抄时代的 `0.12`,
+        // 期望值**从主题取**, 不写字面量：原先这里钉的是手抄时代的 `0.12`,
         // R5 把 `title_theme` 改成取自 `LogTheme` 后它就过期了 (token 是 #0F172A),
-        // 断言随即变红 —— 那条红是真的, 说明它确实盯着颜色。
+        // 断言随即变红 —— 那条红是真的，说明它确实盯着颜色。
         let t = danqing::theme::LightTheme.text_primary();
         let want = danqing::srgb_to_linear(t.r);
         let hit = texts
@@ -6188,20 +6211,20 @@ mod tests {
 
     #[test]
     fn window_clear_color_follows_theme() {
-        // 清屏色的**单点定义** (AD1): 启动与切主题都取它, 不许两处各算一份。
-        // 回归的是这个缺陷: 清屏色原本写死浅色, 且全仓**零处** set_clear_color 调用 ——
-        // 于是存暗色配置启动、或运行中切到暗色, 窗口底色纹丝不动。
+        // 清屏色的**单点定义** (AD1): 启动与切主题都取它，不许两处各算一份。
+        // 回归的是这个缺陷：清屏色原本写死浅色，且全仓**零处** set_clear_color 调用 ——
+        // 于是存暗色配置启动、或运行中切到暗色，窗口底色纹丝不动。
         // 标题栏那条亮带**就是**清屏色 (框架 TitleBar 背景是有意的 TRANSPARENT)。
         use danqing::theme::{DarkTheme, LightTheme, Theme};
         assert_eq!(
             window_clear_color(config::AppTheme::Light),
             LightTheme.background(),
-            "浅色: 清屏色 = 主题背景"
+            "浅色：清屏色 = 主题背景"
         );
         assert_eq!(
             window_clear_color(config::AppTheme::Dark),
             DarkTheme.background(),
-            "暗色: 清屏色 = 主题背景"
+            "暗色：清屏色 = 主题背景"
         );
         assert_ne!(
             window_clear_color(config::AppTheme::Light),
@@ -6241,10 +6264,10 @@ mod tests {
 
     #[test]
     fn search_pattern_is_case_insensitive_by_default_with_opt_out() {
-        // 默认不敏感: 小写查询命中大写内容
+        // 默认不敏感：小写查询命中大写内容
         let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "error")).unwrap();
         assert!(re.is_match(b"2026-09-15 ERROR boom"));
-        // 逃逸舱: `(?-i)` 组内覆盖, 用户想精确时零代码可用
+        // 逃逸舱：`(?-i)` 组内覆盖，用户想精确时零代码可用
         let re =
             regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, "(?-i)error")).unwrap();
         assert!(!re.is_match(b"2026-09-15 ERROR boom"), "逃逸舱须恢复敏感");
@@ -6258,13 +6281,10 @@ mod tests {
         let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"\w+")).unwrap();
         assert!(re.is_match("汉字".as_bytes()), "\\w 必须仍是 Unicode 语义");
         let re = regex::bytes::Regex::new(&build_search_pattern(Encoding::Utf8, r"^\d+$")).unwrap();
-        assert!(
-            re.is_match("１２３".as_bytes()),
-            "\\d 必须仍是 Unicode 数字类"
-        );
+        assert!(re.is_match("123".as_bytes()), "\\d 必须仍是 Unicode 数字类");
     }
 
-    /// `parse_filter` 是过滤解析的**唯一入口**: 键名规范化只在有 schema 时发生,
+    /// `parse_filter` 是过滤解析的**唯一入口**: 键名规范化只在有 schema 时发生，
     /// 且用户输入的原文不改 (状态栏显示的是他敲的那串)。
     #[test]
     fn parse_filter_normalizes_keys_only_when_schema_present() {
@@ -6307,7 +6327,7 @@ mod tests {
     }
 
     /// 过滤栏存的是**用户敲的原文**, 规范化只发生在解析层 —— 状态栏回显与
-    /// 清空重放 (`filter_applied`) 都拿它, 改掉会让用户看到自己没敲过的字。
+    /// 清空重放 (`filter_applied`) 都拿它，改掉会让用户看到自己没敲过的字。
     #[test]
     fn apply_filter_keeps_raw_query_for_display() {
         let mut app = LogApp::new_empty();
@@ -6326,7 +6346,7 @@ mod tests {
 
     /// 模态键盘门禁 (2026-09-14 用户实机): 设置卡开着、卡内下拉未持焦时
     /// 按 ↑↓, 卡底下的日志区滚动了。卡内控件经焦点路由消费、不经 `app.event`;
-    /// 能到这里的都是无人认领的键, 除 Esc (关卡) 外一律吞掉。
+    /// 能到这里的都是无人认领的键，除 Esc (关卡) 外一律吞掉。
     #[test]
     fn settings_modal_swallows_unhandled_keys() {
         let mut app = LogApp::new_empty();
@@ -6346,11 +6366,11 @@ mod tests {
             alt: false,
         };
         app.event(&key(NamedKey::ArrowDown));
-        assert_eq!(app.top_row, 0.0, "设置卡开着: ↓ 不得滚动底层日志");
+        assert_eq!(app.top_row, 0.0, "设置卡开着：↓ 不得滚动底层日志");
         app.event(&key(NamedKey::PageDown));
-        assert_eq!(app.top_row, 0.0, "设置卡开着: PageDown 不得滚动底层日志");
+        assert_eq!(app.top_row, 0.0, "设置卡开着：PageDown 不得滚动底层日志");
 
-        // Esc 不在吞键范围: 必须仍能关卡。
+        // Esc 不在吞键范围：必须仍能关卡。
         app.event(&key(NamedKey::Escape));
         assert!(!app.settings_open, "Esc 必须仍能关闭设置卡");
         std::fs::remove_file(&p).ok();
@@ -6368,7 +6388,7 @@ mod tests {
         path
     }
 
-    /// 追加换入: 计数由落点按「重叠一行」增量更新, 终值必须等于对新文件的全量重算。
+    /// 追加换入：计数由落点按「重叠一行」增量更新，终值必须等于对新文件的全量重算。
     #[test]
     fn apply_appended_updates_counts_incrementally() {
         let mut app = LogApp::new_empty();
@@ -6399,7 +6419,7 @@ mod tests {
     }
 
     /// **计数未就绪时追加**: 不得重起作业 —— 一个持续增长的 tail 会把计数
-    /// 一遍遍从头来过 (永远算不完, 侧栏永远挂在「…」); 也不得把旧快照的增量
+    /// 一遍遍从头来过 (永远算不完，侧栏永远挂在「…」); 也不得把旧快照的增量
     /// 贴到新文件上。正确做法是等作业交付时与快照对账 (`pickup_levels_job`)。
     #[test]
     fn apply_appended_while_pending_keeps_counts_pending() {
@@ -6415,7 +6435,7 @@ mod tests {
 
         let f2 = LogFile::open(&p).unwrap();
         app.apply_appended(f2, None);
-        assert!(app.levels_pending, "仍等原作业交付, 不得重起");
+        assert!(app.levels_pending, "仍等原作业交付，不得重起");
         assert_eq!(
             app.level_counts.total(),
             0,
@@ -6424,8 +6444,8 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// 作业快照之后文件又长过 → 交付时按「重叠一行」与快照对账, 得到与**当前**
-    /// 文件一致的计数 (既不重起作业, 也不交付一份过期的数)。
+    /// 作业快照之后文件又长过 → 交付时按「重叠一行」与快照对账，得到与**当前**
+    /// 文件一致的计数 (既不重起作业，也不交付一份过期的数)。
     #[test]
     fn pickup_levels_job_reconciles_lines_added_after_snapshot() {
         let mut app = LogApp::new_empty();
@@ -6467,7 +6487,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// **R1 回归 (应用层)**: 旧快照末行无换行、被追加补全改判时, 计数与过滤必须
+    /// **R1 回归 (应用层)**: 旧快照末行无换行、被追加补全改判时，计数与过滤必须
     /// **同时**覆盖那一行 —— 只改一侧就会让柱条数字与筛选结果分岔 (D2 红线)。
     #[test]
     fn apply_appended_covers_completed_half_line_on_both_sides() {
@@ -6479,7 +6499,7 @@ mod tests {
         app.levels_pending = false;
         assert_eq!(app.level_counts.get(Level::Error), 0, "半行未成词");
 
-        // 已应用的过滤 + 已建立(空)的过滤表, 模拟 tail 中途
+        // 已应用的过滤 + 已建立 (空) 的过滤表，模拟 tail 中途
         app.filter_applied = "ERROR".into();
         app.filtered = Some(Arc::new(Vec::new()));
 
@@ -6501,7 +6521,7 @@ mod tests {
         assert_eq!(
             shown.len() as u64,
             app.level_counts.get(Level::Error),
-            "D2 红线: 筛出行数必须 == 柱条数字"
+            "D2 红线：筛出行数必须 == 柱条数字"
         );
         assert_eq!(
             shown.as_slice(),
@@ -6519,7 +6539,7 @@ mod tests {
     #[test]
     fn clicking_a_bar_filters_to_exactly_the_bar_count() {
         let mut app = LogApp::new_empty();
-        // 300 行: ERROR / INFO / WARNING 各 100。WARNING 是关键样本 ——
+        // 300 行：ERROR / INFO / WARNING 各 100。WARNING 是关键样本 ——
         // 它验证别名靠前缀通配被吃到 (字节全等的 level=WARN 会筛出 0 行)。
         let mut content = Vec::new();
         for i in 0..300 {
@@ -6538,14 +6558,14 @@ mod tests {
         app.has_file = true;
 
         for level in [Level::Error, Level::Info, Level::Warn] {
-            app.filter_applied.clear(); // 避开 toggle 分支, 单纯验「套用后筛多少」
+            app.filter_applied.clear(); // 避开 toggle 分支，单纯验「套用后筛多少」
             app.apply_level_filter(level);
             let deadline = Instant::now() + Duration::from_secs(5);
             let lines = loop {
                 if let Some(out) = app.filter_job.poll() {
                     break out.lines;
                 }
-                assert!(Instant::now() < deadline, "过滤 job 5s 未交卷 (悬挂?)");
+                assert!(Instant::now() < deadline, "过滤 job 5s 未交卷 (悬挂？)");
                 std::thread::sleep(Duration::from_millis(5));
             };
             assert_eq!(
@@ -6561,16 +6581,16 @@ mod tests {
 
     /// **本次事故的回归 (2026-09-12)**: 打开**不得**等计数。
     ///
-    /// 事由: 计数原先与文件同批交付, 而字段口径的 `extract_field` 要在整行里找
-    /// `"level":`, 成本随行内容走 —— 用户实机打开 1GB JSONL 时, 状态栏写
+    /// 事由：计数原先与文件同批交付，而字段口径的 `extract_field` 要在整行里找
+    /// `"level":`, 成本随行内容走 —— 用户实机打开 1GB JSONL 时，状态栏写
     /// 「索引 92ms」却等了十几秒 (那十几秒全在 worker 里数级别)。
-    /// 修法: 打开只交出口径列名, 计数交独立后台作业, 侧栏随后补入。
+    /// 修法：打开只交出口径列名，计数交独立后台作业，侧栏随后补入。
     ///
-    /// 这条钉住三件事: ① 落地后侧栏处于「未就绪」而非拿 0 冒充; ② 此时只读
+    /// 这条钉住三件事：① 落地后侧栏处于「未就绪」而非拿 0 冒充; ② 此时只读
     /// (不得拿空子句表去点); ③ 作业交付后计数等于全量重算。
     #[test]
     fn apply_fresh_does_not_block_on_level_counting() {
-        // 注入配置路径: apply_fresh 现会读 state.json (T5), 无注入 panic 封死会拦
+        // 注入配置路径：apply_fresh 现会读 state.json (T5), 无注入 panic 封死会拦
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("lvlcnt")));
         let p = temp_log(
             "{\"level\":\"ERROR\",\"m\":\"a\"}\n{\"level\":\"INFO\",\"m\":\"b\"}\n".as_bytes(),
@@ -6585,7 +6605,7 @@ mod tests {
         };
         app.apply_fresh(p.clone(), out);
 
-        // ① 落地即返回: 计数未就绪
+        // ① 落地即返回：计数未就绪
         assert!(app.levels_pending, "打开不得等计数 —— 落地时计数必未就绪");
         assert_eq!(app.level_counts.total(), 0, "不得拿 0 冒充真实计数");
         // ② 未就绪期间侧栏只读 (空子句表), 点不到任何一行
@@ -6598,7 +6618,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.levels_pending {
             app.pickup_levels_job();
-            assert!(Instant::now() < deadline, "计数作业 5s 未交卷 (悬挂?)");
+            assert!(Instant::now() < deadline, "计数作业 5s 未交卷 (悬挂？)");
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
@@ -6619,11 +6639,11 @@ mod tests {
     /// **打开文件后必须有人持焦** (review 轮补的第四条): T14 把「选中行高亮」改成
     /// 只在 `LogView` 持焦时才画 (`visible_selection` 的焦点门禁), 而 `Ctrl+O`
     /// 打开文件后**没有任何控件**持焦 —— 于是打开 1GB 日志看到的是「一行都没选中」,
-    /// 按 ↑↓ 只动底栏行号、屏上什么都不动: 正是本模块判据① (按了有没有立刻的
+    /// 按 ↑↓ 只动底栏行号、屏上什么都不动：正是本模块判据① (按了有没有立刻的
     /// 变化) 要消灭的那一类。修法是 `apply_fresh` 尾部把焦点送进列表。
     ///
-    /// **两半都要钉**: Fresh 送、append 不送。后者若也送, 后台追长 / 轮转会把正在
-    /// 过滤栏里打字的用户当场拽走 (焦点一挪, 接下来敲的字就不进栏了)。
+    /// **两半都要钉**: Fresh 送、append 不送。后者若也送，后台追长 / 轮转会把正在
+    /// 过滤栏里打字的用户当场拽走 (焦点一挪，接下来敲的字就不进栏了)。
     #[test]
     fn fresh_open_hands_focus_to_the_list_but_append_does_not() {
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshfocus")));
@@ -6642,10 +6662,10 @@ mod tests {
         assert_eq!(
             app.focus_target,
             Some("log-view"),
-            "打开文件后须把焦点送进列表 —— T14 起高亮只在持焦时画, 不送就是「一行没选中」"
+            "打开文件后须把焦点送进列表 —— T14 起高亮只在持焦时画，不送就是「一行没选中」"
         );
 
-        // 对照: **追加**不得动焦点 (用户可能正在栏里打字)
+        // 对照：**追加**不得动焦点 (用户可能正在栏里打字)
         app.focus_target = Some("log-bar");
         app.level_counts = Arc::new(levels::count_levels(&app.file));
         app.levels_pending = false;
@@ -6662,8 +6682,8 @@ mod tests {
         std::fs::remove_file(&p2).ok();
     }
 
-    /// 轮转/重建: 计数重新后台算, 且列名与子句表跟着换 —— JSONL 变明文后必须
-    /// 降级只读, 不能留着旧列名的子句去点 (会筛出 0 行)。
+    /// 轮转/重建: 计数重新后台算，且列名与子句表跟着换 —— JSONL 变明文后必须
+    /// 降级只读，不能留着旧列名的子句去点 (会筛出 0 行)。
     #[test]
     fn apply_rebuild_switches_column_and_recounts() {
         let mut app = LogApp::new_empty();
@@ -6678,7 +6698,7 @@ mod tests {
         app.has_file = true;
         assert!(
             app.level_queries[Level::Error as usize].is_some(),
-            "起点: JSONL 可点"
+            "起点：JSONL 可点"
         );
 
         // 轮转后内容变明文 → 口径列随之作废
@@ -6693,7 +6713,7 @@ mod tests {
         app.apply_rebuild(&p2, out);
 
         assert!(app.levels_pending, "重建后计数重新后台算");
-        assert!(app.level_column.is_none(), "列名换掉, 不沿用旧的");
+        assert!(app.level_column.is_none(), "列名换掉，不沿用旧的");
         assert!(
             app.level_queries.iter().all(Option::is_none),
             "明文 → 子句表清空 (降级只读)"
@@ -6718,8 +6738,8 @@ mod tests {
     }
     #[test]
     fn apply_fresh_invalidates_inflight_filter_and_search_jobs() {
-        // review C1 回归: 旧文件上的在途 filter/search 结果, 换入新文件后
-        // 不得贴上 (worker 用通道闸门控制交付时序, 无运气成分)
+        // review C1 回归：旧文件上的在途 filter/search 结果，换入新文件后
+        // 不得贴上 (worker 用通道闸门控制交付时序，无运气成分)
         let mut app = LogApp::new_empty_at(Some(temp_cfg_path("freshinv")));
         let (f_tx, f_rx) = std::sync::mpsc::channel::<()>();
         app.filter_job.launch(move || {
@@ -6751,7 +6771,7 @@ mod tests {
             level_column: None,
         };
         app.apply_fresh(p.clone(), out);
-        // 放行 worker 交付, 长窗轮询: 结果必须永不到达
+        // 放行 worker 交付，长窗轮询：结果必须永不到达
         f_tx.send(()).unwrap();
         s_tx.send(()).unwrap();
         let mut filter_got = false;
@@ -6771,8 +6791,8 @@ mod tests {
     // ---- M3 (T12): 九条沉默接入的回归锁 ----
     //
     // 公共判据是「触发后**出声**且**说得对**」: 只测「有提示」会放过提示写错原因
-    // 的形态, 只测「返回 Consumed/Ignored」则完全测不出这一批改动 (M3 一律不动
-    // 归因, 只加原因)。
+    // 的形态，只测「返回 Consumed/Ignored」则完全测不出这一批改动 (M3 一律不动
+    // 归因，只加原因)。
 
     /// 敲一个无修饰键。
     fn press(app: &mut LogApp, key: Key) {
@@ -6796,7 +6816,7 @@ mod tests {
         });
     }
 
-    /// 造一个开了真文件 (内容自定) 的 app, 交给 `f` 跑, 收尾删文件。
+    /// 造一个开了真文件 (内容自定) 的 app, 交给 `f` 跑，收尾删文件。
     /// 走 `has_file` 门禁**之后**的键处理路径 —— 空态会先被 P26 那条拦下。
     fn with_file<T>(content: &[u8], f: impl FnOnce(&mut LogApp) -> T) -> T {
         let p = temp_log(content);
@@ -6814,7 +6834,7 @@ mod tests {
         app.notice
             .as_ref()
             .map(|(t, _)| t.clone())
-            .unwrap_or_else(|| panic!("须有一条 notice; 当前底栏: {}", app.status))
+            .unwrap_or_else(|| panic!("须有一条 notice; 当前底栏：{}", app.status))
     }
 
     /// 敲一个 Ctrl+字符键事件 (不经过 app, 供 `app_key_filter` 直调)。
@@ -6830,8 +6850,8 @@ mod tests {
 
     /// T17 验收 ③: 拖滚动条**不改选中行** —— 抓条是「看」不是「选」。
     ///
-    /// 对照在同一支测试里: 方向键那条路**会**动选中 (既有行为, 本项不动它)。
-    /// 有对照才说明这条不变量是**有意**分开的, 不是碰巧没动。
+    /// 对照在同一支测试里：方向键那条路**会**动选中 (既有行为，本项不动它)。
+    /// 有对照才说明这条不变量是**有意**分开的，不是碰巧没动。
     #[test]
     fn scroll_to_does_not_move_the_selection() {
         let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
@@ -6852,17 +6872,17 @@ mod tests {
         assert_eq!(app.selected, 7, "抓滚动条不得动选中行");
 
         app.update(Msg::ScrollRows(1.0));
-        assert_eq!(app.selected, 121, "对照: 滚轮/方向键那条路仍让选中跟随首行");
+        assert_eq!(app.selected, 121, "对照：滚轮/方向键那条路仍让选中跟随首行");
         std::fs::remove_file(&p).ok();
     }
 
-    /// T17 回归锁: 在底部**碰一下滚动条**不得静默脱掉 FOLLOW。
+    /// T17 回归锁：在底部**碰一下滚动条**不得静默脱掉 FOLLOW。
     ///
     /// 跟随态下 app 的 `top_row` 是 `count-1`, 而滚动条能表达的最大值是
-    /// `count-可见行数` —— 两个口径差着 `可见行数-1` 行。原先直接比
+    /// `count-可见行数` —— 两个口径差着 `可见行数 -1` 行。原先直接比
     /// `top < top_row`, 于是「在底部往下拖」也被判成「向上看」, ` · FOLLOW`
-    /// 悄悄从底栏消失。修法: 落到条底 (`at_bottom`) 时不参与这个判断、
-    /// 往回拖仍照旧。**A/B 实证**: 去掉 `!at_bottom` 那一项, 本测试第一段必红。
+    /// 悄悄从底栏消失。修法：落到条底 (`at_bottom`) 时不参与这个判断、
+    /// 往回拖仍照旧。**A/B 实证**: 去掉 `!at_bottom` 那一项，本测试第一段必红。
     #[test]
     fn touching_the_scroll_bar_at_the_bottom_keeps_follow() {
         let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
@@ -6881,7 +6901,7 @@ mod tests {
         });
         assert!(app.follow, "拖到条底不该脱跟随 (用户没在往回看)");
 
-        // 对照: 真往回拖 (没到条底) 仍然脱跟随。**必须把 top_row 放回跟随位**
+        // 对照：真往回拖 (没到条底) 仍然脱跟随。**必须把 top_row 放回跟随位**
         // —— 上一条已经把 top_row 拉到了 bar_bottom, 不放回去这条就不是「往回拖」。
         app.follow = true;
         app.top_row = app.max_top();
@@ -6913,10 +6933,10 @@ mod tests {
             ctrl: false,
             alt: false,
         };
-        app.event(&wheel(-1.0)); // 向下滚 (与 view 同向: delta.1 < 0 = 向下)
+        app.event(&wheel(-1.0)); // 向下滚 (与 view 同向：delta.1 < 0 = 向下)
         assert!(app.top_row > 0.0, "侧栏上的滚轮须滚得动列表");
 
-        // 模态不穿透: 卡开着时滚轮只属于卡
+        // 模态不穿透：卡开着时滚轮只属于卡
         let before = app.top_row;
         app.settings_open = true;
         app.event(&wheel(-1.0));
@@ -6926,21 +6946,21 @@ mod tests {
 
     /// T17: 滚轮换算**单点** —— 内容区与「未认领」那一路必须是同一个手感。
     ///
-    /// 顺带钉住上界: 框架把 `LineDelta`(行) 与 `PixelDelta`(像素) 抹平成同一个
-    /// `f32` (G10), 触控板一次给 ±100 时若不夹, 一滚就跳几百行。
+    /// 顺带钉住上界：框架把 `LineDelta`(行) 与 `PixelDelta`(像素) 抹平成同一个
+    /// `f32` (G10), 触控板一次给 ±100 时若不夹，一滚就跳几百行。
     #[test]
     fn wheel_rows_is_clamped_and_sign_flipped() {
         assert!(wheel_rows(-1.0) > 0.0, "与 danqing Scrollable 同向");
         assert_eq!(wheel_rows(0.0), 0.0);
-        // 钉**值**而不是钉「有夹子」: 写 `<= WHEEL_MAX_ROWS` 的话, 把常量从 12
+        // 钉**值**而不是钉「有夹子」: 写 `<= WHEEL_MAX_ROWS` 的话，把常量从 12
         // 改成 50 它照样绿 —— 那就不叫守卫了。
         assert_eq!(wheel_rows(-100.0), WHEEL_MAX_ROWS, "像素档夹到上界");
         assert_eq!(wheel_rows(100.0), -WHEEL_MAX_ROWS);
     }
 
-    /// T18 (P17): notice 自带消退期限 —— 到点清掉, 不留常驻噪声。
+    /// T18 (P17): notice 自带消退期限 —— 到点清掉，不留常驻噪声。
     ///
-    /// 不真等 4 秒: 把期限拨到过去, 语义等价。
+    /// 不真等 4 秒：把期限拨到过去，语义等价。
     #[test]
     fn notice_expires_when_its_deadline_passes() {
         let mut app = LogApp::new_empty();
@@ -6955,13 +6975,129 @@ mod tests {
         assert!(app.notice_until.is_none(), "期限也要一并清掉");
     }
 
+    /// SPEC-notice-visibility T2: 点掉 toast = 与到点消退同途 (dismiss_notice 收口),
+    /// notice 双清。
+    #[test]
+    fn dismiss_notice_clears_notice_like_expiry() {
+        let mut app = LogApp::new_empty();
+        app.set_notice("偏移须是毫秒整数".into(), NoticeKind::Warn);
+        assert!(app.notice.is_some());
+        app.update(Msg::DismissNotice);
+        assert!(app.notice.is_none(), "点掉须清 notice");
+        assert!(app.notice_until.is_none(), "期限一并清");
+    }
+
+    /// SPEC-notice-visibility T2 (非模态铁律): Warn 浮层在屏时 `popover_open()` 仍 false
+    /// —— toast 不进模态门控清单 ( Esc 次序/滚轮门禁/Ctrl 守卫的共同判据),
+    /// 否则 toast 一弹全窗口的键盘滚轮都被模态语义拦掉。
+    #[test]
+    fn warn_toast_does_not_count_as_popover() {
+        let mut app = LogApp::new_empty();
+        app.set_notice("x".into(), NoticeKind::Warn);
+        assert!(
+            !app.popover_open(),
+            "toast 是浮层不是弹层：不得污染模态门控"
+        );
+    }
+
+    /// 分档口径锁 (2026-09-29 全仓大盘点，SPEC-notice-visibility §11):
+    /// 「你按的那下没生效」类提示必须是 **Warn** (上 toast 浮层), 错给 Info =
+    /// 沉回底栏 —— 用户实机 H-a 验收当场撞出第一条 (无选中源点步进是 Info)。
+    /// 锁代表样本三族; 全量 23 处口径表在 spec §11, 新加提示先过表。
+    #[test]
+    fn ineffective_action_notices_are_warn_not_info() {
+        // 指针语义族：无选中源改时间参数 (H-a 原始场景)
+        let mut app = LogApp::new_empty();
+        app.edit_source_time(|o, t| (Some(o + 1), Some(t)));
+        assert!(
+            matches!(app.notice, Some((_, NoticeKind::Warn))),
+            "无选中源改时间参数 = 没生效，必须 Warn: {:?}",
+            app.notice
+        );
+        // 指针语义族：无选中源点移除
+        let mut app = LogApp::new_empty();
+        app.remove_selected_merge_source();
+        assert!(
+            matches!(app.notice, Some((_, NoticeKind::Warn))),
+            "无选中源点移除 = 没生效，必须 Warn: {:?}",
+            app.notice
+        );
+        // 跳转无对象族：无书签按 ' 跳下一书签
+        let mut app = LogApp::new_empty();
+        app.goto_next_bookmark();
+        assert!(
+            matches!(app.notice, Some((_, NoticeKind::Warn))),
+            "无书签跳转 = 没生效，必须 Warn: {:?}",
+            app.notice
+        );
+        // 前置不满足族：无文件按 b 夹书签
+        let mut app = LogApp::new_empty();
+        app.toggle_bookmark();
+        assert!(
+            matches!(app.notice, Some((_, NoticeKind::Warn))),
+            "无文件夹书签 = 没生效，必须 Warn: {:?}",
+            app.notice
+        );
+    }
+
+    /// SPEC-notice-visibility T4 (弹层之上，端到端行为锁): 模态弹层开着时，
+    /// 点击 toast 位置**先到 toast** (DismissNotice 出队), 弹层收不到这次点击
+    /// (不出 CloseMergeMenu —— scrim 点击本会关弹层)。
+    ///
+    /// 构造保证：toast 挂 Stack 末位 + 框架事件反序分发 (`stack.rs` rev) +
+    /// 真实鼠标分发主链 `handler.rs:993` 就是 `tree.event` —— 本测试复刻真实路径。
+    /// ⚠ 点位常量与 `toast.rs` 同源声明：y = 窗底 − STATUS_HEIGHT − BOTTOM_GAP(8)
+    /// − TOAST_H/2(18); 改 toast 几何常量会红这里 (红是安全方向，来同步即可)。
+    #[test]
+    fn toast_gets_the_click_before_modal_popover() {
+        use danqing::event::MouseButton;
+        use danqing::widget::{EventResult, MsgQueue};
+        use danqing::{Constraints, Point, Rect, RectBatch, TextBatch};
+
+        let mut app = LogApp::new_empty();
+        app.merge_menu_open = true; // 模态弹层开态 (直写字段构态，不触门控)
+        app.set_notice("偏移须是毫秒整数 (如 -3000)".into(), NoticeKind::Warn);
+        let mut tree = app.view();
+        tree.sync(&app);
+        let mut texts = TextBatch::default();
+        let mut rects = RectBatch::new();
+        let area = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+        let size = tree.layout(Constraints::tight(area.size), &mut texts);
+        tree.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+
+        let click = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            // 水平窗中 (toast 水平居中，中点必落在其上); y 见函数头同源声明。
+            position: Point::new(640.0, 800.0 - crate::view::STATUS_HEIGHT - 8.0 - 18.0),
+        };
+        let mut msgs = MsgQueue::new();
+        let result = tree.event(&click, area, &mut msgs);
+        assert_eq!(
+            result,
+            EventResult::Consumed,
+            "toast 命中须消费 (弹层收不到)"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::DismissNotice))),
+            "点击 toast 须出 DismissNotice"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::CloseMergeMenu))),
+            "弹层不得吃到这次点击 (scrim 点击本会关弹层)"
+        );
+    }
+
     /// T20 (P37): 侧栏开关与 Ctrl+L 是**同一份状态** —— 两条入口同发一条消息。
     ///
-    /// 「双向同步」不是两处赋值互相对, 而是只有一份真相: 开关读
+    /// 「双向同步」不是两处赋值互相对，而是只有一份真相：开关读
     /// `app.histogram_visible`、Ctrl+L 与开关都发 `Msg::ToggleHistogram`。
     ///
     /// **配置路径必须显式给临时文件**: 这条消息会 `save_config()`, 而默认路径是
-    /// 用户真实的 `config.toml` (整文件覆盖写)。本测试第一版就是这么写的, 被
+    /// 用户真实的 `config.toml` (整文件覆盖写)。本测试第一版就是这么写的，被
     /// review 抓出来 —— 现在 `save_config` 在测试里拿不到路径会直接 panic。
     #[test]
     fn histogram_toggle_is_one_state_for_both_entries() {
@@ -6972,7 +7108,7 @@ mod tests {
         assert_eq!(app.histogram_visible, !before, "两条入口共用的那一支须翻转");
         app.update(Msg::ToggleHistogram);
         assert_eq!(app.histogram_visible, before, "再切一次回到原状");
-        // 落盘也走的是**同一个**路径 (整文件同源, 不碰用户真配置)
+        // 落盘也走的是**同一个**路径 (整文件同源，不碰用户真配置)
         assert_eq!(
             config::Config::load_from(&p).histogram,
             before,
@@ -6981,7 +7117,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// T21 (P39): Ctrl+F **不清草稿** —— 它是「回到搜索框」的反射键,
+    /// T21 (P39): Ctrl+F **不清草稿** —— 它是「回到搜索框」的反射键，
     /// 而原实现每次都销毁用户已输入未应用的内容。
     ///
     /// 这里锁的是**应用侧那一半** (不再发清空信号、改发重聚焦信号);
@@ -6997,18 +7133,18 @@ mod tests {
         assert_eq!(app.search_refocus_rev, refocus0 + 1, "改为请栏处理重聚焦");
         assert_eq!(app.focus_target, Some("log-bar"), "仍要把焦点送进栏");
 
-        // 对照: Esc 那条路**仍然**清空 (本项只动「回到搜索框」这一条)
+        // 对照：Esc 那条路**仍然**清空 (本项只动「回到搜索框」这一条)
         app.clear_search();
         assert_eq!(app.search_clear_rev, clear0 + 1, "Esc 仍须清空");
     }
 
-    /// T16 (P32) 回归锁: 设置卡开着时, 全局键**不得穿透到卡后**。
+    /// T16 (P32) 回归锁：设置卡开着时，全局键**不得穿透到卡后**。
     ///
     /// 逐条断言**卡后副作用没发生**, 而不是断言返回值是不是某个 `Msg` ——
-    /// 「不穿透」的实现可以是吞掉、也可以是别的, 判据应该绑在**后果**上。
+    /// 「不穿透」的实现可以是吞掉、也可以是别的，判据应该绑在**后果**上。
     ///
     /// **Ctrl+O 不在表内 (有意)**: 它的穿透后果是弹一个**阻塞的原生文件对话框**,
-    /// 一旦回归, 这条测试不是红而是**挂住** —— 一个会挂死的守卫比没有守卫更坏。
+    /// 一旦回归，这条测试不是红而是**挂住** —— 一个会挂死的守卫比没有守卫更坏。
     /// 它的门禁与表内三条是同一个 `if`, 位置对了三条就都对了; 实机那一半由
     /// 矩阵 §6 的「卡开着按 Ctrl+O」(P32) 覆盖。
     #[test]
@@ -7024,10 +7160,10 @@ mod tests {
                 Some(Msg::OpenFile(_)) => "弹了文件对话框",
                 _ => "",
             };
-            assert!(leaked.is_empty(), "{name} 穿透了设置卡: {leaked}");
+            assert!(leaked.is_empty(), "{name} 穿透了设置卡：{leaked}");
         }
-        // **反向对照 —— 本测试第一版缺的就是这半边, 于是漏掉了一个 Critical**:
-        // 卡内控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠**焦点分发**收键, 而框架在
+        // **反向对照 —— 本测试第一版缺的就是这半边，于是漏掉了一个 Critical**:
+        // 卡内控件 (主题下拉 / 侧栏开关 / 关闭钮) 全靠**焦点分发**收键，而框架在
         // `app_key_filter` 返回 `Some` 时直接 return、不再分发 (`handler.rs:436-441`)。
         // 所以非全局键**必须**放行 (`None`), 否则卡内键盘全死 —— 而上一段
         // 「不该发生的副作用没发生」是**看不出**这一点的 (吞得越多它越绿)。
@@ -7049,14 +7185,14 @@ mod tests {
         ] {
             assert!(
                 app.app_key_filter(&ev).is_none(),
-                "{name} 必须放行给卡内控件 —— 守卫吞了它, 卡内键盘就死了"
+                "{name} 必须放行给卡内控件 —— 守卫吞了它，卡内键盘就死了"
             );
         }
-        // 这三条由 `LogApp::event` 那条路认领, 那里有同款门禁 —— 一并锁住
+        // 这三条由 `LogApp::event` 那条路认领，那里有同款门禁 —— 一并锁住
         app.event(&ctrl_key("b"));
         app.event(&ctrl_key("g"));
         assert!(app.bookmarks.is_empty(), "Ctrl+B 不得在卡后加书签");
-        // Esc 仍须能关卡 (既有行为保持, 不被守卫吃掉)
+        // Esc 仍须能关卡 (既有行为保持，不被守卫吃掉)
         assert!(
             matches!(
                 app.app_key_filter(&Event::Key {
@@ -7072,10 +7208,10 @@ mod tests {
         );
     }
 
-    /// T11 回归锁: notice 是**第二条通道**, 不得拼进 `status` 串。
+    /// T11 回归锁：notice 是**第二条通道**, 不得拼进 `status` 串。
     ///
-    /// 曾把它拼进去, 而 `LogView::paint` 又单独画一遍 `notice` —— 同一句话在底栏
-    /// 出现**两次**。而两遍还是同色的, 第一眼只像「重复」不像「出错」, 所以这条
+    /// 曾把它拼进去，而 `LogView::paint` 又单独画一遍 `notice` —— 同一句话在底栏
+    /// 出现**两次**。而两遍还是同色的，第一眼只像「重复」不像「出错」, 所以这条
     /// 必须由守卫而不是靠眼睛。
     #[test]
     fn notice_is_not_folded_into_the_status_line() {
@@ -7083,21 +7219,21 @@ mod tests {
         app.refresh_status();
         app.notice = Some(("此处无行".into(), NoticeKind::Info));
         app.refresh_status();
-        assert!(app.notice.is_some(), "前提: notice 还在");
+        assert!(app.notice.is_some(), "前提：notice 还在");
         assert!(
             !app.status.contains("此处无行"),
             "notice 不得拼进 status (会被画两遍): {}",
             app.status
         );
-        // 反向对照: 常态信息该在的仍在 (别把整条底栏一起删了)
+        // 反向对照：常态信息该在的仍在 (别把整条底栏一起删了)
         assert!(!app.status.is_empty(), "常态信息不得一起被删掉");
     }
 
     /// P27 收口 (2026-09-15 用户裁定「**后者**」): 无效正则这类错误**走 status 的
-    /// 错误态 (常驻红)**, **不进 notice 通道** —— notice 有 4 秒消退期, 而它是
+    /// 错误态 (常驻红)**, **不进 notice 通道** —— notice 有 4 秒消退期，而它是
     /// 「你刚按的那下没生效」, 不该自己消失。
     ///
-    /// 这条钉的是**标志与内容同真同假**: 置了错误态就得真有错误, 换了常态就得清掉
+    /// 这条钉的是**标志与内容同真同假**: 置了错误态就得真有错误，换了常态就得清掉
     /// —— 脱钩了就是「绿水配红字」那类假信息。
     #[test]
     fn invalid_regex_marks_the_status_as_an_error_and_normal_status_clears_it() {
@@ -7114,7 +7250,7 @@ mod tests {
         );
         assert!(
             app.notice.is_none(),
-            "错误**不得**走 notice 通道 —— 那条 4 秒就消退, 用户裁定要常驻"
+            "错误**不得**走 notice 通道 —— 那条 4 秒就消退，用户裁定要常驻"
         );
         // **反向对照**: 常态刷新必须清掉标志 —— 否则红字会跟着后续所有信息一起红
         app.refresh_status();
@@ -7126,7 +7262,7 @@ mod tests {
     ///
     /// M3 之前本仓只有一处出声 (正则无效进底栏), 其余静默。这条把那个孤例**升格
     /// 为规则**: 再遇到「按了没反应」, 要做的不是「记得去加提示」, 而是**往这张表
-    /// 加一行** —— 行在, 判据在, 原因就漏不掉。
+    /// 加一行** —— 行在，判据在，原因就漏不掉。
     ///
     /// 每行给的是**期望的原因片段**, 不是「有提示就算」: 后者会放过原因写错的形态。
     /// 本表只收**键盘路径**上的吞键; 鼠标路径各有同构的守卫
@@ -7152,7 +7288,7 @@ mod tests {
                 "非 JSONL",
                 Box::new(|| {
                     with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
-                        assert!(app.schema.is_none(), "前提: 无 JSONL schema");
+                        assert!(app.schema.is_none(), "前提：无 JSONL schema");
                         press_ctrl(app, "t");
                         notice_of(app)
                     })
@@ -7176,7 +7312,7 @@ mod tests {
                     with_file(b"{\"a\":{\"b\":1}}\nplain\n", |app| {
                         app.mode = ViewMode::Table;
                         app.toggle_expand(0); // 真展开 (行 0 含嵌套)
-                        assert!(app.expanded.is_expanded(0), "前提: 行 0 已展开");
+                        assert!(app.expanded.is_expanded(0), "前提：行 0 已展开");
                         press(app, Key::Named(NamedKey::ArrowRight));
                         notice_of(app)
                     })
@@ -7187,7 +7323,7 @@ mod tests {
                 "尚无书签",
                 Box::new(|| {
                     with_file(b"2026-09-14 12:00:00 INFO ready\n", |app| {
-                        assert!(app.bookmarks.is_empty(), "前提: 无书签");
+                        assert!(app.bookmarks.is_empty(), "前提：无书签");
                         press_ctrl(app, "g");
                         notice_of(app)
                     })
@@ -7195,7 +7331,7 @@ mod tests {
             ),
             (
                 // 口径须与 `ROADMAP-v1x.md` §四 同源 —— 写成「暂不支持」之类
-                // 就又是一处各说各话, 故断言片段锁在 "v1.x" 上。
+                // 就又是一处各说各话，故断言片段锁在 "v1.x" 上。
                 "P34 Ctrl+A 被吞",
                 "v1.x",
                 Box::new(|| {
@@ -7217,7 +7353,7 @@ mod tests {
 
     // ---- merge-timeline 腿一 T3: 合并工作区行为锁 ----
 
-    /// 合并 fixture: cur (单文件现场, 3 行 ISO) + 源 a (.log ISO) + 源 b (.jsonl)。
+    /// 合并 fixture: cur (单文件现场，3 行 ISO) + 源 a (.log ISO) + 源 b (.jsonl)。
     fn merge_fixture(tag: &str) -> (LogApp, PathBuf, PathBuf, PathBuf) {
         let app = LogApp::new_empty_at(Some(temp_cfg_path(tag)));
         let dir = std::env::temp_dir();
@@ -7251,7 +7387,7 @@ mod tests {
         app.path = path.to_path_buf();
     }
 
-    /// 同步直驱归并交卷 (注入惯例: 不起线程, 直接喂 apply)。
+    /// 同步直驱归并交卷 (注入惯例：不起线程，直接喂 apply)。
     fn apply_merge_sync(app: &mut LogApp, paths: Vec<PathBuf>) {
         let out = danqing_log::merge_view::build_merge(
             &paths,
@@ -7293,14 +7429,14 @@ mod tests {
         let (mut app, cur, a, b) = merge_fixture("bm");
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // 时间线: cur0(00) a0(01) b0(02) a1(03) → pos 3 = (源1, 行1)
+        // 时间线：cur0(00) a0(01) b0(02) a1(03) → pos 3 = (源 1, 行 1)
         app.merge.as_mut().unwrap().selected = 3;
         app.toggle_bookmark();
         let m = app.merge.as_ref().unwrap();
         assert!(
             m.bookmarks
                 .contains(&danqing_log::merge_view::pack_key(1, 1)),
-            "合并书签打在 (源1, 行1) pack 键"
+            "合并书签打在 (源 1, 行 1) pack 键"
         );
         assert!(app.bookmarks.is_empty(), "单文件书签集零触碰 (D4)");
         assert!(app.notice.is_some(), "书签动作有回执");
@@ -7337,7 +7473,7 @@ mod tests {
         app.reload_file(a.clone());
         assert_eq!(app.workspace, Workspace::Single, "打开新文件回单文件 (D4)");
         assert!(app.merge.is_some(), "bundle 保留");
-        // open_job 在途: 测试不拾取, drop 语义收尾 (open.rs)。
+        // open_job 在途：测试不拾取，drop 语义收尾 (open.rs)。
         app.open_job = None;
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
@@ -7360,7 +7496,7 @@ mod tests {
         assert_eq!(
             app.file.line_count(),
             3,
-            "合并期间**单文件侧** tail 冻结 (T7 起合流发生在合并源上, app.file 不动)"
+            "合并期间**单文件侧** tail 冻结 (T7 起合流发生在合并源上，app.file 不动)"
         );
         assert!(app.open_job.is_none());
         app.update(Msg::ExitMerge);
@@ -7395,7 +7531,7 @@ mod tests {
     }
 
     /// D4 不丢 (加/减源重建): 旧 bundle 在场的重归并交卷**按路径**搬
-    /// 书签/显隐/选中 (carry_view_state) —— 减源后序号漂移仍找回, 消失源的
+    /// 书签/显隐/选中 (carry_view_state) —— 减源后序号漂移仍找回，消失源的
     /// 键静默丢。首并 (无旧 bundle) 不 carry, 全新状态。
     #[test]
     fn rebuild_reapply_carries_bookmarks_hidden_and_selection() {
@@ -7406,15 +7542,15 @@ mod tests {
             source: PaidSource::StoreAddOn,
         };
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // 书签打在**将被隐藏**的源1 (键不因隐藏失效, T3 语义);
-        // 选中打在可见源2 (b) —— 掩码索引里找得回才有意义。
+        // 书签打在**将被隐藏**的源 1 (键不因隐藏失效，T3 语义);
+        // 选中打在可见源 2 (b) —— 掩码索引里找得回才有意义。
         {
             let m = app.merge.as_mut().unwrap();
             m.selected = m.position_of(2, 1).unwrap();
             m.toggle_bookmark(1, 1, 256);
         }
         app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
-        // 重归并交卷: 减掉源0 (cur) → 旧源1→新源0, 旧源2→新源1 (序号漂移)
+        // 重归并交卷：减掉源 0 (cur) → 旧源 1→新源 0, 旧源 2→新源 1 (序号漂移)
         apply_merge_sync(&mut app, vec![a.clone(), b.clone()]);
         let m = app.merge.as_ref().unwrap();
         assert_eq!(m.sources.len(), 2);
@@ -7422,12 +7558,12 @@ mod tests {
         assert!(
             m.bookmarks
                 .contains(&danqing_log::merge_view::pack_key(0, 1)),
-            "书签按路径重映射: 旧 (1,1) → 新 (0,1)"
+            "书签按路径重映射：旧 (1,1) → 新 (0,1)"
         );
         assert_eq!(
             m.selected,
             m.position_of(1, 1).unwrap(),
-            "选中行按 (路径,行) 找回: 旧 (2,1) → 新 (1,1)"
+            "选中行按 (路径，行) 找回：旧 (2,1) → 新 (1,1)"
         );
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
@@ -7440,7 +7576,7 @@ mod tests {
     fn merge_gate_blocks_free_tier_and_never_prompts_paid() {
         let (mut app, cur, a, b) = merge_fixture("m-gate");
         open_single(&mut app, &cur);
-        // 免费态: 入口被拦, 弹层不开
+        // 免费态：入口被拦，弹层不开
         app.update(Msg::OpenMergeMenu);
         assert_eq!(
             app.upgrade_prompt,
@@ -7448,13 +7584,13 @@ mod tests {
             "免费态入口 = 升级提示"
         );
         assert!(!app.merge_menu_open, "免费态不得开弹层");
-        // 免费态: 动作兜底闸全拦 (零变更)
+        // 免费态：动作兜底闸全拦 (零变更)
         app.update(Msg::MergeSourcePicked(a.clone()));
         assert!(app.merge.is_none(), "免费态加源零起并");
         app.update(Msg::RemoveSelectedMergeSource);
         app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
         assert!(app.merge.is_none(), "免费态动作零变更");
-        // 付费态: 放行; 全程永不触发升级提示
+        // 付费态：放行; 全程永不触发升级提示
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -7464,7 +7600,7 @@ mod tests {
         assert!(app.upgrade_prompt.is_none(), "付费态永不误弹");
         app.update(Msg::MergeSourcePicked(a.clone()));
         assert!(app.upgrade_prompt.is_none());
-        // 起并走 AsyncJob: 测试不拾取, drop 语义收尾 (open.rs 同规)
+        // 起并走 AsyncJob: 测试不拾取，drop 语义收尾 (open.rs 同规)
         app.merge_job = Default::default();
         // 直注交卷验证付费动作真生效 (注入惯例)
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
@@ -7482,7 +7618,7 @@ mod tests {
     // ---- 三连接门 (todo-gate-trio G2/G3/G4 两态锁) ----
 
     /// T5 应用层 (腿 D): 快捷档/手输走同一 edit_source_time 通路 ——
-    /// 作用**选中**源, 解析边界重提 (ts 变, 文件行索引不动), 门控两态。
+    /// 作用**选中**源，解析边界重提 (ts 变，文件行索引不动), 门控两态。
     #[test]
     fn merge_time_edit_targets_selected_and_reextracts() {
         let (mut app, cur, a, b) = merge_fixture("m-time");
@@ -7494,7 +7630,7 @@ mod tests {
         // 无选中 → 提示零变更
         app.update(Msg::NudgeMergeOffset(-1_000));
         assert!(app.merge.as_ref().unwrap().sources[0].offset_ms == 0);
-        // 选中源1, 快捷档 -1s
+        // 选中源 1, 快捷档 -1s
         app.merge_source_selected = Some(a.to_string_lossy().into_owned());
         app.update(Msg::NudgeMergeOffset(-1_000));
         let m = app.merge.as_ref().unwrap();
@@ -7509,7 +7645,7 @@ mod tests {
         // 拒收明示 (非数)
         app.update(Msg::SetMergeOffset("abc".into()));
         assert!(app.notice.as_ref().is_some_and(|(t, _)| t.contains("毫秒")));
-        // 免费态: 门拦零变更 (两道闸)
+        // 免费态：门拦零变更 (两道闸)
         app.entitlement = Entitlement::Free;
         app.upgrade_prompt = None;
         app.update(Msg::NudgeMergeOffset(1_000));
@@ -7524,7 +7660,7 @@ mod tests {
         std::fs::remove_file(&b).ok();
     }
 
-    /// G2 列配置两态: 免费态入口/手势动作全拦 (升级提示 + 零变更 + 不落盘);
+    /// G2 列配置两态：免费态入口/手势动作全拦 (升级提示 + 零变更 + 不落盘);
     /// 付费态放行永不误弹。列配置段「不读不写」另有通路锁。
     #[test]
     fn column_gate_blocks_free_tier_and_never_prompts_paid() {
@@ -7546,16 +7682,16 @@ mod tests {
                 width_chars: 8,
             }],
         }));
-        // 免费态: 入口拦
+        // 免费态：入口拦
         app.update(Msg::OpenColMenu);
         assert_eq!(app.upgrade_prompt, Some(Feature::ColumnConfig));
         assert!(!app.col_menu_open);
-        // 免费态: 三动作兜底闸全拦 (列摆法零变更)
+        // 免费态：三动作兜底闸全拦 (列摆法零变更)
         app.update(Msg::ColumnWidthSet("a".into(), 250.0));
         app.update(Msg::ColumnWidthClear("a".into()));
         app.update(Msg::ColumnMoveBefore("a".into(), None));
         assert!(app.columns.widths.is_empty(), "免费态列摆法零变更");
-        // 付费态: 放行且永不误弹
+        // 付费态：放行且永不误弹
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -7601,13 +7737,13 @@ mod tests {
         };
         app.update(Msg::ColumnWidthSet("a".into(), 300.0));
         assert!(app.save_state());
-        // 降级免费: 不读 (默认摆法), 不写 (磁盘原值保留)
+        // 降级免费：不读 (默认摆法), 不写 (磁盘原值保留)
         app.entitlement = Entitlement::Free;
         app.columns.widths.clear();
         app.load_state_for_current_file();
         assert!(app.columns.widths.is_empty(), "免费态不读列配置段");
-        app.save_state(); // 免费态落盘: 付费数据须原样保留
-        // 再回付费: 付费期写的还在 (没被免费期 save 抹掉)
+        app.save_state(); // 免费态落盘：付费数据须原样保留
+        // 再回付费：付费期写的还在 (没被免费期 save 抹掉)
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -7621,7 +7757,7 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// G3 书签持久化两态: 会话内书签照用 (toggle 不拦不弹窗, v1.0 行为);
+    /// G3 书签持久化两态：会话内书签照用 (toggle 不拦不弹窗，v1.0 行为);
     /// 免费态不跨重启恢复; 付费期已写的免费期不删。
     #[test]
     fn bookmark_persist_gated_but_in_session_free() {
@@ -7636,13 +7772,13 @@ l2
         app.file = Arc::new(LogFile::open(&p).unwrap());
         app.has_file = true;
         app.path = std::path::PathBuf::from("C:/logs/g3.log");
-        // 免费态: 会话内书签照用 —— toggle 不弹窗 (提示位在许可页, 不在这)
+        // 免费态：会话内书签照用 —— toggle 不弹窗 (提示位在许可页，不在这)
         app.update(Msg::Noop); // 起步
         app.bookmarks.insert(1);
         app.upgrade_prompt = None;
         assert!(app.bookmarks.contains(&1), "会话内书签照用");
         assert!(app.upgrade_prompt.is_none(), "toggle 不弹窗 (G3 裁决)");
-        // 付费期写书签 → 降级: 免费期不读不写, 付费数据保留
+        // 付费期写书签 → 降级：免费期不读不写，付费数据保留
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
@@ -7662,7 +7798,7 @@ l2
         std::fs::remove_file(&p).ok();
     }
 
-    /// G4 字段点选两态: 免费态「字段…」拦 (升级提示, 弹层不开);
+    /// G4 字段点选两态：免费态「字段…」拦 (升级提示，弹层不开);
     /// 付费态放行永不误弹。手输迷你语法不经此门 (照用)。
     #[test]
     fn picker_gate_blocks_free_tier_and_never_prompts_paid() {
@@ -7700,7 +7836,7 @@ l2
             source: PaidSource::StoreAddOn,
         };
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // 灌满: 追加到 8 源 (直接改 sources 不可行 —— 走 add 的去重/上限逻辑前先造满)
+        // 灌满：追加到 8 源 (直接改 sources 不可行 —— 走 add 的去重/上限逻辑前先造满)
         let m = app.merge.as_mut().unwrap();
         for i in 0..5 {
             m.sources.push(danqing_log::merge_view::MergeSource {
@@ -7747,8 +7883,8 @@ l2
 
     // ---- 腿 E (T6): req_id 追踪 ----
 
-    /// T6 夹具: 在 merge_fixture 上覆写 cur/b —— cur.log 行1 含 req_id=aaa111,
-    /// b.jsonl 行1 同值 (且 msg 带空格, 供字段值放大验), a.log 无命中。
+    /// T6 夹具：在 merge_fixture 上覆写 cur/b —— cur.log 行 1 含 req_id=aaa111,
+    /// b.jsonl 行 1 同值 (且 msg 带空格，供字段值放大验), a.log 无命中。
     fn trace_fixture(tag: &str) -> (LogApp, PathBuf, PathBuf, PathBuf) {
         let (app, cur, a, b) = merge_fixture(tag);
         std::fs::write(
@@ -7767,7 +7903,7 @@ l2
         (app, cur, a, b)
     }
 
-    /// 泵追踪作业至落地 (真线程, 小文件瞬时完成; 有界自旋防挂死)。
+    /// 泵追踪作业至落地 (真线程，小文件瞬时完成; 有界自旋防挂死)。
     fn pump_trace(app: &mut LogApp) {
         for _ in 0..1000 {
             if let Some(out) = app.trace_job.poll() {
@@ -7779,7 +7915,7 @@ l2
         panic!("追踪作业 1s 内未完成");
     }
 
-    /// 端到端: .log 源选区子串追踪 → 三源同请求行一次滤出 → 锚定回发起行 →
+    /// 端到端：.log 源选区子串追踪 → 三源同请求行一次滤出 → 锚定回发起行 →
     /// 底栏常驻追踪态 → ClearTrace 回全量 (验收 b 的机器半边)。
     #[test]
     fn trace_value_filters_across_sources_and_anchors() {
@@ -7787,7 +7923,7 @@ l2
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
         assert_eq!(app.merge.as_ref().unwrap().row_count(), 9);
-        // 从 .log 源 (源0) 行1 追踪子串 "aaa111" (选区字节直注, 鼠标路径在 view 锁)
+        // 从 .log 源 (源 0) 行 1 追踪子串 "aaa111" (选区字节直注，鼠标路径在 view 锁)
         let text =
             danqing_log::merge_view::row_text(&app.merge.as_ref().unwrap().sources[0].file, 1);
         let lo = text.find("aaa111").unwrap();
@@ -7812,7 +7948,7 @@ l2
         );
         assert!(
             app.status.contains("追踪 \"aaa111\""),
-            "底栏常驻追踪态: {}",
+            "底栏常驻追踪态：{}",
             app.status
         );
         app.update(Msg::ClearTrace);
@@ -7858,7 +7994,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// R5 族: 在途追踪遇显隐切换 (掩码重建) → 代次作废, 晚到不复活。
+    /// R5 族：在途追踪遇显隐切换 (掩码重建) → 代次作废，晚到不复活。
     #[test]
     fn trace_in_flight_invalidated_on_source_toggle() {
         let (mut app, cur, a, b) = trace_fixture("stale");
@@ -7876,12 +8012,12 @@ l2
             lo,
             hi: lo + 6,
         });
-        // 不泵, 直接切显隐 —— 掩码重建作废过滤行集, 在途追踪同作废
+        // 不泵，直接切显隐 —— 掩码重建作废过滤行集，在途追踪同作废
         app.update(Msg::ToggleMergeSource(a.to_string_lossy().into_owned()));
         // 注 (评审 Nit): 本锁管的是**接线** (该路径确实调了 invalidate);
         // 「已完成但仍被丢弃」那一半由 search.rs 的
         // `async_job_invalidate_discards_inflight_result` 用确定性子锁住 ——
-        // 这里不做「睡够久再断言」的时序猜测 (家法: 测试不许时序侥幸)。
+        // 这里不做「睡够久再断言」的时序猜测 (家法：测试不许时序侥幸)。
         for _ in 0..200 {
             assert!(app.trace_job.poll().is_none(), "作废旧轮的晚到结果不得拾取");
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -7906,7 +8042,7 @@ l2
             app.notice
                 .as_ref()
                 .is_some_and(|(t, _)| t.contains("合并视图")),
-            "单文件态 Ctrl+R 说清为什么: {:?}",
+            "单文件态 Ctrl+R 说清为什么：{:?}",
             app.notice
         );
         // 合并态 (LogView 未持焦 → 键到应用层): 指路先选值
@@ -7917,7 +8053,7 @@ l2
             app.notice
                 .as_ref()
                 .is_some_and(|(t, _)| t.contains("追踪值")),
-            "合并态未持焦指路选值: {:?}",
+            "合并态未持焦指路选值：{:?}",
             app.notice
         );
         std::fs::remove_file(&cur).ok();
@@ -7927,7 +8063,7 @@ l2
 
     // ---- 腿 F (T7): live-tail 合流 ----
 
-    /// 泵归并作业至落地 (真线程, 小文件瞬时; 有界自旋防挂死)。
+    /// 泵归并作业至落地 (真线程，小文件瞬时; 有界自旋防挂死)。
     fn pump_merge(app: &mut LogApp) {
         for _ in 0..1000 {
             app.pickup_merge_job();
@@ -7939,8 +8075,8 @@ l2
         panic!("归并作业 1s 内未完成");
     }
 
-    /// per-source 增量合流端到端: 合并期间某源长大 → 合并时间线收新行,
-    /// **单文件侧保持冻结** (app.file 不动, 退出后自然追平 —— D4)。
+    /// per-source 增量合流端到端：合并期间某源长大 → 合并时间线收新行，
+    /// **单文件侧保持冻结** (app.file 不动，退出后自然追平 —— D4)。
     #[test]
     fn poll_growth_merge_appends_per_source_single_side_frozen() {
         let (mut app, cur, a, b) = merge_fixture("mrg-tail");
@@ -7954,7 +8090,7 @@ l2
         }
         app.poll_growth();
         let m = app.merge.as_ref().unwrap();
-        assert_eq!(m.row_count(), 10, "合并时间线收新行 (源0 行3)");
+        assert_eq!(m.row_count(), 10, "合并时间线收新行 (源 0 行 3)");
         let last = m.row_at(9).unwrap();
         assert_eq!((last.src, last.line), (0, 3), "新行在时间线尾");
         assert_eq!(app.file.line_count(), 3, "单文件侧仍冻结 (退出才追平)");
@@ -7963,21 +8099,21 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// 断流降级: 源文件消失 → 标记 + 底栏「断流 N 源」, 其余源照常合流;
+    /// 断流降级：源文件消失 → 标记 + 底栏「断流 N 源」, 其余源照常合流;
     /// 恢复可读 (stat 成功) 即清标记。
     #[test]
     fn poll_growth_merge_marks_stale_and_recovers() {
         let (mut app, cur, a, b) = merge_fixture("mrg-stale");
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        std::fs::remove_file(&a).unwrap(); // 源1 消失 (mmap 持有仍可读旧快照)
+        std::fs::remove_file(&a).unwrap(); // 源 1 消失 (mmap 持有仍可读旧快照)
         app.poll_growth();
         {
             let m = app.merge.as_ref().unwrap();
             assert!(m.sources[1].stale, "消失的源标断流");
             assert!(!m.sources[0].stale && !m.sources[2].stale, "其余源不连坐");
         }
-        assert!(app.status.contains("断流 1 源"), "底栏明示: {}", app.status);
+        assert!(app.status.contains("断流 1 源"), "底栏明示：{}", app.status);
         // 断流期间其余源照常合流 (不拖垮全局)
         {
             use std::io::Write;
@@ -7988,11 +8124,11 @@ l2
         assert_eq!(
             app.merge.as_ref().unwrap().row_count(),
             10,
-            "断流源在场, 其他源照常合流"
+            "断流源在场，其他源照常合流"
         );
-        // 恢复可读即清 (注入断流标记到**健在**的源0 —— 源1 已被删, stat 只会
+        // 恢复可读即清 (注入断流标记到**健在**的源 0 —— 源 1 已被删，stat 只会
         // 继续失败; Windows 上被 mmap 持有的文件删除后处于 delete-pending,
-        // 同名重建被拒直到句柄关闭, 真轮转走改名+新建):
+        // 同名重建被拒直到句柄关闭，真轮转走改名 + 新建):
         app.merge.as_mut().unwrap().sources[0].stale = true;
         app.poll_growth();
         assert!(
@@ -8001,7 +8137,7 @@ l2
         );
         assert!(
             app.merge.as_ref().unwrap().sources[1].stale,
-            "源1 仍断流 (文件没回来)"
+            "源 1 仍断流 (文件没回来)"
         );
         assert!(!app.merge_job_live, "无变化不触发重归并");
         std::fs::remove_file(&cur).ok();
@@ -8015,8 +8151,8 @@ l2
         let (mut app, cur, a, b) = merge_fixture("mrg-rot");
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // 源1 轮转: **改名 + 新建** (真轮转形态 —— 被 mmap 持有的文件不能
-        // 就地覆写, Windows ERROR_USER_MAPPED_FILE; 改名靠 DELETE 共享走得通)
+        // 源 1 轮转：**改名 + 新建** (真轮转形态 —— 被 mmap 持有的文件不能
+        // 就地覆写，Windows ERROR_USER_MAPPED_FILE; 改名靠 DELETE 共享走得通)
         let rotated = a.with_extension("old");
         std::fs::rename(&a, &rotated).unwrap();
         std::fs::write(
@@ -8030,7 +8166,7 @@ l2
             app.notice
                 .as_ref()
                 .is_some_and(|(t, k)| t.contains("轮转") && matches!(k, crate::NoticeKind::Warn)),
-            "轮转明示: {:?}",
+            "轮转明示：{:?}",
             app.notice
         );
         // 在途期间再 poll 不叠加 (旧 bundle 行数没变 = 旧内容保持可见)
@@ -8052,7 +8188,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// 合并跟随 (T7): f 键接通 —— 开即钉时间线尾, 新行合流保持钉尾。
+    /// 合并跟随 (T7): f 键接通 —— 开即钉时间线尾，新行合流保持钉尾。
     #[test]
     fn merge_follow_pins_timeline_tail() {
         let (mut app, cur, a, b) = merge_fixture("mrg-follow");
@@ -8088,12 +8224,12 @@ l2
         app.entitlement = Entitlement::Paid {
             source: PaidSource::StoreAddOn,
         };
-        // 互斥: 开二关一
+        // 互斥：开二关一
         app.update(Msg::OpenSessionMenu);
         app.update(Msg::OpenMergeMenu);
         assert!(app.merge_menu_open && !app.session_menu_open, "开二关一");
         assert!(app.popover_open(), "家族判据纳入 merge_menu");
-        // Esc 插层: 合并源管理在命名会话**前**被关
+        // Esc 插层：合并源管理在命名会话**前**被关
         let esc = Event::Key {
             key: Key::Named(NamedKey::Escape),
             pressed: true,
@@ -8156,7 +8292,7 @@ l2
         }
     }
 
-    /// 保存侧: 合并工作区存会话 = 单文件侧四样 + 合并组快照 (源/偏移/显隐),
+    /// 保存侧：合并工作区存会话 = 单文件侧四样 + 合并组快照 (源/偏移/显隐),
     /// 落盘读回逐项对得上。
     #[test]
     fn save_session_in_merge_captures_merge_group() {
@@ -8167,7 +8303,7 @@ l2
         };
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // 造可辨现场: 源1 拨 -3s (tz 不动), 源2 隐藏
+        // 造可辨现场：源 1 拨 -3s (tz 不动), 源 2 隐藏
         {
             let tz = app.merge.as_ref().unwrap().sources[1].tz_offset_ms;
             let m = app.merge.as_mut().unwrap();
@@ -8202,7 +8338,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// 恢复侧端到端: 合并中存 → 退出合并 + bundle 丢弃 (「明天重开」) →
+    /// 恢复侧端到端：合并中存 → 退出合并 + bundle 丢弃 (「明天重开」) →
     /// 应用会话 → 真线程归并落地 → 源组/偏移/显隐全回 (排序与行集双证)。
     #[test]
     fn apply_merge_session_restores_group_offsets_and_hidden() {
@@ -8237,7 +8373,7 @@ l2
         assert_eq!(
             (r0.src, r0.line),
             (1, 0),
-            "偏移生效: a0@01s-3s=前日 23:59:58 排最前"
+            "偏移生效：a0@01s-3s=前日 23:59:58 排最前"
         );
         assert_eq!(
             app.session_selected.as_deref(),
@@ -8251,7 +8387,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// 源缺失**明示跳过**不拒全体 (T8 验收 g): 三源缺一 → 两源重建,
+    /// 源缺失**明示跳过**不拒全体 (T8 验收 g): 三源缺一 → 两源重建，
     /// notice 说清跳过几个。
     #[test]
     fn apply_merge_session_skips_missing_sources_with_notice() {
@@ -8286,7 +8422,7 @@ l2
             .as_ref()
             .map(|(t, _)| t.clone())
             .unwrap_or_default();
-        assert!(note.contains("跳过 1 个缺失源"), "缺失明示, 实得: {note}");
+        assert!(note.contains("跳过 1 个缺失源"), "缺失明示，实得：{note}");
         pump_merge(&mut app);
         let m = app.merge.as_ref().unwrap();
         assert_eq!(m.sources.len(), 2, "缺失源不进组");
@@ -8298,7 +8434,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// 现存源不足两个 = 整体拒绝并说清 (零副作用: 工作区不动/不起作业/
+    /// 现存源不足两个 = 整体拒绝并说清 (零副作用：工作区不动/不起作业/
     /// 会话留着); 合并现场不被误伤。
     #[test]
     fn apply_merge_session_refuses_when_fewer_than_two_sources_survive() {
@@ -8334,7 +8470,7 @@ l2
             .as_ref()
             .map(|(t, _)| t.clone())
             .unwrap_or_default();
-        assert!(note.contains("不足两个"), "说清为何拒, 实得: {note}");
+        assert!(note.contains("不足两个"), "说清为何拒，实得：{note}");
         assert!(
             app.sessions.iter().any(|s| s.name == "全缺台"),
             "会话留着 (修源后重试)"
@@ -8348,8 +8484,8 @@ l2
 
     /// pickup **交付才清**在途标记 (T8 修 T7 遗留错形): 在途 poll 空转
     /// **不清** live —— 「重归并在途不叠加」门禁不许提前开门 (旧
-    /// 「先清后 poll」形让 pump 首拾取即返回, 作业还在飞)。慢作业
-    /// (50ms) 保证在途窗口确定存在, 无时序侥幸。
+    /// 「先清后 poll」形让 pump 首拾取即返回，作业还在飞)。慢作业
+    /// (50ms) 保证在途窗口确定存在，无时序侥幸。
     #[test]
     fn pickup_merge_job_keeps_live_flag_until_delivery() {
         let (mut app, cur, a, b) = merge_fixture("t8-live");
@@ -8376,7 +8512,7 @@ l2
     }
 
     /// 评审 C1 端到端 (安全审计 Required 同源): 换源落地点 (apply_merge_outcome)
-    /// 之后, **旧源集合的在途追踪结果**迟到 —— 必须丢弃 + 出声, 不许越界 panic
+    /// 之后，**旧源集合的在途追踪结果**迟到 —— 必须丢弃 + 出声，不许越界 panic
     /// (release 档 = 整进程 abort)。
     #[test]
     fn late_trace_after_source_swap_is_discarded_with_notice() {
@@ -8396,13 +8532,13 @@ l2
         app.merge = None; // 「明天重开」: 换一组源
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone()]);
         assert_eq!(app.merge.as_ref().unwrap().sources.len(), 2);
-        app.apply_trace_outcome(stale); // 迟到交卷: 不许崩
+        app.apply_trace_outcome(stale); // 迟到交卷：不许崩
         let note = app
             .notice
             .as_ref()
             .map(|(t, _)| t.clone())
             .unwrap_or_default();
-        assert!(note.contains("源已变化"), "出声说清, 实得: {note}");
+        assert!(note.contains("源已变化"), "出声说清，实得：{note}");
         assert!(app.merge.as_ref().unwrap().trace.is_none(), "追踪未落地");
         std::fs::remove_file(&cur).ok();
         std::fs::remove_file(&a).ok();
@@ -8422,7 +8558,7 @@ l2
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
         app.update(Msg::SaveSession("冷启台".into()));
-        // 冷启: 无文件在手 (has_file = false, file = 空文件占位)
+        // 冷启：无文件在手 (has_file = false, file = 空文件占位)
         app.has_file = false;
         app.file = Arc::new(LogFile::open(&cur).unwrap());
         app.merge = None;
@@ -8441,7 +8577,7 @@ l2
     }
 
     /// T9 评审补 (静默重置洞): 时钟偏移/时区是用户调过的现场 —— 加/减源重归并
-    /// 必须**按路径随行** (旧 carry_view_state 只搬显隐与键, 偏移会被重置成默认)。
+    /// 必须**按路径随行** (旧 carry_view_state 只搬显隐与键，偏移会被重置成默认)。
     #[test]
     fn rebuild_merge_keeps_time_params_by_path() {
         let (mut app, cur, a, b) = merge_fixture("t9-params");
@@ -8485,7 +8621,7 @@ l2
                 .collect()
         };
         assert_eq!(full.len(), 9);
-        // 藏源2 (b.jsonl, 3 行)
+        // 藏源 2 (b.jsonl, 3 行)
         app.update(Msg::ToggleMergeSource(b.to_string_lossy().into_owned()));
         let hidden_rows: Vec<(u32, u32)> = {
             let m = app.merge.as_ref().unwrap();
@@ -8517,14 +8653,14 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// T9 D4: 追加落在**选中行之前** → 位置整体推后, 选中仍钉同一 (源,行)。
-    /// (有界窗口重定位; 窗口按 [原位-补全, 原位+批行数] 取, 编不出更远。)
+    /// T9 D4: 追加落在**选中行之前** → 位置整体推后，选中仍钉同一 (源，行)。
+    /// (有界窗口重定位; 窗口按 [原位 - 补全，原位 + 批行数] 取，编不出更远。)
     #[test]
     fn append_source_keeps_selection_on_same_row() {
         let (mut app, cur, a, b) = merge_fixture("t9-anchor");
         open_single(&mut app, &cur);
         apply_merge_sync(&mut app, vec![cur.clone(), a.clone(), b.clone()]);
-        // fixture 归并序: c0 a0 b0 a1 b1 b2 c1 c2 a2 —— 位 7 = (源0, 行2)
+        // fixture 归并序：c0 a0 b0 a1 b1 b2 c1 c2 a2 —— 位 7 = (源 0, 行 2)
         app.merge.as_mut().unwrap().selected = 7;
         {
             use std::io::Write;
@@ -8540,7 +8676,7 @@ l2
         assert_eq!(
             (r.src, r.line),
             (0, 2),
-            "选中仍钉同一 (源,行): {:?}",
+            "选中仍钉同一 (源，行): {:?}",
             m.selected
         );
         std::fs::remove_file(&cur).ok();
@@ -8548,7 +8684,7 @@ l2
         std::fs::remove_file(&b).ok();
     }
 
-    /// T9 产品闸: 合并源单轮增长超 [`MERGE_SYNC_MAX_ROWS`] → 交 worker 全量
+    /// T9 产品闸：合并源单轮增长超 [`MERGE_SYNC_MAX_ROWS`] → 交 worker 全量
     /// 重归并 (旧 bundle 保持可见), 不在 UI 线程做增量合流。
     #[test]
     fn merge_large_growth_routes_to_rebuild_not_incremental() {
@@ -8572,7 +8708,7 @@ l2
         app.poll_growth();
         assert!(
             app.merge_job_live,
-            "超闸增量 → worker 重归并在途, 不走同步合流"
+            "超闸增量 → worker 重归并在途，不走同步合流"
         );
         assert_eq!(
             app.merge.as_ref().unwrap().row_count(),

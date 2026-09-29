@@ -61,9 +61,16 @@
   含并行会话 8 条, 归属已核)。**code-simplify 收口 (2026-09-29) → 五阶段全闭**:
   两刀行为零变化 (`width_cap()` 三处同式收单点 / `BAR_INSET` 钉色条内缩常量),
   测试零修改全绿; 不动清单落 spec §10 (含 `paints_color` 三份同逻辑 ——
-  settings.rs 是并行会话活跃文件不能碰, 待其收口另裁)。**余 = H 组人工验收
-  (待实机) + commit (待点头)**; 人工验收 H 组五条记账
-  `tasks/acceptance-pending.md` (大部不需付费态)。
+  settings.rs 是并行会话活跃文件不能碰, 待其收口另裁)。
+  **H-a 实机验收撞出分档大盘点 (2026-09-29, 用户「go」全表批准)**: 「先点选源再
+  改时间参数」沉底栏不上浮层 —— 根因非 toast 失效, 是该提示错给 Info
+  (分级语义确立前写的提示从未系统分档) → 全仓盘点 **23 处「没生效」类
+  Info→Warn 改档** (口径表 = `SPEC-notice-visibility` §11: Warn=没生效/Info=
+  回执·进行中·状态说明; 新加提示先过表); 留 Info ~15 处不动; 锁
+  `ineffective_action_notices_are_warn_not_info` (三族代表样本), P20 锁免疫,
+  M3 旧锁 Info 样本换真 Info 文案。**518 绿** (含并行会话新增), clippy 全仓 0。
+  **余 = H 组人工验收 (待实机复验 H-a) + commit (待点头)**; 人工验收 H 组五条
+  记账 `tasks/acceptance-pending.md` (大部不需付费态)。
 - 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
   spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
   机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
