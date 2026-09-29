@@ -477,8 +477,10 @@ fn format_btn(label: Text, on_click: impl Fn() -> Msg + 'static) -> impl Widget 
 }
 
 /// 列管理弹层 (SPEC-v1x-table-column-config D3, 裁定①): 表头「列…」按钮/右键入口,
-/// 卡体 = 每列一行开关 (`[x]`/`[ ]` ASCII 勾选, GB2312 字体约束) + 「恢复默认」。
-/// 复用 export 菜单四件套范式; 与导出菜单**互斥** (开一个先关另一个, 防双 scrim 叠)。
+/// 卡体 = 每列一行开关 (行首复选框 = 框架 `Checkbox` 矢量盒, SPEC-checkbox-widget;
+/// 原 `[x]`/`[ ]` ASCII 勾选已退役 —— 内嵌字体子集无 ✓ 字形, 矢量绕开字体约束) +
+/// 「恢复默认」。复用 export 菜单四件套范式; 与导出菜单**互斥** (开一个先关另一个,
+/// 防双 scrim 叠)。
 /// 行集走 [`col_menu_rows`] (RowList 自绘, 每帧取态 —— T0 修复: 建树快照不许冻结)。
 pub(crate) fn col_menu_overlay(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
@@ -507,8 +509,9 @@ fn col_menu_row_names(
         .collect()
 }
 
-/// 「显示列」行集 (T0, RowList): 行文案 = `[x]`/`[ ]` + 列名, 载荷 = 列名 ——
-/// **每帧从 LogApp 取** (`col_menu_row_names` + 显隐标记), 建树后开文件/换文件
+/// 「显示列」行集 (T0, RowList): 行文案 = 纯列名 (勾选态在行首复选框,
+/// SPEC-checkbox-widget T4 —— `[x]`/`[ ]` 文本前缀已退役), 载荷 = 列名 ——
+/// **每帧从 LogApp 取** (`col_menu_row_names` + 显隐勾态), 建树后开文件/换文件
 /// 行集跟随 (启动快照 bug 的修复本体, 锁
 /// `col_menu_rows_follow_schema_across_sync`)。封顶见 [`POPOVER_ROWS_MAX`]。
 fn col_menu_rows() -> crate::pick_list::RowList {
@@ -517,20 +520,14 @@ fn col_menu_rows() -> crate::pick_list::RowList {
         |app: &LogApp| {
             col_menu_row_names(app.schema.as_deref(), &app.columns)
                 .into_iter()
-                .map(|name| {
-                    let mark = if app.columns.is_hidden(&name) {
-                        "[ ]"
-                    } else {
-                        "[x]"
-                    };
-                    (format!("{mark} {name}"), name)
-                })
+                .map(|name| (name.clone(), name))
                 .collect()
         },
         |_app: &LogApp| None,
         |payload: &str| Msg::ToggleColumn(payload.to_string()),
         |n| format!("… 还有 {n} 列"),
     )
+    .with_checkbox(|app: &LogApp, payload: &str| Some(!app.columns.is_hidden(payload)))
 }
 
 /// 卡体 (壳见 [`card_shell`]; 行数据**不**取值传入 —— 那正是启动快照 bug 的
@@ -877,9 +874,33 @@ pub(crate) fn merge_menu_overlay(theme: config::AppTheme) -> impl Widget {
         .on_scrim_click(|| Msg::CloseMergeMenu)
 }
 
-/// 源行 (RowList): 行 = `[x]`/`[ ]` + 源名 · 格式结论 (T3 探测结论),
+/// 合并源行文案 (T4 抽出为可测纯函数, [`merge_union_hint`] 先例): 源名 ·
+/// 格式结论 (+断流尾注)。勾选态已移交行首复选框 (`with_checkbox`) ——
+/// 文案不含 `[x]`/`[ ]` (文本勾选退役, SPEC-checkbox-widget)。
+fn merge_source_label(name: &str, route: &danqing_log::timestamp::TsRoute, stale: bool) -> String {
+    // T7: 断流源行内明示 (stat/追加读取失败; 行集保持旧快照, 恢复可读自清) ——
+    // 单源断流不拖垮全局, 但用户必须看得见。
+    let tail = if stale { " · 断流" } else { "" };
+    format!(
+        "{name} · {}{tail}",
+        danqing_log::merge_view::route_label(route)
+    )
+}
+
+/// 按载荷 (路径字符串) 查合并源序号 —— 源行两个行首件 (色块/复选框) 闭包的
+/// 共同起手式, 收口一处 (无合并/无该源 = None)。
+fn merge_source_idx(app: &LogApp, payload: &str) -> Option<usize> {
+    app.merge
+        .as_ref()?
+        .sources
+        .iter()
+        .position(|s| s.path.to_string_lossy() == payload)
+}
+
+/// 源行 (RowList): 行 = 复选框 (显隐) + 色块 + 源名 · 格式结论 ([`merge_source_label`]),
 /// 载荷 = 路径; 点行 = 切显隐 + 记选中 (「移除」指针, ApplySession 同规)。
-/// 行首色块 = `source_palette()[源序号]` (D11/CP2-A 同一 token 族)。
+/// 行首色块 = `source_palette()[源序号]` (D11/CP2-A 同一 token 族);
+/// 复选框 = 框架 `Checkbox::paint_box` (SPEC-checkbox-widget; 高亮行反白 D3b)。
 fn merge_source_rows() -> crate::pick_list::RowList {
     crate::pick_list::RowList::new(
         POPOVER_ROWS_MAX,
@@ -890,15 +911,7 @@ fn merge_source_rows() -> crate::pick_list::RowList {
             m.sources
                 .iter()
                 .map(|s| {
-                    let mark = if s.hidden { "[ ]" } else { "[x]" };
-                    // T7: 断流源行内明示 (stat/追加读取失败; 行集保持旧快照,
-                    // 恢复可读自清) —— 单源断流不拖垮全局, 但用户必须看得见。
-                    let tail = if s.stale { " · 断流" } else { "" };
-                    let label = format!(
-                        "{mark} {} · {}{tail}",
-                        s.name(),
-                        danqing_log::merge_view::route_label(&s.route)
-                    );
+                    let label = merge_source_label(s.name(), &s.route, s.stale);
                     (label, s.path.to_string_lossy().into_owned())
                 })
                 .collect()
@@ -908,12 +921,10 @@ fn merge_source_rows() -> crate::pick_list::RowList {
         |n| format!("… 还有 {n} 个"),
     )
     .with_swatch(|app: &LogApp, payload: &str| {
-        let m = app.merge.as_ref()?;
-        let idx = m
-            .sources
-            .iter()
-            .position(|s| s.path.to_string_lossy() == payload)?;
-        Some(app.theme.theme().source_palette()[idx])
+        Some(app.theme.theme().source_palette()[merge_source_idx(app, payload)?])
+    })
+    .with_checkbox(|app: &LogApp, payload: &str| {
+        Some(!app.merge.as_ref()?.sources[merge_source_idx(app, payload)?].hidden)
     })
 }
 
@@ -2461,6 +2472,104 @@ mod tests {
         assert!(
             w <= content_width(),
             "步进钮排自然宽 {w} > 卡片内容宽 {}: Row 不换行不裁剪, 会画出卡片右边界",
+            content_width()
+        );
+    }
+
+    // ---- T4: 复选框换挂 (SPEC-checkbox-widget) ----
+
+    /// 前缀退役锁 (断言**产出串**, 不 grep 源码 —— 防注释骗锁): 「显示列」
+    /// 行文案 = 纯列名, 载荷 = 列名不变; `[x]`/`[ ]` 文本勾选随复选框换挂退役。
+    #[test]
+    fn col_menu_rows_have_no_ascii_check_prefix() {
+        use crate::jsonl::{Column, Schema};
+        use std::sync::Arc;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-t4-colmenu-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.schema = Some(Arc::new(Schema {
+            columns: ["a", "b"]
+                .iter()
+                .map(|n| Column {
+                    name: (*n).to_string(),
+                    width_chars: 4,
+                })
+                .collect(),
+        }));
+        app.columns =
+            danqing_log::columns::ColumnConfig::from_schema(&["a".to_string(), "b".to_string()]);
+        app.columns.toggle_hidden("b"); // 隐藏列同规: 勾态在盒不在文案
+        let mut list = col_menu_rows();
+        list.sync(&app);
+        let rows = list.rows_snapshot();
+        assert_eq!(rows.len(), 2, "行集 = 两列");
+        assert_eq!(
+            rows[0],
+            ("a".to_string(), "a".to_string()),
+            "文案 = 纯列名, 载荷不变"
+        );
+        assert_eq!(rows[1].0, "b");
+        for (label, _) in rows {
+            assert!(
+                !label.contains("[x]") && !label.contains("[ ]"),
+                "前缀应退役, 实得: {label}"
+            );
+        }
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T4: 合并源行文案 = 纯「源名 · 格式结论 (+断流尾注)」; 勾选前缀退役,
+    /// 断流尾注 (T7 明示) 保留。
+    #[test]
+    fn merge_source_label_has_no_ascii_check_prefix() {
+        use danqing_log::timestamp::TsRoute;
+        let route = TsRoute::JsonlField("ts".to_string());
+        let label = merge_source_label("src0.jsonl", &route, false);
+        assert!(
+            !label.contains("[x]") && !label.contains("[ ]"),
+            "前缀应退役, 实得: {label}"
+        );
+        assert!(label.starts_with("src0.jsonl · "), "源名打头: {label}");
+        let stale = merge_source_label("src1.log", &route, true);
+        assert!(stale.ends_with(" · 断流"), "断流尾注保留: {stale}");
+    }
+
+    /// T4 行宽守卫 ×2 (G-d 同族, 判据不同): 行内容 = 左距 + [色块] + 盒位 + 文案,
+    /// 用**代表性** label 量 —— 锁的是「常量同源 + 排版不漂移」, 不是「任意长
+    /// 文件名不溢出」(真实源名可任意长, RowList 文案无裁剪, 超长溢出是既有边界,
+    /// 已挂 `ROADMAP-v1x.md` §四 待裁)。
+    ///
+    /// 换挂后净宽 −8px (评审实测; `[x] ` 前缀 28px 退役 vs 盒位 20px)。
+    #[test]
+    fn merge_source_row_width_within_card_budget() {
+        use danqing_log::timestamp::TsRoute;
+        let mut texts = TextBatch::default();
+        let route = TsRoute::JsonlField("ts".to_string());
+        let worst = merge_source_label("src0.jsonl", &route, true); // 代表性 (含断流尾注)
+        let w = crate::pick_list::ROW_PAD_X
+            + crate::pick_list::RowList::SWATCH_W
+            + crate::pick_list::RowList::CHECK_W
+            + texts.measure(&worst, crate::view::FONT_SIZE);
+        assert!(
+            w <= content_width(),
+            "代表性行内容宽 {w} > 卡片内容宽 {}: 常量漂移了 (同源守卫)",
+            content_width()
+        );
+    }
+
+    #[test]
+    fn col_menu_row_width_within_card_budget() {
+        let mut texts = TextBatch::default();
+        let worst = "http_request_duration_ms"; // 代表性长列名 (24 字符)
+        let w = crate::pick_list::ROW_PAD_X
+            + crate::pick_list::RowList::CHECK_W
+            + texts.measure(worst, crate::view::FONT_SIZE);
+        assert!(
+            w <= content_width(),
+            "代表性行内容宽 {w} > 卡片内容宽 {}: 常量漂移了 (同源守卫)",
             content_width()
         );
     }

@@ -5,21 +5,28 @@
 //! (`app.view()` 一次性建树不再重建, 每帧只 `sync` 刷值) 下**动态行列表**的正解 ——
 //! 行文案/高亮经 sync 闭包每帧取自 LogApp, paint 动态画行, event 合成几何命中。
 //!
-//! 消费者两处 (T0 修复 + 本模块): 「显示列」弹层行集 (`settings::col_menu_rows`,
-//! 修复其启动快照 bug) 与字段查询弹层的字段行。行 = (显示文案, 载荷), 点击把
-//! **载荷**交给 `on_pick` 构造 Msg —— 显示前缀 (`[x]`/`[ ]`) 不污染语义身份。
+//! 消费者四处: 「显示列」弹层 (`settings::col_menu_rows`) / 字段查询弹层字段行 /
+//! 命名会话卡 / 合并源弹层源行。行 = (显示文案, 载荷), 点击把
+//! **载荷**交给 `on_pick` 构造 Msg —— 显示装饰不污染语义身份。
+//! 行首可选件 (加法不改契约, 不装 = 零变化): 色块 (`with_swatch`) /
+//! 复选框 (`with_checkbox`, SPEC-checkbox-widget —— `[x]`/`[ ]` 文本勾选
+//! 2026-09-28 退役, 勾选态移交框架矢量盒 `Checkbox::paint_box` 单真源)。
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 
 use danqing::event::MouseButton;
-use danqing::widget::{EventResult, MsgQueue, Widget};
+use danqing::widget::{Checkbox, CheckboxColors, EventResult, MsgQueue, Widget};
 use danqing::{Color, Constraints, Event, Point, Rect, RectBatch, Size, TextBatch, Theme};
 
 use crate::{LogApp, Msg};
 
 /// 行高 (与侧栏行指标同尺度; 弹层行列表的紧凑行)。
 pub(crate) const ROW_H: f32 = 28.0;
+
+/// 行内左边距 —— paint 三处 (色块/文案/尾行) 与行宽守卫**同源** (G-d 教训:
+/// 各写一份 8.0 会漂)。
+pub(crate) const ROW_PAD_X: f32 = 8.0;
 
 /// 行数据源: (显示文案, 载荷) 列表 —— sync 每帧取。
 type RowsFn = Box<dyn Fn(&LogApp) -> Vec<(String, String)>>;
@@ -28,6 +35,22 @@ type HighlightFn = Box<dyn Fn(&LogApp) -> Option<String>>;
 /// 行首色块 (可选第四闭包, 合并源弹层用): (app, 载荷) → 色; None = 该行不画块。
 /// **加法不改契约** —— 既有三消费者不 `with_swatch` 就是零变化 (画法见 paint)。
 type SwatchFn = Box<dyn Fn(&LogApp, &str) -> Option<Color>>;
+/// 行首复选框 (可选第五闭包, SPEC-checkbox-widget T3): (app, 载荷) → 勾态;
+/// None = 该行不画盒。与色块可同装 (次序: 色块→盒→文案, spec D9)。
+type CheckboxFn = Box<dyn Fn(&LogApp, &str) -> Option<bool>>;
+
+/// 逐行派生闭包的擦除引用形态 (per_row 参数; clippy type_complexity 收口)。
+type PerRowFn<T> = dyn Fn(&LogApp, &str) -> Option<T>;
+
+/// 逐行派生缓存 (swatches/checked 同法收口): 装了闭包 = 逐行取态, 没装 = 空 Vec
+/// (paint 里 `.get(i)` 得 None = 该行不画)。**每帧重取** —— 摘掉 = 冻结在首帧
+/// 快照 (T0 行集锁与勾态锁的共同判罪点)。
+fn per_row<T>(rows: &[(String, String)], f: Option<&PerRowFn<T>>, app: &LogApp) -> Vec<Option<T>> {
+    match f {
+        Some(f) => rows.iter().map(|(_, p)| f(app, p)).collect(),
+        None => Vec::new(),
+    }
+}
 
 /// 行列表件 (自绘; 契约见模块注释)。
 pub(crate) struct RowList {
@@ -41,9 +64,17 @@ pub(crate) struct RowList {
     more_fn: Box<dyn Fn(usize) -> String>,
     /// 行首色块 (可选; [`RowList::with_swatch`] 装)。
     swatch_fn: Option<SwatchFn>,
+    /// 行首复选框 (可选; [`RowList::with_checkbox`] 装)。
+    checkbox_fn: Option<CheckboxFn>,
     // ---- sync 缓存 (paint/event 只读) ----
     rows: Vec<(String, String)>,
     swatches: Vec<Option<Color>>,
+    /// 逐行勾态 (装了 checkbox_fn 才填充; None = 该行不画盒)。
+    checked: Vec<Option<bool>>,
+    /// 常态复选框颜色套 (主题 token, 每帧刷新)。
+    checkbox_colors: CheckboxColors,
+    /// 高亮行 (accent 底) 反白套 (spec D3b)。
+    checkbox_on_accent: CheckboxColors,
     more: usize,
     highlight: Option<String>,
     text_secondary: Color,
@@ -72,8 +103,12 @@ impl RowList {
             max_rows,
             more_fn: Box::new(more_fn),
             swatch_fn: None,
+            checkbox_fn: None,
             rows: Vec::new(),
             swatches: Vec::new(),
+            checked: Vec::new(),
+            checkbox_colors: CheckboxColors::from_theme(&danqing::LightTheme),
+            checkbox_on_accent: CheckboxColors::on_accent(danqing::LightTheme.accent()),
             more: 0,
             highlight: None,
             text_secondary: Color::rgb(0.4, 0.4, 0.42),
@@ -126,8 +161,26 @@ impl RowList {
         self
     }
 
-    /// 色块宽 (含与文案的间隔) —— paint 与文案 x 同源。
-    const SWATCH_W: f32 = 18.0;
+    /// 装行首复选框 (加法 builder; 不装 = 零变化, spec D4)。
+    pub(crate) fn with_checkbox(
+        mut self,
+        f: impl Fn(&LogApp, &str) -> Option<bool> + 'static,
+    ) -> Self {
+        self.checkbox_fn = Some(Box::new(f));
+        self
+    }
+
+    /// 测试内省: (显示文案, 载荷) 快照 —— 前缀退役锁等「断言产出」用
+    /// (框架 `TextBatch::glyph_clips` 同款测试通道)。
+    #[cfg(test)]
+    pub(crate) fn rows_snapshot(&self) -> &[(String, String)] {
+        &self.rows
+    }
+
+    /// 色块宽 (含与文案的间隔) —— paint 与文案 x 同源, 行宽守卫同读。
+    pub(crate) const SWATCH_W: f32 = 18.0;
+    /// 复选框位宽 (盒 14 + 与文案间隔 6) —— paint 与文案 x 同源 (SWATCH_W 同规)。
+    pub(crate) const CHECK_W: f32 = Checkbox::BOX_SIZE + 6.0;
 }
 
 impl Widget for RowList {
@@ -139,15 +192,16 @@ impl Widget for RowList {
         let all = (self.rows_fn)(app);
         self.more = all.len().saturating_sub(self.max_rows);
         self.rows = all.into_iter().take(self.max_rows).collect();
-        self.swatches = match &self.swatch_fn {
-            Some(f) => self.rows.iter().map(|(_, p)| f(app, p)).collect(),
-            None => Vec::new(),
-        };
+        // 行首件 (色块/勾态) **每帧重取** (行数据同规: 摘掉 = 冻结在首帧快照)
+        self.swatches = per_row(&self.rows, self.swatch_fn.as_deref(), app);
+        self.checked = per_row(&self.rows, self.checkbox_fn.as_deref(), app);
         self.highlight = (self.highlight_fn)(app);
         let t = app.theme.theme();
         self.text_secondary = t.text_secondary();
         self.hover_bg = t.surface_variant();
         self.accent = t.accent();
+        self.checkbox_colors = CheckboxColors::from_theme(&t);
+        self.checkbox_on_accent = CheckboxColors::on_accent(t.accent());
     }
 
     fn layout(&mut self, constraints: Constraints, _texts: &mut TextBatch) -> Size {
@@ -172,11 +226,11 @@ impl Widget for RowList {
             let color = if is_hi { Color::WHITE } else { self.accent };
             // 行首色块 (with_swatch 装了才画): 10×10 圆角小块, 画块才右移文案
             // (x 偏移与色块同源 —— 两处各写一个 8.0 会漂)。
-            let mut text_x = r.origin.x + 8.0;
+            let mut text_x = r.origin.x + ROW_PAD_X;
             if let Some(c) = self.swatches.get(i).copied().flatten() {
                 rects.push_rect(
                     Rect::from_xywh(
-                        r.origin.x + 8.0,
+                        r.origin.x + ROW_PAD_X,
                         r.origin.y + (ROW_H - 10.0) / 2.0,
                         10.0,
                         10.0,
@@ -185,6 +239,23 @@ impl Widget for RowList {
                     2.0,
                 );
                 text_x += Self::SWATCH_W;
+            }
+            // 行首复选框 (with_checkbox 装了且该行 Some 才画; 高亮行用反白套 D3b)。
+            // 画法 = 框架 `Checkbox::paint_box` 单真源 —— 此处不另起画法。
+            if let Some(checked) = self.checked.get(i).copied().flatten() {
+                let box_rect = Rect::from_xywh(
+                    text_x,
+                    r.origin.y + (ROW_H - Checkbox::BOX_SIZE) / 2.0,
+                    Checkbox::BOX_SIZE,
+                    Checkbox::BOX_SIZE,
+                );
+                let colors = if is_hi {
+                    self.checkbox_on_accent
+                } else {
+                    self.checkbox_colors
+                };
+                Checkbox::paint_box(rects, box_rect, checked, colors);
+                text_x += Self::CHECK_W;
             }
             texts.push_text(
                 label,
@@ -199,7 +270,7 @@ impl Widget for RowList {
             let label = (self.more_fn)(self.more);
             texts.push_text(
                 &label,
-                r.origin.x + 8.0,
+                r.origin.x + ROW_PAD_X,
                 r.origin.y + base_off,
                 crate::view::FONT_SIZE,
                 self.text_secondary,
@@ -684,5 +755,218 @@ mod tests {
         ]);
         list.sync(&app);
         assert_eq!(list.highlight.as_deref(), Some("sel"), "高亮 = 载荷匹配");
+    }
+
+    // ---- T3: with_checkbox (SPEC-checkbox-widget) ----
+
+    /// 探针: 单画一枚盒, 量出 (勾中填充色, 未选边框色) —— 期望值由画法自身产出,
+    /// 不手算线性空间 (RectBatch 实例存线性值, 见框架 Switch 测试 rgba_of 先例)。
+    fn probe_box_colors(app: &LogApp) -> ([f32; 4], [f32; 4]) {
+        let t = app.theme.theme();
+        let colors = CheckboxColors::from_theme(&t);
+        let a = Rect::from_xywh(0.0, 0.0, Checkbox::BOX_SIZE, Checkbox::BOX_SIZE);
+        let mut checked = RectBatch::new();
+        Checkbox::paint_box(&mut checked, a, true, colors);
+        let fill = checked.instance_colors()[checked
+            .instance_rects()
+            .iter()
+            .position(|r| r.size.width == Checkbox::BOX_SIZE)
+            .expect("勾中探针应有整盒填充")];
+        let mut unchecked = RectBatch::new();
+        Checkbox::paint_box(&mut unchecked, a, false, colors);
+        let border = unchecked.instance_colors()[0];
+        (fill, border)
+    }
+
+    fn count_color(rects: &RectBatch, color: [f32; 4]) -> usize {
+        rects
+            .instance_colors()
+            .iter()
+            .filter(|c| **c == color)
+            .count()
+    }
+
+    fn paint_list(list: &mut RowList, app: &LogApp) -> RectBatch {
+        list.sync(app);
+        let mut texts = TextBatch::new();
+        let _ = list.layout(Constraints::loose(Size::new(300.0, 10_000.0)), &mut texts);
+        let mut rects = RectBatch::new();
+        list.paint(
+            Rect::from_xywh(0.0, 0.0, 300.0, 200.0),
+            &mut rects,
+            &mut texts,
+        );
+        rects
+    }
+
+    /// 复选框加法锁 (T3, swatch 锁同构): **不装 = 零盒** (A 面);
+    /// **装了 = 每可点行恰一盒** (B 面, 全勾数填充 / 全不勾数边框)。
+    #[test]
+    fn checkbox_paints_one_box_per_row_only_when_installed() {
+        let cfg = temp_cfg("checkbox");
+        let app = app_with(&["a", "b", "c"]);
+        let (fill, border) = probe_box_colors(&app);
+        // A 面: 不装 (行可点、无高亮无色块) → RectBatch 零实例
+        let mut list = test_list();
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(
+            rects.instance_rects().len(),
+            0,
+            "不装 = 零矩形 (文案走 TextBatch, 盒/块都没有)"
+        );
+        // B 面全勾: 每行恰一枚填充盒
+        let mut list = test_list().with_checkbox(|_app, _payload| Some(true));
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(
+            count_color(&rects, fill),
+            3,
+            "三行全勾 = 三枚填充盒 (摘画 = 红)"
+        );
+        // B 面全不勾: 每行恰一组边框 (单盒边框实例数探针量, 不写死); 零填充
+        let mut one = RectBatch::new();
+        let a14 = Rect::from_xywh(0.0, 0.0, Checkbox::BOX_SIZE, Checkbox::BOX_SIZE);
+        let t = app.theme.theme();
+        Checkbox::paint_box(&mut one, a14, false, CheckboxColors::from_theme(&t));
+        let per_box = count_color(&one, border);
+        let mut list = test_list().with_checkbox(|_app, _payload| Some(false));
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(count_color(&rects, fill), 0, "全不勾 = 零填充");
+        assert_eq!(
+            count_color(&rects, border),
+            per_box * 3,
+            "三行未选 = 三盒边框 (每盒 {per_box} 实例)"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// None = 该行不画盒: a 勾 / b 未选 / c None → 恰一填充 + 恰一边框组。
+    #[test]
+    fn checkbox_none_payload_paints_no_box() {
+        let cfg = temp_cfg("checkbox-none");
+        let app = app_with(&["a", "b", "c"]);
+        let (fill, border) = probe_box_colors(&app);
+        let mut one = RectBatch::new();
+        let a14 = Rect::from_xywh(0.0, 0.0, Checkbox::BOX_SIZE, Checkbox::BOX_SIZE);
+        let t = app.theme.theme();
+        Checkbox::paint_box(&mut one, a14, false, CheckboxColors::from_theme(&t));
+        let per_box = count_color(&one, border);
+        let mut list = test_list().with_checkbox(|_app, payload: &str| match payload {
+            "a" => Some(true),
+            "b" => Some(false),
+            _ => None, // c 不画盒
+        });
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(count_color(&rects, fill), 1, "仅 a 一枚填充");
+        assert_eq!(
+            count_color(&rects, border),
+            per_box,
+            "仅 b 一盒边框; c 无盒"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 勾态**每帧重取** (T0 判罪锁同族): sync 换数据盒态跟随 —— 摘重取 = 冻结红。
+    #[test]
+    fn checkbox_state_follows_sync() {
+        let cfg = temp_cfg("checkbox-sync");
+        let mut app = app_with(&["a", "b"]);
+        app.columns =
+            danqing_log::columns::ColumnConfig::from_schema(&["a".to_string(), "b".to_string()]);
+        let (fill, _) = probe_box_colors(&app);
+        let mut list = test_list()
+            .with_checkbox(|app: &LogApp, payload: &str| Some(!app.columns.is_hidden(payload)));
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(count_color(&rects, fill), 2, "初始两列全可见 = 两勾");
+        app.columns.toggle_hidden("a");
+        let rects = paint_list(&mut list, &app);
+        assert_eq!(
+            count_color(&rects, fill),
+            1,
+            "隐藏 a 后 sync 重取: 勾态跟随 (摘重取 = 此断言红在 2)"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// D3b 反白锁: 高亮行 (accent 底) 上的盒反白 —— 勾中 = 白填充盒,
+    /// 未选 = 白边框; 非高亮行保持常态套。白在线性空间仍是 (1,1,1,1), 可直断。
+    #[test]
+    fn checkbox_on_highlighted_row_uses_inverse_colors() {
+        let cfg = temp_cfg("checkbox-hi");
+        let app = app_with(&["a", "b", "c"]);
+        let (fill, _) = probe_box_colors(&app);
+        const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let mut list = RowList::new(
+            16,
+            |app: &LogApp| {
+                app.schema
+                    .as_deref()
+                    .map(|s| {
+                        s.columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+            |_app: &LogApp| Some("a".to_string()), // a 行高亮
+            |payload: &str| Msg::ToggleColumn(payload.to_string()),
+            |n| format!("… 还有 {n}"),
+        )
+        .with_checkbox(|_app, payload: &str| Some(payload != "c")); // a,b 勾中; c 未选
+        let rects = paint_list(&mut list, &app);
+        let box_at = |row: f32, color: [f32; 4]| {
+            rects
+                .instance_rects()
+                .iter()
+                .zip(rects.instance_colors().iter())
+                .filter(|(r, _)| r.size.width == Checkbox::BOX_SIZE)
+                .any(|(r, c)| {
+                    r.origin.y == row * ROW_H + (ROW_H - Checkbox::BOX_SIZE) / 2.0 && *c == color
+                })
+        };
+        assert!(box_at(0.0, WHITE), "高亮+勾中 = 白填充盒 (D3b)");
+        assert!(
+            !box_at(0.0, fill),
+            "高亮行上 accent 填充不可见, 不许用常态套"
+        );
+        assert!(box_at(1.0, fill), "非高亮+勾中 = accent 填充盒 (常态套)");
+        assert!(
+            !rects.instance_rects().iter().any(|r| r.origin.y
+                == 2.0 * ROW_H + (ROW_H - Checkbox::BOX_SIZE) / 2.0
+                && r.size.width == Checkbox::BOX_SIZE),
+            "未选行无整盒填充 (仅边框小件)"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 暗色主题锁 (评审补锁): 探针与画法都经 `app.theme` 取 token —— 暗色
+    /// AppTheme 下盒色套换暗色 (accent/border 都是另一支), 防 09-13 式 token
+    /// 再校准时暗色路径静默劣化无人拦 (此前全模块探针只跑浅色)。
+    #[test]
+    fn checkbox_colors_follow_app_theme_dark() {
+        let cfg = temp_cfg("checkbox-dark");
+        let mut app = app_with(&["a"]);
+        app.theme = crate::config::AppTheme::Dark;
+        let (dark_fill, dark_border) = probe_box_colors(&app);
+        app.theme = crate::config::AppTheme::Light;
+        let (light_fill, light_border) = probe_box_colors(&app);
+        assert_ne!(dark_fill, light_fill, "暗色 accent 与浅色不同支");
+        assert_ne!(dark_border, light_border, "暗色 border 与浅色不同支");
+        // 暗色下真画一遍: 勾中填充 = 暗色探针 fill, 未选边框 = 暗色 border
+        app.theme = crate::config::AppTheme::Dark;
+        let mut app2_rows = app_with(&["a", "b"]);
+        app2_rows.theme = crate::config::AppTheme::Dark;
+        let mut list = test_list().with_checkbox(|_app, payload: &str| Some(payload == "a"));
+        let rects = paint_list(&mut list, &app2_rows);
+        assert_eq!(
+            count_color(&rects, dark_fill),
+            1,
+            "暗色勾中盒 = 暗色 accent 填充"
+        );
+        assert!(
+            count_color(&rects, dark_border) > 0,
+            "暗色未选盒 = 暗色 border 边框"
+        );
+        std::fs::remove_file(&cfg).ok();
     }
 }
