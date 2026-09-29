@@ -4,6 +4,66 @@
 
 ## 状态
 
+- 2026-09-28 (**checkbox-widget 机器半边 T1–T5 收口, 人工验收 I 组三条记账待实机**):
+  触发 = 用户实机看合并源卡问「勾选状态使用中括号+x 表示吗」→ 框架新增复选框。
+  spec `docs/specs/SPEC-checkbox-widget.md`（三裁定: 两处都换 / 完整 widget + 静态画法 /
+  accent 实心+白勾）→ plan → /build auto 全绿。**产出**: danqing 新
+  `src/widget/form/checkbox.rs`（`Checkbox` 全件 + `paint_box` 静态画法**单真源** +
+  `CheckboxColors::from_theme`/`on_accent` 两套 —— 纯矢量绕开字体子集无 ✓ 字形的
+  根约束; showcase 已登记）, **danqing `c5b1fcf` 已 push**, 本仓 lock 复钉 `b091040`;
+  产品 `RowList::with_checkbox` 第五闭包（加法不改契约，四消费者零改动）,
+  合并源卡 + 显示列弹层两处 `[x]` 文本勾选退役换矢量盒, **事件路径零改动**（整行
+  点击不变）。**516 绿**（+8 锁; 摘勾/摘重取两处 A/B 精确红在案; 基线复核更正:
+  记档 495 已过期, 实测 507）。人工验收 = **I 组三条**（三条均需付费态 —— 三连弹层
+  与合并源卡都在付费层; 组别 H→I 让位: notice-visibility 并行会话先占 H）。
+  **review 同日收口**: 双路独立评审（五轴 + 红队六区深潜）均
+  APPROVE 零 Critical/Required, Optional×6+Nit×4 全清（受约束 paint 溢出 /
+  暗色零锁 / 勾形无锚 / showcase 静态盒假交互 / 守卫名 overclaim / 文档错命令
+  假绿），修复锁 +4 → 框架 705 / 产品 **517 绿**; danqing `8151d46` 已 push,
+  本仓 lock 二次复钉 `3f00814`（**非常规单点换钉**: cargo update 连带重解撞
+  wgpu 的 windows 双版本错配, diff 恰一行 + 517 绿验证, commit 有案）。
+  B-O4「RowList 长文案无裁剪溢出」挂账 ROADMAP §四。**code-simplify 同日收口 →
+  五段全闭**: 三项行为零变化（BOX_SIZE 并主 impl / `per_row` 收同形双块 /
+  `merge_source_idx` 收查源起手式）, 测试零修改, 框架 704 / 产品 517 绿;
+  danqing `7813d1d` push, 本仓单点换钉 `5275a0f`。环境备注: showcase.exe 被
+  用户窗口文件锁 → 备用 target-dir 绕锁验证（spec §11）。
+  **余: I 组三条实机验收**（需付费态, 与 G/H 同窗口）。
+  **并发注意**: notice-visibility 会话同窗口 build
+  （toast.rs/main.rs/view.rs 是其改动）, 任何一方 commit src 前按路径 diff 防混入
+  （09-15 事故同型）。
+- 2026-09-28 (**notice 提示可见性 intent 落盘**, 用户 interview-me 四轮裁定 + 显式 yes):
+  `docs/intent/notice-visibility.md` —— 「状态栏操作提示文本, 不注意的话用户都看不到」
+  (用户原话) → notice 通道分级升级: **Warn 上底部中央浮层** (状态栏正上方, 可点掉,
+  4 秒消退沿用) / **Info 留底栏强化样式** (色块/图标打底); 不做通知中心/系统通知/
+  Info 不上浮层/不改调用点文案。关键约束 (spec 输入): toast **非模态** (不是弹层族
+  第八员) 且须画在模态弹层**之上** (合并源卡里输错偏移的 Warn 正发生在弹层开着时);
+  动 `set_notice` 落点对照家族病史⑤ (内含 refresh_status 次序陷阱)。
+  **spec 已写待批**: `docs/specs/SPEC-notice-visibility.md` (两腿: Warn toast 浮层+
+  view 层分派 / Info 底栏色块强化; D4 分派在 view 层、`set_notice` 零改动绕开
+  家族病史⑤; toast 挂 Stack 末位 = 画在模态弹层之上; Open Q1–Q3 待批)。
+  spec 用户「go」批准 (Open Q 按推荐收) → plan/todo 已落盘
+  (`tasks/plan-notice-visibility.md` / `todo-notice-visibility.md`, T1–T4),
+  **plan 核实**: Stack 事件分发反序 (stack.rs:87) = 末位 toast 事件最先+paint 最上,
+  零框架改动; `STATUS_HEIGHT` 需 pub(crate) 化 (一字)。**build T1–T4 全闭 (同日)**:
+  新 `src/toast.rs` 非模态 Widget + view 层 kind 分派 (Warn 挪浮层/底栏不重复画) +
+  Info 色块衬底 (`surface_variant`, 两主题 ΔL* ≥6 实测回填 spec Q2) + 13 条新锁
+  (含整树行为锁 `toast_gets_the_click_before_modal_popover` —— 模态弹层开着时点
+  toast 先到; A/B 摘分派判据精确红已验证); **508 绿** (495+13), clippy 0 / fmt 过。
+  **并发事故记**: 同窗口并行会话在做 SPEC-checkbox-widget (danqing c5b1fcf +
+  pick_list.rs/settings.rs), clippy 报 `no Checkbox` = cargo git checkout 被 fetch
+  重写一半的中间态 (rustc 新/clippy 旧), touch 依赖源码强制重编解; 教训与
+  `| tail` 退出码骗局复发均落 spec §9-5。**review 已收口 (同日, 双路)**:
+  代码评审 REQUEST CHANGES (1 Required = NoticeKind/Msg::Notice 两处定义点 doc 旧模型
+  —— 家法「清旧文字」复发; 2 Optional = 弱锁加固+暗主题断言; 3 Nit) + 安全审计
+  PASS (3 Nit 观感级) → 全修, 含删 `fit_toast_text` 复用框架 canonical
+  `fit::ellipsize_tail` (安全 Nit① 查实 = 近重复); 记档不修三条 (Info 色块无截断/
+  每帧双 measure/极窄窗省略号微出界) 落 spec §9-8。**516 绿** (评审代理亲跑复核;
+  含并行会话 8 条, 归属已核)。**code-simplify 收口 (2026-09-29) → 五阶段全闭**:
+  两刀行为零变化 (`width_cap()` 三处同式收单点 / `BAR_INSET` 钉色条内缩常量),
+  测试零修改全绿; 不动清单落 spec §10 (含 `paints_color` 三份同逻辑 ——
+  settings.rs 是并行会话活跃文件不能碰, 待其收口另裁)。**余 = H 组人工验收
+  (待实机) + commit (待点头)**; 人工验收 H 组五条记账
+  `tasks/acceptance-pending.md` (大部不需付费态)。
 - 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
   spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
   机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
