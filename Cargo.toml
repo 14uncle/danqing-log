@@ -49,6 +49,9 @@ version = "0.2"
 
 [profile.dev]
 opt-level = 1
+# 调试信息只留行号表 (2026-09-30 腾空间裁定): debuginfo 是 dev target 体积大头。
+# 代价: 断点/单步仍可用, 但调试器里**变量值基本看不了**; 要查变量时临时改回 2 重编。
+debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2
