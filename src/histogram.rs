@@ -488,7 +488,7 @@ impl Widget for LevelHistogram {
             };
             msgs.push(Box::new(Msg::Notice(
                 reason.into(),
-                crate::NoticeKind::Info,
+                crate::NoticeKind::Warn,
             )));
             return EventResult::Consumed;
         }
@@ -616,6 +616,35 @@ mod tests {
             EventResult::Ignored
         );
         assert_eq!(w.hover.get(), None, "移出后 hover 清空");
+    }
+
+    /// 分档口径 (SPEC-notice-visibility §11): 点**不可点**的行 = 「你按的那下
+    /// 没生效」→ 提示必须是 **Warn** (上 toast 浮层), 错给 Info = 沉底栏。
+    /// (2026-09-29 复查抓回的漏网 —— P21「吞掉时说清」家法锁只断文案不断 kind。)
+    #[test]
+    fn clicking_unclickable_row_warns_not_info() {
+        let area = Rect::from_xywh(0.0, 0.0, HIST_WIDTH, 600.0);
+        let mut q = MsgQueue::default();
+        // 只读侧栏 (全 None): 任何行不可点 —— 点第 0 行
+        let mut ro = LevelHistogram::new();
+        let r = row_rect(area, 0, 0.0);
+        ro.event(
+            &Event::MouseInput {
+                button: danqing::event::MouseButton::Left,
+                pressed: true,
+                position: Point {
+                    x: r.origin.x + 4.0,
+                    y: r.origin.y + 4.0,
+                },
+            },
+            area,
+            &mut q,
+        );
+        let notice = q.iter().find_map(|m| m.downcast_ref::<Msg>());
+        assert!(
+            matches!(notice, Some(Msg::Notice(_, crate::NoticeKind::Warn))),
+            "点不可点行 = 没生效, 必须 Warn (上浮层)"
+        );
     }
 
     /// **指示器跟着规范化走, 不跟原串走** (2026-09-15 review 抓的缺口)。

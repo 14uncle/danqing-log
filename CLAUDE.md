@@ -4,6 +4,33 @@
 
 ## 状态
 
+- 2026-09-29 (**main.rs 拆分机器半边完成, 待 commit 点头**): 用户指令
+  「danqing_log::main 太大了，拆分」。两项裁定 (AskUserQuestion): ①先提交
+  notice-visibility 再拆 (已落 `62c1254`; 含 23 处 Info→Warn 改档 + 注释标点
+  全角归一化附注) ②按功能簇拆 7 模块。**产出** (`tools/split_main.py` 机械执行,
+  可复现): main.rs **8728 → 1934 行** —— 68 方法按簇搬 `app_persist` /
+  `app_export` / `app_license` / `app_merge` / `app_open` / `app_filter` /
+  `app_status` (各 = `impl LogApp` 分片 + `use super::*`, 跨簇调用 `pub(crate)`,
+  自由函数经根 re-export 保持 tests/main 调用点零改动), 29 方法留根
+  (构造器/导航访问器/门禁/impl App); `mod tests` 4744 行原样搬 `src/tests.rs`
+  (内容零修改)。**三件套绿: 521 测试** (基线 518 + 并行会话 D 闸 2 锁 + H-a
+  复跑波 histogram 1 锁) / clippy 0 / fmt 过。**并发记一笔**: 拆分进行中并行
+  会话完成 G 组缺陷② D 闸修复
+  (见下条 checkbox 条目内 G 组段), 其 impl 直接写进拆分后的 `app_merge.rs`、
+  2 条锁进了 `tests.rs` —— 同树纠缠无法剥离, 提交时并账注明。
+  **review 双路已收口 (同日)**: 五轴 —— 改动 A **APPROVE** (逐行多重集比对
+  零未解释字节; 可见性最小性抽查过) / 改动 B REQUEST CHANGES ×1 Required
+  (`Msg::RemoveSelectedMergeSource` doc 仍写被删旧行为 —— 「清旧文字」复发,
+  已修为 D 闸语义; Optional×3 留账: 1 源边角「只剩两源」文案失真 / remove
+  路径无 stale-selection 守卫 / SPEC §11 死串 —— 均在并行会话活跃文件, 不碰);
+  红队 —— **搬家保真 CONFIRMED** 零 Critical/Required (项集恰一次 only_old=0 /
+  104 项逐字节 + 62 pub(crate) + 4 fmt 折行 / 测试 token 流 34,875=34,875 /
+  63 个 pub(crate) 全有跨模块调用点 0 过度发布 / re-export 全有真消费者);
+  Nit×3 全清 (start_trace 横幅接缝空行 / 簇文件方法间补空行 —— 首遍脚本把
+  doc 块切碎, 被 clippy suspicious_doc_comments 当场抓住, 修复后复查全 0 /
+  台账行数滞后改 1934)。**结构节已更新**
+  (main.rs 条目改写 + toast.rs 补登记)。**余 = commit 待点头** (拆分 +
+  D 闸 + H-a 复跑波三波同树并账); view.rs (8131 行) 同病未拆, 本次不动。
 - 2026-09-28 (**checkbox-widget 机器半边 T1–T5 收口, 人工验收 I 组三条记账待实机**):
   触发 = 用户实机看合并源卡问「勾选状态使用中括号+x 表示吗」→ 框架新增复选框。
   spec `docs/specs/SPEC-checkbox-widget.md`（三裁定: 两处都换 / 完整 widget + 静态画法 /
@@ -69,8 +96,22 @@
   回执·进行中·状态说明; 新加提示先过表); 留 Info ~15 处不动; 锁
   `ineffective_action_notices_are_warn_not_info` (三族代表样本), P20 锁免疫,
   M3 旧锁 Info 样本换真 Info 文案。**518 绿** (含并行会话新增), clippy 全仓 0。
-  **余 = H 组人工验收 (待实机复验 H-a) + commit (待点头)**; 人工验收 H 组五条
-  记账 `tasks/acceptance-pending.md` (大部不需付费态)。
+  **G 组缺陷② D 闸 (2026-09-29, 用户裁定)**: 两源态点「移除」UI 零变化
+  (生效了但弹层行列表数据源=保留 bundle, 毫无反馈, 读作「移除不了」) →
+  只剩两源时「移除」不出手 + 指路「退出合并」; ≥3 源正常删; 原「不足两源
+  退出」分支删除 (闸后不可达)。锁 `remove_with_only_two_sources_is_refused_
+  and_points_to_exit` (Prove-It 先红) + `remove_with_three_sources_still_works`;
+  改在拆分后的 `src/app_merge.rs` (同日 main.rs 拆分重构进行中, 另一工作流),
+  **520 绿** clippy 0。
+  **H-a 复跑再抓漏网三条 (2026-09-29, 用户实机报「打开 A 追加源选 A」)**: 首盘
+  多行调用跳读漏列 `start_merge` 去重后不足两源提示; 复查全仓 `NoticeKind::Info`
+  逐条对 §11 口径再抓 3 条 (起并重复源 / 非合并态追踪 / 直方图 P21 两条) →
+  Info→Warn, 复查确认扫净; 行为锁加两族样本 +
+  `clicking_unclickable_row_warns_not_info`, **521 绿** clippy 0。
+  **H 组五条用户实机全过 (2026-09-29)** —— notice-visibility 功能+验收双闭环
+  (浮层醒目 / 模态之上 / 点掉+自消 / Info 色块可辨 / 双主题); I 组三条同日全过
+  (checkbox-widget 亦双闭环)。**余 = commit (待点头, 拆分工作流混居需分路径)**;
+  G 组九条仍待实机 (D 闸已修, 复验「移除」场景一并验)。
 - 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
   spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
   机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
@@ -1032,7 +1073,17 @@ path 态的 lock 给不了外人复现, 而 pinned 与「本地用未 push 的�
   preserve_order 保首见列序)。2026-09-10 拆为兄弟 crate `danqing-logfile`, 经 `lib.rs` 的
   `pub use danqing_logfile::{jsonl, logfile}` re-export; **2026-09-12 删除仓内残留副本**
   —— 拆分时漏删, 两份 2266 行已与兄弟 crate 分叉, 且 47 个测试静默不跑 (无 `mod` 声明 = 无人编译)
-- `src/main.rs` + `src/view.rs` — GUI (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
+- `src/main.rs` — 应用根: `LogApp` 状态结构 + `Msg` 枚举 + `impl App` 事件分发 +
+  构造器/导航访问器/弹层门禁 + `main()`; **方法簇 2026-09-29 拆出** (8728 → 1934 行,
+  纯搬家行为零变化): `app_persist.rs` (config.toml/state.json/命名会话/损坏备份) /
+  `app_export.rs` (导出流程) / `app_license.rs` (key 激活/商店购买) /
+  `app_merge.rs` (合并时间线) / `app_open.rs` (打开/重建/live-tail) /
+  `app_filter.rs` (过滤/搜索/书签) / `app_status.rs` (notice/底栏状态) ——
+  每个文件是 `impl LogApp` 的一个分片 + `use super::*`, 跨簇调用经 `pub(crate)`;
+  133+ 条测试同批原样挪 `src/tests.rs` (`#[cfg(test)] mod tests;`, 内容零修改)
+- `src/view.rs` — 视图层 (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
+- `src/toast.rs` — Warn 级 notice 的非模态浮层 Widget (SPEC-notice-visibility D4;
+  挂 Stack 末位 = 画在模态弹层之上; Info 不走这里, 留底栏色块)
 - ~~`src/encoding.rs`~~ — 编码检测/转码 (2026-09-10 独立为兄弟 crate `danqing-encoding`, danqing 通过 `pub use danqing_encoding as encoding` re-export)
 - `src/search.rs` — AsyncJob (worker+tick拾取泛化) + SearchNav 命中导航
 - `src/levels.rs` — **级别分类与计数** (level-histogram 纯逻辑层): 6 桶分类器
