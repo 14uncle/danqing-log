@@ -29,8 +29,10 @@
   Nit×3 全清 (start_trace 横幅接缝空行 / 簇文件方法间补空行 —— 首遍脚本把
   doc 块切碎, 被 clippy suspicious_doc_comments 当场抓住, 修复后复查全 0 /
   台账行数滞后改 1934)。**结构节已更新**
-  (main.rs 条目改写 + toast.rs 补登记)。**余 = commit 待点头** (拆分 +
-  D 闸 + H-a 复跑波三波同树并账); view.rs (8131 行) 同病未拆, 本次不动。
+  (main.rs 条目改写 + toast.rs 补登记)。**已 commit `598e2d8`** (2026-10-07
+  点头; 拆分 + D 闸 + H-a 复跑波三波同树并账, 提交前复跑三件套 521 绿);
+  同批 `647ac7a` = Cargo.toml dev profile debug=1 (09-30 腾空间裁定, 独立成笔)。
+  view.rs (8131 行) 同病未拆, 本次不动。**未 push** (待指示)。
 - 2026-09-28 (**checkbox-widget 机器半边 T1–T5 收口, 人工验收 I 组三条记账待实机**):
   触发 = 用户实机看合并源卡问「勾选状态使用中括号+x 表示吗」→ 框架新增复选框。
   spec `docs/specs/SPEC-checkbox-widget.md`（三裁定: 两处都换 / 完整 widget + 静态画法 /
@@ -110,7 +112,7 @@
   `clicking_unclickable_row_warns_not_info`, **521 绿** clippy 0。
   **H 组五条用户实机全过 (2026-09-29)** —— notice-visibility 功能+验收双闭环
   (浮层醒目 / 模态之上 / 点掉+自消 / Info 色块可辨 / 双主题); I 组三条同日全过
-  (checkbox-widget 亦双闭环)。**余 = commit (待点头, 拆分工作流混居需分路径)**;
+  (checkbox-widget 亦双闭环)。commit 随拆分工作流并账落 `598e2d8` (2026-10-07);
   G 组九条仍待实机 (D 闸已修, 复验「移除」场景一并验)。
 - 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
   spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
@@ -1000,9 +1002,9 @@
   **上轮失败教训** (`docs/SPEC-dark-theme.md` 产出当前暗色): 对比度数值全达标仍难看 ——
   **对比度合格 ≠ 好看**, 本轮判据是整屏观感
 - 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
-- 测试基线: **184 绿** (51 lib + 125 main + 8 genlog), 2026-09-16 实测
-  (上一版记的 178 是 09-15 旧值 —— 那之后又进了 P27 常驻红 / 滚动条拇指 / 「清除筛选」
-  居中量 ink 等守卫。**别拿 178 当回归基线**; 更早的 115 是 09-13 值, 早已作废)。
+- 测试基线: **521 绿** (186 lib + 321 main + 11 genlog + 3 keygen), 2026-10-07
+  提交前复跑实测 (拆分三波并账 `598e2d8` 前)。**别拿更早的数当回归基线**
+  (184 = 09-16 / 495 = 09-28 / 518 = 09-29 H-a 首波, 均已过期)。
   含: 设置卡溢出守卫与 `VERSION_ROW_H` 同源、暗色语义色板 AA 守卫、
   跨面阶梯守卫、浅色语义色 AA 守卫、展开块整段铺一次守卫、
   case-insensitive 的穷举 oracle / 逃逸舱 / `\w` 类语义 / D2 逐桶相等 /
