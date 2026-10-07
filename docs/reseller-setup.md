@@ -3,8 +3,9 @@
 - @author 十四叔
 - @date 2026/10/07
 - 状态: **终选 = Paddle**（2026-10-07 用户实测 paddle.com 可达；接受个人卖家、
-  CNY payout 不经 PayPal）。**执行前置 = EULA 落盘**（Paddle 域名审核要 ToS 页面，
-  与 09-27 EULA 身份门裁决合并落地，见 §一·0）。平台政策时效性强，执行时以官网为准。
+  CNY payout 不经 PayPal）。**执行中**（进展见 §一·1 末「执行进展」：注册 / 产品 /
+  折扣 / 落地页 / 域名审核提交已完成，待身份验证 + hosted checkout 权限 + payout
+  绑卡）。平台政策时效性强，执行时以官网为准。
 - 上游: `specs/SPEC-v1x-licensing.md` D2 / §8 待裁 · `ROADMAP-v1x.md` §三 ·
   `../tasks/todo-v1x-licensing.md` 末节用户侧清单
 
@@ -42,8 +43,13 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
   Paddle 要的 ToS
 - 隐私政策已有 `docs/privacy-policy.md`（公开 URL 现成）
 - README 加这两个链接（购买节同窗口补）
-- website 就填 **GitHub 仓库 URL**（独立开发者过审先例存在；若域名审核被驳回，
-  退路 = GitHub Pages 起一页落地页，零成本，届时再裁）
+- website 就填 **GitHub 仓库 URL**（独立开发者过审先例存在）
+  - **2026-10-07 执行勘正**：注册资料填仓库 URL 可行，但后台 **Add domain 只收
+    裸域名**（不带协议/路径；`github.com` 非自有域名必拒）→ 退路兑现：
+    **GitHub Pages 落地页已建成** `https://14uncle.github.io`（用户级 Pages 仓
+    `14uncle/14uncle.github.io`，main 根目录即服务；含产品/定价/下载 +
+    ToS/隐私/退款三链，政策正文只链接不复制防漂移）；页面资源一律**自托管**
+    （`raw.githubusercontent.com` 国内不可达，外链 logo 裂图已修）
 
 ### 1. 注册与审核（网页 ~20 分钟 + 审核 48 小时–数天）
 
@@ -57,6 +63,26 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
 3. 被驳回按邮件原因补料重提（常见死因：网站缺 ToS/隐私政策 → §0 已防）
 4. 税务信息按 onboarding 引导填（Paddle 为 MoR，终端销售税由它承担；
    你与 Paddle 之间按其指引完成税务声明）
+
+**执行进展（2026-10-07）**：
+
+- ✅ 注册完成（Individual；Business name Danqing）
+- ✅ 产品 ×2 建成（Personal $29 / Business $59，one-time，英文描述）
+- ✅ 折扣 ×2 建成（§4 表；各 Active、Uses left 50，**expiry 未设——发布日再设**）
+- ✅ 落地页 `14uncle.github.io` 上线 + **域名审核已提交**（官方口径 1–2 工作日）
+- ⏳ 身份验证（Sumsub）：入口 = 后台 **Get started → 02 Verify your account**
+  （10-07 在 onboarding 页发现，**不必等邀请邮件**）；物料 = 身份证 +
+  近三个月地址证明（与注册地址一致，银行/信用卡电子账单最稳）+ 手机活体
+- ⏳ **Hosted checkouts 权限**：live 账号的 hosted checkout 只开放给
+  「app-to-web 销售漏斗 / 桌面应用嵌入」（防被当免审核通用网店）——
+  Settings → Hosted checkouts → **Request access**（mailto: sellers@paddle.com；
+  机器无邮件客户端时右键复制链接、网页邮箱手动发，直接点会打开空白页）。
+  话术核心 = **桌面应用 + 应用内许可页按钮打开浏览器购买**（我们恰好是
+  允许的场景）；10-07 已申请，自动回执称 1–2 工作日回复。**别重复发件催**
+  （官方明示重复工单反而拖慢）
+- ⏸ payout 绑卡：等身份验证过后做（CNY 电汇；开户名拼音 = 注册实名逐字一致）
+- onboarding 页另有三步：01 Set up your live account（In progress，
+  可能含 payout/税务余项）/ 02 Verify / 03 Test and go live（真购买验证在这步）
 
 ### 2. 产品配置
 
@@ -80,13 +106,38 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
   电汇，看实际到帐金额再定长期路线**；银行账户开户名与 Paddle 注册名一致
 - 放款节奏与持有期以 Paddle Billing 后台当前口径为准
 
+### 4. 早鸟折扣（2026-10-07 用户裁定：标价不动 + 首发早鸟价）
+
+标价 $29/$59 不动，开业首月**或前 50 单**（先到为准）早鸟 **$19/$39**。
+Paddle 实现（Catalog → Discounts → Create discount，两个）：
+
+| Discount | Type | Amount | 限制 |
+|---|---|---|---|
+| `early-bird-personal` | Fixed amount | **−$10** USD | expires = 开业日 +30 天；max redemptions = 50 |
+| `early-bird-business` | Fixed amount | **−$20** USD | 同上 |
+
+生成 checkout link 时把对应 discount 挂上（自动应用，买家不用输码）——
+checkout 页会显示划线原价 + 折后价，锚点免费展示。到期/到量自动失效回正价。
+**产品描述里不写早鸟**（会过期的文字不进常驻文案，防「清旧文字」事故）；
+早鸟叙事放发布渠道（README / Release notes / 商店文案），届时随发布稿写。
+
+### 5. 产品线共用约定（2026-10-07 定）
+
+- **Paddle 域名审核是账号级**：`14uncle.github.io` 过一个，未来 farm01 全部
+  产品经本账号销售共用此域名，新品只走产品级审核（轻），不用再审域名
+- **Pages 仓布局**：一个用户级 Pages 仓装全产品线——根 = 当前唯一在售产品
+  （现 LogLens 占根），未来产品各占一个子目录（`14uncle.github.io/pomodoro/`
+  等）；没有第二件产品需要页面之前不重构根目录（外部旧链接成本）
+- Store add-on 轨产品（番茄钟）用不上 Paddle（商店代收），它需要落地页的
+  场景只是营销引流，与域名审核无关
+
 ## 二、每单 key 签发 SOP（手动模式）
 
 ```
 1. Paddle 订单通知邮件到（或每天看一次后台 Sales）
 2. 本地跑 keygen（私钥在仓库外）:
-     cargo run --bin keygen -- sign --email <买家邮箱> --tier <personal|enterprise>
-   （keygen 的 sign 子命令如尚未实现，属收银台联动小件，发布前补）
+     cargo run --bin keygen -- sign <私钥路径> <买家邮箱> <personal|enterprise>
+   （工具 09-19 licensing 已交付: generate/pubkey/sign 三件套齐, 无需补造）
 3. 把 key 粘进邮件发给买家（平台后台可直接给该 customer 发消息，购买记录留痕）
 4. 每月导出一次 Sales CSV 存档（对账 + 退款复查）
 ```
@@ -130,7 +181,9 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
 5. **是否 MS Store 轨先行**：若 Paddle 审核意外拖长，先开 Store 轨把前提③
    首单外检跑起来、GitHub 轨后补，是合法选项；代价 = 两轨付费信号先后到，
    首单外检判读口径要注明渠道
-6. 店铺/产品链接：注册后把个人档 checkout link 给我回填 `PURCHASE_URL`
+6. 店铺/产品链接：产品 ×2 已建成（2026-10-07）；**checkout link 生成受 hosted
+   checkout 权限闸**（§一·1 执行进展，10-07 已申请）——获批后把个人档 link
+   给我回填 `PURCHASE_URL`
 
 ## 五、终选落地后的仓库联动（我来做，逐项点头）
 
