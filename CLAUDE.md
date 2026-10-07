@@ -4,6 +4,30 @@
 
 ## 状态
 
+- 2026-10-07 (**收银台执行日: Paddle 全链路落地 + G 组验收通过 = v1.x 人工验收全闭环**):
+  **Paddle 侧 (用户操作, 全程截图问答)**: 注册 Individual (Business name Danqing) →
+  产品×2 (Personal $29 / Business $59 one-time) → 折扣×2 (early-bird −$10/−$20,
+  Uses left 50, **expiry 发布日再设**) → **落地页 `14uncle.github.io` 上线** (GitHub
+  Pages 用户级仓; ToS/隐私/退款三链齐; 资源自托管 —— raw.githubusercontent.com 国内
+  不可达致 logo 裂图已修; `#pricing` 锚点为审核表单而加) → **域名审核已提交** →
+  onboarding 表单全链 (个体工商户 / 产品描述 / 网站三链 / 合规声明全 No) →
+  **Sumsub 身份验证当日过** (身份证件 + **租房合同**作地址证明 —— 电子居住证
+  三投三拒的完整原因链与解法录 `docs/reseller-setup.md` 踩坑记) →
+  **hosted checkout 权限工单已发** (sellers@paddle.com; app-to-web 桌面应用话术)。
+  **余钟三条**: ①域名审核 ②验证徽标翻牌 → payout 绑卡 (建行/招行储蓄卡) ③checkout
+  权限 → 生成链接 → 回填 `PURCHASE_URL` (license.rs, settings.rs:341 D8 显隐判据)。
+  Paddle 账号资料两项 (Product website → 落地页 / display name) 待工单回复同线程
+  请改, 已记 reseller-setup §五。**产品线约定**: Paddle 域名审核账号级, 一个 Pages
+  仓装全产品线 (根=在售产品, 新品占子目录) —— 落 reseller-setup §一·5 + pages 仓 README。
+  **G 组九条用户实机全过** (付费态 key 本地激活; D 闸「移除」场景复验一并) ——
+  **A–I 九组人工验收至此全闭环**, acceptance-pending 与 merge-timeline spec §7 已回填。
+  **裁决点①③确认 (用户 go)**: 手动签发模式正式确认 → `SPEC-v1x-licensing.md` 回写
+  (D2 核销「两家均不支持」/ §8 终选 Paddle / 逃逸舱「未启用 · 保留」);
+  邮件模板照 §二 草稿定稿。**定价重裁 (用户裁定)**: 标价 $29/$59 不动 + 首发早鸟
+  $19/$39 (首月或前 50 单先到为准), 复核时点 = 首单外检 30 天钟 —— 落
+  ROADMAP-v1x §三 + reseller-setup §一·4。**文档批已提**: `815b270` (EULA+终选) /
+  `c0d262d` (早鸟+进展) / `10da029` (身份验证+踩坑记); pages 仓 `ae40074` 已推。
+
 - 2026-09-29 (**main.rs 拆分机器半边完成, 待 commit 点头**): 用户指令
   「danqing_log::main 太大了，拆分」。两项裁定 (AskUserQuestion): ①先提交
   notice-visibility 再拆 (已落 `62c1254`; 含 23 处 Info→Warn 改档 + 注释标点
@@ -113,16 +137,18 @@
   **H 组五条用户实机全过 (2026-09-29)** —— notice-visibility 功能+验收双闭环
   (浮层醒目 / 模态之上 / 点掉+自消 / Info 色块可辨 / 双主题); I 组三条同日全过
   (checkbox-widget 亦双闭环)。commit 随拆分工作流并账落 `598e2d8` (2026-10-07);
-  G 组九条仍待实机 (D 闸已修, 复验「移除」场景一并验)。
+  ~~G 组九条仍待实机~~ **G 组 2026-10-07 用户实机全过** (D 闸「移除」场景复验一并) ——
+  A–I 九组人工验收全闭环, 见顶部当日条目。
 - 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
   spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
   机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
   `merge_view::build_merge` / `MergeState`) 实测回填 `PERFORMANCE_REPORT.md` 合并节:
   **947 / 962 / 967 ms** 三跑热缓存 (复查另得 1439 ms 负载波动如实记), D5 红线 ✅
-  (非红线目标 ≤0.8 s 差 ~17%)。**人工验收 G 组九条** (spec §7 原文) 记账总清单
-  `tasks/acceptance-pending.md` ⬜ 待实机 —— **需付费态 key**, 与 B/F 同一条
-  license key 本地激活通路 (三源合并打开 / req_id 追踪 / 按源着色隐藏 / 时钟偏移 /
-  无 ts 行 / 免费态门控 / merge group 会话 / 探测失败明示 / 性能体感)。
+  (非红线目标 ≤0.8 s 差 ~17%)。**人工验收 G 组九条** (spec §7 原文) ~~记账总清单
+  `tasks/acceptance-pending.md` ⬜ 待实机~~ **✅ 2026-10-07 用户实机全过** (付费态
+  key 本地激活, 与 B/F 同一条通路; 账目同文件 G 组) —— 三源合并打开 / req_id 追踪 /
+  按源着色隐藏 / 时钟偏移 / 无 ts 行 / 免费态门控 / merge group 会话 / 探测失败明示 /
+  性能体感。
   **试跑即修一条 (同日)**: 合并源卡首排步进钮 (±1h/±1m/±1s 六枚) 走 Button 默认
   横向 padding (16×2) 自然宽 **348** > 卡片内容宽 **312**, Row 不裁剪画出卡外
   (用户实机报) → 横向收紧 `spacing_sm`(8) 纵向不动; 锁
