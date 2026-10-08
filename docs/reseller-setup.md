@@ -4,8 +4,9 @@
 - @date 2026/10/07
 - 状态: **终选 = Paddle**（2026-10-07 用户实测 paddle.com 可达；接受个人卖家、
   CNY payout 不经 PayPal）。**执行中**（进展见 §一·1 末「执行进展」：注册 / 产品 /
-  折扣 / 落地页 / 身份验证已完成；域名审核 + hosted checkout 权限在审；
-  payout 绑卡进行中）。平台政策时效性强，执行时以官网为准。
+  折扣 / 落地页 / 身份验证已完成；**域名审核 10-08 已过**（Checkout +
+  Apple Pay 双徽标）；hosted checkout 权限在审；payout 绑卡已完成
+  （10-08 CNY 电汇））。平台政策时效性强，执行时以官网为准。
 - 上游: `specs/SPEC-v1x-licensing.md` D2 / §8 待裁 · `ROADMAP-v1x.md` §三 ·
   `../tasks/todo-v1x-licensing.md` 末节用户侧清单
 
@@ -69,7 +70,10 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
 - ✅ 注册完成（Individual；Business name Danqing）
 - ✅ 产品 ×2 建成（Personal $29 / Business $59，one-time，英文描述）
 - ✅ 折扣 ×2 建成（§4 表；各 Active、Uses left 50，**expiry 未设——发布日再设**）
-- ✅ 落地页 `14uncle.github.io` 上线 + **域名审核已提交**（官方口径 1–2 工作日）
+- ✅ 落地页 `14uncle.github.io` 上线 + **域名审核已通过**（10-07 提交 →
+  **10-08 过审**，Website approval 双徽标：Checkout approved + Apple Pay
+  approved；注意每域名/子域名单独审——`14uncle.github.io` 覆盖本账号全部
+  产品，与 §一·5 账号级约定吻合）
 - ✅ 身份验证（Sumsub）**已通过**（10-07 当日过审）：身份证件 + **租房合同**
   作地址证明；入口 = 后台 **Get started → 02 Verify your account**
   （onboarding 页内直接开始，**不必等邀请邮件**）——地址证明踩坑见文末记
@@ -79,10 +83,25 @@ Privacy Policy 页面**。材料合并方案（一件事办两个裁决）：
   机器无邮件客户端时右键复制链接、网页邮箱手动发，直接点会打开空白页）。
   话术核心 = **桌面应用 + 应用内许可页按钮打开浏览器购买**（我们恰好是
   允许的场景）；10-07 已申请，自动回执称 1–2 工作日回复。**别重复发件催**
-  （官方明示重复工单反而拖慢）
-- ⏳ payout 绑卡（身份验证过后解锁，10-07 进行中）：CNY 电汇；开户名拼音 =
-  注册实名逐字一致；表单要 CNAPS 联行号（12 位）时银行 APP 搜「联行号」或
-  客服问开户支行，SWIFT 代码以开户行给的为准
+  （官方明示重复工单反而拖慢）。**10-08 真人 Ivan 回复**「refer this to my
+  team」= 已转交团队，**非最终答复**，继续等钟；同线程捎带账号资料两项
+  修改请求（§五 末项，草稿已交用户）。**两道闸独立实证（10-08）**：域名
+  过审（双徽标）后 Hosted checkouts 黄条仍在、产品菜单无 link 生成入口——
+  Website approval 是前置不是解锁，别把域名翻绿误读成能生成 link 了
+- ✅ payout 绑卡（2026-10-08 表单已保存，Wire transfer / CNY）：**Business account →
+  Payouts → Payout Settings**（左栏 Business account 展开；绑卡**不在**
+  Account settings——那个页面没有 Payout 区块）。方式 = Wire transfer，
+  币种 **CNY 首选**（§一·3 既定：首笔试走看实到；小额起步避开 USD 电汇
+  中转行 $10–25 级按笔费，CNY 只付 Paddle 换汇 margin 1.5–3% 且人民币
+  直接入账不碰结汇额度；若要 CNAPS 联行号已从 APP「开户行查询」备查）。
+  **USD 兜底已备齐**（10-07 建行官方「外汇境外汇入汇款途径」拿到）：
+  收款行 SWIFT = 北京分行级 `PCBCCNBJBJX`（支行无独立 SWIFT，靠卡号
+  落账到户），中转行 BoA/花旗/摩根大通纽约三路由打款方自选（表单无此栏，
+  Notes 空着）；到账 = 美元现汇，建行 APP「结汇」换人民币（占个人年度
+  5 万美元便利化额度）。收款人名 = 拼音与 Paddle 注册实名逐字一致
+  （惯例姓在前全大写，校验不匹配再调顺序）。银行侧前置：跨境 KYC 问卷
+  **已提交（10-08**；关键题「境外上游资金 = 是」）。卡号/支行等敏感信息
+  不落库，原件存仓库外
 - onboarding 页另有三步：01 Set up your live account（In progress，
   可能含 payout/税务余项）/ 02 Verify / 03 Test and go live（真购买验证在这步）
 
@@ -212,12 +231,16 @@ checkout 页会显示划线原价 + 折后价，锚点免费展示。到期/到�
       逃逸舱段标注「未启用 · 保留」
 - [ ] `tasks/todo-v1x-licensing.md` 末节用户侧清单打勾
 - [ ] README 购买节补 Paddle 链接（EULA 身份门口径同窗口）
-- [ ] checkout 域名（buy.paddle.com）国内可达性实测（买家侧，发布前）
+- [x] checkout 域名国内可达性实测（买家侧）：**10-08 已测**——`buy.paddle.com`
+      HTTP 200 / `pay.paddle.com` 405 / `checkout.paddle.com` 404（后两个根
+      路径无 GET 是预期，TLS 握手全部成功未被墙）；真 checkout 页带表单的
+      终验随真购买验证一并
 - [ ] 真购买链路验证（前提③前置）：自己下一单 $29 → 走通 签发→激活→升级提示消失
-- [ ] Paddle 账号资料两项顺手改（Account settings 页标注「Paddle sets these
+- [x] Paddle 账号资料两项顺手改（Account settings 页标注「Paddle sets these
       details，改须发邮件」）：**Product website** `github.com/14uncle/danqing-log`
       → `https://14uncle.github.io`；**Company display name** Not set → Danqing
-      —— 等 sellers 工单真人回复时**同一线程**请改，不单发邮件
+      —— **已随 Ivan 工单线程发出（10-08）**，同线程捎带、未单发邮件；
+      落实结果待 Paddle 确认（改没改回后台 Account settings 核一眼即可）
 
 ---
 
