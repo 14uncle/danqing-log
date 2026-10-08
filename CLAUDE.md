@@ -4,6 +4,20 @@
 
 ## 状态
 
+- 2026-10-08 (**Paddle Checkout settings 七节配齐保存**, 实录落 `docs/reseller-setup.md`
+  §一·6): 支付方式开 PayPal/Apple Pay/Google Pay/Bancontact/**WeChat Pay** (中国买家
+  唯一通路, USD/CNY+一次性买断 ✅; **延迟捕获 ~10 分钟** → 手动签发以 transaction
+  完成态为准再签 key); 概念澄清落档: 该页勾选 = 买家侧支付方式, 与卖家账户无关
+  (MoR 代收, 回款只有 CNY 电汇一条路)。Statement descriptor 定 `LOGLENS` (防
+  「这是什么扣款」拒付); Default payment link 填 `https://14uncle.github.io/checkout`
+  (已过审域名绿勾; 不设则创建 transaction 报 `transaction_default_checkout_url_not_set`;
+  购买流走托管 checkout link 不经此页, 暂不为它建 Paddle.js 页面); 弃购挽回邮件开 /
+  挽回折扣关 (早鸟挂着时本就不发 + 防「弃购=拿折扣」+ 守标价不动) / 折扣码输码框关 /
+  买家营销 opt-in 开 (买家邮箱列表 = 新品大版本直达渠道)。Styling 页签只配品牌色
+  (官方: overlay 无 logo 上传位, 深度定制须 inline+Paddle.js 非我们路线;
+  Brand color 填框架 accent `#0F766E`)。**余钟只剩一条**: hosted checkout 权限 (Ivan 工单 10-08 已转交
+  团队, 勿催) → 生成链接 → 回填 `PURCHASE_URL`。校准钟 T+20 快照同日已落
+  `tasks/calibration-30d.md` (commit `892a0de`)。
 - 2026-10-07 (**收银台执行日: Paddle 全链路落地 + G 组验收通过 = v1.x 人工验收全闭环**):
   **Paddle 侧 (用户操作, 全程截图问答)**: 注册 Individual (Business name Danqing) →
   产品×2 (Personal $29 / Business $59 one-time) → 折扣×2 (early-bird −$10/−$20,

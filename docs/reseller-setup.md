@@ -6,7 +6,8 @@
   CNY payout 不经 PayPal）。**执行中**（进展见 §一·1 末「执行进展」：注册 / 产品 /
   折扣 / 落地页 / 身份验证已完成；**域名审核 10-08 已过**（Checkout +
   Apple Pay 双徽标）；hosted checkout 权限在审；payout 绑卡已完成
-  （10-08 CNY 电汇））。平台政策时效性强，执行时以官网为准。
+  （10-08 CNY 电汇）；**Checkout settings 已配保存**（10-08，§一·6））。
+  平台政策时效性强，执行时以官网为准。
 - 上游: `specs/SPEC-v1x-licensing.md` D2 / §8 待裁 · `ROADMAP-v1x.md` §三 ·
   `../tasks/todo-v1x-licensing.md` 末节用户侧清单
 
@@ -164,6 +165,31 @@ checkout 页会显示划线原价 + 折后价，锚点免费展示。到期/到�
   等）；没有第二件产品需要页面之前不重构根目录（外部旧链接成本）
 - Store add-on 轨产品（番茄钟）用不上 Paddle（商店代收），它需要落地页的
   场景只是营销引流，与域名审核无关
+
+### 6. Checkout settings 配置实录（2026-10-08 已保存）
+
+Checkout → Checkout configuration → Settings 页签。核心概念先记一条（10-08
+用户问答澄清）：**这页勾的是「买家能用什么付」，不是「卖家有什么账户」** ——
+Paddle 以 MoR 身份代收全款，卖家回款只有 Payouts 里那条 CNY 电汇一条路，
+与买家侧勾选完全无关（买家 PayPal ≠ 卖家 PayPal；选型规避的是后者）。
+
+| 节 | 最终状态 | 依据 / 备注 |
+|---|---|---|
+| Payment methods | **开**: PayPal / Apple Pay / Google Pay / Bancontact / **WeChat Pay**；关: iDEAL / Pix / UPI / BLIK / MB Way / 韩国本地卡 / Naver Pay | 区域方法 Paddle 按买家地区自动显隐，不开的只是少个顺手选项。**WeChat Pay = 中国买家唯一通路**（官方：中国地址买家 + 桌面端 + USD/CNY + 一次性买断 ✅，无需卖家有微信商户号/中国主体）；注意它是**延迟捕获**（授权后 ~10 分钟才落账）——手动签发 SOP 以后台 transaction 完成态为准再签 key，天然容错。Alipay 不在 Paddle Billing 方法列表 |
+| Saved payment methods | 开（Allow saved cards） | 订阅续费场景为主；买断制下仅省回头客输卡号，零成本 |
+| Marketing consent | 开 | 买家 opt-in 进营销列表（默认文案「Danqing can send me product updates and offers via email…」）；买断 + v2 另议 + 产品线共用账号 → 买家邮箱列表是将来新品/大版本唯一直达渠道，合规收集 |
+| Checkout discount | **关**（Allow buyers to add a discount code） | 早鸟挂 checkout link 自动应用、买家不输码；露出输码框诱发「搜码分心」流失。以后发补偿码/活动码再开 |
+| Default payment link | `https://14uncle.github.io/checkout`（已过审域名，绿勾） | 官方口径：不设则创建 transaction 报 `transaction_default_checkout_url_not_set`。机制 = 该 URL 拼 `?_ptxn=txn_...` 且页面需嵌 Paddle.js 才弹 checkout。**我们的购买流不走它**（买家点 Paddle 托管 checkout link，buy.paddle.com 一族）——填上 = 拆潜在闸 + 满足表单，暂不为它在 Pages 站建页面 |
+| Statement description | `LOGLENS`（原 `DANQING5` 改） | 账单描述符 2–10 字符全大写；买家认产品名，防「这是什么扣款」型拒付 |
+| Recovery | Checkout recovery **开** / Apply discount **关** | 弃购挽回邮件 = 免费自动召回，与手动签发零冲突。挽回折扣不开：①早鸟挂着时它本就不发（每产品同时仅一折扣，页面写明）②防「弃购=拿折扣」训练效应，守住「标价不动」纪律 ③上线后看弃购数据再裁 |
+
+Styling 页签（2026-10-08 勘误后口径）：官方明确 overlay checkout 只有**品牌色级**
+微调、**无 logo 上传位**（深度定制须 inline + Paddle.js 集成，非我们路线；checkout
+页头部只显示 business name = Danqing）——唯一要填的是 **Brand color (overlay) =
+`#0F766E`**（框架浅色 accent，白底对比 ~5:1 实测值；若分模式填暗色则 `#1A9E8A`），
+Fonts（默认 Lato）/ Focus state / General 维持默认。
+**这页配完不解锁 hosted checkout 权限**（§一·1 工单等钟）——意义是权限一到
+即可直接生成链接回填 `PURCHASE_URL`，中间不再卡表单。
 
 ## 二、每单 key 签发 SOP（手动模式）
 
