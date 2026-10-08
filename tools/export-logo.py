@@ -10,6 +10,8 @@
 输出:
     assets/logo/log_{16,24,32,48,128,256}.png
     assets/logo.ico  (build.rs 嵌入 exe; 引擎运行时另读 log_16/256.png)
+    ../release-archives/log/store/addon-icon-300.png  (商店 add-on 图标, 下限 300x300,
+        只作 Partner Center 上传素材, 不进仓库 —— 2026-10-08 加)
 """
 
 from pathlib import Path
@@ -19,6 +21,7 @@ from PIL import Image, ImageDraw
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO_ROOT / "assets" / "logo"
 ICO_PATH = REPO_ROOT / "assets" / "logo.ico"
+ADDON_DIR = REPO_ROOT / ".." / "release-archives" / "log" / "store"
 
 PNG_SIZES = [16, 24, 32, 48, 128, 256]
 ICO_SIZES = [16, 24, 32, 48, 256]
@@ -69,6 +72,13 @@ def main() -> None:
     ico_sizes = [(s, s) for s in ICO_SIZES]
     rendered[256].save(ICO_PATH, format="ICO", sizes=ico_sizes)
     print(f"Exported {ICO_PATH}")
+
+    # 商店 add-on 图标 (下限 300x300; 上传素材, 落仓库外归档目录)
+    ADDON_DIR.mkdir(parents=True, exist_ok=True)
+    addon = render_logo(300)
+    addon_path = ADDON_DIR / "addon-icon-300.png"
+    addon.save(addon_path, "PNG")
+    print(f"Exported {addon_path}")
 
 
 if __name__ == "__main__":

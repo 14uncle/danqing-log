@@ -4,6 +4,29 @@
 
 ## 状态
 
+- 2026-10-08 (**空窗裁决 + 发布阶段 0 备料全落, 均未 commit**): 用户问「收费版收尾阶段可以开下个
+  产品吗」→ 农场根 interview-me 收敛 (动机=空窗带宽利用, 非新现象敲门) → **两道闸不放行**
+  (组合纪律: 2.0 未发布; round8 c+ 复活条件未响) → 空窗派活三件, 意图
+  `docs/intent/v1x-release-window.md`。**版本号裁定 = 2.0.0** (对外物料一律 2.0.0,
+  仓内「v1.x」仅为开发期代号)。产物:
+  ① `docs/distribution-prep.md` = 2.0 波次**增量**计划 —— 底稿是
+     `danqing/docs/intent/curated-channel-submission-plan-2026-09-20.md` (渠道入口已核实 /
+     文案 1–9 定稿 / 投放记录表 §三 / 判据 §四), 本文档只写增量: 付费层价格口径改稿 +
+     合并时间线叙事主线 + V2EX/LINUX DO 新增渠道 + **就绪待投四家 (软餐/异次元/反斗/阮一峰)
+     并入 2.0 波次, 旧稿「当前版本完全免费」句必须改**; 推送时机 = 2.0 可购买后。
+     (教训: 初稿曾把底稿重抄一遍 + 4 处事实错 —— 写新文档前先全局搜既有产物。)
+  ② `tasks/v1x-release-checklist.md` 发布检查单 —— **阶段 0 已完成**: add-on 图标 300×300
+     已产 `release-archives/log/store/addon-icon-300.png` (`tools/export-logo.py` 加 300 档,
+     重跑零 churn 已验) / `docs/release-notes-v2.0.0-draft.md` / `docs/ms-store-copy.md` §6
+     预起草 (产品功能 13 条 + 免费节改写 + 专业版段 + IARC 改答); **add-on 价格档待裁**
+     (微软档与 Paddle $29/$59 对齐); 隐私政策正文已是 1.x 版, 提交时只改版本行。
+  ③ 截图: **`tools/take_shot.ps1` 新脚本 (PrintWindow 按 HWND 截窗口)** —— 本机双屏下
+     CopyFromScreen 只截到裸壁纸 (窗口 visible=True 也截不到), PrintWindow
+     PW_RENDERFULLCONTENT 对 wgpu 自绘窗口实测有效; 最大化窗口裁 8px 隐形边框。
+     零交互 6 张已拍 `release-archives/log/shots/2026-10-08/` (raw/jsonl/gbk × dark/light,
+     状态栏计时在图); 浅色图借道改 config.toml 拍摄, 拍完已还原 dark。
+     **合并时间线/字段分析特写需交互构图 = 用户拍**, fixture 已备
+     `release-archives/log/demo/merge-3src/` (5MiB×3 源, 偏移 -3.4s/-1.7s/0, 含 truth.txt)。
 - 2026-10-08 (**Paddle Checkout settings 七节配齐保存**, 实录落 `docs/reseller-setup.md`
   §一·6): 支付方式开 PayPal/Apple Pay/Google Pay/Bancontact/**WeChat Pay** (中国买家
   唯一通路, USD/CNY+一次性买断 ✅; **延迟捕获 ~10 分钟** → 手动签发以 transaction
