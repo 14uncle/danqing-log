@@ -21,13 +21,14 @@
 
 ## 1. 底稿当前状态（2026-10-08 盘点）
 
-- **已发（09-21，1.0 内容）**：小众软件论坛（topic/92198，33 浏览 1 陌生人回复）/ CSDN / 知乎 / 掘金 /
-  公众号 / 抖音 / 开源中国博客
-- **审核中（09-21 投）**：少数派 Matrix、HelloGitHub 站内收录 —— 结果回读属校准钟动作
-- **就绪待投（用户动作，一直没投）**：软餐（文案 5）/ 异次元（文案 6）/ 反斗（文案 5 改）/
-  阮一峰周刊（文案 8）
-- ⚠️ **四份待投稿是 1.0 时代内容**（「当前版本完全免费…后续计划走买断」）。
-  **处置：并入 1.5 波次，投稿前按 §2 改稿** —— 别先投 1.0 旧稿再投 1.5，同一渠道烧两次曝光。
+- **已发（09-21，1.0 内容）**：小众软件论坛（topic/92198，177 浏览 1 陌生人回复）/ CSDN（228）/
+  公众号（116）/ 知乎 / 掘金 / 抖音 / 开源中国博客（后四者各几十）——阅读数均为 10-09 用户后台读，
+  详单与拉取日在底稿 §三
+- **少数派 Matrix：审核通过已发布**（60 阅读，10-09 读）——策展渠道首收，0 拒 1 收；
+  **HelloGitHub：仍审核中**（10-09 确认，月刊节奏）—— 后续回读属校准钟动作
+- ~~**就绪待投（用户动作，一直没投）**：软餐 / 异次元 / 反斗 / 阮一峰周刊~~
+  **2026-10-09 用户裁决不投**：前三家活跃度预判不足；阮一峰周刊适配度预判不足（估计不会收录）。
+  文案 5/6/8 留档（底稿），复活即用——但复活投稿前仍需先按 §2 改价格口径。
 
 ## 2. 1.5 波次变更点
 
@@ -59,7 +60,10 @@
 
 ### 2.2 渠道增量
 
-- **新增（开发者正对，底稿未列）**：V2EX 分享创造（`v2ex.com/go/create`）、LINUX DO 发现频道。
+- ~~**新增（开发者正对，底稿未列）**：V2EX 分享创造（`v2ex.com/go/create`）、LINUX DO 发现频道~~
+  **已砍（2026-10-09）**：用户报两站不可达，本机 curl 实测双双连接超时（12s，`http_code 000`）——
+  同 HN 死法（GFW），无代理通道。文案未写，无留档损失；环境变化可复活。
+  空位（连同不投四家）由 §2.4 三件机制新渠道顶替：知乎回答 / dev.to / WinGet·Scoop。
 - **二波已投渠道**：CSDN / 掘金 / 知乎 / 开源中国博客 —— 新发一篇 1.5 文无平台障碍；
   少数派 Matrix 自助发布，新发一篇体验文（1.5 场景向）。
 - **小众软件论坛**：规则明令「不要重复发帖」—— 1.5 更新走**编辑原帖 + 回帖**（规则明文
@@ -76,6 +80,94 @@
 | 新拍 | 字段分析面板（数值分布 + p50/p99） | ⬜ 需交互（点字段行） |
 | 新拍 | 明文主视图 + 直方图侧栏（dark/light 各一） | ⬜ 零交互，agent 可拍 |
 | 新拍 | GBK 中文（light 一） | ⬜ 零交互，agent 可拍 |
+
+### 2.4 渠道折叠三件（2026-10-09，用户「go」批准）：知乎回答 / dev.to / WinGet·Scoop
+
+背景：同日两刀（不投四家 + V2EX/LINUX DO 不可达）清出 6 个空位，折入三件**机制新渠道**——农场此前从未用过这三种机制：
+① 知乎回答 = **拦截机制**（答已有问题，提问者此刻正在找解法，与广播式专栏不同）；② dev.to = **英文搜索资产**
+（HN 砍掉后的英文拦截位）；③ WinGet/Scoop = **安装路径管道**（`winget install` 是对的受众 + 零摩擦 + 信任状三合一）。
+**纪律不变：全部只备料，随 1.5 波次发（可购买后）**——提前发会污染 10-18 校准钟归因窗；想提前铺管道需用户特批。
+
+#### ① 知乎回答（待人工选题）
+
+**机器选题失败（如实记）**：WebSearch 本会话空转（连英文查询都零结果）、WebFetch 服务被网络策略整体拦截、
+本机 curl 打 cn.bing / 知乎站内搜索 / 搜狗知乎 / 百度四路全空（JS 壳或反爬）。
+**零命中 = 工具故障面，不代表问题不存在**（09-20 红队 R1 教训原句），故不编问题 URL，转人工选题。
+
+**人工选题包**（用户登录知乎站内搜索）：
+
+- 检索词：「大日志文件怎么打开」「日志分析工具 推荐」「Windows 日志查看器」「几个G 的日志 怎么查」「log viewer 大文件」
+- 选题判据（四条全过才入选）：
+  1. 问题描述里有**真实凑合现象**（卡死 / 记事本打不动 / grep 太慢）——心法第一条「谁还在凑合」
+  2. 关注者 ≥50 或浏览 ≥1 万
+  3. 现有回答无强势答案（或答案是 klogg/LogViewPlus 且评论区在抱怨）
+  4. 近一年仍有新回答/新关注（老票多新票无 = 已死，日期分布检）
+- 答案骨架：场景痛点一句 → 同机实测对照（VS Code ~10s / Daucloud ~7s / LogViewPlus 60s / 我们冷开 0.6s）
+  → 原理两句（mmap + 行索引，不解析不加载）→ 不做什么（无 ANSI / 无云端）
+  → 价格挑明（免费层永久免费 + 买断 $29/$59，早鸟 $19/$39）→ GitHub 链接 + 「自研工具」披露
+- **回填槽位**（选定后填，关注/浏览数以用户后台读数为准）：
+
+| 问题 | URL | 关注/浏览 | 入选理由 | 答案角度 |
+|---|---|---|---|---|
+|  |  |  |  |  |
+
+#### ② dev.to 英文体验文
+
+文案 10 已备（底稿 §二 文案 10，1.5 口径，front matter `published: false` 防误发）；
+两张现有截图（JSONL 列化 / GBK 中文）可直贴。发后读数进底稿 §三记录表（行已立）。
+
+#### ③ WinGet / Scoop 收录 PR（清单已备，名字零冲突）
+
+**名字零冲突（2026-10-09 实证）**：winget code search `LogLens` = 0 命中；scoop extras 的
+`loglens.json` / `danqing-log.json` 均 404。
+
+**winget**（成稿实证 = microsoft/winget-pkgs 里 `junegunn.fzf`（**zip + portable 同款形态**）与
+`yt-dlp.yt-dlp`（单文件 portable），schema **1.12.0**，两稿均由 komac 生成）：
+
+- 标识符建议 **`14uncle.LogLens`**（待用户点头）
+- installer.yaml 草案（形态照抄 fzf 成稿）：
+
+```yaml
+PackageIdentifier: 14uncle.LogLens
+PackageVersion: 1.5.0        # 提交时 = 当时发布版本
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+- RelativeFilePath: danqing-log.exe
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/14uncle/danqing-log/releases/download/v1.5.0/danqing-log-v1.5.0-win-x64.zip
+  InstallerSha256: <发布时从 .sha256 sidecar 填>
+ManifestType: installer
+ManifestVersion: 1.12.0
+```
+
+  另需 locale.en-US / locale.zh-CN / version 三个 yaml（名称「丹青日志 LogLens」、Publisher `14uncle`、
+  License `MIT OR Apache-2.0`）。提交工具 **komac**（fzf 稿同款，从 GitHub Release 自动生成全套并开 PR）
+  或 wingetcreate；PR → microsoft/winget-pkgs，CI 校验。
+
+**scoop**（成稿实证 = extras 里 `everything.json`（GUI zip 应用全套）与 `obsidian.json`
+（checkver github + autoupdate 标准式））：
+
+- GUI 应用走 **extras bucket**（main 是命令行工具）；快捷方式用 `shortcuts` 字段（不是 bin）：
+
+```json
+{
+    "version": "1.5.0",
+    "description": "Native Windows log/JSONL viewer — opens 1 GiB logs in ~0.6 s (mmap + line index).",
+    "homepage": "https://github.com/14uncle/danqing-log",
+    "license": "MIT/Apache-2.0",
+    "url": "https://github.com/14uncle/danqing-log/releases/download/v1.5.0/danqing-log-v1.5.0-win-x64.zip",
+    "hash": "<发布时填>",
+    "shortcuts": [["danqing-log.exe", "Danqing LogLens"]],
+    "checkver": { "github": "https://github.com/14uncle/danqing-log" },
+    "autoupdate": {
+        "url": "https://github.com/14uncle/danqing-log/releases/download/v$version/danqing-log-v$version-win-x64.zip"
+    }
+}
+```
+
+  （双协议串 `MIT/Apache-2.0` 的写法以 PR CI 验证为准；备选 = 自建 bucket——零评审摩擦但零发现价值，首选 extras。）
 
 ## 3. 1.5 发布主稿（anchor，各渠道按底稿调性改编）
 
@@ -116,8 +208,9 @@
 ## 4. 时机、埋点与判读
 
 - **推送触发**：`tasks/v1x-release-checklist.md` 阶段 3 完成后。顺序建议：
-  就绪待投四家（改稿后）+ 二波渠道同日批量投（referrer 归因互不污染，底稿 §三方法）；
-  V2EX / LINUX DO 新渠道隔两天再发（错开阅读数归因）。
+  二波渠道同日批量投（referrer 归因互不污染，底稿 §三方法）。
+  （原「就绪待投四家改稿后同批投」10-09 随用户不投裁决取消，见 §1；
+  V2EX / LINUX DO 同日因不可达砍掉，见 §2.2）
 - **记录**：动作记底稿 §三表；读数记 `tasks/calibration-30d.md`；发帖日期全部落账，
   校准回填按日期分段解读（自然量 vs 推送增量可分离）。
 - **判据沿用底稿 §四**：正向 = 任一策展站单篇 >50 GitHub uniques 或 >50 商店页面视图；
