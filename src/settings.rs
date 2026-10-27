@@ -1549,13 +1549,14 @@ mod tests {
         );
     }
 
-    /// 「获取付费层」按钮显隐 (D8): 测试环境 = 便携版且 `PURCHASE_URL` 未回填
-    /// → 必须隐藏 (不给死链接)。回填后本测试转红, 届时改写为「显示」。
+    /// 「获取付费层」按钮显隐 (D8): **2026-10-27 收银台开业**, `PURCHASE_URL`
+    /// 已回填 → 便携版必须**显示**。前身是反向锁「占位期间隐藏」(设计即约定
+    /// 回填当日翻转), 本测试即那次翻转的兑现。
     #[test]
-    fn purchase_button_hidden_until_shop_opens() {
+    fn purchase_button_visible_since_shop_opened() {
         assert!(
-            !show_purchase_button(),
-            "PURCHASE_URL 占位期间便携版不显示购买按钮"
+            show_purchase_button(),
+            "PURCHASE_URL 已回填 (2026-10-27), 便携版应显示购买按钮"
         );
     }
 

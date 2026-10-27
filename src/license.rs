@@ -6,16 +6,20 @@
 //!
 //! 只做离线校验, 零网络请求 (D2)。私钥永不入本仓库 —— 签发工具
 //! (`src/bin/keygen.rs`) 从仓库外路径读私钥, 本文件只 embed 公钥常量。
-//! 公钥占位为全零时任何 key 都验不过, 等于「收银台未开业」—— 这是刻意的
-//! 安全默认, 等用户生成真密钥对后回填公钥、商店开业。
+//! 公钥 2026-09-19 已回填真值 (私钥仓库外, 永不入库); 收银台 2026-10-27
+//! 开业 (`PURCHASE_URL` 已回填 Paddle hosted checkout)。
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 /// 便携版购买页 URL (D8): **单点常量**。`None` = 店铺未开业 —— UI 层此时
-/// 隐藏「获取付费层」按钮, 不给死链接。用户开店后回填 `Some(url)`。
-pub const PURCHASE_URL: Option<&str> = None;
+/// 隐藏「获取付费层」按钮, 不给死链接。**2026-10-27 开业回填**: Paddle hosted
+/// checkout · LogLens Full — Personal ($29, 早鸟 −$10 已挂建单表单); 国内实测
+/// 可达 (HTTP 200 / 1.2s)。Business 档链接不入码 —— 应用内升级入口只指个人档,
+/// 企业档走落地页/README。
+pub const PURCHASE_URL: Option<&str> =
+    Some("https://pay.paddle.io/hsc_01m5z030nhbajgmkj987wmbva9_c85re6taregcexaf8nzvc980w8np56r0");
 
 /// key 串格式: `loglens1.<payload_b64url>.<sig_b64url>`。
 const KEY_PREFIX: &str = "loglens1";

@@ -40,8 +40,15 @@
   挽回折扣关 (早鸟挂着时本就不发 + 防「弃购=拿折扣」+ 守标价不动) / 折扣码输码框关 /
   买家营销 opt-in 开 (买家邮箱列表 = 新品大版本直达渠道)。Styling 页签只配品牌色
   (官方: overlay 无 logo 上传位, 深度定制须 inline+Paddle.js 非我们路线;
-  Brand color 填框架 accent `#0F766E`)。**余钟只剩一条**: hosted checkout 权限 (Ivan 工单 10-08 已转交
-  团队, 勿催) → 生成链接 → 回填 `PURCHASE_URL`。校准钟 T+20 快照同日已落
+  Brand color 填框架 accent `#0F766E`)。**余钟只剩一条 → 已解**: hosted checkout 权限 **2026-10-23 Ivan 回信已批** →
+     **10-27 两条链接建成 + `PURCHASE_URL` 已回填 license.rs** (Personal $29/Business $59,
+     早鸟折扣表单直挂, redirect=14uncle.github.io/thank-you——该页同日已建上线;
+     国内实测两条均 200 <1.2s; 表单实证勘误: Redirect 必填、discount 表单直挂,
+     档案 reseller-setup §一·1 末 10-23 条 + §一·2 10-27 条) → 余 = README/落地页
+     公开挂链 (既定裁决挂 v1.5.0 发布日, 早鸟 expiry 同窗口设开业日+30d) +
+     自购 $29 真购买验证 (前提③起点, 现在即可走) + 商店 add-on 轨 (§六)。
+     **2026-10-27 定价再裁 (用户 go)**: 驳回地板价提议, 维持 $29/$59 + 早鸟 $19/$39
+     (六条论据存档 reseller-setup §一·4 10-27 条)。校准钟 T+20 快照同日已落
   `tasks/calibration-30d.md` (commit `892a0de`)。
 - 2026-10-07 (**收银台执行日: Paddle 全链路落地 + G 组验收通过 = v1.x 人工验收全闭环**):
   **Paddle 侧 (用户操作, 全程截图问答)**: 注册 Individual (Business name Danqing) →
