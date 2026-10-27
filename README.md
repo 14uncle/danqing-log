@@ -96,14 +96,20 @@ GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索
   由商店代管更新。联网行为：**v1.0 零网络请求**；v1.x 起商店版会查询付费层购买授权
   （经 Windows 的商店服务，应用自身不发 HTTP），便携版唯一联网动作仍是启动时查一次
   新版本（见[隐私政策](docs/privacy-policy.md)）
-- **付费层（v1.x，收银台与首批功能腿已建成，销售通路待开业）**：免费层永久免费不变
+- **付费层（v1.x，2026-10-28 开业）**：免费层永久免费不变
   （**限个人、非商业用途**；职务/商用请购付费层——分界是「谁出钱」：个人自购 $29 可商用，
   组织出资/报销 $59/seat，详见 [EULA](docs/eula.md)）；
   付费层是**新增**的批量 / 留存 / 交付能力（见
-  [`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md)）。首批腿 = **字段分析**（数值分位数 /
-  枚举分布）、**导出**（过滤结果 / JSON 美化 / CSV）与**工作台会话**（过滤/搜索/
-  摆列/展开一键保存切换排障现场）；便携版 license key 离线校验不联网；
-  购买链接开业后回填此处
+  [`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md)）。腿 = **多文件时间线合并**（最多 8 源
+  按时间戳归并、req_id 跨源追踪）、**字段分析**（数值分位数 / 枚举分布）、
+  **导出**（过滤结果 / JSON 美化 / CSV）、**工作台会话**（过滤/搜索/摆列/展开
+  一键保存切换排障现场），另含列配置 / 书签持久化 / 字段点选查询三连；
+  便携版 license key 离线校验不联网。**购买**（Paddle 托管收银台，微信 / PayPal / 卡）：
+  **[Personal $29](https://pay.paddle.io/hsc_01m5z030nhbajgmkj987wmbva9_c85re6taregcexaf8nzvc980w8np56r0)** ·
+  **[Business $59/seat](https://pay.paddle.io/hsc_01m5z04yns6220j7jp385fdpwb_7fy2bhgj7jdyfq2z76gg3rb1rjs0nnw1)**
+  ——开业早鸟 $19/$39（至 2026-11-27 或前 50 单先到为准，checkout 页自动减、无需优惠码）；
+  key 人工签发，通常 24 小时内发至结账邮箱；30 天无理由退款。收据/订单售后走
+  [Paddle 客户门户](https://customer-portal.paddle.com/cpl_01m49sdngv9g6vhtc1qday33mg)
 
 > 系统要求：Windows 10 1809+（x64）、DirectX 12 兼容显卡。两个渠道是同一个免费层，功能一致。
 

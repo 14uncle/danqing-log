@@ -1,11 +1,12 @@
-# LogLens v1.5.0 发布说明（草稿 · 未发布）
+# LogLens v1.5.0 发布说明
 
 - @author 十四叔
 - @date 2026/10/07
-- 状态: **草稿** —— 发布日前定稿；购买链接 / 日期为占位；**版本号已定 = 1.5.0**
+- 状态: **已发布（2026-10-28）** —— 购买链接 10-27 建成 10-28 回填；**版本号 1.5.0**
   （2026-10-08 曾裁 2.0.0 → 10-09 用户改判 1.5.0，与仓内「v1.x」代号同族）
 - 用法: GitHub Release 正文 = 本文件去掉头部元信息段；README 购买节与商店
-  文案的早鸟段落从 §二 取；**早鸟到期/到量后删 §二**（会过期的文字不留常驻文案）
+  文案的早鸟段落从 §二 取；**早鸟到期/到量（2026-11-27 或 50 单）后删 §二**
+  （会过期的文字不留常驻文案）
 
 ## TL;DR
 
@@ -40,9 +41,10 @@ $59 business per seat. **Launch early bird: $19 / $39** (first month or first
 
 ## 三、怎么买
 
-- **GitHub 轨（Paddle 代收）**：购买链接 → [占位：发布日回填 Paddle checkout link]
-  付款后 license key 经**邮件交付**（通常 24 小时内）；设置 → 许可 → 粘贴激活，
-  离线校验零网络请求。**30 天无理由退款**（EULA §5）
+- **GitHub 轨（Paddle 代收）**：[Personal $29（早鸟 $19）](https://pay.paddle.io/hsc_01m5z030nhbajgmkj987wmbva9_c85re6taregcexaf8nzvc980w8np56r0) ·
+  [Business $59/seat（早鸟 $39）](https://pay.paddle.io/hsc_01m5z04yns6220j7jp385fdpwb_7fy2bhgj7jdyfq2z76gg3rb1rjs0nnw1)——checkout 页自动显示划线价，
+  支持微信 / PayPal / 卡。付款后 license key 经**邮件人工交付**（通常 24 小时内）；
+  设置 → 许可 → 粘贴激活，离线校验零网络请求。**30 天无理由退款**（EULA §5）
 - **Microsoft Store 轨**：add-on「完整版」店内购买（上架时间以后续公告为准）
 - **免费层**：GitHub Releases 与商店继续免费，功能不变
 

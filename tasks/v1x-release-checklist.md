@@ -25,7 +25,8 @@
       **2026-10-27 已回填**，D8 反向锁翻正向，521 绿
 - [ ] 早鸟折扣 expiry 设为发布日 +1 个月（「首月或前 50 单先到为准」，2026-10-07 裁定；
       Uses left 50 已设）—— **发布日 10-28 设 `2026-11-27`**（用户后台动作：
-      Catalog → Discounts 两个各设）
+      Catalog → Discounts 两个各设；10-28 API 代劳被钱路闸拦下——「1-7开工」未点名
+      API 路线，须用户显式说「用 API 设」才走 API，否则用户后台手动）
 - [x] 三件套：`cargo fmt` / clippy 0 / 521 测试绿（基线见 CLAUDE.md，别拿旧数）——
       **10-27 复跑绿（含版本号 1.5.0 同步后）**；发布打包前再跑一次
 - [x] 手动签发运营链自检：邮件模板（`docs/specs/SPEC-v1x-licensing.md` §二定稿）+
@@ -33,10 +34,16 @@
 
 ## 阶段 2：打包与自验
 
-- [ ] 便携 zip：`powershell -NoProfile -File tools/package_portable.ps1` + sha256
-- [ ] MSIX：`build_msix.ps1` → `sign_msix_local.ps1`（sidecar 签名后重算逻辑已有）
-- [ ] 两包 exe 与 `target/release` 三方同哈希核对
-- [ ] 本机侧载 + 便携版实机：购买入口显隐（D8）、key 激活、付费门控三道
+- [x] 便携 zip：`powershell -NoProfile -File tools/package_portable.ps1` + sha256 ——
+      **10-28 已产** `danqing-log-v1.5.0-win-x64.zip`（4,988,608 B <5MB 红线内，
+      sha256 `801c975c…`）
+- [x] MSIX：`build_msix.ps1` → `sign_msix_local.ps1`（sidecar 签名后重算逻辑已有）——
+      **10-28 已产已签** `danqing-log-store-v1.5.0-x64.msix`（v1.5.0.0，签名后
+      sha256 `838f8dd4…` 已回写 sidecar）
+- [x] 两包 exe 与 `target/release` 三方同哈希核对 —— **10-28 过**：三方同
+      `fc48fedd0d8535e2`
+- [ ] 本机侧载 + 便携版实机：购买入口显隐（D8）、key 激活、付费门控三道 ——
+      **侧载已装（1.5.0.0 顶掉 1.0.2.0）**；实机三道 = **用户动作**
 
 ## 阶段 3：发布
 
