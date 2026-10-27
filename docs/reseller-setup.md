@@ -374,7 +374,9 @@ Fonts（默认 Lato）/ Focus state / General 维持默认。
       路径无 GET 是预期，TLS 握手全部成功未被墙）；真 checkout 页带表单的
       终验随真购买验证一并
 - [ ] 真购买链路验证（前提③前置）：自己下一单 $29 → 走通 签发→激活→升级提示消失
-      —— **现在即可走**（链接已活、code 已回填；dev 构建上激活即验，不必等发布日）
+      —— **进行中（2026-10-28）**：自购单已付款落账（`txn_01m5z37pc…` completed $19
+      早鸟价，微信通路）→ key 已签（新 nonce）→ **待用户免费态激活确认**后勾销；
+      此单剔除出首单外检（calibration-30d.md 记档）
 - [x] Paddle 账号资料两项顺手改（Account settings 页标注「Paddle sets these
       details，改须发邮件」）：**Product website** `github.com/14uncle/danqing-log`
       → `https://14uncle.github.io`；**Company display name** Not set → Danqing
