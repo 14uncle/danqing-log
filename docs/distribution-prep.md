@@ -169,6 +169,13 @@ ManifestVersion: 1.12.0
 
   （双协议串 `MIT/Apache-2.0` 的写法以 PR CI 验证为准；备选 = 自建 bucket——零评审摩擦但零发现价值，首选 extras。）
 
+**清单已产（2026-10-28）**：`release-archives/log/packagers/`（仓库外）——winget 四件
+（installer / locale.en-US / locale.zh-CN / version，schema 1.12.0，sha256 = v1.5.0
+sidecar 实测值 `801c975c…`）+ scoop `loglens.json`（JSON 校验过、全 ASCII）。
+**提交 PR 仍是对外动作，用户点头后走**（komac 或手动）。注：发布夜本机 curl 拉
+GitHub 资产 CDN 连续 000（exit 35），`gh api` 实证资产 uploaded——CDN 路由抖动
+非资产问题；国内用户直连下载不稳正是 MS Store 兜底轨存在的理由之一。
+
 ## 3. 1.5 发布主稿（anchor，各渠道按底稿调性改编）
 
 ### 标题候选
