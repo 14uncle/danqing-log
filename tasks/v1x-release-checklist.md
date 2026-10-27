@@ -2,7 +2,7 @@
 
 - @author 十四叔
 - @date 2026/10/08
-- 状态: 待触发 —— 唯一前置 = Paddle hosted checkout 权限（Ivan 工单 2026-10-08 已转交团队，**勿催**）
+- 状态: **已触发（2026-10-23 权限落地），发布日定档 2026-10-28（用户 10-27 裁定）**
 - 上游: `docs/intent/v1x-release-window.md`
 
 ## 阶段 0：权限落地前（空窗期现在就能做）
@@ -18,11 +18,17 @@
 
 ## 阶段 1：权限落地 → 可购买（预计半个工作日）
 
-- [ ] Paddle 后台生成 checkout 链接（Personal $29 / Business $59 两产品）
-- [ ] 回填 `PURCHASE_URL`（`src/license.rs`；显隐判据 `src/settings.rs:341` D8）
-- [ ] 早鸟折扣 expiry 设为发布日 +1 个月（「首月或前 50 单先到为准」，2026-10-07 裁定；Uses left 50 已设）
-- [ ] 三件套：`cargo fmt` / clippy 0 / 521 测试绿（基线见 CLAUDE.md，别拿旧数）
-- [ ] 手动签发运营链自检：邮件模板（`docs/specs/SPEC-v1x-licensing.md` §二定稿）+
+- [x] Paddle 后台生成 checkout 链接（Personal $29 / Business $59 两产品）—— **2026-10-27
+      建成**（hosted checkout 表单：Redirect 必填 = `14uncle.github.io/thank-you`，
+      早鸟折扣表单直挂；链接存档 `docs/reseller-setup.md` §一·2，国内实测均 200）
+- [x] 回填 `PURCHASE_URL`（`src/license.rs`；显隐判据 `src/settings.rs:341` D8）——
+      **2026-10-27 已回填**，D8 反向锁翻正向，521 绿
+- [ ] 早鸟折扣 expiry 设为发布日 +1 个月（「首月或前 50 单先到为准」，2026-10-07 裁定；
+      Uses left 50 已设）—— **发布日 10-28 设 `2026-11-27`**（用户后台动作：
+      Catalog → Discounts 两个各设）
+- [x] 三件套：`cargo fmt` / clippy 0 / 521 测试绿（基线见 CLAUDE.md，别拿旧数）——
+      **10-27 复跑绿（含版本号 1.5.0 同步后）**；发布打包前再跑一次
+- [x] 手动签发运营链自检：邮件模板（`docs/specs/SPEC-v1x-licensing.md` §二定稿）+
       **WeChat Pay 延迟捕获 ~10 分钟 → 以 transaction 完成态为准再签 key**（`docs/reseller-setup.md` §一·6）
 
 ## 阶段 2：打包与自验
@@ -36,6 +42,10 @@
 
 - [ ] dev → master 合并 + tag（发布点打，不提前 —— 死标签教训）
 - [ ] GitHub Release（正文 = release notes 去文件头元信息段）
+- [ ] **README 购买节补双链接 + 落地页购买按钮解注挂链**（本单原漏；文案与按钮
+      占位均已备——README「购买链接开业后回填此处」、pages 仓 `index.html`
+      HTML 注释占位 `PADDLE_CHECKOUT_PERSONAL/BUSINESS`；注意 dev = 默认分支，
+      push 即公开 = 开业钟起算，与早鸟 expiry 同窗口）
 - [ ] MS Store 提交：照 `docs/ms-store-copy.md`「v1.x 上架时必须改什么」逐项核
       （IARC 改答「是」→ 分级标签全变 / 隐私政策贴**新版**文本 / 文案三处 / add-on 图标 300×300）
 - [ ] 商店 add-on 提交
