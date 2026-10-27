@@ -380,10 +380,12 @@ agent 无发信能力；备胎 = Paddle 后台给 customer 发消息）。24h �
       HTTP 200 / `pay.paddle.com` 405 / `checkout.paddle.com` 404（后两个根
       路径无 GET 是预期，TLS 握手全部成功未被墙）；真 checkout 页带表单的
       终验随真购买验证一并
-- [ ] 真购买链路验证（前提③前置）：自己下一单 $29 → 走通 签发→激活→升级提示消失
-      —— **进行中（2026-10-28）**：自购单已付款落账（`txn_01m5z37pc…` completed $19
-      早鸟价，微信通路）→ key 已签（新 nonce）→ **待用户免费态激活确认**后勾销；
-      此单剔除出首单外检（calibration-30d.md 记档）
+- [x] 真购买链路验证（前提③前置）：自己下一单 $29 → 走通 签发→激活→升级提示消失
+      —— **已走通（2026-10-28）**：自购单付款落账（`txn_01m5z37pc…` completed $19
+      早鸟价 = 折扣自动应用实证，微信通路 + 买家 locale zh-Hans = 中文买家链实证）
+      → keygen 签发 → 免费态激活 → 付费态翻转（实机截图在案）；收据邮件正常送达。
+      **收银台全链（付款→落账→签发→激活→门控开）闭环**。此单剔除出首单外检
+      （calibration-30d.md 记档）
 - [x] Paddle 账号资料两项顺手改（Account settings 页标注「Paddle sets these
       details，改须发邮件」）：**Product website** `github.com/14uncle/danqing-log`
       → `https://14uncle.github.io`；**Company display name** Not set → Danqing

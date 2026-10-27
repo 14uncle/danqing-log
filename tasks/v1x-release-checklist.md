@@ -63,7 +63,9 @@
 
 ## 阶段 4：发布后外检（前提③开门）
 
-- [ ] 真付费链路验收：代销 key 真购买 → 激活（便携版通路）
+- [x] 真付费链路验收：代销 key 真购买 → 激活（便携版通路）—— **10-28 自购单
+      全链走通**（微信付 $19 早鸟 → transaction completed → keygen → 免费态激活
+      → 付费态；收据邮件正常送达。剔除出首单外检）
 - [ ] 商店 add-on entitlement 链路验收
 - [ ] **触发分发推送**（`docs/distribution-prep.md`，两波）
 - [ ] 校准钟回填：10-18 GitHub / 10-21 商店（`tasks/calibration-30d.md`）
