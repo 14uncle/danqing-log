@@ -47,15 +47,19 @@
 
 ## 阶段 3：发布
 
-- [ ] dev → master 合并 + tag（发布点打，不提前 —— 死标签教训）
-- [ ] GitHub Release（正文 = release notes 去文件头元信息段）
-- [ ] **README 购买节补双链接 + 落地页购买按钮解注挂链**（本单原漏；文案与按钮
-      占位均已备——README「购买链接开业后回填此处」、pages 仓 `index.html`
-      HTML 注释占位 `PADDLE_CHECKOUT_PERSONAL/BUSINESS`；注意 dev = 默认分支，
-      push 即公开 = 开业钟起算，与早鸟 expiry 同窗口）
+- [x] dev → master 合并 + tag（发布点打，不提前 —— 死标签教训）—— **10-28 已落**：
+      master `b17a2e4`（--no-ff）+ tag `v1.5.0`，均已推
+- [x] GitHub Release（正文 = release notes 去文件头元信息段）—— **10-28 已发**：
+      `github.com/14uncle/danqing-log/releases/tag/v1.5.0`，双资产齐
+      （zip + .sha256）
+- [x] **README 购买节补双链接 + 落地页购买按钮解注挂链** —— **10-28 已公开**：
+      README 随 master 合并上线；pages 仓 `698f3f4` 已推（线上实测 2 条
+      pay.paddle.io 链接在页）。**开业钟 = 此刻起算**
 - [ ] MS Store 提交：照 `docs/ms-store-copy.md`「v1.x 上架时必须改什么」逐项核
       （IARC 改答「是」→ 分级标签全变 / 隐私政策贴**新版**文本 / 文案三处 / add-on 图标 300×300）
-- [ ] 商店 add-on 提交
+      —— **用户动作**（Partner Center）
+- [ ] 商店 add-on 提交 —— **用户动作**（须先在 Partner Center 预创建，
+      Offer ID 逐字 = `danqing-log-full`，对齐 `src/store_license.rs:32`）
 
 ## 阶段 4：发布后外检（前提③开门）
 
