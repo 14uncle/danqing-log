@@ -3,6 +3,8 @@
 > ⚠️ **本文档是 POC 期产物（2026-09-21 清扫时保留作档案）**。权威口径以
 > `PERFORMANCE_REPORT.md`（实测数字 + 竞品对比表）、`docs/DEEP_COMPETITIVE_RESEARCH.md` §2.2、
 > `docs/ROADMAP-v1x.md` §六（对外口径基准）为准。本文数字若与它们冲突，以它们为准。
+> **功能对齐 / 缺口 / 创新的分类总表 = `docs/FEATURE-MATRIX.md`**；本文「ANSI 颜色 ✅」主张
+> 已被证伪，**禁止引用**。
 
 ## 快速开始
 

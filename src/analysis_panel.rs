@@ -1022,4 +1022,37 @@ mod tests {
             "截断结果必须量得出 ≤ max_w"
         );
     }
+
+    /// SPEC-v1x-table-column-config D5 对等锁 (评审五轴①): 分析面板字段列表
+    /// 取 schema 首见序, **不受列配置影响** (摆列/隐藏都不跟随 —— 显示归显示,
+    /// 交付归交付; CSV 半边有 `csv_columns_ignore_column_config`, 这里补面板半边)。
+    #[test]
+    fn picker_fields_ignore_column_config() {
+        let mut app = LogApp::new_empty_at(Some(temp_cfg("d5-cols")));
+        app.has_file = true;
+        app.schema = Some(Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        // 列配置真身照常可摆: 换序 + 隐藏
+        app.columns =
+            danqing_log::columns::ColumnConfig::from_schema(&["a".to_string(), "b".to_string()]);
+        assert!(app.columns.move_column(1, 0)); // b a
+        assert!(app.columns.set_hidden("a", true));
+        let mut panel = AnalysisPanel::new();
+        panel.sync(&app);
+        assert_eq!(
+            panel.columns,
+            vec!["a".to_string(), "b".to_string()],
+            "字段列表 = schema 首见序全列, 不跟随显示配置 (D5)"
+        );
+    }
 }

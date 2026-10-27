@@ -83,6 +83,11 @@ impl ExpandMap {
         self.expanded.get(&line).copied().unwrap_or(0)
     }
 
+    /// 展开行号表 (升序 —— BTreeMap 键序; 会话快照 D2 用)。
+    pub fn lines(&self) -> Vec<u64> {
+        self.expanded.keys().copied().collect()
+    }
+
     /// file_line 之前、且出现在显示中的展开行子行总数 (显示行偏移)。
     pub fn expanded_before(&self, lines: Lines, line: u64) -> usize {
         self.expanded

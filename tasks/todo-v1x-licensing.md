@@ -81,8 +81,15 @@
 
 ## 遗留 / 待用户动作（plan 用户侧清单原样有效）
 
-1. 注册 Lemon Squeezy / Gumroad + 提现；核实「自带 key 列表分发」（定 D2 逃逸舱去留）
-2. `cargo run --bin keygen -- generate <仓库外路径>` 生成真密钥对 → `pubkey` 子命令
-   输出贴回 `license.rs` 的 `PRODUCT_PUBKEY`
+1. ~~注册 Lemon Squeezy / Gumroad + 提现；核实「自带 key 列表分发」~~ **作废**
+   —— 2026-10-07 代销终选 Paddle（LS 大陆不可行 / Gumroad 主站被墙，
+   见 `docs/reseller-setup.md` §〇），D2 手动签发模式同日用户确认，
+   spec 已回写核销
+2. ~~keygen 真密钥对~~ **已完成（2026-09-19）** —— `PRODUCT_PUBKEY` 已回填
+   真公钥（私钥仓库外），便携版激活通路当日实机走通
 3. ~~v1.0 商店过审后~~ **前置已解锁（v1.0 过审上架 2026-09-21）**: trial 时长（建议 30 天, 待裁）+ add-on 创建（Offer ID 须 =
-   `danqing-log-full`, 图标 300×300 超采样工艺）+ IARC 改答「是」+ `PURCHASE_URL` 回填
+   `danqing-log-full`, 图标 300×300 超采样工艺）+ IARC 改答「是」；
+   ~~`PURCHASE_URL` 回填~~ **已完成（2026-10-27）** —— Paddle hosted checkout
+   权限 10-23 获批, Personal/Business 链接建成（国内实测 200）, 个人档
+   已回填 `license.rs`（链接存档 `docs/reseller-setup.md` §一·2）;
+   **README/落地页公开挂链按既定裁决挂 v1.5.0 发布日**

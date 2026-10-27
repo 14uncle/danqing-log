@@ -4,6 +4,390 @@
 
 ## 状态
 
+- 2026-10-08 (**空窗裁决 + 发布阶段 0 备料**, commit `5e6f22a` 未 push): 用户问「收费版收尾阶段可以开下个
+  产品吗」→ 农场根 interview-me 收敛 (动机=空窗带宽利用, 非新现象敲门) → **两道闸不放行**
+  (组合纪律: 付费版未发布; round8 c+ 复活条件未响) → 空窗派活三件, 意图
+  `docs/intent/v1x-release-window.md`。**版本号: 10-08 裁 2.0.0 → 10-09 用户改判 1.5.0**
+  (与仓内「v1.x」代号同族; 隐私政策「适用版本 1.x」因此天然覆盖, 版本行免改)。产物:
+  ① `docs/distribution-prep.md` = 1.5 波次**增量**计划 —— 底稿是
+     `danqing/docs/intent/curated-channel-submission-plan-2026-09-20.md` (渠道入口已核实 /
+     文案 1–9 定稿 / 投放记录表 §三 / 判据 §四), 本文档只写增量: 付费层价格口径改稿 +
+     合并时间线叙事主线 + V2EX/LINUX DO 新增渠道 + **就绪待投四家 (软餐/异次元/反斗/阮一峰)
+     并入 1.5 波次, 旧稿「当前版本完全免费」句必须改**; 推送时机 = 1.5 可购买后。
+     (教训: 初稿曾把底稿重抄一遍 + 4 处事实错 —— 写新文档前先全局搜既有产物。)
+  ② `tasks/v1x-release-checklist.md` 发布检查单 —— **阶段 0 已完成**: add-on 图标 300×300
+     已产 `release-archives/log/store/addon-icon-300.png` (`tools/export-logo.py` 加 300 档,
+     重跑零 churn 已验) / release notes 真身 = **`docs/release-notes-v1x.md`** (10-07 既有草稿;
+     10-08 误建重复稿 v2.0.0-draft —— 同族错误第二次犯, 10-09 已删并修该稿**三连分层错置**:
+     列配置/书签持久化/字段点选是 09-27 改的付费项, 草稿误列免费层) / `docs/ms-store-copy.md`
+     §6 v1.5 预起草 (产品功能 13 条 + 免费节改写 + 专业版段 + IARC 改答);
+     **add-on 价格档待裁** (微软档与 Paddle $29/$59 对齐)。
+  ③ 截图: **`tools/take_shot.ps1` 新脚本 (PrintWindow 按 HWND 截窗口)** —— 本机双屏下
+     CopyFromScreen 只截到裸壁纸 (窗口 visible=True 也截不到), PrintWindow
+     PW_RENDERFULLCONTENT 对 wgpu 自绘窗口实测有效; 最大化窗口裁 8px 隐形边框。
+     零交互 6 张已拍 `release-archives/log/shots/2026-10-08/` (raw/jsonl/gbk × dark/light,
+     状态栏计时在图); 浅色图借道改 config.toml 拍摄, 拍完已还原 dark。
+     **合并时间线/字段分析特写需交互构图 = 用户拍**, fixture 已备
+     `release-archives/log/demo/merge-3src/` (5MiB×3 源, 偏移 -3.4s/-1.7s/0, 含 truth.txt)。
+- 2026-10-08 (**Paddle Checkout settings 七节配齐保存**, 实录落 `docs/reseller-setup.md`
+  §一·6): 支付方式开 PayPal/Apple Pay/Google Pay/Bancontact/**WeChat Pay** (中国买家
+  唯一通路, USD/CNY+一次性买断 ✅; **延迟捕获 ~10 分钟** → 手动签发以 transaction
+  完成态为准再签 key); 概念澄清落档: 该页勾选 = 买家侧支付方式, 与卖家账户无关
+  (MoR 代收, 回款只有 CNY 电汇一条路)。Statement descriptor 定 `LOGLENS` (防
+  「这是什么扣款」拒付); Default payment link 填 `https://14uncle.github.io/checkout`
+  (已过审域名绿勾; 不设则创建 transaction 报 `transaction_default_checkout_url_not_set`;
+  购买流走托管 checkout link 不经此页, 暂不为它建 Paddle.js 页面); 弃购挽回邮件开 /
+  挽回折扣关 (早鸟挂着时本就不发 + 防「弃购=拿折扣」+ 守标价不动) / 折扣码输码框关 /
+  买家营销 opt-in 开 (买家邮箱列表 = 新品大版本直达渠道)。Styling 页签只配品牌色
+  (官方: overlay 无 logo 上传位, 深度定制须 inline+Paddle.js 非我们路线;
+  Brand color 填框架 accent `#0F766E`)。**余钟只剩一条 → 已解**: hosted checkout 权限 **2026-10-23 Ivan 回信已批** →
+     **10-27 两条链接建成 + `PURCHASE_URL` 已回填 license.rs** (Personal $29/Business $59,
+     早鸟折扣表单直挂, redirect=14uncle.github.io/thank-you——该页同日已建上线;
+     国内实测两条均 200 <1.2s; 表单实证勘误: Redirect 必填、discount 表单直挂,
+     档案 reseller-setup §一·1 末 10-23 条 + §一·2 10-27 条) → 余 = README/落地页
+     公开挂链 (既定裁决挂 v1.5.0 发布日, 早鸟 expiry 同窗口设开业日+30d=2026-11-27) +
+     自购 $29 真购买验证 (前提③起点, 现在即可走) + 商店 add-on 轨 (§六)。
+     **发布日定档 2026-10-28 (用户 10-27 裁定)**; 版本号已同步 1.5.0 (Cargo.toml+lock
+     复跑 521 绿), 检查单 `tasks/v1x-release-checklist.md` 阶段 1 全勾 (余早鸟 expiry
+     发布日设), 阶段 2/3 逐项点头。
+     **2026-10-27 定价再裁 (用户 go)**: 驳回地板价提议, 维持 $29/$59 + 早鸟 $19/$39
+     (六条论据存档 reseller-setup §一·4 10-27 条)。校准钟 T+20 快照同日已落
+  `tasks/calibration-30d.md` (commit `892a0de`)。
+- 2026-10-07 (**收银台执行日: Paddle 全链路落地 + G 组验收通过 = v1.x 人工验收全闭环**):
+  **Paddle 侧 (用户操作, 全程截图问答)**: 注册 Individual (Business name Danqing) →
+  产品×2 (Personal $29 / Business $59 one-time) → 折扣×2 (early-bird −$10/−$20,
+  Uses left 50, **expiry 发布日再设**) → **落地页 `14uncle.github.io` 上线** (GitHub
+  Pages 用户级仓; ToS/隐私/退款三链齐; 资源自托管 —— raw.githubusercontent.com 国内
+  不可达致 logo 裂图已修; `#pricing` 锚点为审核表单而加) → **域名审核已提交** →
+  onboarding 表单全链 (个体工商户 / 产品描述 / 网站三链 / 合规声明全 No) →
+  **Sumsub 身份验证当日过** (身份证件 + **租房合同**作地址证明 —— 电子居住证
+  三投三拒的完整原因链与解法录 `docs/reseller-setup.md` 踩坑记) →
+  **hosted checkout 权限工单已发** (sellers@paddle.com; app-to-web 桌面应用话术)。
+  **余钟三条**: ①域名审核 ②验证徽标翻牌 → payout 绑卡 (建行/招行储蓄卡) ③checkout
+  权限 → 生成链接 → 回填 `PURCHASE_URL` (license.rs, settings.rs:341 D8 显隐判据)。
+  Paddle 账号资料两项 (Product website → 落地页 / display name) 待工单回复同线程
+  请改, 已记 reseller-setup §五。**产品线约定**: Paddle 域名审核账号级, 一个 Pages
+  仓装全产品线 (根=在售产品, 新品占子目录) —— 落 reseller-setup §一·5 + pages 仓 README。
+  **G 组九条用户实机全过** (付费态 key 本地激活; D 闸「移除」场景复验一并) ——
+  **A–I 九组人工验收至此全闭环**, acceptance-pending 与 merge-timeline spec §7 已回填。
+  **裁决点①③确认 (用户 go)**: 手动签发模式正式确认 → `SPEC-v1x-licensing.md` 回写
+  (D2 核销「两家均不支持」/ §8 终选 Paddle / 逃逸舱「未启用 · 保留」);
+  邮件模板照 §二 草稿定稿。**定价重裁 (用户裁定)**: 标价 $29/$59 不动 + 首发早鸟
+  $19/$39 (首月或前 50 单先到为准), 复核时点 = 首单外检 30 天钟 —— 落
+  ROADMAP-v1x §三 + reseller-setup §一·4。**文档批已提**: `815b270` (EULA+终选) /
+  `c0d262d` (早鸟+进展) / `10da029` (身份验证+踩坑记); pages 仓 `ae40074` 已推。
+
+- 2026-09-29 (**main.rs 拆分机器半边完成, 待 commit 点头**): 用户指令
+  「danqing_log::main 太大了，拆分」。两项裁定 (AskUserQuestion): ①先提交
+  notice-visibility 再拆 (已落 `62c1254`; 含 23 处 Info→Warn 改档 + 注释标点
+  全角归一化附注) ②按功能簇拆 7 模块。**产出** (`tools/split_main.py` 机械执行,
+  可复现): main.rs **8728 → 1934 行** —— 68 方法按簇搬 `app_persist` /
+  `app_export` / `app_license` / `app_merge` / `app_open` / `app_filter` /
+  `app_status` (各 = `impl LogApp` 分片 + `use super::*`, 跨簇调用 `pub(crate)`,
+  自由函数经根 re-export 保持 tests/main 调用点零改动), 29 方法留根
+  (构造器/导航访问器/门禁/impl App); `mod tests` 4744 行原样搬 `src/tests.rs`
+  (内容零修改)。**三件套绿: 521 测试** (基线 518 + 并行会话 D 闸 2 锁 + H-a
+  复跑波 histogram 1 锁) / clippy 0 / fmt 过。**并发记一笔**: 拆分进行中并行
+  会话完成 G 组缺陷② D 闸修复
+  (见下条 checkbox 条目内 G 组段), 其 impl 直接写进拆分后的 `app_merge.rs`、
+  2 条锁进了 `tests.rs` —— 同树纠缠无法剥离, 提交时并账注明。
+  **review 双路已收口 (同日)**: 五轴 —— 改动 A **APPROVE** (逐行多重集比对
+  零未解释字节; 可见性最小性抽查过) / 改动 B REQUEST CHANGES ×1 Required
+  (`Msg::RemoveSelectedMergeSource` doc 仍写被删旧行为 —— 「清旧文字」复发,
+  已修为 D 闸语义; Optional×3 留账: 1 源边角「只剩两源」文案失真 / remove
+  路径无 stale-selection 守卫 / SPEC §11 死串 —— 均在并行会话活跃文件, 不碰);
+  红队 —— **搬家保真 CONFIRMED** 零 Critical/Required (项集恰一次 only_old=0 /
+  104 项逐字节 + 62 pub(crate) + 4 fmt 折行 / 测试 token 流 34,875=34,875 /
+  63 个 pub(crate) 全有跨模块调用点 0 过度发布 / re-export 全有真消费者);
+  Nit×3 全清 (start_trace 横幅接缝空行 / 簇文件方法间补空行 —— 首遍脚本把
+  doc 块切碎, 被 clippy suspicious_doc_comments 当场抓住, 修复后复查全 0 /
+  台账行数滞后改 1934)。**结构节已更新**
+  (main.rs 条目改写 + toast.rs 补登记)。**已 commit `598e2d8`** (2026-10-07
+  点头; 拆分 + D 闸 + H-a 复跑波三波同树并账, 提交前复跑三件套 521 绿);
+  同批 `647ac7a` = Cargo.toml dev profile debug=1 (09-30 腾空间裁定, 独立成笔)。
+  view.rs (8131 行) 同病未拆, 本次不动。**未 push** (待指示)。
+- 2026-09-28 (**checkbox-widget 机器半边 T1–T5 收口, 人工验收 I 组三条记账待实机**):
+  触发 = 用户实机看合并源卡问「勾选状态使用中括号+x 表示吗」→ 框架新增复选框。
+  spec `docs/specs/SPEC-checkbox-widget.md`（三裁定: 两处都换 / 完整 widget + 静态画法 /
+  accent 实心+白勾）→ plan → /build auto 全绿。**产出**: danqing 新
+  `src/widget/form/checkbox.rs`（`Checkbox` 全件 + `paint_box` 静态画法**单真源** +
+  `CheckboxColors::from_theme`/`on_accent` 两套 —— 纯矢量绕开字体子集无 ✓ 字形的
+  根约束; showcase 已登记）, **danqing `c5b1fcf` 已 push**, 本仓 lock 复钉 `b091040`;
+  产品 `RowList::with_checkbox` 第五闭包（加法不改契约，四消费者零改动）,
+  合并源卡 + 显示列弹层两处 `[x]` 文本勾选退役换矢量盒, **事件路径零改动**（整行
+  点击不变）。**516 绿**（+8 锁; 摘勾/摘重取两处 A/B 精确红在案; 基线复核更正:
+  记档 495 已过期, 实测 507）。人工验收 = **I 组三条**（三条均需付费态 —— 三连弹层
+  与合并源卡都在付费层; 组别 H→I 让位: notice-visibility 并行会话先占 H）。
+  **review 同日收口**: 双路独立评审（五轴 + 红队六区深潜）均
+  APPROVE 零 Critical/Required, Optional×6+Nit×4 全清（受约束 paint 溢出 /
+  暗色零锁 / 勾形无锚 / showcase 静态盒假交互 / 守卫名 overclaim / 文档错命令
+  假绿），修复锁 +4 → 框架 705 / 产品 **517 绿**; danqing `8151d46` 已 push,
+  本仓 lock 二次复钉 `3f00814`（**非常规单点换钉**: cargo update 连带重解撞
+  wgpu 的 windows 双版本错配, diff 恰一行 + 517 绿验证, commit 有案）。
+  B-O4「RowList 长文案无裁剪溢出」挂账 ROADMAP §四。**code-simplify 同日收口 →
+  五段全闭**: 三项行为零变化（BOX_SIZE 并主 impl / `per_row` 收同形双块 /
+  `merge_source_idx` 收查源起手式）, 测试零修改, 框架 704 / 产品 517 绿;
+  danqing `7813d1d` push, 本仓单点换钉 `5275a0f`。环境备注: showcase.exe 被
+  用户窗口文件锁 → 备用 target-dir 绕锁验证（spec §11）。
+  **余: I 组三条实机验收**（需付费态, 与 G/H 同窗口）。
+  **并发注意**: notice-visibility 会话同窗口 build
+  （toast.rs/main.rs/view.rs 是其改动）, 任何一方 commit src 前按路径 diff 防混入
+  （09-15 事故同型）。
+- 2026-09-28 (**notice 提示可见性 intent 落盘**, 用户 interview-me 四轮裁定 + 显式 yes):
+  `docs/intent/notice-visibility.md` —— 「状态栏操作提示文本, 不注意的话用户都看不到」
+  (用户原话) → notice 通道分级升级: **Warn 上底部中央浮层** (状态栏正上方, 可点掉,
+  4 秒消退沿用) / **Info 留底栏强化样式** (色块/图标打底); 不做通知中心/系统通知/
+  Info 不上浮层/不改调用点文案。关键约束 (spec 输入): toast **非模态** (不是弹层族
+  第八员) 且须画在模态弹层**之上** (合并源卡里输错偏移的 Warn 正发生在弹层开着时);
+  动 `set_notice` 落点对照家族病史⑤ (内含 refresh_status 次序陷阱)。
+  **spec 已写待批**: `docs/specs/SPEC-notice-visibility.md` (两腿: Warn toast 浮层+
+  view 层分派 / Info 底栏色块强化; D4 分派在 view 层、`set_notice` 零改动绕开
+  家族病史⑤; toast 挂 Stack 末位 = 画在模态弹层之上; Open Q1–Q3 待批)。
+  spec 用户「go」批准 (Open Q 按推荐收) → plan/todo 已落盘
+  (`tasks/plan-notice-visibility.md` / `todo-notice-visibility.md`, T1–T4),
+  **plan 核实**: Stack 事件分发反序 (stack.rs:87) = 末位 toast 事件最先+paint 最上,
+  零框架改动; `STATUS_HEIGHT` 需 pub(crate) 化 (一字)。**build T1–T4 全闭 (同日)**:
+  新 `src/toast.rs` 非模态 Widget + view 层 kind 分派 (Warn 挪浮层/底栏不重复画) +
+  Info 色块衬底 (`surface_variant`, 两主题 ΔL* ≥6 实测回填 spec Q2) + 13 条新锁
+  (含整树行为锁 `toast_gets_the_click_before_modal_popover` —— 模态弹层开着时点
+  toast 先到; A/B 摘分派判据精确红已验证); **508 绿** (495+13), clippy 0 / fmt 过。
+  **并发事故记**: 同窗口并行会话在做 SPEC-checkbox-widget (danqing c5b1fcf +
+  pick_list.rs/settings.rs), clippy 报 `no Checkbox` = cargo git checkout 被 fetch
+  重写一半的中间态 (rustc 新/clippy 旧), touch 依赖源码强制重编解; 教训与
+  `| tail` 退出码骗局复发均落 spec §9-5。**review 已收口 (同日, 双路)**:
+  代码评审 REQUEST CHANGES (1 Required = NoticeKind/Msg::Notice 两处定义点 doc 旧模型
+  —— 家法「清旧文字」复发; 2 Optional = 弱锁加固+暗主题断言; 3 Nit) + 安全审计
+  PASS (3 Nit 观感级) → 全修, 含删 `fit_toast_text` 复用框架 canonical
+  `fit::ellipsize_tail` (安全 Nit① 查实 = 近重复); 记档不修三条 (Info 色块无截断/
+  每帧双 measure/极窄窗省略号微出界) 落 spec §9-8。**516 绿** (评审代理亲跑复核;
+  含并行会话 8 条, 归属已核)。**code-simplify 收口 (2026-09-29) → 五阶段全闭**:
+  两刀行为零变化 (`width_cap()` 三处同式收单点 / `BAR_INSET` 钉色条内缩常量),
+  测试零修改全绿; 不动清单落 spec §10 (含 `paints_color` 三份同逻辑 ——
+  settings.rs 是并行会话活跃文件不能碰, 待其收口另裁)。
+  **H-a 实机验收撞出分档大盘点 (2026-09-29, 用户「go」全表批准)**: 「先点选源再
+  改时间参数」沉底栏不上浮层 —— 根因非 toast 失效, 是该提示错给 Info
+  (分级语义确立前写的提示从未系统分档) → 全仓盘点 **23 处「没生效」类
+  Info→Warn 改档** (口径表 = `SPEC-notice-visibility` §11: Warn=没生效/Info=
+  回执·进行中·状态说明; 新加提示先过表); 留 Info ~15 处不动; 锁
+  `ineffective_action_notices_are_warn_not_info` (三族代表样本), P20 锁免疫,
+  M3 旧锁 Info 样本换真 Info 文案。**518 绿** (含并行会话新增), clippy 全仓 0。
+  **G 组缺陷② D 闸 (2026-09-29, 用户裁定)**: 两源态点「移除」UI 零变化
+  (生效了但弹层行列表数据源=保留 bundle, 毫无反馈, 读作「移除不了」) →
+  只剩两源时「移除」不出手 + 指路「退出合并」; ≥3 源正常删; 原「不足两源
+  退出」分支删除 (闸后不可达)。锁 `remove_with_only_two_sources_is_refused_
+  and_points_to_exit` (Prove-It 先红) + `remove_with_three_sources_still_works`;
+  改在拆分后的 `src/app_merge.rs` (同日 main.rs 拆分重构进行中, 另一工作流),
+  **520 绿** clippy 0。
+  **H-a 复跑再抓漏网三条 (2026-09-29, 用户实机报「打开 A 追加源选 A」)**: 首盘
+  多行调用跳读漏列 `start_merge` 去重后不足两源提示; 复查全仓 `NoticeKind::Info`
+  逐条对 §11 口径再抓 3 条 (起并重复源 / 非合并态追踪 / 直方图 P21 两条) →
+  Info→Warn, 复查确认扫净; 行为锁加两族样本 +
+  `clicking_unclickable_row_warns_not_info`, **521 绿** clippy 0。
+  **H 组五条用户实机全过 (2026-09-29)** —— notice-visibility 功能+验收双闭环
+  (浮层醒目 / 模态之上 / 点掉+自消 / Info 色块可辨 / 双主题); I 组三条同日全过
+  (checkbox-widget 亦双闭环)。commit 随拆分工作流并账落 `598e2d8` (2026-10-07);
+  ~~G 组九条仍待实机~~ **G 组 2026-10-07 用户实机全过** (D 闸「移除」场景复验一并) ——
+  A–I 九组人工验收全闭环, 见顶部当日条目。
+- 2026-09-28 (**腿一 merge-timeline 机器半边 T9 落账, 人工验收 G 组九条记账待实机**):
+  spec `docs/specs/SPEC-v1x-merge-timeline.md` (D5 红线: 3 源 × 1 GiB 合并就绪 ≤1.6 s);
+  机器半边全绿 (**486 测试**); 性能半边由 `logbench --merge` (走产品路径
+  `merge_view::build_merge` / `MergeState`) 实测回填 `PERFORMANCE_REPORT.md` 合并节:
+  **947 / 962 / 967 ms** 三跑热缓存 (复查另得 1439 ms 负载波动如实记), D5 红线 ✅
+  (非红线目标 ≤0.8 s 差 ~17%)。**人工验收 G 组九条** (spec §7 原文) ~~记账总清单
+  `tasks/acceptance-pending.md` ⬜ 待实机~~ **✅ 2026-10-07 用户实机全过** (付费态
+  key 本地激活, 与 B/F 同一条通路; 账目同文件 G 组) —— 三源合并打开 / req_id 追踪 /
+  按源着色隐藏 / 时钟偏移 / 无 ts 行 / 免费态门控 / merge group 会话 / 探测失败明示 /
+  性能体感。
+  **试跑即修一条 (同日)**: 合并源卡首排步进钮 (±1h/±1m/±1s 六枚) 走 Button 默认
+  横向 padding (16×2) 自然宽 **348** > 卡片内容宽 **312**, Row 不裁剪画出卡外
+  (用户实机报) → 横向收紧 `spacing_sm`(8) 纵向不动; 锁
+  `merge_time_edit_row_fits_card_width` (修复前精确红 348>312), **实机复验通过**,
+  缺陷记录落 `tasks/acceptance-pending.md` G 组「验收中缺陷记录」, **495 绿**。
+- 2026-09-28 (**功能对齐/创新矩阵落盘 = `docs/FEATURE-MATRIX.md`**): 用户问「对齐竞品的功能
+  与创新功能列出」→ 盘点发现**这套信息散在五处文档**(DEEP §2.1 / ROADMAP §一·§二 / 调研 §十 /
+  禁声称清单 / PERFORMANCE_REPORT §功能对比)且**两处互相打架** → 落成唯一总表, 三档分类
+  (**对齐 / 缺口 / 创新**, 含「对齐项不许包装成创新」「对竞品断言须有实测+日期」两条纪律)。
+  **同批修掉两处不一致**: ① `PERFORMANCE_REPORT.md` §功能对比 表重做 —— LogViewPlus 的 JSONL
+  原标 ❌ (实为「⚠️ 基础」, 与禁声称清单自相矛盾) + **整表缺合并行**(腿一没进过表); 现与
+  DEEP §2.1 同构。② **新识别两个缺口**(此前从未进过任何欠账表): **用户自定义高亮规则集**
+  (六竞品全有, 我方只有级别着色+搜索命中高亮) / **拖到窗口内打开**(`WM_DROPFILE` 零命中,
+  只有「拖到 exe 上」可用; `main.rs:2271` 那句「Ctrl+O / 拖拽」是起草期残留标签) ——
+  两项均已立 `ROADMAP-v1x.md` §四 待裁。**指针五处**: README / ROADMAP §六 / CLAUDE.md 必读 /
+  两份 POC 存档 banner(加「禁止引用」)。**注: 中间档发现 「级别直方图」对 LogViewPlus 也是
+  对齐项非差异化**(ROADMAP:70 记它是对方最能卖钱的功能), 对 klogg 才是差异。
+- 2026-09-27 (**付费层竞争力四路调研 → 重裁五点, v1.x 发布延期等腿一**): interview 中段
+  用户发题「付费层有竞争力吗」→ 四路并行 Web 调研 (LogViewPlus 深扒 / 免费在位者覆盖 /
+  邻近品定价切法 / 付费行为一手证据, 各 75 分钟时间盒) → 合成落盘
+  `docs/research-v1x-paid-tier-2026-09-27.md` (含 §十 创新候选池)。核心证据: **现三腿
+  买家实锤≈零** (LogViewPlus 43 条买家评价无人提导出/会话/SQL 报表; Modern CSV 免费版
+  即给导出); **合并=付费入场券** (3/10 评价点名 + Dadroit Union 钉 $198/年顶档) 但免费
+  等价物最多, 差异化须带「大文件+JSONL 列化+GUI 零语法」组合; **远程源=免费真空带**
+  (klogg/LogExpert 均不做) 且付费实锤并列最强; JSONL 流量真付费零 = 定位钩非付费钩;
+  lnav 免费覆盖全四腿但全挂 SQL/TUI 门槛; $29/$59 带内零偏离, 买断 2026 是卖点,
+  LogViewPlus「换机即死」授权摩擦 = 对照弹药; 企业合规付费有 09-24 新鲜询单实锤。
+  用户裁决五点: ①**腿一从第二波提前为 v1.x 发布前置** (收银台开张即有承重梁,
+  首单外检信号可解释) ②**三连收付费** (列配置/书签持久化/字段点选; 边界对齐非付费钩;
+  会话内书签与 .log 直用保持免费; 接门待做与腿一同窗口) ③**腿五候选=远程日志源挂起**
+  (本轮不建) ④**EULA 身份门收** (免费层二进制个人/非商业, 君子协定) ⑤**更新窗=永久买断**
+  (v2 另议)。ROADMAP-v1x / SPEC-v1x-map / 三连 spec 头部已同步翻案记录。
+  **下一件 = 腿一 (merge-timeline) 起 spec** (五阶段; 含 danqing-logfile 时间戳解析
+  引擎前置, 地图备注① parser 边界同窗口; spec 调研输入含合并时钟偏移校准/按源着色,
+  见调研 §十); 发布链动作挂起另行点头。
+- 2026-09-27 (**人工验收 B/C/F 三组 10 条用户实机全过 → 总清单 26 条全闭**):
+  B export 四条 (免费态门控无保存框 / 三格式真文件含 **Excel** 开 CSV 不乱码 /
+  1GB 导出可响应可取消 `.partial` 消失 / 明文只现原始行 + live-tail 快照) /
+  C 真商店更新流一条 (旧版见角标 → 点「更新」→ 系统对话框装完 ——
+  `SPEC-update-badge` 遗留 (i) 验收欠账兑现, **兼实证 v1.0.2 商店已认证上架**) /
+  F 命名会话五条 (四样保存重启应用全回、书签不动 / 两会话互切同名覆盖 /
+  免费态门控数据不丢、激活后可用 / 轮转后越界展开安静消失 / 列表只显本路径)。
+  三份 spec 人工验收节 + `SPEC-v1x-map.md` + 总清单已同步回填, 总清单状态转
+  「已全部验收 2026-09-27」。**唯一遗留 (挂收银台开业, 不属验收清单)**:
+  真付费获取链路未验 —— 付费态经 license key 本地激活取得 (09-20 走通过的
+  通路), 商店 add-on entitlement 与代销 key 真购买 → 激活, 待 add-on 创建 /
+  代销商注册 / `PURCHASE_URL` 回填后验, 并为前提③首单外检。
+- 2026-09-27 (**人工验收 A/D/E 三组 16 条用户实机全过, 零缺陷回填**): 总清单
+  `tasks/acceptance-pending.md` —— A 列配置六条 (含 A6 截断列边缘拖宽评审验点;
+  A3 勘误验点「列管理行随文件换」经 E5 兼验通过, T0 修复实证) / D 书签持久化
+  五条 / E 免语法字段查询五条, 逐项打勾。三份 spec 人工验收节 +
+  `SPEC-v1x-map.md` 模块索引已同步回填。**余**: B export 四条 + F 命名会话五条
+  (**需付费态**, 收银台开业后验) / C 商店更新流一条 (需商店先有更新版)。
+- 2026-09-24 (**field-picker-ui simplify 收口 → 五段全闭; workspace-sessions build 全闭**): 8 项行为零变化
+  简化 (**393 测试零修改全绿**): 拒收说清单一收口 `clause_reject_notice` (判据+
+  文案同一函数, PickerSubmit 22 行分类链→4 行; 修程: `?` 极性写反被表驱动锁当场
+  红) / `close_popovers`+`popover_open` 三弹层开合与三门禁同源 (评审 R6 落实为
+  代码) / 五卡壳收口 `card_shell`/`card_column`/`card_title` (设置/升级/导出/列
+  管理/字段查询, 约 75 行重复→3 helper, 注释随壳搬家) / `POPOVER_ROWS_MAX` /
+  `BODY_SIZE`→`view::FONT_SIZE` 别名钉同值 / RowList 假缓存字段删 / view 两处
+  「TextInput 既不裁剪」过期注释更正 (框架 09-20 已裁剪, P33 规矩保留说理) /
+  可见性收紧。**FONT_SIZE 耦合方向裁定**: view = bin 布局 token 家, 消费者指向
+  它方向正确 (同 crate 无环), 不为一 const 开新家; 真害 = 同值分家已钉。留档:
+  许可页镜像 R3 同族窗实机再收 / RowList 五闭包等第三消费者。余人工验收 E 组
+  五条记账待实机。
+  **同日下一棒 workspace-sessions build T1–T4 全闭**（「go」批 spec+plan 全按
+  推荐 → /build auto）: ①账本**改名 `state.json` 一次到位**（bookmark-persist
+  既定裁定兑现; `legacy_state_path` **分支配对**读旧写新迁移 —— 测试
+  `with_extension` 邻居派生 vs 生产整名兄弟无统一表达式; panic 封死家法随迁
+  should_panic 锁）②`SessionEntry` 四样载荷（查询串×2+`ColumnConfig`+展开
+  行号表; **结构无 `bookmarks` 键** = Open Q1 strip 落类型面）+ sessions 段
+  恒写/坏条丢条/`put_sessions_for_path` 只动本路径切片 ③save/apply/delete 链
+  （写穿 per-file 接缝兑现 / `rebuild_expands` 越界·不可展开静默剔除 / 书签
+  零触碰锁 / **`DeleteSelectedSession` 指针语义** —— plan 偏差: 无状态钮读不到
+  选中名, TextInput 无 set API 不绕镜像）④`PickerInput`→`SubmitInput` 零行为
+  变化泛化 + `sessions_card`（**RowList 第三消费者契约零变化**, 评审留档了结）
+  + 状态栏「会话」钮（空态不出）+ 门控两道闸 `session_gate`（数据永在）+
+  弹层族第四员（Esc 首插/互斥扩员/模态同源）。A/B 三红（摘恒写/摘写穿/摘
+  剔除）; **407 绿**（393+14）零 commit; 人工验收 F 组五条记账（**需付费态**）;
+  三处前账兑现注记（bookmark-persist 改名 / col-config 写穿 / columns.rs
+  strip）。
+  **同日 review 收口（双路评审均 REQUEST CHANGES → 并账全修）**: Critical ×3
+  （M1 `backup_if_corrupt` 判据不认 sessions 段——合法容错账本被整账判损丢
+  他会话; M2 迁移读/备判据不对称+非一次性——坏/空新名经 legacy 空内存覆盖
+  本路径记忆, 修 = **可辨谓词 `is_recognizable` 收口** + 回落同源 + 旧名
+  rename 退役 `.migrated`; M3 上限 32 vs 可视 12 脱节——第 13 条起静默不可达,
+  修 = 上限取齐 12 + 展示降序）+ Required ×5（导出点穿「此处无行」覆盖守卫
+  文案——家族⑤复发 / 滚轮锁假绿——家族⑥复发改真锁 / 互斥双向补锁 /
+  `clear_search` 不作废在途复活旧搜索 / 正则拒收 3/4 写穿谎报成功→显式清空）
+  全修, Optional/Nit 全清, +6 锁 → **413 绿**。教训两笔: 家族病史⑤⑥在新
+  面复发均被本轮对照清单抓出——对照清单要继续随模块传代; spec 措辞两处
+  （「重命名」「同容错」）被实现打脸后勘误, 勘误随评审记走。
+  **同日 code-simplify 收口 → 五段全闭**: 3 项行为零变化（widths 双向去重
+  —— 列三字段同模型真身 / `now_secs` 收口 / 杂项）+ 不动清单（hidden 解析
+  分叉 = M13 本体 / 同构双锁 / 状态栏镜像块）, **413 测试零修改**。留档:
+  删除指针独立选中实机再裁 / 窄窗几何实机核对 / OpenColMenu 不关 settings
+  既有缺口。地图**七模块至此全闭**（licensing/field-analytics/export/
+  table-column-config/bookmark-persist/field-picker-ui/workspace-sessions）,
+  v1.x 首波收口。
+- 2026-09-23 (**v1.0.2 MSIX 用户已提交; 腿三 export 一日全链: spec→plan→build T1–T7**):
+  商店侧余认证 (v1.0.0 同款节奏, 认证通过后照 `docs/ms-store-copy.md`「v1.x 上架时
+  必须改什么」清单核隐私政策双轨口径贴的是新版)。export: 四项口径 interview 裁定
+  (行集=当前结果全集 / 明文只出原始行 / 流式+可取消+实测定档 / 导出整体付费) →
+  `docs/specs/SPEC-v1x-export.md` (D1–D9) 「go」批准 (Open Q① 分析结果导出不做) →
+  plan/todo → **/build auto T1–T7 全绿零 commit**。产出: `src/export.rs`
+  (ExportSet 行集冻结 + raw 全集 `bytes()` 整拷/稀疏行尾探测 + CSV BOM+CRLF+RFC4180
+  手写转义 + pretty 失败行原样 + ExportJob 删半成品/在途拒绝/invalidate) /
+  底栏「导出…」+ `Ctrl+E` + 格式菜单两卡收口 (明文仅原始行) + 门控点位=入口
+  (对话框前) / `logbench --export` / **PANEL_CONTENT_H 180→192** (快捷键页加行越界)。
+  **实测 (release 热缓存)**: raw 全集 **608ms**/1684MiB/s · 稀疏 129ms · pretty
+  **18.1s** · CSV **20.7s** —— D9 目标全过, 已进 PERFORMANCE_REPORT。
+  测试 **298 绿** (基线实测 265→298; plan 记 262 为 09-22 旧值); 三处 A/B 精确红
+  (行尾策略/CSV 转义/pretty 空行)。**联动**: `danqing-logfile` 新增 `LogFile::bytes()`
+  (**已 push**: logfile `a81dcac`, lock 钉 `a81dcac2`; 本仓三笔 `688ce4e`(search 代次
+  拒覆盖)/`1e669db`(评审修复+简化)/`0ad53ae`(文档) 同日已推 `dev`)。
+  实现口径分叉已回写 spec 实现记 (T2 逐行 parse 修正 / schema.is_some() 判据 /
+  轮转不作废在途导出 / UTC 时间戳 / UTF-16 转码副本局限)。
+  **人工验收 (spec 四条) 记账延后** (2026-09-23 用户裁定「人工验收先记账」,
+  待实机回填 —— CSV 记得在 Excel 开验); review+simplify 同日已收口 (见下) ——
+  **五阶段全闭**。地图下一棒 = table-column-config (免费层欠账三连), 同日 spec 已起
+  (三项口径裁定全按推荐: 表头「列管理」弹层 / 表头拖拽换位 / 自带轻持久化
+  免费 columns.json; 调研: 拖拽基建零框架改动, event 无 TextBatch 列几何须 paint
+  同源) → 「go」批准 → plan/todo (Open Q①② 裁定: 光标首版零联动 / 弹层上移下移不进
+  首版) → **/build auto T1–T6 全绿零 commit** (348 测试绿, 314→348): `src/columns.rs`
+  (模型+对账+columns.json Value 手拼 LRU64) / view (表头几何缓存+手柄拖宽预览+拖拽
+  换位+hover) / settings (「列管理」弹层, format_btn 泛化收 impl Fn) / main (Msg 链+
+  per-路径记忆载入+变更即落盘+Esc 插层+模态互斥)。**panic 封死当场抓 3 条既有测试**
+  (apply_fresh 读 columns.json 无注入 → 补 temp 注入, 守卫按 save_config 先例起效);
+  A/B 三红: 对账 (摘补尾/retain) / 持久化 (摘 widths 写出) / paint 预览 (摘预览分支)。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (表头右键开列管理是死代码 —— 左键筛选提前返回吞掉右键分支, D3 第二入口从未接通)
+  + Required ×6 (零位移单击误冻结采样宽 / 换文件·rebuild·Ctrl+T 打断手势不清态→
+  抬起写错文件错列 / columns.json 外部数据三连: hidden 重复 usize 下溢破 D6 +
+  order 重复画两列 + inf 宽入库 / merge 后可 0 列 / 「列…」按钮盖末列手柄 /
+  右缘截断列手柄热区在屏外) 全修 + Optional 修 8·预防锁 1·文档化 1, 修复锁 +17 →
+  **365 绿** (348→365)。
+  **同日 code-simplify 收口 → 五段全闭**: Nit×5 清零 (move_column 边界 /
+  `HeaderHit::None`→`Miss` / `last_is_move`→`msg_count` / widths 键排序落盘 /
+  「排尾」doc 补全) + 消重复形状 (`header_gesture_active` / `abandon_header_gesture`
+  各收 3 处), 365 绿行为零变化。**人工验收全部记账** (2026-09-23 用户裁定) ——
+  跨模块总清单 `tasks/acceptance-pending.md` (A 组列配置六条含评审验点 /
+  B 组 export 四条需付费态 / C 组商店更新流一条)。
+  **同日下一棒 bookmark-persist build T1–T2 全闭** (「go」三项全按推荐: 并入
+  columns.json FileEntry.bookmarks / 上限 256 / 行号越界剔除; plan 核实⑤次序
+  陷阱 = apply_fresh 载入后的 `bookmarks.clear()` 已拆, 替换语义收在
+  load_state 一处): `columns.rs` 加 bookmarks 字段 + normalize_bookmarks 收编
+  (升序去重截断, 坏字段丢字段不丢条) + `put(FileEntry)`/`get_entry`;
+  main `load_state_for_current_file`/`save_state` 改名同取两态 + toggle 上限
+  守卫落盘。**A/B 三红** (摘写出/摘载入读取/摘 toggle 落盘) 在案; **372 绿**
+  (365+7), 零 view/框架/引擎改动。人工验收五条记账总清单 D 组。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (坏 columns.json 后 save_state 读改写覆盖成单条抹掉其余全部记忆 —— 修 =
+  save_to temp+rename 原子落盘 + 损坏备份守卫 rename .bak) + Required ×6
+  (幽灵行号塌 0 落盘 / LRU 静默丢真书签→无书签先挤淘汰保护 / 落盘失败谎报
+  「已添加」→bool+「(未落盘)」+ **set_notice 内含 refresh_status 的次序陷阱**
+  / 两锁补半边 / 旧注释勘误) 全修, +4 锁 → **376 绿**。
+  **同日 code-simplify 收口 → 五段全闭**: 抽 `backup_if_corrupt` (save_state
+  守卫策略块命名化), 不动清单见 spec 简化记, 376 绿行为零变化。
+  **同日下一棒 field-picker-ui build T0–T2 全闭** (「go」三项+T0 全按推荐):
+  **事实盘点揭发框架生命周期铁律** —— `app.view()` 一次性建树不再重建 (六处
+  框架文档), 每帧只 sync 刷值 → **揪出 table-column-config 漏判**: 「显示列」
+  弹层行集 = 建树快照 (schema=None) 结构上只剩「恢复默认」一行 (双路评审与
+  机器锁均未触到框架生命周期面) → **T0 搭车修**: `src/pick_list.rs` RowList
+  自绘行列表件 (sync 闭包每帧取态) + col_menu 换挂 (快照参数整个删除), 判罪锁
+  `col_menu_rows_follow_schema_across_sync` (摘 sync 重建红 `0.0≠84.0`)。
+  T1 拼子句 `build_clause` (6 算符+前缀尾 `*`, 空值/含空白拒绝) + picker 三态 +
+  6 Msg 臂 (**plan 偏差**: `on_change` 值镜像 = 许可页 `LicenseKeyInput` 先例,
+  替代自绘复合件; Enter 经 app_key_filter 拦 —— TextInput 不消费 Enter 已核);
+  T2 Bar「字段…」按钮 (hint 同款先测后存同帧让位, `.log` 不出) + 查询卡 +
+  Esc 插层/模态/互斥/换文件关/清草稿。**A/B 两红** (T0 sync 重建 / 追加拼接)
+  在案; **388 绿** (376+12)。人工验收五条记账 E 组 (E5 兼 table-column-config
+  A3 勘误验点)。
+  **同日 review 收口 (双路评审均 REQUEST CHANGES → 并账全修)**: Critical ×1
+  (**拼接面 < parse 破坏面** —— 值含 `>`/`<` 静默改写查询 / 双字符算符拼合 /
+  Eq 尾星偷换前缀 / 字段含点逃逸; 修 = build_clause 拒收面盖住破坏面 + 表驱动
+  对抗锁) + Required ×6 (托盘 OpenSettings 互斥缺口 / roundtrip 锁过弱 /
+  **值镜像 vs bind_clear 脱钩 → 镜像退役回归 PickerInput 持有者收口** ——
+  plan 偏差反转, R3/R7/R8 三缺陷一次消解: 值随信/Enter 只归值框/focus_id 送焦 /
+  RowList pressed 存行号送错列 → 载荷锚定 + rebuild 关弹层 / 弹层导航键穿透 →
+  门禁与模态清单同源) 全修, Optional/Nit 全清, +5 锁 → **393 绿**。待 simplify。
+  **同日 code-simplify 收口 → 五阶段全闭**: 4 处简化 (outcome_of / `ExportFormat::
+  write` 双份分派收一 / now_stamp / 评审 defer 的 D1·命名件迁 export.rs 并折叠
+  main 双分支 match), 行为零变化 314 绿; 不动清单见 spec 简化记。
+  **同日 review 收口 (双路独立评审均 REQUEST CHANGES → 全修)**: Critical ×2
+  (覆盖写吃用户旧文件 → `.partial`+rename 目标保护; invalidate+relaunch 跨代
+  共享 Arc + AsyncJob 单槽覆写 → 会话级卡死, 修在 search.rs 代次拒覆盖全作业族
+  受益) + Required ×7 (扩展名分派 / D1 四态上锁 / CSV 公式注入中和 / apply_fresh
+  关菜单 / panic catch_unwind / 搜索 100 万封顶拒绝导出 / 稀疏末行不补+BOM 对齐
+  +UTF-8 直 parse) 全修, 修复锁 +14 → **312 绿**。教训一笔: 修复中测试直调
+  begin_export 穿到真保存对话框 (家法违规, 当轮改正, 评审记有案)。
 - 2026-09-22 (**v1.0.2 GitHub 已发布; MS Store 余用户提交一步**): 更新提示两批
   (update-badge 双轨更新检查 + update-hint-ui 角标/link 形按钮/版本行居中, 均
   五段+人工验收+review+simplify 全闭, 含实机「角标 y 双加」返修)。**首个带更新
@@ -372,7 +756,8 @@
   中断 —— **截图用户早已线下备好, CLAUDE.md 状态滞后于用户线下动作**。
   发布类动手前先问一句「哪些物料你已备好」。期间动过用户配置主题 (已还原 dark)
   并 kill 过应用一次; 抓到两张图已删, 未流出。
-- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布; MS Store 已过审上架 (2026-09-19 提交, 09-21 认证通过, 仅 2 天) —— 商店校准钟起算 09-21, 回填 10-21 (GitHub 侧钟 10-18 不变)** ——
+- 当前: **UI 改造五模块已闭环; v1.0.0 GitHub 已发布; MS Store 已过审上架 (2026-09-19 提交, 09-21 认证通过, 仅 2 天) —— 商店校准钟起算 09-21, 回填 10-21 (GitHub 侧钟 10-18 不变; 回填表已立
+  `tasks/calibration-30d.md` —— T+20 快照 10-08 已拉)** ——
   ① **UI 视觉重构** (2026-09-13 立项 → **同日五模块全闭环**; 意图
      `docs/intent/ui-redesign.md`, spec `docs/specs/SPEC-ui-redesign.md`):
      `color-pipeline` / `theme-recalibrate` / `component-polish` / `token-completion` /
@@ -693,9 +1078,9 @@
   **上轮失败教训** (`docs/SPEC-dark-theme.md` 产出当前暗色): 对比度数值全达标仍难看 ——
   **对比度合格 ≠ 好看**, 本轮判据是整屏观感
 - 联动顺序: 见「依赖与联动」节 (2026-09-13 重写 —— 原措辞「danqing 先 push → 本仓 cargo update」缺了前提: **patch 默认关**, 改兄弟仓前得先 `cp tools/local-patch.toml .cargo/config.toml`)
-- 测试基线: **184 绿** (51 lib + 125 main + 8 genlog), 2026-09-16 实测
-  (上一版记的 178 是 09-15 旧值 —— 那之后又进了 P27 常驻红 / 滚动条拇指 / 「清除筛选」
-  居中量 ink 等守卫。**别拿 178 当回归基线**; 更早的 115 是 09-13 值, 早已作废)。
+- 测试基线: **521 绿** (186 lib + 321 main + 11 genlog + 3 keygen), 2026-10-07
+  提交前复跑实测 (拆分三波并账 `598e2d8` 前)。**别拿更早的数当回归基线**
+  (184 = 09-16 / 495 = 09-28 / 518 = 09-29 H-a 首波, 均已过期)。
   含: 设置卡溢出守卫与 `VERSION_ROW_H` 同源、暗色语义色板 AA 守卫、
   跨面阶梯守卫、浅色语义色 AA 守卫、展开块整段铺一次守卫、
   case-insensitive 的穷举 oracle / 逃逸舱 / `\w` 类语义 / D2 逐桶相等 /
@@ -710,6 +1095,8 @@
 
 - 意图 (为什么做/竞品裂缝/MVP 边界/开枪前提/定价锚): `../danqing/docs/intent/log-viewer-poc.md`
 - 意图 (UI 视觉重构的约束与裁决): `docs/intent/ui-redesign.md`
+- **功能对齐 / 缺口 / 创新分类总表 (写任何对外文案前必读)**: `docs/FEATURE-MATRIX.md`
+  (2026-09-28 落盘; 另含「禁止声称清单」入口与两条新识别缺口)
 - 框架规则: `../danqing/CLAUDE.md`
 - 农场跨仓约定: `../CLAUDE.md`
 
@@ -764,7 +1151,17 @@ path 态的 lock 给不了外人复现, 而 pinned 与「本地用未 push 的�
   preserve_order 保首见列序)。2026-09-10 拆为兄弟 crate `danqing-logfile`, 经 `lib.rs` 的
   `pub use danqing_logfile::{jsonl, logfile}` re-export; **2026-09-12 删除仓内残留副本**
   —— 拆分时漏删, 两份 2266 行已与兄弟 crate 分叉, 且 47 个测试静默不跑 (无 `mod` 声明 = 无人编译)
-- `src/main.rs` + `src/view.rs` — GUI (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
+- `src/main.rs` — 应用根: `LogApp` 状态结构 + `Msg` 枚举 + `impl App` 事件分发 +
+  构造器/导航访问器/弹层门禁 + `main()`; **方法簇 2026-09-29 拆出** (8728 → 1934 行,
+  纯搬家行为零变化): `app_persist.rs` (config.toml/state.json/命名会话/损坏备份) /
+  `app_export.rs` (导出流程) / `app_license.rs` (key 激活/商店购买) /
+  `app_merge.rs` (合并时间线) / `app_open.rs` (打开/重建/live-tail) /
+  `app_filter.rs` (过滤/搜索/书签) / `app_status.rs` (notice/底栏状态) ——
+  每个文件是 `impl LogApp` 的一个分片 + `use super::*`, 跨簇调用经 `pub(crate)`;
+  133+ 条测试同批原样挪 `src/tests.rs` (`#[cfg(test)] mod tests;`, 内容零修改)
+- `src/view.rs` — 视图层 (行锚定虚拟视口, 不用 Scrollable: f32 像素偏移在 2 亿像素域失真, 见 view.rs 模块头; 表格模式四区 = 过滤栏/表头/虚拟化行/状态栏)
+- `src/toast.rs` — Warn 级 notice 的非模态浮层 Widget (SPEC-notice-visibility D4;
+  挂 Stack 末位 = 画在模态弹层之上; Info 不走这里, 留底栏色块)
 - ~~`src/encoding.rs`~~ — 编码检测/转码 (2026-09-10 独立为兄弟 crate `danqing-encoding`, danqing 通过 `pub use danqing_encoding as encoding` re-export)
 - `src/search.rs` — AsyncJob (worker+tick拾取泛化) + SearchNav 命中导航
 - `src/levels.rs` — **级别分类与计数** (level-histogram 纯逻辑层): 6 桶分类器

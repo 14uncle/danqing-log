@@ -30,11 +30,12 @@ use danqing::{
 };
 
 use danqing::selection::{self, TextSelection};
+use danqing_log::columns::{ColumnConfig, MAX_COL_W, MIN_COL_W};
 use danqing_log::expand::{self, ExpandMap};
 use danqing_log::jsonl::{self, Column, Schema, SubRow};
 use danqing_log::logfile::LogFile;
 
-use crate::{LogApp, Msg, ViewMode};
+use crate::{LogApp, Msg, ViewMode, Workspace};
 
 /// 复制行数上限 (R3 业务护栏): 滚轮甩底可造出全文件选区, 无上限复制 = 逐行
 /// 解码 + 逐行分配, UI 冻结分钟级。10 万行 ≈ 16MB 文本, 剪贴板与内存都安全。
@@ -44,7 +45,8 @@ const COPY_MAX_LINES: u64 = 100_000;
 /// 行高 (逻辑像素)。24 = 可读性底线: 14px 正文上下仍留呼吸, 终端感消失。
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// 正文字号 (实机验收定档 14: 像素吸附落地后用户拍板; 行高 24 容得下)。
-const FONT_SIZE: u16 = 14;
+/// 全应用唯一定义: 弹层 (`settings::BODY_SIZE` 同源别名) 与 RowList 行文同号。
+pub(crate) const FONT_SIZE: u16 = 14;
 /// 行号/状态栏字号 (12: 竞品基准的可读底线, 11 在白底上偏吃力)。
 const AUX_FONT_SIZE: u16 = 12;
 /// 行号槽最小宽度。
@@ -67,7 +69,11 @@ const EXPAND_FONT_SIZE: u16 = 16;
 const GLYPH_COLLAPSED: &str = "+";
 const GLYPH_EXPANDED: &str = "-";
 /// 底栏状态行高度。
-const STATUS_HEIGHT: f32 = 26.0;
+pub(crate) const STATUS_HEIGHT: f32 = 26.0;
+/// 命名会话入口标签 (SPEC-v1x-workspace-sessions D5)。
+const SESSIONS_BTN_LABEL: &str = "会话";
+/// 底栏「合并…」按钮标签 (merge-timeline T4, D6 入口)。
+const MERGE_BTN_LABEL: &str = "合并…";
 
 /// 更新角标直径 (逻辑像素; 圆点半径取直径之半)。SPEC-update-badge D1, 拟态值待验收 (e) 定档。
 const UPDATE_DOT_D: f32 = 6.0;
@@ -96,6 +102,12 @@ fn settings_hit_rect(settings_x: f32, settings_w: f32, text_top: f32, row_top: f
     Rect::from_xywh(left, row_top, right - left, STATUS_HEIGHT)
 }
 
+/// 导出入口命中矩形 (纯函数, SPEC-v1x-export D7): 文字 + 4px 内垫, 行高整条。
+/// 与 [`settings_hit_rect`] 同款垫法, 但**无角标可吞** —— 不共用免得耦合角标语义。
+fn export_hit_rect(export_x: f32, export_w: f32, row_top: f32) -> Rect {
+    Rect::from_xywh(export_x - 4.0, row_top, export_w + 8.0, STATUS_HEIGHT)
+}
+
 /// 画更新角标 (D1): 有提示画 accent 圆点, 无提示**什么都不画** (零痕迹)。
 /// 几何与 [`update_dot_rect`] 同源; 断言走 `RectBatch` 实例内省, 不设返回值。
 fn paint_update_dot(
@@ -117,6 +129,52 @@ const FILTER_BAR_H: f32 = 32.0;
 const HEADER_H: f32 = 28.0;
 /// 列内边距 (含在列宽里, 单元格文本右留 8)。
 const COL_PAD: f32 = 16.0;
+/// 列宽手柄热区半宽 (SPEC-v1x-table-column-config D2): 列右缘 ±4px, 优先于表头体。
+const HANDLE_HALF: f32 = 4.0;
+/// 表头「列…」按钮标签 (D3): ASCII + GB2312 「列」+ 省略号 (与「导出…」同款)。
+const COLS_BTN_LABEL: &str = "列…";
+/// 过滤栏「字段…」按钮标签 (SPEC-v1x-field-picker-ui D1): 免语法查询弹层入口。
+const FIELDS_BTN_LABEL: &str = "字段…";
+
+/// 表头列区间 (T3, paint 写 event 读): 显示序可见列的 (x0, x1, schema 下标,
+/// 显示序位), 绝对窗口 x (含 `x_offset` 平移) —— 与 [`LogView::col_spans`] 同口径
+/// (D2 铁律: event 无 `TextBatch`, 命中测试与渲染同源只认缓存)。
+/// `x1` = 真布局右缘 (拖宽起算宽 / 换位缝隙用); **手柄与可见体右缘 = `handle_x`**
+/// (`x1.min(text_right)` —— 右缘截断列的边缘钉在可见处, 评审 B2)。
+#[derive(Clone, Copy)]
+struct HeaderSpan {
+    x0: f32,
+    x1: f32,
+    /// 命中/hover 用的可见右缘 (手柄位置)。
+    handle_x: f32,
+    schema_idx: usize,
+    /// 显示序位 (含滚出视口的列的全集下标) —— 换位缝隙计算用 (T4)。
+    display_idx: usize,
+}
+
+/// 列宽拖拽态 (T4, 视图局部, `Cell` 可 Copy): 预览宽在 move 里跟手 clamp,
+/// **抬起才发 `Msg::ColumnWidthSet` 提交** —— Esc/放弃 = 丢预览, 真身零半提交 (D2)。
+#[derive(Clone, Copy)]
+struct ColWDrag {
+    schema_idx: usize,
+    start_x: f32,
+    start_w: f32,
+    preview_w: f32,
+}
+
+/// 表头命中三态 (T3, D2): **手柄 (±[`HANDLE_HALF`]) > 「列…」按钮 > 表头体**
+/// (评审 B1: 重叠带手柄胜 ——「看得见的边缘点得中」是主手势; 与公共边界
+/// 「左列手柄胜」同款文档化裁决)。
+enum HeaderHit {
+    /// 列右缘手柄 (schema 下标) —— 拖宽该列。
+    Handle(usize),
+    /// 列体 (schema 下标) —— 拖拽换位的潜伏起点。
+    Body(usize),
+    /// 「列…」按钮 —— 列管理弹层 (表头右键同发)。
+    ColsButton,
+    /// 不在表头命中区 (不叫 `None` —— 与 `Option::None` 撞名误读)。
+    Miss,
+}
 /// 右侧滚动条宽度。
 const SCROLLBAR_W: f32 = 6.0;
 /// 滚动条拇指最小长度 (竖条取高度, 横条取宽度)。
@@ -704,6 +762,14 @@ struct RowGeom {
     offs: Vec<(f32, usize)>,
 }
 
+/// caret 归属 (hit_text 单点, 单文件/合并两分支同源): 首个 x_end > content_x
+/// 的字符即 caret (TextInput hit_to_index 同语义); 全在左侧 → 末字符后;
+/// 全在右侧 (左缘点击) → base_byte。
+fn caret_at_geom(g: &RowGeom, content_x: f32) -> usize {
+    let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
+    if n == 0 { g.base_byte } else { g.offs[n - 1].1 }
+}
+
 /// 构建一行可见窗口的命中几何: 从 `base` (左截断字节) 起逐字符累计宽度,
 /// 越过 `right_bound` (内容域 x) 即停 —— 右缘外字符用户点不到, 不测。
 /// `start_x` = base 处的内容域 x (调用方由 scroll_trim 的 sub 换算, 免重复测量)。
@@ -758,13 +824,14 @@ pub(crate) struct LogView {
     status: String,
     /// 底栏那行 `status` 是不是**错误** (P27)。2026-09-15 用户裁定「**常驻红**」——
     /// 不给它走 notice 通道: notice 有 4 秒消退期, 而「正则无效」是「你刚按的那下
-    /// 没生效」, 不该自己消失 (用户原话)。与 notice 的 `Warn` 档共用 `danger()`,
+    /// 没生效」, 不该自己消失 (用户原话)。与 toast 浮层共用 `danger()` 语义色,
     /// 但活在另一条通道上。真身是 `app.status_error`, 唯一写入点是
     /// `LogApp::set_status_error`。
     status_error: bool,
-    /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的 —— 常态信息
-    /// `text_secondary()` / 提示 `text_primary()` / 警示 `danger()`, 见 paint。
-    /// sync 时从 `app.notice` 读; **不得**再拼进 `status` (那会画两遍)。
+    /// 底栏瞬时提示 (M3): 与 `status` **分通道**, 各画各的。
+    /// SPEC-notice-visibility D4 (2026-09-28): **只画 Info** (色块衬底) —— Warn 的
+    /// 呈现位挪 toast 浮层, 底栏不重复画。sync 时从 `app.notice` 读;
+    /// **不得**再拼进 `status` (那会画两遍)。
     notice: Option<(String, crate::NoticeKind)>,
     mode: ViewMode,
     schema: Option<Arc<Schema>>,
@@ -795,6 +862,18 @@ pub(crate) struct LogView {
     has_update_hint: bool,
     /// 设置按钮 hover 态 (event 写, paint 读)。
     settings_hover: std::cell::Cell<bool>,
+    /// 导出入口 (SPEC-v1x-export D7): 标签随作业态切换 (「导出…」↔「取消导出 N%」),
+    /// 标签走 sync 注入 (与角标同款惯例); 显隐直接判 `has_file` (导出无对象不画)。
+    export_label: String,
+    export_hover: std::cell::Cell<bool>,
+    export_btn_rect: std::cell::Cell<Rect>,
+    /// 「会话」入口 (D5): hover + hit rect, export 同规。
+    sessions_hover: std::cell::Cell<bool>,
+    sessions_btn_rect: std::cell::Cell<Rect>,
+    merge_hover: std::cell::Cell<bool>,
+    merge_btn_rect: std::cell::Cell<Rect>,
+    /// 列配置门快照 (G2): true = 免费态, 表头拖宽/换位手势不启动 (发升级提示)。
+    col_gesture_free: bool,
     /// 设置按钮矩形 (paint 计算, event 用; Cell 跨 paint/event 共享)。
     settings_btn_rect: std::cell::Cell<Rect>,
     /// 鼠标悬停显示行 (u64::MAX = 无; event 写, paint 读)。
@@ -817,6 +896,22 @@ pub(crate) struct LogView {
     /// 绝对窗口 x —— 列宽靠 TextBatch 实测, event 侧重算不可能 (D2)。
     /// 非表格模式 = 空 (paint 每帧重置, 顺带清陈旧)。
     col_spans: std::cell::RefCell<Vec<(f32, f32, usize)>>,
+    /// 列配置镜像 (T3; 真身在 LogApp —— sync 拷入并对账, paint 直信不变量)。
+    columns: ColumnConfig,
+    /// 表头几何缓存 (T3, paint 写 event 读): 显示序可见列区间 + 手柄 (D2)。
+    header_geom: std::cell::RefCell<Vec<HeaderSpan>>,
+    /// 「列…」按钮命中矩形 (paint 写; 固定表头右角, **不随** `x_offset`)。
+    cols_btn_rect: std::cell::Cell<Rect>,
+    /// hover 手柄 (schema 下标) —— paint 高亮用 (D8 发现性)。
+    hover_handle: std::cell::Cell<Option<usize>>,
+    /// hover 「列…」按钮。
+    hover_cols_btn: std::cell::Cell<bool>,
+    /// 列宽拖拽 (T4, 视图局部预览; 抬起才提交, D2)。
+    col_w_drag: std::cell::Cell<Option<ColWDrag>>,
+    /// 表头换位拖拽 (T4): (schema 下标, 插入位) —— 潜伏超阈值才升级。
+    col_move_drag: std::cell::Cell<Option<(usize, usize)>>,
+    /// 表头体按下潜伏 (T4): (schema 下标, 按下点) —— 未超 `CLICK_DIST` 抬起 = 单击无动作。
+    header_press: Option<(usize, Point)>,
     /// 按下待升级 (行, 字节, 屏幕位置): 拖超 CLICK_DIST 升级框选,
     /// 未超即抬起 = 单击 (不产空选区)。
     press: Option<(u64, usize, Point)>,
@@ -833,8 +928,56 @@ pub(crate) struct LogView {
     /// 无它 focusable 形同虚设 —— hit_focusable 只认 hit_area (评审自查发现:
     /// 只加 focusable 不加 hit_area, 点击永不聚焦, Ctrl+C 链路断路)。
     area: std::cell::Cell<Rect>,
+    // ---- 合并工作区 (merge-timeline 腿一 T3) ----
+    /// 合并模式激活 (sync 自 app.workspace; D4)。
+    merge_active: bool,
+    /// 可见窗口行快照 (sync 每帧拷; 窗口拷贝纪律见 merge_view 模块头)。
+    merge_rows: Vec<danqing_log::merge_view::MergeRowView>,
+    /// 窗口首行位置 (merge_rows[0] 的合并行号)。
+    merge_rows_from: u64,
+    /// 合并总行数 (滚动条/行号槽口径)。
+    merge_total: u64,
+    /// 源元数据 (名, hidden) —— 行首源标签; 源色 = `theme.source_palette()[序号]` (D11/CP2-A)。
+    merge_sources: Vec<(String, bool)>,
+    /// 合并书签 pack 键集 (gutter 标记; 用户量级逐帧克隆无感)。
+    merge_bookmarks: std::collections::BTreeSet<u64>,
+    /// 合并文本选区 (腿 E/T6): (源, 文件行, anchor/caret 字节) —— **单行选区**。
+    /// 键用 (源,行) 不用合并位置: 位置随过滤/滚动漂, (源,行) 内容稳定
+    /// (偏移/显隐/追踪都不动它; 加/减源经 sel_rev 代次清空)。
+    /// 跨行选区首版不做 —— 合并视图相邻行可能来自**不同文件**, 跨行复制的
+    /// 字节语义没有诚实答案。
+    merge_sel: Option<MergeSel>,
+    /// 合并消息列的绝对 x (paint 缓存; event 无 TextBatch, 命中/按下靠它
+    /// 划内容域 —— 时间栏/源栏点击不启动选区)。
+    merge_msg_x: std::cell::Cell<f32>,
+    /// 合并源文件句柄 (sync 每帧 Arc 克隆, ≤8 个可忽略): 复制/追踪取行原文用 ——
+    /// 窗口快照只有可见行, 选中行滚出窗后 Ctrl+C 仍要拿得到 (单文件 `file`
+    /// 常驻同款语义)。
+    merge_files: Vec<Arc<LogFile>>,
+    /// 追踪过滤在途标记 (sync 自 MergeState.trace): Esc 清追踪的判据 (view 侧
+    /// 升级序列 = 选区 → 追踪过滤, 与单文件「先局部后全局」同款)。
+    merge_traced: bool,
+    /// 已见的合并选区代次 (sync 对账: 源集合一变, 选区键失效清空)。
+    merge_sel_rev_seen: u64,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
+}
+
+/// 合并文本选区 (腿 E/T6): 单行, anchor/caret 为解码文本字节偏移 (trim_end 口径,
+/// 见 `merge_view::row_text`)。空选区 (anchor == caret) 视同无选区。
+struct MergeSel {
+    src: u32,
+    line: u32,
+    anchor: usize,
+    caret: usize,
+}
+
+impl MergeSel {
+    /// 规范化字节区间; 空选区 → None。
+    fn range(&self) -> Option<(usize, usize)> {
+        (self.anchor != self.caret)
+            .then(|| (self.anchor.min(self.caret), self.anchor.max(self.caret)))
+    }
 }
 
 impl LogView {
@@ -866,6 +1009,14 @@ impl LogView {
             x_offset: std::cell::Cell::new(0.0),
             max_seen: std::cell::Cell::new(0.0),
             settings_hover: std::cell::Cell::new(false),
+            export_label: String::new(),
+            export_hover: std::cell::Cell::new(false),
+            export_btn_rect: std::cell::Cell::new(Rect::default()),
+            sessions_hover: std::cell::Cell::new(false),
+            sessions_btn_rect: std::cell::Cell::new(Rect::default()),
+            merge_hover: std::cell::Cell::new(false),
+            merge_btn_rect: std::cell::Cell::new(Rect::default()),
+            col_gesture_free: false, // 默认放行: 测试直构造零 sync = 付费语义; 生产 sync 每帧写真值
             settings_btn_rect: std::cell::Cell::new(Rect::default()),
             hover_row: std::cell::Cell::new(u64::MAX),
             hover_expand: std::cell::Cell::new(false),
@@ -873,6 +1024,14 @@ impl LogView {
             last_expand_rev: 0,
             selected_cell: None,
             col_spans: std::cell::RefCell::new(Vec::new()),
+            columns: ColumnConfig::default(),
+            header_geom: std::cell::RefCell::new(Vec::new()),
+            cols_btn_rect: std::cell::Cell::new(Rect::default()),
+            hover_handle: std::cell::Cell::new(None),
+            hover_cols_btn: std::cell::Cell::new(false),
+            col_w_drag: std::cell::Cell::new(None),
+            col_move_drag: std::cell::Cell::new(None),
+            header_press: None,
             press: None,
             dragging: false,
             last_click: None,
@@ -880,6 +1039,17 @@ impl LogView {
             gutter_w: std::cell::Cell::new(GUTTER_MIN),
             area: std::cell::Cell::new(Rect::default()),
             theme: crate::config::AppTheme::Light,
+            merge_active: false,
+            merge_rows: Vec::new(),
+            merge_rows_from: 0,
+            merge_total: 0,
+            merge_sources: Vec::new(),
+            merge_bookmarks: std::collections::BTreeSet::new(),
+            merge_sel: None,
+            merge_msg_x: std::cell::Cell::new(0.0),
+            merge_files: Vec::new(),
+            merge_traced: false,
+            merge_sel_rev_seen: 0,
         }
     }
 
@@ -888,9 +1058,124 @@ impl LogView {
         self.mode == ViewMode::Table && self.schema.is_some()
     }
 
+    /// 表头命中 (T3, SPEC-v1x-table-column-config D2): 行外/非表格 = None;
+    /// **手柄 (可见右缘 ±[`HANDLE_HALF`]) > 「列…」按钮 > 表头体**。
+    /// 几何全部来自 paint 缓存 —— event 无 `TextBatch` (D2 铁律), 不许现场量宽。
+    /// 相邻列手柄热区在公共边界重叠时**左列手柄胜** (先遍历到者): 拖的是左列宽。
+    /// 手柄与按钮矩形重叠时**手柄胜** (评审 B1): 主手势优先, 按钮主体仍可点。
+    fn header_hit_at(&self, area: Rect, position: Point) -> HeaderHit {
+        if !self.table_mode() {
+            return HeaderHit::Miss;
+        }
+        if position.y < area.origin.y || position.y >= area.origin.y + HEADER_H {
+            return HeaderHit::Miss;
+        }
+        let geom = self.header_geom.borrow();
+        for hs in geom.iter() {
+            if (position.x - hs.handle_x).abs() <= HANDLE_HALF {
+                return HeaderHit::Handle(hs.schema_idx);
+            }
+        }
+        if self.cols_btn_rect.get().contains(position) {
+            return HeaderHit::ColsButton;
+        }
+        for hs in geom.iter() {
+            if position.x >= hs.x0 && position.x < hs.handle_x {
+                return HeaderHit::Body(hs.schema_idx);
+            }
+        }
+        HeaderHit::Miss
+    }
+
+    /// 换位缝隙 (T4): 显示序**全集**的插入位 —— 滚出左缘的列占前导槽 (首在视列的
+    /// `display_idx`), 在视列按中点计数 (过中点 = 插到该列之后); 拖到最右 = 排尾。
+    fn header_gap_at(&self, position: Point) -> usize {
+        let geom = self.header_geom.borrow();
+        if geom.is_empty() {
+            return 0;
+        }
+        let lead = geom[0].display_idx;
+        let past = geom
+            .iter()
+            .filter(|h| position.x >= (h.x0 + h.x1) / 2.0)
+            .count();
+        lead + past
+    }
+
+    /// 表头拖拽跟手 (T4): 列宽预览 clamp / 换位缝隙更新 / 潜伏超阈值升级
+    /// (文本框选同款 `CLICK_DIST` 阈值)。
+    fn on_header_drag_move(&mut self, position: Point) {
+        if let Some(mut d) = self.col_w_drag.get() {
+            d.preview_w = (d.start_w + (position.x - d.start_x)).clamp(MIN_COL_W, MAX_COL_W);
+            self.col_w_drag.set(Some(d));
+            return;
+        }
+        if let Some((schema_idx, _)) = self.col_move_drag.get() {
+            let gap = self.header_gap_at(position);
+            self.col_move_drag.set(Some((schema_idx, gap)));
+            return;
+        }
+        if let Some((schema_idx, p0)) = self.header_press {
+            if (position.x - p0.x).abs() > CLICK_DIST || (position.y - p0.y).abs() > CLICK_DIST {
+                self.col_move_drag
+                    .set(Some((schema_idx, self.header_gap_at(position))));
+                self.header_press = None;
+            }
+        }
+    }
+
+    /// 表头手势落点 (T4): 列宽提交 / 换位落点 / 未升级 = 单击表头**无动作** (D2)。
+    /// **零位移抬起不提交** (评审 R①): 预览未变 = 无变更, 否则采样宽被单击
+    /// 冻成手动宽 (半提交污染)。
+    fn on_header_release(&mut self, msgs: &mut MsgQueue) {
+        if let Some(d) = self.col_w_drag.take() {
+            if d.preview_w != d.start_w {
+                if let Some(col) = self
+                    .schema
+                    .as_deref()
+                    .and_then(|s| s.columns.get(d.schema_idx))
+                {
+                    msgs.push(Box::new(Msg::ColumnWidthSet(col.name.clone(), d.preview_w)));
+                }
+            }
+            return;
+        }
+        if let Some((schema_idx, gap)) = self.col_move_drag.take() {
+            let before = self.columns.visible_names().nth(gap).map(str::to_string);
+            if let Some(col) = self
+                .schema
+                .as_deref()
+                .and_then(|s| s.columns.get(schema_idx))
+            {
+                msgs.push(Box::new(Msg::ColumnMoveBefore(col.name.clone(), before)));
+            }
+            return;
+        }
+        self.header_press = None;
+    }
+
+    /// 表头手势进行中 (拖宽/换位/潜伏) —— 跟手短路 / 滚轮锁 (评审 A4) /
+    /// 抬起收口三处共用的同一判据。
+    fn header_gesture_active(&self) -> bool {
+        self.col_w_drag.get().is_some()
+            || self.col_move_drag.get().is_some()
+            || self.header_press.is_some()
+    }
+
+    /// 弃表头手势三态 (Esc / FocusOut / sync 失效守卫同语义): 预览零半提交 (D2)。
+    fn abandon_header_gesture(&mut self) {
+        self.col_w_drag.set(None);
+        self.col_move_drag.set(None);
+        self.header_press = None;
+    }
+
     /// 顶部 chrome 高度: 过滤/搜索栏是独立 sibling (Column 上面), LogView 不含它;
     /// 表格模式只留表头, 原始模式无 chrome。
     fn chrome_top(&self) -> f32 {
+        // 合并工作区 (T3): 三栏表头 (时间|源|消息) 占表头高。
+        if self.merge_active {
+            return HEADER_H;
+        }
         if self.table_mode() { HEADER_H } else { 0.0 }
     }
 
@@ -905,7 +1190,11 @@ impl LogView {
     }
 
     /// 显示行数: 文件行数 + 展开子行数。
+    /// 合并工作区 (T3) = 合并总行数 (无展开子行, 嵌套展开待并集列波再裁)。
     fn display_count(&self) -> u64 {
+        if self.merge_active {
+            return self.merge_total;
+        }
         expand::display_count(self.lines(), &self.expanded)
     }
 
@@ -918,6 +1207,15 @@ impl LogView {
     /// `label = value` 串 (构造点 = [`sub_row_text`], paint 与行兜底同用)。
     /// 无文件/子行缺失 → 空串 (复制拼装对零宽切片本就跳过)。
     fn row_content(&self, row: u64) -> String {
+        // 合并分支 (腿 E/T6): 行内容 = 窗口快照消息列文本 (双击只发生在可见行,
+        // 与命中几何同窗口同源)。复制路径不走这里 (selected_text 直读源文件)。
+        if self.merge_active {
+            return self
+                .merge_rows
+                .get(row.saturating_sub(self.merge_rows_from) as usize)
+                .map(|rv| rv.text.clone())
+                .unwrap_or_default();
+        }
         let Some(file) = self.file.as_ref() else {
             return String::new();
         };
@@ -989,7 +1287,27 @@ impl LogView {
 
     /// 复制来源的三级 (T18)。**判据的唯一真身** —— `selected_text` (取文本) 与
     /// 复制回执 (取说明) 都从它出发, 于是「真复制了」与「说复制了」不可能分家。
+    /// 合并态文本选区的**唯一解析点**: 选区键 `(源,行)` + 字节区间 → 源文件
+    /// 句柄 + 原文切片区间。`None` = 无选区 / 空选区 / 拓扑已变 (源集合换过)。
+    /// 「有没有可复制的文本」([`Self::copy_source`]) 与「取出来是什么」
+    /// ([`Self::selected_text`]) 都判它 —— 此前靠注释约定两处一致, 现在靠构造
+    /// (T6 那轮在这条链上漏出过「说有选中却复制错行」, 故不再留约定)。
+    fn merge_sel_slice(&self) -> Option<(&LogFile, u32, std::ops::Range<usize>)> {
+        let sel = self.merge_sel.as_ref()?;
+        let (lo, hi) = sel.range()?;
+        let file = self.merge_files.get(sel.src as usize)?;
+        Some((file, sel.line, lo..hi))
+    }
+
     fn copy_source(&self) -> Option<CopySource> {
+        // 合并分支 (腿 E/T6): 仅文本选区可复制。整行兜底**不能**走下面那条 —
+        // line_at/file 是单文件机制, 在合并位置空间会静默复制**错行** (T6 前
+        // 的活洞: 合并态 Ctrl+C 复制的是单文件文件的无关行)。整行复制**未接**
+        // (非「随某波」—— T7 波没做, 记 spec 实现记)。
+        if self.merge_active {
+            self.merge_sel_slice()?; // 判据与取串同源 (见该函数注)
+            return Some(CopySource::Text { rows: 1 });
+        }
         if let Some(sel) = &self.selection {
             if !sel.is_empty() {
                 if self.selection_over_limit() {
@@ -1095,15 +1413,43 @@ impl LogView {
                 // 与命中几何/渲染同串 (三源一体), token 边界才不偏
                 let text = self.row_content(r);
                 let (s, e) = selection::token_at(&text, b);
-                self.selection = Some(TextSelection::new((r, s), (r, e)));
+                if self.merge_active {
+                    // 腿 E/T6: 双击 token = 合并选区 (单行, (源,行) 键)
+                    if let Some((src, line)) = self.merge_row_key_at(r) {
+                        self.merge_sel = Some(MergeSel {
+                            src,
+                            line,
+                            anchor: s,
+                            caret: e,
+                        });
+                    }
+                } else {
+                    self.selection = Some(TextSelection::new((r, s), (r, e)));
+                }
             }
             self.press = None;
             self.dragging = false;
             self.last_click = None; // 三连击不链式放大, 重新开始计数
         } else {
             self.press = self.hit_text(area, position).map(|(r, b)| (r, b, position));
+            if self.merge_active {
+                // 按下即落定空选区 (anchor=caret, 不可见); 拖动升级为选区
+                // (CursorMoved), 单击抬起 = 清旧选区 (单文件同惯例)。
+                self.merge_sel = None;
+                if let Some((r, b, _)) = self.press {
+                    if let Some((src, line)) = self.merge_row_key_at(r) {
+                        self.merge_sel = Some(MergeSel {
+                            src,
+                            line,
+                            anchor: b,
+                            caret: b,
+                        });
+                    }
+                }
+            } else {
+                self.selection = None;
+            }
             self.dragging = false;
-            self.selection = None;
             self.last_click = Some((now, position));
         }
     }
@@ -1128,6 +1474,13 @@ impl LogView {
             return None;
         }
         let row = self.row_at(rel_y);
+        // 合并分支 (腿 E/T6): 内容域 = 消息列 (x 起自 paint 缓存的 merge_msg_x);
+        // 合并视图**无水平滚动**, 无 x_offset 分叉; 行几何键 = 合并位置。
+        if self.merge_active {
+            let geom = self.row_geom.borrow();
+            let g = geom.get(&row)?;
+            return Some((row, caret_at_geom(g, pos.x - self.merge_msg_x.get())));
+        }
         let text_x = self.text_x(area);
         let (_, sub_off) = self.line_at(row);
         let content_x = if sub_off > 0 {
@@ -1137,11 +1490,14 @@ impl LogView {
         };
         let geom = self.row_geom.borrow();
         let g = geom.get(&row)?;
-        // 首个 x_end > content_x 的字符即 caret 归属 (TextInput hit_to_index 同语义);
-        // 全在左侧 → 末字符后; 全在右侧 (左缘点击) → base_byte。
-        let n = g.offs.partition_point(|(x_end, _)| *x_end <= content_x);
-        let byte = if n == 0 { g.base_byte } else { g.offs[n - 1].1 };
-        Some((row, byte))
+        Some((row, caret_at_geom(g, content_x)))
+    }
+
+    /// 合并位置 → (源, 文件行) —— 只能从**当前窗口快照**解析 (选择只发生在
+    /// 可见行; geom 未缓存的行 hit_text 本就拒, 两者同一张网)。
+    fn merge_row_key_at(&self, pos: u64) -> Option<(u32, u32)> {
+        let i = pos.checked_sub(self.merge_rows_from)? as usize;
+        self.merge_rows.get(i).map(|rv| (rv.src, rv.line))
     }
 
     /// 列区间命中 (M4): 屏幕 x → 列下标。读 paint 缓存的绝对窗口坐标
@@ -1253,24 +1609,99 @@ impl Widget for LogView {
             self.press = None;
             self.dragging = false;
             self.selected_cell = None; // M4: 同守卫块, 同一作废理由
+            // 表头手势同弃 (评审 R②/深潜 A1): 换文件/rebuild/Ctrl+T 打断后抬起
+            // 若仍按旧 `schema_idx` 提交, 会把宽写进**新**文件的错列配置 ——
+            // Esc 同语义清场, 预览零半提交 (D2)。
+            self.abandon_header_gesture();
         }
         self.file = Some(Arc::clone(&app.file));
         self.has_file = app.has_file;
         self.loading_label = app.loading_label.clone();
-        self.top_row = app.top_row;
-        self.selected = app.selected;
+        self.top_row = app.cur_top();
+        self.selected = app.cur_selected();
         self.status = app.status.clone();
         self.status_error = app.status_error;
         self.notice = app.notice.clone();
+        self.export_label = if app.export_job.is_running() {
+            let pct = (app.export_job.progress() * 100)
+                .checked_div(app.export_job.total())
+                .unwrap_or(0);
+            format!("取消导出 {pct}%")
+        } else {
+            "导出…".to_string()
+        };
         self.mode = app.mode;
         self.schema = app.schema.clone();
         self.filtered = app.filtered.clone();
+        // 合并工作区快照 (腿一 T3): 窗口拷贝纪律见 merge_view 模块头;
+        // 单文件显示模式的遗物 (Table/schema/filtered) 在合并期**清空**,
+        // 免得表头命中/单元格选中那套单文件机制在合并视图背后误动作。
+        let merge_on = app.merge_active().is_some();
+        self.merge_active = merge_on;
+        if merge_on {
+            self.mode = ViewMode::Raw;
+            self.schema = None;
+            self.filtered = None;
+            let m = app.merge.as_ref().expect("merge_active 保证 bundle 在");
+            let from = m.top_row.floor().max(0.0) as u64;
+            self.merge_rows_from = from;
+            self.merge_rows = m.window(from, danqing_log::merge_view::WINDOW_ROWS);
+            self.merge_total = m.row_count();
+            self.merge_sources = m
+                .sources
+                .iter()
+                .map(|s| (s.name().to_string(), s.hidden))
+                .collect();
+            self.merge_bookmarks = m.bookmarks.clone();
+            // T6 (腿 E): 源文件句柄 (复制/追踪取原文) + 追踪态 (Esc 升级序列判据)
+            // + 选区代次对账 (源集合一变, (源,行) 键漂移 → 选区失效)。
+            // **退役整表交释放通道** (评审 R2): state 侧换快照时只减一个引用
+            // (refcount 2→1), 真正的 munmap 会落到这里 (UI 线程) —— 所以本侧
+            // 退役的 Arc 也要走同一条一次性线程, 保证**最后一次** drop 不压 UI。
+            let fresh: Vec<Arc<LogFile>> = m.file_handles();
+            let changed = fresh.len() != self.merge_files.len()
+                || fresh
+                    .iter()
+                    .zip(self.merge_files.iter())
+                    .any(|(a, b)| !Arc::ptr_eq(a, b));
+            if changed {
+                let old = std::mem::replace(&mut self.merge_files, fresh);
+                danqing_log::merge_view::dispose_snapshots(old);
+            }
+            self.merge_traced = m.trace.is_some();
+            if self.merge_sel_rev_seen != m.sel_rev {
+                self.merge_sel = None;
+                self.merge_sel_rev_seen = m.sel_rev;
+            }
+        } else {
+            self.merge_rows.clear();
+            self.merge_total = 0;
+            self.merge_sources.clear();
+            self.merge_bookmarks.clear();
+            // 退出合并即松手 (评审 Optional: 否则 Single 态仍攥着 ≤8 个 mmap)
+            if !self.merge_files.is_empty() {
+                let old = std::mem::take(&mut self.merge_files);
+                danqing_log::merge_view::dispose_snapshots(old);
+            }
+        }
         self.search_hits = app.search.as_ref().map(|n| Arc::clone(n.hits()));
         self.encoding = app.file.encoding();
         self.bookmarks = app.bookmarks.clone();
         self.expanded = app.expanded.clone();
         self.sub_rows = app.sub_rows.clone();
         self.theme = app.theme;
+        // 列配置门快照 (gate-trio G2): 手势起点判据 —— 免费态拖宽/换位手势
+        // **不启动** (G0 口径), event 只读本缓存 (D2 同规: event 无 App)。
+        self.col_gesture_free = !app
+            .entitlement
+            .allows(danqing_log::license::Feature::ColumnConfig);
+        // 列配置镜像 (T3): 真身在 LogApp; 拷入后对账一次 —— paint 只信
+        // 「order 覆盖全部 schema 列」的不变量。幂等且 ≤16 列, 每帧成本可忽略。
+        self.columns = app.columns.clone();
+        if let Some(s) = &app.schema {
+            let names: Vec<String> = s.columns.iter().map(|c| c.name.clone()).collect();
+            self.columns.merge_with_schema(&names);
+        }
         // 模式变化才重编译 (正则编译 ms 级, 不能进 paint)。
         // **只认 app.search_pattern 这一串** —— 它就是搜索执行用的那串
         // (`build_search_pattern` 的产物), 故大小写敏感之类的 flag 自动同源,
@@ -1328,12 +1759,31 @@ impl Widget for LogView {
         let mut cols: Vec<(f32, f32, &Column)> = Vec::new();
         // 列区间缓存 (M4): 可见列的 (x0, x1, 列下标) 绝对窗口 x, paint 写 event 读
         let mut spans: Vec<(f32, f32, usize)> = Vec::new();
+        // 表头几何缓存 (T3): 显示序可见列区间 + 手柄 (列右缘), 与 spans 同口径
+        let mut hgeom: Vec<HeaderSpan> = Vec::new();
         if table {
             let schema = self.schema.as_deref().expect("表格模式必有 schema");
             let mut x = text_x - x_off;
             let mut total_w = 0.0f32;
-            for (col_idx, col) in schema.columns.iter().enumerate() {
-                let w = texts.measure(&"8".repeat(col.width_chars), FONT_SIZE) + COL_PAD;
+            // 显示序 = 列配置 (SPEC-v1x-table-column-config D1): order 过滤隐藏,
+            // 手动宽覆盖采样建议宽。**空配置容错** = schema 首见序全显采样宽
+            // (未 sync 的测试夹具/首帧前; sync 后必是对账态)。
+            let names: Vec<&str> = if self.columns.order.is_empty() {
+                schema.columns.iter().map(|c| c.name.as_str()).collect()
+            } else {
+                self.columns.visible_names().collect()
+            };
+            for (display_idx, name) in names.into_iter().enumerate() {
+                let Some(col_idx) = schema.columns.iter().position(|c| c.name == name) else {
+                    continue; // 对账保证命中, 防御性跳过
+                };
+                let col = &schema.columns[col_idx];
+                let sampled = texts.measure(&"8".repeat(col.width_chars), FONT_SIZE) + COL_PAD;
+                // T4: 拖宽中的预览宽优先 (视图局部态, 抬起才进列配置)
+                let w = match self.col_w_drag.get() {
+                    Some(d) if d.schema_idx == col_idx => d.preview_w,
+                    _ => self.columns.width_of(name, sampled),
+                };
                 total_w += w;
                 if x + w <= text_x {
                     x += w;
@@ -1345,6 +1795,15 @@ impl Widget for LogView {
                 }
                 cols.push((x, w, col));
                 spans.push((x, x + w, col_idx));
+                hgeom.push(HeaderSpan {
+                    x0: x,
+                    x1: x + w,
+                    // 命中/hover 用可见右缘 (评审 B2): 右缘截断列钉在 text_right,
+                    // 否则手柄热区在屏外, 视觉边缘点不中
+                    handle_x: (x + w).min(text_right),
+                    schema_idx: col_idx,
+                    display_idx,
+                });
                 x += w;
             }
             if total_w > self.max_seen.get() {
@@ -1381,9 +1840,63 @@ impl Widget for LogView {
                 header_line(&th),
                 0.0,
             );
+            // 手柄 hover 高亮 (T3/D8 发现性): 列**可见**右缘 accent 竖线
+            // (与命中同源用 handle_x —— 评审 B2: 截断列画在屏外等于没反馈)
+            for hs in &hgeom {
+                if self.hover_handle.get() == Some(hs.schema_idx) {
+                    rects.push_rect(
+                        Rect::from_xywh(hs.handle_x - 1.0, hy, 2.0, HEADER_H),
+                        th.accent(),
+                        0.0,
+                    );
+                }
+            }
+            // 换位插入位指示 (T4/D2 最小可辨): 缝隙处 accent 2px 竖线
+            if let Some((_, gap)) = self.col_move_drag.get() {
+                let gx = if hgeom.is_empty() {
+                    text_x
+                } else {
+                    let lead = hgeom[0].display_idx;
+                    match gap.saturating_sub(lead) {
+                        0 => hgeom[0].x0,
+                        i if i >= hgeom.len() => hgeom[hgeom.len() - 1].x1,
+                        i => hgeom[i].x0,
+                    }
+                };
+                rects.push_rect(
+                    Rect::from_xywh(gx - 1.0, hy, 2.0, HEADER_H),
+                    th.accent(),
+                    0.0,
+                );
+            }
+            // 「列…」按钮 (T3/D3): 固定表头右角, 不随 x_offset; hit rect 4px 内垫
+            // (export_hit_rect 同款垫法), paint 写 event 读。
+            let btn_w = texts.measure(COLS_BTN_LABEL, FONT_SIZE);
+            let btn_x = text_right - btn_w - 8.0;
+            let btn_color = if self.hover_cols_btn.get() {
+                th.accent()
+            } else {
+                th.text_secondary()
+            };
+            fit_push(
+                texts,
+                COLS_BTN_LABEL,
+                btn_w + 1.0,
+                btn_x,
+                hy + baseline_off,
+                FONT_SIZE,
+                btn_color,
+            );
+            self.cols_btn_rect
+                .set(Rect::from_xywh(btn_x - 4.0, hy, btn_w + 8.0, HEADER_H));
         }
         // M4: 列区间入缓存 (非表格模式 = 空, 顺带清掉切模式前的陈旧缓存)
         self.col_spans.replace(spans);
+        // T3: 表头几何同批入缓存; 非表格清按钮矩形 (防陈旧命中)
+        self.header_geom.replace(hgeom);
+        if !table {
+            self.cols_btn_rect.set(Rect::default());
+        }
 
         // 可见行窗口: 唯一有渲染成本的部分, 与文件大小无关
         let rows_top = area.origin.y + chrome_top;
@@ -1416,6 +1929,55 @@ impl Widget for LogView {
                 th.text_secondary(),
             );
         }
+        // merge-timeline 腿一 T3: 合并三栏表头 (时间|源|消息) —— 必须在行裁剪区
+        // **外** (裁剪只护行区; 表头画进裁剪区会被整片裁掉 = 永远看不见)。
+        // 固定三栏, T3 不做横向滚动/列管理 (列配置三件套在合并视图的形态待 T4 并集列)。
+        if self.merge_active {
+            let hy = area.origin.y;
+            rects.push_rect(
+                Rect::from_xywh(area.origin.x, hy, area.size.width, HEADER_H - 1.0),
+                th.surface_variant(),
+                0.0,
+            );
+            let time_w = texts.measure("00:00:00.000", AUX_FONT_SIZE) + 16.0;
+            // 源列宽 = 最宽源名 (字符数钳 [4,16]) 实测 + 垫 —— 源名截断到源列宽。
+            let src_chars = self
+                .merge_sources
+                .iter()
+                .map(|(n, _)| n.chars().count())
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 16);
+            let src_w = texts.measure(&"8".repeat(src_chars), AUX_FONT_SIZE) + 16.0;
+            let mut hx = text_x;
+            for (label, w) in [("时间", time_w), ("源", src_w)] {
+                fit_push(
+                    texts,
+                    label,
+                    w,
+                    hx,
+                    hy + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
+                );
+                hx += w;
+            }
+            fit_push(
+                texts,
+                "消息",
+                (text_right - hx).max(0.0),
+                hx,
+                hy + aux_baseline_off,
+                AUX_FONT_SIZE,
+                th.text_secondary(),
+            );
+            rects.push_rect(
+                Rect::from_xywh(area.origin.x, hy + HEADER_H - 1.0, area.size.width, 1.0),
+                header_line(&th),
+                0.0,
+            );
+        }
+
         // 裁剪: 行内容不溢出到表头/底栏
         let clip = Rect::from_xywh(area.origin.x, rows_top, area.size.width, list_h);
         rects.push_clip(clip);
@@ -1435,124 +1997,116 @@ impl Widget for LogView {
             // → rel_y = (j - top_row) * ROW_HEIGHT; 绝对 y = rows_top + rel_y
             rows_top + (j as f64 - self.top_row) as f32 * ROW_HEIGHT
         };
-        for block in expand_block_rects(
-            first,
-            scan_limit,
-            row_y,
-            |j| self.line_at(j).1 > 0,
-            area.origin.x,
-            area.size.width - SCROLLBAR_W,
-        ) {
-            rects.push_rect(block, expand_block_bg(self.theme), 0.0);
-        }
-        let mut i = first;
-        loop {
-            let y = row_y(i);
-            // 行顶部超出可见区底部 → 停止
-            if y >= rows_bottom || i >= count {
-                break;
-            }
-            // 行完全在可见区上方 → 跳过 (滚动时首行可能部分溢出)
-            if y + ROW_HEIGHT <= rows_top {
-                i += 1;
-                continue;
-            }
-            // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
-            // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
-            // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
-            // → 命中行底 (hit_row_bg, 弱一档) → 选中 (底色 + 左侧 3px 强调条)
-            // → hover (永画, 压过命中行底 —— 「指针现在在哪」必须盖过「搜索留下的痕迹」)
-            let row_rect =
-                Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
-            let (line_no, sub_off) = self.line_at(i);
-            let is_sub_row = sub_off > 0;
-            // 展开块底色已在上面整层铺完 (2026-09-13): 子行原先与真实行长得一模一样
-            // (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
-            // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
-            if table && i % 2 == 1 && !is_sub_row {
-                // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
-                // 交替条纹会把它切碎、语义又糊回去。
-                rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
-            }
-            // **三态不是互斥关系** (2026-09-14 实机 M0 P10): 原先
-            // `if selected && !has_text_sel {…} else if hover {…}` 有两重压制 ——
-            // ① 有文本选区时选中行的底与左 accent 竖条一起消失;
-            // ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
-            // 修复 = 各自独立: 选中行**永画**, hover **永画**, 文本选区照旧只画区间带。
-            //
-            // 画序 (2026-09-14 实机 M0 P11): 命中行底**先**画, hover **后**画 ——
-            // 命中行是「搜索留下的痕迹」, hover 是「指针现在在哪」, 后者必须压过前者。
-            // 原先把命中行底画在 hover 之后且同用 `th.selection()`, 命中行上 hover 无反馈。
-            if table {
-                if let Some(hits) = &self.search_hits {
-                    if hits.binary_search(&line_no).is_ok() {
-                        rects.push_rect(
-                            Rect::from_xywh(
-                                area.origin.x,
-                                y,
-                                area.size.width - SCROLLBAR_W,
-                                ROW_HEIGHT,
-                            ),
-                            hit_row_bg(self.theme),
-                            0.0,
-                        );
-                    }
+        // merge-timeline 腿一 T3: 合并工作区的行循环 (时间|源|消息三栏) ——
+        // 单文件行循环整体跳过; 行底色/选中/hover/书签的视觉层级与单文件同款,
+        // y 映射复用同一个 row_y 闭包 (S1 单点纪律)。
+        if self.merge_active {
+            let time_w = texts.measure("00:00:00.000", AUX_FONT_SIZE) + 16.0;
+            let src_chars = self
+                .merge_sources
+                .iter()
+                .map(|(n, _)| n.chars().count())
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 16);
+            let src_w = texts.measure(&"8".repeat(src_chars), AUX_FONT_SIZE) + 16.0;
+            // 消息列 x (循环不变量): paint 缓存给 event 侧划选区内容域 (T6)。
+            let msg_x = text_x + time_w + src_w;
+            self.merge_msg_x.set(msg_x);
+            let msg_w = (text_right - msg_x).max(0.0);
+            for (i, rv) in self.merge_rows.iter().enumerate() {
+                let pos = self.merge_rows_from + i as u64;
+                let y = row_y(pos);
+                if y >= rows_bottom {
+                    break;
                 }
-            }
-            if i == self.selected && self.focused {
-                rects.push_rect(row_rect, th.selection(), 0.0);
-                rects.push_rect(
-                    Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
-                    th.accent(),
-                    0.0,
+                if y + ROW_HEIGHT <= rows_top {
+                    continue;
+                }
+                let row_rect =
+                    Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
+                // 选中 (底色 + 左 accent 条) → hover —— 层级与单文件一致。
+                if pos == self.selected && self.focused {
+                    rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
+                        th.accent(),
+                        0.0,
+                    );
+                } else if pos == self.hover_row.get() {
+                    rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
+                }
+                // 书签 (pack 键): gutter 内圆点 (bookmark_color 同 token)。
+                let key = danqing_log::merge_view::pack_key(rv.src, rv.line);
+                if self.merge_bookmarks.contains(&key) {
+                    let bx = area.origin.x + gutter_w / 2.0 - 3.0;
+                    rects.push_rect(
+                        Rect::from_xywh(bx, y + ROW_HEIGHT / 2.0 - 3.0, 6.0, 6.0),
+                        bookmark_color(self.theme),
+                        3.0,
+                    );
+                }
+                // gutter 行号 = 合并位置 (1-based), 右对齐同单文件口径。
+                let no = format!("{}", pos + 1);
+                let nw = texts.measure(&no, AUX_FONT_SIZE);
+                fit_push(
+                    texts,
+                    &no,
+                    gutter_w - 8.0,
+                    area.origin.x + gutter_w - nw - 6.0,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
                 );
-            }
-            if i == self.hover_row.get() {
-                // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
-                // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
-                // 不再与选中行互斥 —— 拖框选经过选中行时 hover 仍可见。
-                rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
-            }
-            // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
-            // 与行选中可同存 —— 单元格是更具体的选中, 画在上层)
-            if let Some((srow, scol)) = self.selected_cell {
-                if srow == i && !is_sub_row && self.focused {
-                    let spans = self.col_spans.borrow();
-                    if let Some((x0, x1, _)) = spans.iter().find(|(_, _, ci)| *ci == scol) {
-                        let hx0 = x0.max(text_x);
-                        let hx1 = x1.min(text_right);
-                        if hx1 > hx0 {
-                            let cell_rect =
-                                Rect::from_xywh(hx0, y + 2.0, hx1 - hx0, ROW_HEIGHT - 4.0);
-                            // 两笔: 底色 (与行选中同 token, 见 cell_highlight_colors)
-                            // + 描边 (唯一指出「具体哪一格」的一笔, 按钮焦点环同款原语)
-                            let (fill, border) = cell_highlight_colors(&th);
-                            rects.push_rect(cell_rect, fill, 2.0);
-                            rects.push_rounded_border(cell_rect, border, 2.0, 1.5);
-                        }
-                    }
-                }
-            }
-            // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
-            if is_sub_row {
-                if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1)) {
-                    let indent = (row.depth as f32 - 1.0) * 16.0;
-                    let s = sub_row_text(row);
-                    let draw_x = text_x + indent;
-                    if draw_x < text_right {
-                        // 选区命中几何 (M3): 串由 `sub_row_text` 单点构造, 命中/渲染/
-                        // 复制三源一体; 子行不参与水平滚动 (无 x_off) → 内容域起点
-                        // = indent, hit_text 对子行相应不加 x_offset (D3 分叉)
-                        let geom =
-                            measure_row_geom(texts, &s, 0, indent, text_right - text_x + 64.0);
-                        self.row_geom.borrow_mut().insert(i, geom);
-                        // 文本选区区间 (M3): 与 raw 行同法 (measure 前缀→矩形),
-                        // 唯二差异 = 串是子行串、无 x_off (子行不水平滚动)
-                        if let Some(sel) = self.visible_selection() {
-                            if let Some((b0, b1)) = selection::row_slice(sel, i, &s) {
-                                let x0 = (draw_x + texts.measure(&s[..b0], FONT_SIZE)).max(text_x);
-                                let x1 =
-                                    (draw_x + texts.measure(&s[..b1], FONT_SIZE)).min(text_right);
+                // 三栏: 时间 | 源 | 消息。
+                let ts_text = danqing_log::merge_view::fmt_time_of_day(rv.ts);
+                fit_push(
+                    texts,
+                    &ts_text,
+                    time_w,
+                    text_x,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    th.text_secondary(),
+                );
+                let (src_name, _) = &self.merge_sources[rv.src as usize];
+                // D11 (CP2-A): 源名按源着色 —— `source_palette` 索引 = 源序号,
+                // 一眼分源 (LogViewPlus/logmerge 全部按源着色, 合并视图可读性核心)。
+                // 色板上限 8 与 `merge_view::MAX_SOURCES` 同值, 序号不越界。
+                let src_color = th.source_palette()[rv.src as usize];
+                fit_push(
+                    texts,
+                    src_name,
+                    (src_w - 8.0).max(0.0),
+                    text_x + time_w,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    src_color,
+                );
+                // 消息列 (rv.text 已在 window() 解码+trim_end —— 选区字节同口径)。
+                fit_push(
+                    texts,
+                    &rv.text,
+                    msg_w,
+                    msg_x,
+                    y + baseline_off,
+                    FONT_SIZE,
+                    th.text_primary(),
+                );
+                // 选区命中几何 (腿 E/T6): 内容域 = 消息列 (x 起自 0, 无横滚);
+                // 与单文件同一 measure_row_geom (event 无 TextBatch, 靠缓存同源)。
+                let geom = measure_row_geom(texts, &rv.text, 0, 0.0, msg_w);
+                self.row_geom.borrow_mut().insert(pos, geom);
+                // 选区带: 单行选区 + (源,行) 键比对; 持焦才画 (与单文件
+                // visible_selection 同纪律 —— 看得见与复制得到同一个因)。
+                if self.focused {
+                    if let Some(sel) = &self.merge_sel {
+                        if sel.src == rv.src && sel.line == rv.line {
+                            if let Some((b0, b1)) = sel.range() {
+                                let x0 = (msg_x + texts.measure(&rv.text[..b0], FONT_SIZE))
+                                    .min(text_right);
+                                let x1 = (msg_x + texts.measure(&rv.text[..b1], FONT_SIZE))
+                                    .min(text_right);
                                 if x1 > x0 {
                                     rects.push_rect(
                                         Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
@@ -1562,213 +2116,352 @@ impl Widget for LogView {
                                 }
                             }
                         }
-                        fit_push(
-                            texts,
-                            &s,
-                            text_right - draw_x,
-                            draw_x,
-                            y + baseline_off,
-                            FONT_SIZE,
-                            th.text_secondary(),
-                        );
                     }
                 }
-                i += 1;
-                continue;
             }
-            // 行号 (文件真实行号; 书签行金色)
-            let no = format!("{}", line_no + 1);
-            let no_w = texts.measure(&no, AUX_FONT_SIZE);
-            let bookmarked = self.bookmarks.contains(&line_no);
-            if bookmarked {
-                // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
-                // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
-                // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
-                // 两条都可见; 表格模式的 +/- 在 [0,EXPAND_W) 内, 不撞。
-                rects.push_rect(
-                    Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
-                    bookmark_color(self.theme),
-                    0.0,
-                );
+        } else {
+            for block in expand_block_rects(
+                first,
+                scan_limit,
+                row_y,
+                |j| self.line_at(j).1 > 0,
+                area.origin.x,
+                area.size.width - SCROLLBAR_W,
+            ) {
+                rects.push_rect(block, expand_block_bg(self.theme), 0.0);
             }
-            let no_color = if bookmarked {
-                bookmark_color(self.theme)
-            } else {
-                th.text_secondary()
-            };
-            texts.push_text(
-                &no,
-                area.origin.x + EXPAND_W + gutter_w - 10.0 - no_w,
-                y + aux_baseline_off,
-                AUX_FONT_SIZE,
-                no_color,
-            );
-            let raw = file.line(line_no);
-            // 原始模式: 命中行内区间高亮 (仅命中行跑 regex, 逐可见行恒定成本;
-            // 前缀宽度测量与行显示同一解码路径, 宽度一致)
-            if !table {
-                if let (Some(re), Some(hits)) = (&self.search_re, &self.search_hits) {
-                    if hits.binary_search(&line_no).is_ok() {
-                        for m in re.find_iter(raw) {
-                            let px0 = texts.measure(
-                                &danqing::encoding::decode_line(self.encoding, &raw[..m.start()]),
-                                FONT_SIZE,
+            let mut i = first;
+            loop {
+                let y = row_y(i);
+                // 行顶部超出可见区底部 → 停止
+                if y >= rows_bottom || i >= count {
+                    break;
+                }
+                // 行完全在可见区上方 → 跳过 (滚动时首行可能部分溢出)
+                if y + ROW_HEIGHT <= rows_top {
+                    i += 1;
+                    continue;
+                }
+                // 行底色层叠: 斑马纹 (仅表格模式 —— 宽表横向跟踪不串行;
+                // 原始模式整行是连续文本, 斑马打断阅读, klogg 基准无斑马;
+                // 奇数显示行, 绝对行号奇偶, 滚动时不游动)
+                // → 命中行底 (hit_row_bg, 弱一档) → 选中 (底色 + 左侧 3px 强调条)
+                // → hover (永画, 压过命中行底 —— 「指针现在在哪」必须盖过「搜索留下的痕迹」)
+                let row_rect =
+                    Rect::from_xywh(area.origin.x, y, area.size.width - SCROLLBAR_W, ROW_HEIGHT);
+                let (line_no, sub_off) = self.line_at(i);
+                let is_sub_row = sub_off > 0;
+                // 展开块底色已在上面整层铺完 (2026-09-13): 子行原先与真实行长得一模一样
+                // (只差没有行号), 用户分不清「这坨是第 1 行展开的」还是「又是几行日志」。
+                // 铺在最下层, 选中/hover 仍能压在上面 (那两态必须保持可见)。
+                if table && i % 2 == 1 && !is_sub_row {
+                    // 斑马纹**不盖展开块**: 块要靠**单一底色**读作「一整块」,
+                    // 交替条纹会把它切碎、语义又糊回去。
+                    rects.push_rect(row_rect, row_band_bg(self.theme), 0.0);
+                }
+                // **三态不是互斥关系** (2026-09-14 实机 M0 P10): 原先
+                // `if selected && !has_text_sel {…} else if hover {…}` 有两重压制 ——
+                // ① 有文本选区时选中行的底与左 accent 竖条一起消失;
+                // ② hover 与选中行共用 else-if, 选中行上 hover 也熄灭。
+                // 修复 = 各自独立: 选中行**永画**, hover **永画**, 文本选区照旧只画区间带。
+                //
+                // 画序 (2026-09-14 实机 M0 P11): 命中行底**先**画, hover **后**画 ——
+                // 命中行是「搜索留下的痕迹」, hover 是「指针现在在哪」, 后者必须压过前者。
+                // 原先把命中行底画在 hover 之后且同用 `th.selection()`, 命中行上 hover 无反馈。
+                if table {
+                    if let Some(hits) = &self.search_hits {
+                        if hits.binary_search(&line_no).is_ok() {
+                            rects.push_rect(
+                                Rect::from_xywh(
+                                    area.origin.x,
+                                    y,
+                                    area.size.width - SCROLLBAR_W,
+                                    ROW_HEIGHT,
+                                ),
+                                hit_row_bg(self.theme),
+                                0.0,
                             );
-                            let px1 = px0
-                                + texts.measure(
+                        }
+                    }
+                }
+                if i == self.selected && self.focused {
+                    rects.push_rect(row_rect, th.selection(), 0.0);
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x, y, 3.0, ROW_HEIGHT),
+                        th.accent(),
+                        0.0,
+                    );
+                }
+                if i == self.hover_row.get() {
+                    // hover 走**独立通道**: 与斑马同色会让「悬停奇数行看不出、
+                    // 悬停偶数行三行连片」(用户实机报)。见 `row_hover_bg`。
+                    // 不再与选中行互斥 —— 拖框选经过选中行时 hover 仍可见。
+                    rects.push_rect(row_rect, row_hover_bg(self.theme), 0.0);
+                }
+                // 单元格选中高亮 (M4): 列区间的可见部分 (随 paint 缓存, 水平滚动自然跟随;
+                // 与行选中可同存 —— 单元格是更具体的选中, 画在上层)
+                if let Some((srow, scol)) = self.selected_cell {
+                    if srow == i && !is_sub_row && self.focused {
+                        let spans = self.col_spans.borrow();
+                        if let Some((x0, x1, _)) = spans.iter().find(|(_, _, ci)| *ci == scol) {
+                            let hx0 = x0.max(text_x);
+                            let hx1 = x1.min(text_right);
+                            if hx1 > hx0 {
+                                let cell_rect =
+                                    Rect::from_xywh(hx0, y + 2.0, hx1 - hx0, ROW_HEIGHT - 4.0);
+                                // 两笔: 底色 (与行选中同 token, 见 cell_highlight_colors)
+                                // + 描边 (唯一指出「具体哪一格」的一笔, 按钮焦点环同款原语)
+                                let (fill, border) = cell_highlight_colors(&th);
+                                rects.push_rect(cell_rect, fill, 2.0);
+                                rects.push_rounded_border(cell_rect, border, 2.0, 1.5);
+                            }
+                        }
+                    }
+                }
+                // 展开子行: 缩进路径段 = 值, 无行号/列/搜索高亮
+                if is_sub_row {
+                    if let Some(row) = self.sub_rows.get(&line_no).and_then(|v| v.get(sub_off - 1))
+                    {
+                        let indent = (row.depth as f32 - 1.0) * 16.0;
+                        let s = sub_row_text(row);
+                        let draw_x = text_x + indent;
+                        if draw_x < text_right {
+                            // 选区命中几何 (M3): 串由 `sub_row_text` 单点构造, 命中/渲染/
+                            // 复制三源一体; 子行不参与水平滚动 (无 x_off) → 内容域起点
+                            // = indent, hit_text 对子行相应不加 x_offset (D3 分叉)
+                            let geom =
+                                measure_row_geom(texts, &s, 0, indent, text_right - text_x + 64.0);
+                            self.row_geom.borrow_mut().insert(i, geom);
+                            // 文本选区区间 (M3): 与 raw 行同法 (measure 前缀→矩形),
+                            // 唯二差异 = 串是子行串、无 x_off (子行不水平滚动)
+                            if let Some(sel) = self.visible_selection() {
+                                if let Some((b0, b1)) = selection::row_slice(sel, i, &s) {
+                                    let x0 =
+                                        (draw_x + texts.measure(&s[..b0], FONT_SIZE)).max(text_x);
+                                    let x1 = (draw_x + texts.measure(&s[..b1], FONT_SIZE))
+                                        .min(text_right);
+                                    if x1 > x0 {
+                                        rects.push_rect(
+                                            Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                            th.selection(),
+                                            2.0,
+                                        );
+                                    }
+                                }
+                            }
+                            fit_push(
+                                texts,
+                                &s,
+                                text_right - draw_x,
+                                draw_x,
+                                y + baseline_off,
+                                FONT_SIZE,
+                                th.text_secondary(),
+                            );
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                // 行号 (文件真实行号; 书签行金色)
+                let no = format!("{}", line_no + 1);
+                let no_w = texts.measure(&no, AUX_FONT_SIZE);
+                let bookmarked = self.bookmarks.contains(&line_no);
+                if bookmarked {
+                    // 书签竖条: 行号槽左缘 3px 满行高。金色行号单兵作战时扫屏不可见
+                    // (用户实机「这功能体现在哪」), 竖条成列才能用余光扫到。
+                    // x=EXPAND_W: 与 x=0 的选中 accent 竖条错位, 选中+书签同存时
+                    // 两条都可见; 表格模式的 +/- 在 [0,EXPAND_W) 内, 不撞。
+                    rects.push_rect(
+                        Rect::from_xywh(area.origin.x + EXPAND_W, y, 3.0, ROW_HEIGHT),
+                        bookmark_color(self.theme),
+                        0.0,
+                    );
+                }
+                let no_color = if bookmarked {
+                    bookmark_color(self.theme)
+                } else {
+                    th.text_secondary()
+                };
+                texts.push_text(
+                    &no,
+                    area.origin.x + EXPAND_W + gutter_w - 10.0 - no_w,
+                    y + aux_baseline_off,
+                    AUX_FONT_SIZE,
+                    no_color,
+                );
+                let raw = file.line(line_no);
+                // 原始模式: 命中行内区间高亮 (仅命中行跑 regex, 逐可见行恒定成本;
+                // 前缀宽度测量与行显示同一解码路径, 宽度一致)
+                if !table {
+                    if let (Some(re), Some(hits)) = (&self.search_re, &self.search_hits) {
+                        if hits.binary_search(&line_no).is_ok() {
+                            for m in re.find_iter(raw) {
+                                let px0 = texts.measure(
                                     &danqing::encoding::decode_line(
                                         self.encoding,
-                                        &raw[m.start()..m.end()],
+                                        &raw[..m.start()],
                                     ),
                                     FONT_SIZE,
                                 );
-                            let x0 = (text_x + px0 - x_off).max(text_x);
-                            let x1 = (text_x + px1 - x_off).min(text_right);
+                                let px1 = px0
+                                    + texts.measure(
+                                        &danqing::encoding::decode_line(
+                                            self.encoding,
+                                            &raw[m.start()..m.end()],
+                                        ),
+                                        FONT_SIZE,
+                                    );
+                                let x0 = (text_x + px0 - x_off).max(text_x);
+                                let x1 = (text_x + px1 - x_off).min(text_right);
+                                if x1 > x0 {
+                                    rects.push_rect(
+                                        Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
+                                        th.selection(),
+                                        2.0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if table {
+                    // 单元格: 逐可见行 serde_json parse (真 parser, 消除 memmem 内嵌误判),
+                    // 取顶层字段紧凑显示; level 列按级别着色;
+                    // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
+                    let parsed = jsonl::parse_line(raw);
+                    // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
+                    // (字体是 GB2312 子集, 无 +/- 几何形, 用 ASCII +- 保可用)
+                    let expanded_here = self.expanded.is_expanded(line_no);
+                    let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
+                    if expanded_here || expandable {
+                        // 字符见 `GLYPH_EXPANDED` / `GLYPH_COLLAPSED` 上的说明
+                        // (ASCII 约束是硬要求, 不是风格)。
+                        let glyph = if expanded_here {
+                            GLYPH_EXPANDED
+                        } else {
+                            GLYPH_COLLAPSED
+                        };
+                        // P3 的另一半: **可点却无任何 hover 指示**。悬停时换 accent 色。
+                        // 只在真有 glyph 的行点亮 —— `hover_expand` 只说明指针在展开列里,
+                        // 「这一行画不画 glyph」是 paint 才知道的事 (见字段注释)。
+                        let hot = self.hover_expand.get() && i == self.hover_row.get();
+                        texts.push_text(
+                            glyph,
+                            Self::expand_glyph_x(area),
+                            y + row_baseline_off,
+                            EXPAND_FONT_SIZE,
+                            if hot { th.accent() } else { th.text_primary() },
+                        );
+                    }
+                    for (cx, cw, col) in &cols {
+                        let Some(v) = parsed
+                            .as_ref()
+                            .and_then(|p| p.get(col.name.as_str()))
+                            .map(jsonl::cell_display)
+                        else {
+                            continue;
+                        };
+                        let color = cell_color(&col.name, &v, &th);
+                        let cell_x = cx + 8.0;
+                        let left_cut = (text_x - cell_x).max(0.0);
+                        let right_edge = (cx + cw - 8.0).min(text_right);
+                        // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
+                        if left_cut <= 0.0 && is_numeric(&v) {
+                            let (shown, truncated) =
+                                danqing::fit::fit_line(&v, right_edge - cell_x, |t| {
+                                    texts.measure(t, FONT_SIZE)
+                                });
+                            if !truncated {
+                                let w = texts.measure(shown, FONT_SIZE);
+                                texts.push_text(
+                                    shown,
+                                    right_edge - w,
+                                    y + baseline_off,
+                                    FONT_SIZE,
+                                    color,
+                                );
+                                continue;
+                            }
+                        }
+                        let (shown, sub) = danqing::fit::scroll_trim(&v, left_cut, |t| {
+                            texts.measure(t, FONT_SIZE)
+                        });
+                        let draw_x = cell_x + left_cut - sub;
+                        let max_w = right_edge - draw_x;
+                        if max_w > 0.0 {
+                            fit_push(
+                                texts,
+                                shown,
+                                max_w,
+                                draw_x,
+                                y + baseline_off,
+                                FONT_SIZE,
+                                color,
+                            );
+                        }
+                    }
+                } else {
+                    // 原始模式: 整行级别着色 + 水平左截断 (scroll_trim) + 右截断省略;
+                    // 行内容宽度边测边长 (max_seen, 水平滚动范围估计)
+                    let raw = file.line_lossy(line_no);
+                    let color = level_color(raw.as_bytes(), &th);
+                    let full_w = texts.measure(&raw, FONT_SIZE);
+                    if full_w > self.max_seen.get() {
+                        self.max_seen.set(full_w);
+                    }
+                    let (shown, sub) =
+                        danqing::fit::scroll_trim(&raw, x_off, |t| texts.measure(t, FONT_SIZE));
+                    // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
+                    // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
+                    let base = raw.len() - shown.len();
+                    let geom =
+                        measure_row_geom(texts, &raw, base, x_off - sub, x_off + text_w + 64.0);
+                    self.row_geom.borrow_mut().insert(i, geom);
+                    // 文本选区区间 (T3): 与命中高亮同法 (measure 前缀→矩形);
+                    // 在循环末尾才画 = 与同批命中矩形交叠时选区优先
+                    if let Some(sel) = self.visible_selection() {
+                        if let Some((b0, b1)) = selection::row_slice(sel, i, &raw) {
+                            let x0 =
+                                (text_x + texts.measure(&raw[..b0], FONT_SIZE) - x_off).max(text_x);
+                            // 整行选中时复用刚算过的 full_w, 省一次 O(行长) 测量
+                            let w1 = if b1 == raw.len() {
+                                full_w
+                            } else {
+                                texts.measure(&raw[..b1], FONT_SIZE)
+                            };
+                            let x1 = (text_x + w1 - x_off).min(text_right);
                             if x1 > x0 {
+                                // T9 (2026-09-14 实机 M0 P28): 超复制上限的选区带
+                                // **拖选进行中即**换警示色 —— 原先只在 Ctrl+C 时才报
+                                // (view.rs:1621), 用户拖到一半不知道已经越界。
+                                let sel_color = if self.selection_over_limit() {
+                                    th.danger()
+                                } else {
+                                    th.selection()
+                                };
                                 rects.push_rect(
                                     Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                    th.selection(),
+                                    sel_color,
                                     2.0,
                                 );
                             }
                         }
                     }
-                }
-            }
-            if table {
-                // 单元格: 逐可见行 serde_json parse (真 parser, 消除 memmem 内嵌误判),
-                // 取顶层字段紧凑显示; level 列按级别着色;
-                // 水平滚动: 左缘切断走 scroll_trim (亚字符平滑)
-                let parsed = jsonl::parse_line(raw);
-                // 展开开关: + 可展开未展开 / - 已展开 (表格模式专属, 独立展开区)
-                // (字体是 GB2312 子集, 无 +/- 几何形, 用 ASCII +- 保可用)
-                let expanded_here = self.expanded.is_expanded(line_no);
-                let expandable = parsed.as_ref().is_some_and(jsonl::is_expandable);
-                if expanded_here || expandable {
-                    // 字符见 `GLYPH_EXPANDED` / `GLYPH_COLLAPSED` 上的说明
-                    // (ASCII 约束是硬要求, 不是风格)。
-                    let glyph = if expanded_here {
-                        GLYPH_EXPANDED
-                    } else {
-                        GLYPH_COLLAPSED
-                    };
-                    // P3 的另一半: **可点却无任何 hover 指示**。悬停时换 accent 色。
-                    // 只在真有 glyph 的行点亮 —— `hover_expand` 只说明指针在展开列里,
-                    // 「这一行画不画 glyph」是 paint 才知道的事 (见字段注释)。
-                    let hot = self.hover_expand.get() && i == self.hover_row.get();
-                    texts.push_text(
-                        glyph,
-                        Self::expand_glyph_x(area),
-                        y + row_baseline_off,
-                        EXPAND_FONT_SIZE,
-                        if hot { th.accent() } else { th.text_primary() },
+                    let draw_x = text_x - sub;
+                    fit_push(
+                        texts,
+                        shown,
+                        text_right - draw_x,
+                        draw_x,
+                        y + baseline_off,
+                        FONT_SIZE,
+                        color,
                     );
                 }
-                for (cx, cw, col) in &cols {
-                    let Some(v) = parsed
-                        .as_ref()
-                        .and_then(|p| p.get(col.name.as_str()))
-                        .map(jsonl::cell_display)
-                    else {
-                        continue;
-                    };
-                    let color = cell_color(&col.name, &v, &th);
-                    let cell_x = cx + 8.0;
-                    let left_cut = (text_x - cell_x).max(0.0);
-                    let right_edge = (cx + cw - 8.0).min(text_right);
-                    // 数字右对齐 (量级可一眼比较); 列左缘被切断或文本截断时回落左对齐
-                    if left_cut <= 0.0 && is_numeric(&v) {
-                        let (shown, truncated) =
-                            danqing::fit::fit_line(&v, right_edge - cell_x, |t| {
-                                texts.measure(t, FONT_SIZE)
-                            });
-                        if !truncated {
-                            let w = texts.measure(shown, FONT_SIZE);
-                            texts.push_text(
-                                shown,
-                                right_edge - w,
-                                y + baseline_off,
-                                FONT_SIZE,
-                                color,
-                            );
-                            continue;
-                        }
-                    }
-                    let (shown, sub) =
-                        danqing::fit::scroll_trim(&v, left_cut, |t| texts.measure(t, FONT_SIZE));
-                    let draw_x = cell_x + left_cut - sub;
-                    let max_w = right_edge - draw_x;
-                    if max_w > 0.0 {
-                        fit_push(
-                            texts,
-                            shown,
-                            max_w,
-                            draw_x,
-                            y + baseline_off,
-                            FONT_SIZE,
-                            color,
-                        );
-                    }
-                }
-            } else {
-                // 原始模式: 整行级别着色 + 水平左截断 (scroll_trim) + 右截断省略;
-                // 行内容宽度边测边长 (max_seen, 水平滚动范围估计)
-                let raw = file.line_lossy(line_no);
-                let color = level_color(raw.as_bytes(), &th);
-                let full_w = texts.measure(&raw, FONT_SIZE);
-                if full_w > self.max_seen.get() {
-                    self.max_seen.set(full_w);
-                }
-                let (shown, sub) =
-                    danqing::fit::scroll_trim(&raw, x_off, |t| texts.measure(t, FONT_SIZE));
-                // 选区命中几何 (T3): 起点宽 = x_off - sub (scroll_trim 已算),
-                // 免一次 O(行长) 前缀测量; event 无 TextBatch, 靠这份缓存同源
-                let base = raw.len() - shown.len();
-                let geom = measure_row_geom(texts, &raw, base, x_off - sub, x_off + text_w + 64.0);
-                self.row_geom.borrow_mut().insert(i, geom);
-                // 文本选区区间 (T3): 与命中高亮同法 (measure 前缀→矩形);
-                // 在循环末尾才画 = 与同批命中矩形交叠时选区优先
-                if let Some(sel) = self.visible_selection() {
-                    if let Some((b0, b1)) = selection::row_slice(sel, i, &raw) {
-                        let x0 =
-                            (text_x + texts.measure(&raw[..b0], FONT_SIZE) - x_off).max(text_x);
-                        // 整行选中时复用刚算过的 full_w, 省一次 O(行长) 测量
-                        let w1 = if b1 == raw.len() {
-                            full_w
-                        } else {
-                            texts.measure(&raw[..b1], FONT_SIZE)
-                        };
-                        let x1 = (text_x + w1 - x_off).min(text_right);
-                        if x1 > x0 {
-                            // T9 (2026-09-14 实机 M0 P28): 超复制上限的选区带
-                            // **拖选进行中即**换警示色 —— 原先只在 Ctrl+C 时才报
-                            // (view.rs:1621), 用户拖到一半不知道已经越界。
-                            let sel_color = if self.selection_over_limit() {
-                                th.danger()
-                            } else {
-                                th.selection()
-                            };
-                            rects.push_rect(
-                                Rect::from_xywh(x0, y + 2.0, x1 - x0, ROW_HEIGHT - 4.0),
-                                sel_color,
-                                2.0,
-                            );
-                        }
-                    }
-                }
-                let draw_x = text_x - sub;
-                fit_push(
-                    texts,
-                    shown,
-                    text_right - draw_x,
-                    draw_x,
-                    y + baseline_off,
-                    FONT_SIZE,
-                    color,
-                );
+                i += 1;
             }
-            i += 1;
-        }
+        } // merge 分支收口 (腿一 T3: else 里是单文件行循环)
         rects.pop_clip();
         texts.pop_clip();
 
@@ -1820,14 +2513,11 @@ impl Widget for LogView {
         // M3 (2026-09-14 实机 M0 P27): notice 与常态信息**分通道** —— 原先整个
         // status 字符串一个颜色, 错误在视觉上不存在。
         //
-        // 三档取色: 警示 `danger()` / 提示 `text_primary()` / 常态 `text_secondary()`。
-        // 提示**不能**也用 `text_secondary()` —— 那就与常态同色, 等于没分通道
-        // (T11 的验收判据正是「同屏可辨」)。常态那一档不再随有无 notice 变化:
-        // 「降噪」既没有更暗的 token 可用, 又会让整行文字在提示出现时集体变一下。
-        let notice_color = self.notice.as_ref().map(|(_, kind)| match kind {
-            crate::NoticeKind::Warn => th.danger(),
-            crate::NoticeKind::Info => th.text_primary(),
-        });
+        // SPEC-notice-visibility D4 (2026-09-28): notice 呈现按 kind **分派** ——
+        // Warn 挪 toast 浮层 (视野内, 底栏不再画, 方案二无留痕); **Info 留底栏**,
+        // 加圆角色块衬底 (腿 B): 原先与常态信息只差一档文字色, 「扫到了也读不出
+        // 是给我的反馈」—— 色块与常态信息形成样式差。常态档不随有无 notice 变化
+        // (「降噪」既没有更暗的 token 可用, 又会让整行文字集体变一下)。
         texts.push_text(
             &self.status,
             area.origin.x + 10.0,
@@ -1841,15 +2531,18 @@ impl Widget for LogView {
                 th.text_secondary()
             },
         );
-        if let Some((notice_text, _)) = &self.notice {
+        if let Some((notice_text, crate::NoticeKind::Info)) = &self.notice {
             let status_w = texts.measure(&self.status, AUX_FONT_SIZE);
-            texts.push_text(
-                notice_text,
-                area.origin.x + 10.0 + status_w + 16.0,
-                sy,
-                AUX_FONT_SIZE,
-                notice_color.unwrap_or_else(|| th.text_primary()),
+            let nw = texts.measure(notice_text, AUX_FONT_SIZE);
+            let nx = area.origin.x + 10.0 + status_w + 16.0;
+            // 色块衬底: `surface_variant` 打底 (与 hover 块同 token 家族; 两主题
+            // 与底色都有台阶 —— 浅色 D1 修过, 暗色 1.25 淡台阶), 几何包住文本。
+            rects.push_rect(
+                Rect::from_xywh(nx - 6.0, status_y + 3.0, nw + 12.0, STATUS_HEIGHT - 6.0),
+                th.surface_variant(),
+                4.0,
             );
+            texts.push_text(notice_text, nx, sy, AUX_FONT_SIZE, th.text_primary());
         }
         // 设置入口 (S2): ⚙ 设置 — 位置计数左侧, hover 可辨
         let settings_label = "⚙ 设置";
@@ -1879,7 +2572,72 @@ impl Widget for LogView {
             self.has_update_hint,
             th.accent(),
         );
-        // 位置计数: 设置入口左侧 (空态无意义, 不画)
+        // 导出入口 (SPEC-v1x-export D7): 设置入口左侧; 作业态标签变「取消导出 N%」
+        // (同一按钮 = 取消, spec D2 单作业语义)。空态不画 (导出无对象)。
+        // 合并工作区不画 (腿一 T3: 合并时间线的导出口径随 T9 实测波再裁)。
+        let export_anchor_x = if self.has_file && !self.merge_active {
+            let export_w = texts.measure(&self.export_label, AUX_FONT_SIZE);
+            let export_x = settings_x - 16.0 - export_w;
+            self.export_btn_rect
+                .set(export_hit_rect(export_x, export_w, status_y));
+            let export_color = if self.export_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(
+                &self.export_label,
+                export_x,
+                sy,
+                AUX_FONT_SIZE,
+                export_color,
+            );
+            export_x
+        } else {
+            self.export_btn_rect.set(Rect::default());
+            settings_x
+        };
+        // 命名会话入口 (SPEC-v1x-workspace-sessions D5): 导出入口左侧;
+        // 空态不画 (Open Q3: 无文件不出入口)。
+        // 合并工作区**照画** (T8 翻案: 合并组会话载荷已接通 —— 保存带 merge
+        // 段, 应用重开源组重建合并, apply_session 有载荷分流)。
+        let sessions_anchor_x = if self.has_file {
+            let sw = texts.measure(SESSIONS_BTN_LABEL, AUX_FONT_SIZE);
+            let sx = export_anchor_x - 16.0 - sw;
+            self.sessions_btn_rect
+                .set(export_hit_rect(sx, sw, status_y));
+            let sessions_color = if self.sessions_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(SESSIONS_BTN_LABEL, sx, sy, AUX_FONT_SIZE, sessions_color);
+            sx
+        } else {
+            self.sessions_btn_rect.set(Rect::default());
+            export_anchor_x
+        };
+        // 合并入口 (merge-timeline T4, D6): 会话入口左侧; 空态不画 (合并以当前
+        // 文件为主源, 无主源无合并)。合并工作区**仍画** —— 它就是源管理弹层入口。
+        let merge_anchor_x = if self.has_file {
+            let mw = texts.measure(MERGE_BTN_LABEL, AUX_FONT_SIZE);
+            let mx = sessions_anchor_x - 16.0 - mw;
+            self.merge_btn_rect.set(export_hit_rect(mx, mw, status_y));
+            let merge_color = if self.merge_hover.get() {
+                th.text_primary()
+            } else {
+                th.text_secondary()
+            };
+            texts.push_text(MERGE_BTN_LABEL, mx, sy, AUX_FONT_SIZE, merge_color);
+            mx
+        } else {
+            self.merge_btn_rect.set(Rect::default());
+            sessions_anchor_x
+        };
+        // 位置计数: 合并/会话入口 (无则导出/设置入口) 左侧 (空态无意义, 不画);
+        // **放不下就不画** (评审 M11, Bar hint 家规): 窄窗下左缘钳制会把 pos 推
+        // 进「会话」钮带 —— 画序后画的 pos 压钮字 = 看得见行号点出会话, 与钮
+        // hit 带重叠即整条不画。
         let pos = if !self.has_file {
             String::new()
         } else if count == 0 {
@@ -1888,14 +2646,16 @@ impl Widget for LogView {
             format!("行 {}/{count}", self.selected + 1)
         };
         let pos_w = texts.measure(&pos, AUX_FONT_SIZE);
-        let pos_x = settings_x - 16.0 - pos_w;
-        texts.push_text(
-            &pos,
-            pos_x.max(area.origin.x + 10.0),
-            sy,
-            AUX_FONT_SIZE,
-            th.text_secondary(),
-        );
+        let pos_x = merge_anchor_x - 16.0 - pos_w;
+        if pos.is_empty() || pos_x >= area.origin.x + 10.0 {
+            texts.push_text(
+                &pos,
+                pos_x.max(area.origin.x + 10.0),
+                sy,
+                AUX_FONT_SIZE,
+                th.text_secondary(),
+            );
+        }
     }
 
     fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
@@ -1906,6 +2666,26 @@ impl Widget for LogView {
             Event::CursorMoved(position) => {
                 self.settings_hover
                     .set(self.settings_btn_rect.get().contains(*position));
+                self.export_hover
+                    .set(self.export_btn_rect.get().contains(*position));
+                self.sessions_hover
+                    .set(self.sessions_btn_rect.get().contains(*position));
+                self.merge_hover
+                    .set(self.merge_btn_rect.get().contains(*position));
+                // T3: 表头 hover (手柄/「列…」) —— 命中几何来自 paint 缓存 (D2)
+                let hhit = self.header_hit_at(area, *position);
+                self.hover_cols_btn
+                    .set(matches!(hhit, HeaderHit::ColsButton));
+                self.hover_handle.set(match hhit {
+                    HeaderHit::Handle(idx) => Some(idx),
+                    _ => None,
+                });
+                // T4: 表头手势跟手 (列宽预览 / 换位缝隙 / 潜伏升级) —— 状态机与
+                // 滚动条/文本选区互斥 (T17「压根没进 self.press」同纪律)。
+                if self.header_gesture_active() {
+                    self.on_header_drag_move(*position);
+                    return EventResult::Consumed;
+                }
                 // T17: 拖拽跟手 —— 拇指顶 = 指针 − 抓握偏移, 再走逆运算得 top_row。
                 // 夹取在 `top_row_at` / `x_offset_at` 里 (验收 ②), 故拖出轨道也不越界。
                 //
@@ -1964,7 +2744,18 @@ impl Widget for LogView {
                         || (position.y - pos0.y).abs() > CLICK_DIST;
                     if self.dragging || moved {
                         self.dragging = true;
-                        if let Some((crow, cbyte)) = self.hit_text(area, *position) {
+                        if self.merge_active {
+                            // 腿 E/T6 单行选区: caret 只在**同一行**内跟随;
+                            // 拖出该行 = 冻结在最后有效点 (合并相邻行可能来自
+                            // 不同文件, 跨行选区首版不做 —— 字段注释)。
+                            if let Some((crow, cbyte)) = self.hit_text(area, *position) {
+                                if crow == arow {
+                                    if let Some(sel) = self.merge_sel.as_mut() {
+                                        sel.caret = cbyte;
+                                    }
+                                }
+                            }
+                        } else if let Some((crow, cbyte)) = self.hit_text(area, *position) {
                             self.selection = Some(TextSelection::new((arow, abyte), (crow, cbyte)));
                         }
                     }
@@ -1973,6 +2764,9 @@ impl Widget for LogView {
             }
             Event::CursorLeft => {
                 self.settings_hover.set(false);
+                self.export_hover.set(false);
+                self.sessions_hover.set(false);
+                self.merge_hover.set(false);
                 self.hover_row.set(u64::MAX);
                 // T17: 第三个缓存也要清 —— 漏了它, 指针甩出窗口后拇指会保持
                 // 加深态、`cursor_icon` 仍返回手型, 直到下一次进窗才复位。
@@ -1986,6 +2780,11 @@ impl Widget for LogView {
                 EventResult::Ignored
             }
             Event::MouseWheel { delta, shift, .. } => {
+                // 表头手势进行中: 滚轮整个吞掉 (评审 A4) —— x_offset 一动,
+                // 列几何在手下漂移, 拖宽/换位跟手失准。横竖两轴同锁。
+                if self.header_gesture_active() {
+                    return EventResult::Consumed;
+                }
                 // 横滚源 (T7): 触控板直接给 delta.0; 否则 Shift+纵滚
                 // (MouseWheel 修饰键是 danqing 打磨寄生新增, 联动改动两仓待提交)
                 let dx = if delta.0 != 0.0 {
@@ -2018,6 +2817,17 @@ impl Widget for LogView {
                 button,
                 ..
             } => {
+                // 表头右键 = 开列管理 (D3, 与「列…」按钮同 Msg) —— **必须在左键
+                // 筛选之前** (评审 Critical/深潜 A2: 原先放在 `button != Left`
+                // 提前返回之后, 是永远到不了的死代码, D3 第二入口从未接通)。
+                // 仅表头行; 表头外右键照旧 P29「不冒充左键」(Ignored 放行应用层)。
+                if *button == MouseButton::Right
+                    && self.table_mode()
+                    && (area.origin.y..area.origin.y + HEADER_H).contains(&position.y)
+                {
+                    msgs.push(Box::new(Msg::OpenColMenu));
+                    return EventResult::Consumed;
+                }
                 // 只认左键 (T15/P29): 原先不筛 button, 右键/中键与左键**同效**
                 // (选中行 / 开设置卡)。缺陷不在「右键没有菜单」—— 界面从未暗示
                 // 右键能做什么, 所以右键无反应不违第 3 问; 缺陷在**左键的语义被
@@ -2035,6 +2845,90 @@ impl Widget for LogView {
                 // 设置按钮点击 (S2)
                 if self.settings_btn_rect.get().contains(*position) {
                     msgs.push(Box::new(Msg::OpenSettings));
+                    return EventResult::Consumed;
+                }
+                // 导出入口点击 (SPEC-v1x-export D7): 发入口消息 —— 门控/开格式菜单/
+                // 作业态变取消, 全在应用层 (Msg::ExportEntryClicked)。
+                if self.export_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::ExportEntryClicked));
+                    // 点穿防护 (评审 M4): 不 return 会落入「此处无行」, 后到的
+                    // Notice 覆盖守卫文案 (家族⑤次序陷阱) 且事件不被认领。
+                    return EventResult::Consumed;
+                }
+                // 命名会话入口 (D5): 门控/互斥全在应用层 (Msg::OpenSessionMenu)
+                if self.sessions_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::OpenSessionMenu));
+                    return EventResult::Consumed;
+                }
+                // 合并入口 (merge-timeline T4/D6): 门控/开弹层全在应用层
+                // (Msg::OpenMergeMenu), 与会话钮同规 (点穿防护同 return)。
+                if self.merge_btn_rect.get().contains(*position) {
+                    msgs.push(Box::new(Msg::OpenMergeMenu));
+                    return EventResult::Consumed;
+                }
+                // 表头命中 (T3/T4, SPEC-v1x-table-column-config): 表头行内一律收口,
+                // 不再落「此处无行」—— 手柄拖宽 / 表头体换位 /「列…」(T5 开弹层)。
+                if self.table_mode()
+                    && (area.origin.y..area.origin.y + HEADER_H).contains(&position.y)
+                {
+                    let now = Instant::now();
+                    let dbl = self.is_double_click(now, *position);
+                    match self.header_hit_at(area, *position) {
+                        HeaderHit::Handle(schema_idx) if self.col_gesture_free => {
+                            // G2 免费态手势不启动 (拖宽/恢复都不启动), 弹升级对话框
+                            let _ = schema_idx;
+                            msgs.push(Box::new(Msg::ShowUpgradePrompt(
+                                danqing_log::license::Feature::ColumnConfig,
+                            )));
+                            return EventResult::Consumed;
+                        }
+                        HeaderHit::Body(schema_idx) if self.col_gesture_free => {
+                            // G2 同拦换位潜伏 (不启动 = 不进 header_press)
+                            let _ = schema_idx;
+                            msgs.push(Box::new(Msg::ShowUpgradePrompt(
+                                danqing_log::license::Feature::ColumnConfig,
+                            )));
+                            return EventResult::Consumed;
+                        }
+                        HeaderHit::Handle(schema_idx) => {
+                            if dbl {
+                                // 双击手柄恢复采样宽 (D2): 删手动宽覆盖
+                                if let Some(col) = self
+                                    .schema
+                                    .as_deref()
+                                    .and_then(|s| s.columns.get(schema_idx))
+                                {
+                                    msgs.push(Box::new(Msg::ColumnWidthClear(col.name.clone())));
+                                }
+                                self.last_click = Some((now, *position));
+                                return EventResult::Consumed;
+                            }
+                            let w = self
+                                .header_geom
+                                .borrow()
+                                .iter()
+                                .find(|h| h.schema_idx == schema_idx)
+                                .map(|h| h.x1 - h.x0)
+                                .unwrap_or(0.0);
+                            self.col_w_drag.set(Some(ColWDrag {
+                                schema_idx,
+                                start_x: position.x,
+                                start_w: w,
+                                preview_w: w,
+                            }));
+                            // 双击锚点只记**手柄**命中 (评审 A3 区一): 按钮/表头体
+                            // 写入会与紧邻手柄串扰成误双击 (300ms/4px 内恢复采样宽)。
+                            self.last_click = Some((now, *position));
+                        }
+                        HeaderHit::Body(schema_idx) => {
+                            // 潜伏, 超 `CLICK_DIST` 升级换位 (T4); 未超抬起 = 单击无动作
+                            self.header_press = Some((schema_idx, *position));
+                        }
+                        HeaderHit::ColsButton => {
+                            msgs.push(Box::new(Msg::OpenColMenu));
+                        }
+                        HeaderHit::Miss => {}
+                    }
                     return EventResult::Consumed;
                 }
                 // 滚动条按下 (T17)。在行命中**之前**: 条压在列表右缘/底缘之上,
@@ -2102,38 +2996,50 @@ impl Widget for LogView {
                         } else {
                             msgs.push(Box::new(Msg::Notice(
                                 "本行无嵌套可展".into(),
-                                crate::NoticeKind::Info,
+                                crate::NoticeKind::Warn,
                             )));
                         }
                     } else {
                         msgs.push(Box::new(Msg::Select(row)));
-                        let text_x = self.text_x(area);
-                        let sub_row = self.line_at(row).1 > 0;
-                        // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
-                        // | 表格模式仅展开子行); 右键不清选区/不污染双击判定
-                        // (评审 O1); 左键落 gutter = 仅行选中并清选区
-                        if *button == MouseButton::Left
-                            && (!self.table_mode() || sub_row)
-                            && self.has_file
-                        {
-                            if position.x >= text_x {
+                        // 腿 E/T6: 合并视图先行分流 —— table_mode()/line_at 是单文件
+                        // 机制, 在合并位置空间是垃圾值; 选区只在**消息列**内启动
+                        // (时间栏/源栏/gutter 左键 = 仅行选中并清选区, gutter 同惯例)。
+                        if self.merge_active {
+                            if *button == MouseButton::Left && position.x >= self.merge_msg_x.get()
+                            {
                                 self.handle_text_press(area, *position);
-                            } else {
-                                self.selection = None;
+                            } else if *button == MouseButton::Left {
+                                self.merge_sel = None;
                             }
-                            self.selected_cell = None; // M4: 文本选区动作清单元格选中
-                        } else if *button == MouseButton::Left
-                            && self.table_mode()
-                            && self.has_file
-                            && !sub_row
-                            && position.x >= text_x
-                        {
-                            // 单元格双击 (M4): 表格模式普通行的文本区左键
-                            self.handle_cell_press(row, *position);
-                        } else if *button == MouseButton::Left && self.table_mode() {
-                            // 表格普通行的 gutter/行号区单击: 也清单元格选中
-                            // (单击他处 = 放弃, 与文本选区的 gutter 惯例一致)
-                            self.selected_cell = None;
+                        } else {
+                            let text_x = self.text_x(area);
+                            let sub_row = self.line_at(row).1 > 0;
+                            // 文本选区 (T3/M3): 仅左键 + 已打开文件 + (原始模式全行区
+                            // | 表格模式仅展开子行); 右键不清选区/不污染双击判定
+                            // (评审 O1); 左键落 gutter = 仅行选中并清选区
+                            if *button == MouseButton::Left
+                                && (!self.table_mode() || sub_row)
+                                && self.has_file
+                            {
+                                if position.x >= text_x {
+                                    self.handle_text_press(area, *position);
+                                } else {
+                                    self.selection = None;
+                                }
+                                self.selected_cell = None; // M4: 文本选区动作清单元格选中
+                            } else if *button == MouseButton::Left
+                                && self.table_mode()
+                                && self.has_file
+                                && !sub_row
+                                && position.x >= text_x
+                            {
+                                // 单元格双击 (M4): 表格模式普通行的文本区左键
+                                self.handle_cell_press(row, *position);
+                            } else if *button == MouseButton::Left && self.table_mode() {
+                                // 表格普通行的 gutter/行号区单击: 也清单元格选中
+                                // (单击他处 = 放弃, 与文本选区的 gutter 惯例一致)
+                                self.selected_cell = None;
+                            }
                         }
                     }
                     EventResult::Consumed
@@ -2146,7 +3052,7 @@ impl Widget for LogView {
                     // 2026-09-15 用户实机报它没出声, 因为原先只判了 ①)。
                     msgs.push(Box::new(Msg::Notice(
                         "此处无行".into(),
-                        crate::NoticeKind::Info,
+                        crate::NoticeKind::Warn,
                     )));
                     EventResult::Ignored
                 }
@@ -2156,6 +3062,12 @@ impl Widget for LogView {
                 button: MouseButton::Left,
                 ..
             } => {
+                // T4: 表头手势落点 (列宽提交/换位/单击无动作) —— 状态机独立,
+                // 先于滚动条/选区收口 (T17「互不污染」同纪律)。
+                if self.header_gesture_active() {
+                    self.on_header_release(msgs);
+                    return EventResult::Consumed;
+                }
                 // T17: 拖条收手。与文本选区各走各的 —— 滚动条按下时压根没进
                 // `self.press`, 两条状态机不会互相污染。
                 if self.v_drag.get().is_some() || self.h_drag.get().is_some() {
@@ -2194,6 +3106,14 @@ impl Widget for LogView {
                         crate::NoticeKind::Warn,
                     )));
                     EventResult::Ignored
+                } else if self.merge_active {
+                    // 腿 E/T6 边界: 合并视图整行复制未接 (待 T7 波) —— 说清怎么
+                    // 复制得到 (P24), 不静默吞键 (T6 前这里会静默复制**错行**)。
+                    msgs.push(Box::new(Msg::Notice(
+                        "合并视图: 复制需先双击/框选消息文本 (整行复制未接)".into(),
+                        crate::NoticeKind::Warn,
+                    )));
+                    EventResult::Ignored
                 } else {
                     EventResult::Ignored
                 }
@@ -2206,6 +3126,31 @@ impl Widget for LogView {
             }
             Event::FocusOut => {
                 self.focused = false;
+                // 表头手势同弃 (评审 A3, Esc 同语义): 失焦后指针捕获可能收不到
+                // 抬起, 残留拖宽会被「任意左键抬起」误提交成脏写。
+                self.abandon_header_gesture();
+                EventResult::Consumed
+            }
+            // 腿 E/T6: Ctrl+R 追踪选中值 (合并视图) —— view 只出选区键
+            // (源,行,字节), 值提取/过滤链在应用层 (Msg::TraceValue)。
+            Event::Key {
+                key: Key::Character(s),
+                ctrl: true,
+                pressed: true,
+                ..
+            } if self.merge_active && s.eq_ignore_ascii_case("r") => {
+                let armed = self
+                    .merge_sel
+                    .as_ref()
+                    .and_then(|sel| sel.range().map(|(lo, hi)| (sel.src, sel.line, lo, hi)));
+                if let Some((src, line, lo, hi)) = armed {
+                    msgs.push(Box::new(Msg::TraceValue { src, line, lo, hi }));
+                } else {
+                    msgs.push(Box::new(Msg::Notice(
+                        "先双击或框选消息里的追踪值 (如 req_id)".into(),
+                        crate::NoticeKind::Warn,
+                    )));
+                }
                 EventResult::Consumed
             }
             Event::Key {
@@ -2215,18 +3160,32 @@ impl Widget for LogView {
             } => {
                 // Esc = 放弃当前手势: 清文本选区 / 单元格选中 / **潜伏按下**
                 // (潜伏按下也算 —— 否则按住左键中途 Esc 再继续拖仍会升级成框选);
+                // T4: 表头手势 (列宽预览/换位/潜伏) 同弃 —— 预览零半提交, 列配置
+                // 真身从未被碰, Esc 自动回拖前值 (D2);
                 // 全无 → Ignored (框架清焦, 现状)
+                let merge_sel_live = self.merge_sel.as_ref().is_some_and(|s| s.range().is_some());
                 if self.selection.as_ref().is_none_or(|s| s.is_empty())
                     && self.selected_cell.is_none()
                     && self.press.is_none()
                     && !self.dragging
+                    && !self.header_gesture_active()
+                    && !merge_sel_live
                 {
+                    // 腿 E/T6: 本地全空时合并追踪过滤是下一级 Esc 目标 ——
+                    // 先局部后全局 (第一下清选区, 第二下清追踪), 与单文件
+                    // 栏 Esc (先清草稿再清已应用) 同款升级序列。
+                    if self.merge_active && self.merge_traced {
+                        msgs.push(Box::new(Msg::ClearTrace));
+                        return EventResult::Consumed;
+                    }
                     EventResult::Ignored
                 } else {
                     self.selection = None;
                     self.selected_cell = None;
+                    self.merge_sel = None;
                     self.press = None;
                     self.dragging = false;
+                    self.abandon_header_gesture();
                     EventResult::Consumed
                 }
             }
@@ -2292,6 +3251,15 @@ impl Widget for LogView {
     /// 本函数只负责把选中的那一级**取成字符串** (那两处 `?` 在 `copy_source`
     /// 返回 `Some` 的前提下不可能落空, 留着只为 `Option` 收口)。
     fn selected_text(&self) -> Option<String> {
+        // 合并分支 (腿 E/T6): 选区键 (源,行) → 源文件原文切片; 滚出窗口仍复制
+        // 得到 (merge_files 常驻, 与单文件「滚出屏幕仍能复制」同语义)。
+        if self.merge_active {
+            return self.merge_sel_slice().and_then(|(file, line, r)| {
+                danqing_log::merge_view::row_text(file, line)
+                    .get(r)
+                    .map(str::to_string)
+            });
+        }
         match self.copy_source()? {
             CopySource::Text { .. } => {
                 let sel = self.selection.as_ref()?;
@@ -2432,6 +3400,14 @@ pub(crate) struct Bar {
     hint_reserved: std::cell::Cell<f32>,
     /// 主题模式 (从 LogApp 同步)。
     theme: crate::config::AppTheme,
+    /// 有 schema (表格语境) —— 「字段…」按钮显示判据 (T2; `.log` 不出)。
+    has_schema: bool,
+    /// 「字段…」按钮 hit rect (paint 写 event 读, `cols_btn_rect` 同规)。
+    fields_btn_rect: std::cell::Cell<Rect>,
+    /// 「字段…」hover (自绘变色, D8 同款发现性)。
+    fields_hover: std::cell::Cell<bool>,
+    /// 「字段…」让位宽 (paint 先测后存; `hint_reserved` 同纪律)。
+    fields_reserved: std::cell::Cell<f32>,
 }
 
 impl Bar {
@@ -2451,6 +3427,10 @@ impl Bar {
             label_width: std::cell::Cell::new(0.0),
             hint_reserved: std::cell::Cell::new(0.0),
             theme: crate::config::AppTheme::Light,
+            has_schema: false,
+            fields_btn_rect: std::cell::Cell::new(Rect::default()),
+            fields_hover: std::cell::Cell::new(false),
+            fields_reserved: std::cell::Cell::new(0.0),
         }
     }
 
@@ -2534,9 +3514,14 @@ impl Bar {
     fn input_area(&self, area: Rect, label_w: f32) -> Rect {
         let text_x = area.origin.x + BAR_PAD_X + label_w + BAR_LABEL_GAP;
         // 持焦时右侧让出键义提示的位置 (hint_reserved 由 paint 测量后写入;
-        // 未持焦 / 放不下时为 0)。**单点收口**: paint 与 event 转发都走这里。
-        let w = (area.size.width - (text_x - area.origin.x) - BAR_PAD_X - self.hint_reserved.get())
-            .max(1.0);
+        // 未持焦 / 放不下时为 0); 「字段…」常让位 (fields_reserved 同纪律)。
+        // **单点收口**: paint 与 event 转发都走这里。
+        let w = (area.size.width
+            - (text_x - area.origin.x)
+            - BAR_PAD_X
+            - self.hint_reserved.get()
+            - self.fields_reserved.get())
+        .max(1.0);
         Rect::from_xywh(text_x, area.origin.y, w, area.size.height)
     }
 
@@ -2588,7 +3573,9 @@ impl Widget for Bar {
             .downcast_ref::<LogApp>()
             .expect("Bar 绑定状态类型不匹配");
         // 生效角色: 表格=过滤, 原始=搜索 (搜索栏始终可见, 不可隐藏); 空态无文件不出栏。
-        self.active = if !app.has_file {
+        // 合并工作区 (腿一 T3): 栏整体隐藏 —— 单文件口径的过滤/搜索串不许在
+        // 合并视图背后悄悄跑 (合并过滤 = 跨源, 语义在 T6 req_id 追踪接通)。
+        self.active = if !app.has_file || app.workspace == Workspace::Merge {
             ActiveBar::Hidden
         } else if app.mode == ViewMode::Table {
             ActiveBar::Filter
@@ -2596,6 +3583,7 @@ impl Widget for Bar {
             ActiveBar::Search
         };
         self.theme = app.theme;
+        self.has_schema = app.schema.is_some();
 
         // 两个输入框是**字段**而非子节点, 框架不会替它们传播 sync ——
         // 挂在 `TextInput` 上的 `bind_theme` 不手动踢一脚就不生效。
@@ -2689,14 +3677,27 @@ impl Widget for Bar {
         // 持焦态两条反馈 (P33 键义提示 / P6 焦点线)。提示宽度**先测后存**,
         // `input_area` 才好在同一帧内让位 —— 顺序反了就会压字一帧。
         //
-        // 提示只在**输入框为空**时出现。这不是省事, 是被框架逼出来的:
-        // `TextInput::paint` **既不裁剪也不横向滚动** (源码是整串一次性
-        // `push_text`, 没有任何 scroll offset), 所以「让位」保护得了命中测试,
-        // 保护不了字形 —— 有字时长查询照旧会画进提示的地盘。空态下要避的只剩
-        // 占位文案, 那是**可测**的, 于是能给出真正的「放不下就不画」判据。
+        // 提示只在**输入框为空**时出现 (P33)。原由是框架逼的 —— 当年
+        // `TextInput::paint` 既不裁剪也不横向滚动, 有字时长查询会画进提示的
+        // 地盘; 2026-09-20 起框架裁剪进边框 (长查询被裁断, 不再外溢), 但空态
+        // 才画的规矩留了下来: 「放不下就不画」的宽度判据只对占位文案成立
+        // (量得出来), 且裁断边紧贴提示会误读成查询的延续。
         let focused = self.input_focused();
+        // 「字段…」按钮 (T2/D1): 过滤行 + schema 在手才出 (`.log` 不出 —— 判据 6);
+        // 宽度**先测后存**, input_area 同帧让位 (hint 同纪律)。
+        let fields_w = if self.active == ActiveBar::Filter && self.has_schema {
+            let w = texts.measure(FIELDS_BTN_LABEL, FONT_SIZE);
+            self.fields_reserved.set(w + BAR_LABEL_GAP);
+            w
+        } else {
+            self.fields_reserved.set(0.0);
+            0.0
+        };
         let hint_w = if focused && self.active_input().is_some_and(|t| t.value().is_empty()) {
-            let room = area.size.width - (BAR_PAD_X + label_w + BAR_LABEL_GAP) - BAR_PAD_X;
+            let room = area.size.width
+                - (BAR_PAD_X + label_w + BAR_LABEL_GAP)
+                - BAR_PAD_X
+                - self.fields_reserved.get();
             let w = texts.measure(BAR_KEY_HINT, FONT_SIZE);
             let ph_w = texts.measure(&self.active_placeholder(), FONT_SIZE);
             if room >= ph_w + BAR_HINT_GAP + BAR_LABEL_GAP + w {
@@ -2720,11 +3721,35 @@ impl Widget for Bar {
             ActiveBar::Hidden => {}
         }
 
+        if fields_w > 0.0 {
+            // 右对齐: 尾端贴栏右内边距 (与让位同源); hover 换 accent (发现性)。
+            let bx = area.origin.x + area.size.width - BAR_PAD_X - fields_w;
+            texts.push_text(
+                FIELDS_BTN_LABEL,
+                bx,
+                baseline,
+                FONT_SIZE,
+                if self.fields_hover.get() {
+                    th.accent()
+                } else {
+                    th.text_secondary()
+                },
+            );
+            self.fields_btn_rect.set(Rect::from_xywh(
+                bx - 4.0,
+                area.origin.y,
+                fields_w + 8.0,
+                FILTER_BAR_H,
+            ));
+        } else {
+            self.fields_btn_rect.set(Rect::default());
+        }
         if hint_w > 0.0 {
-            // 右对齐推 x: 提示尾端贴栏的右内边距, 与输入区让出的宽度同源。
+            // 右对齐推 x: 提示尾端贴「字段…」左缘 (无按钮则贴栏右内边距),
+            // 与输入区让出的宽度同源。
             texts.push_text(
                 BAR_KEY_HINT,
-                area.origin.x + area.size.width - BAR_PAD_X - hint_w,
+                area.origin.x + area.size.width - BAR_PAD_X - self.fields_reserved.get() - hint_w,
                 baseline,
                 FONT_SIZE,
                 th.text_secondary(),
@@ -2748,6 +3773,27 @@ impl Widget for Bar {
         let active = self.active;
         if active == ActiveBar::Hidden {
             return EventResult::Ignored;
+        }
+        // 「字段…」按钮 (T2/D1): 命中优先于输入转发, 只认左键 (P29);
+        // hover 经 CursorMoved 缓存 (自绘变色), 离窗不粘 (评审 Nit)。
+        if let Event::CursorMoved(p) = event {
+            self.fields_hover
+                .set(self.fields_btn_rect.get().contains(*p));
+        }
+        if let Event::CursorLeft = event {
+            self.fields_hover.set(false);
+        }
+        if let Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position,
+            ..
+        } = event
+        {
+            if self.fields_btn_rect.get().contains(*position) {
+                msgs.push(Box::new(Msg::OpenPicker));
+                return EventResult::Consumed;
+            }
         }
         // 拦截 Enter/Esc/PageUp/PageDown: Enter=应用, Esc=关闭/清除, Page=滚动 (栏聚焦时导航仍可用)。
         if let Event::Key {
@@ -2961,9 +4007,9 @@ mod tests {
         );
     }
 
-    /// P33 边界: **框里有字就不画提示** —— 框架的 `TextInput::paint` 既不裁剪也不
-    /// 横向滚动 (整串一次性 `push_text`), 「让位」保护得了命中测试、保护不了字形,
-    /// 长查询会直接画进提示的地盘。故只在空框时画, 那时要避的只剩占位文案。
+    /// P33 边界: **框里有字就不画提示** —— 原为框架不裁剪、长查询会画进提示的
+    /// 地盘; 2026-09-20 裁剪落地后规矩保留 (宽度判据只对占位文案可测, 裁断边
+    /// 紧贴提示会误读成查询的延续)。
     ///
     /// 但**焦点线不跟着消失**: 「焦点在哪」与「键义怎么说」是两件事。
     #[test]
@@ -3177,12 +4223,15 @@ mod tests {
         v.paint(area, &mut rects, &mut texts);
         let plain = texts.instance_colors();
 
-        v.notice = Some(("此处无行".into(), crate::NoticeKind::Info));
+        v.notice = Some(("已复制 3 行".into(), crate::NoticeKind::Info));
         let mut texts = TextBatch::new();
         v.paint(area, &mut rects, &mut texts);
         let with_notice = texts.instance_colors();
 
-        let n = "此处无行".chars().count();
+        // Info 样本用真 Info 文案 (2026-09-29 分档大盘点后「此处无行」生产上
+        // 已是 Warn —— 拿 Warn 文案当 Info 样本会误导; 锁的本意是「Info 画
+        // 一次且颜色独立」, 与具体文案无关)。
+        let n = "已复制 3 行".chars().filter(|c| !c.is_whitespace()).count();
         assert_eq!(
             with_notice.len() - plain.len(),
             n,
@@ -3354,6 +4403,79 @@ mod tests {
             n,
             "置错误态后, status 那 {n} 个字形须**全部**离开 `text_secondary` \
              (A/B: 去掉 paint 里的分支, 这条必红)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SPEC-notice-visibility D4 分派锁: **Warn 不再画在底栏** (呈现位挪 toast
+    /// 浮层, 方案二无留痕), Info 留底栏。三态差手法 (status_error 锁同款):
+    /// 无 notice = N; Warn = 仍 N (底栏零增量); Info = N + 文案字形数。
+    /// A/B: 把 paint 里的 `NoticeKind::Info` 匹配放宽成 `_` → Warn 档立即红
+    /// (已验证: 摘锁精确红在 warn ≠ base)。
+    #[test]
+    fn warn_notice_leaves_status_bar_info_stays() {
+        let (mut v, path) = cell_fixture("notice-dispatch");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.status = "索引 92ms · 2 行".into();
+        let glyph_count = |v: &mut LogView| {
+            let mut texts = TextBatch::new();
+            let mut rects = RectBatch::new();
+            v.paint(area, &mut rects, &mut texts);
+            texts.glyph_clips().count()
+        };
+        v.notice = None;
+        let base = glyph_count(&mut v);
+        v.notice = Some(("警示甲乙丙".into(), crate::NoticeKind::Warn));
+        let warn = glyph_count(&mut v);
+        assert_eq!(warn, base, "Warn 不得再画在底栏 (挪 toast 浮层)");
+        let info_text = "提示甲乙丙";
+        v.notice = Some((info_text.into(), crate::NoticeKind::Info));
+        let info = glyph_count(&mut v);
+        let n = info_text.chars().filter(|c| !c.is_whitespace()).count();
+        assert_eq!(info, base + n, "Info 留底栏: 字形增量须恰为文案字形数");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 腿 B 色块锁: Info 时底栏画 `surface_variant` 衬底圆角块, 几何包住文案
+    /// (宽 = 文案宽+12 横向 padding, 高 = 状态栏-6), 落在底栏带内。
+    /// 画面上还有其他 surface_variant 面 (表头底) —— 用尺寸谓词挑出色块。
+    #[test]
+    fn info_notice_has_surface_chip_behind_text() {
+        let (mut v, path) = cell_fixture("notice-chip");
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        v.status = "索引 92ms · 2 行".into();
+        let info_text = "提示甲乙丙";
+        v.notice = Some((info_text.into(), crate::NoticeKind::Info));
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let nw = texts.measure(info_text, AUX_FONT_SIZE);
+        let want = lin(v.theme.theme().surface_variant());
+        let status_y = area.origin.y + area.size.height - STATUS_HEIGHT;
+        let chips: Vec<Rect> = rects
+            .instance_rects()
+            .into_iter()
+            .zip(rects.instance_colors())
+            .filter(|(_, c)| *c == want)
+            .map(|(r, _)| r)
+            .collect();
+        let chip = chips.iter().find(|r| {
+            (r.size.height - (STATUS_HEIGHT - 6.0)).abs() < 0.01
+                && (r.size.width - (nw + 12.0)).abs() < 0.5
+        });
+        let chip = chip.unwrap_or_else(|| {
+            panic!(
+                "Info 衬底色块须存在且几何包住文案 (高 {}, 宽 {}); 候选面: {:?}",
+                STATUS_HEIGHT - 6.0,
+                nw + 12.0,
+                chips
+            )
+        });
+        assert!(
+            chip.origin.y >= status_y - 0.01
+                && chip.origin.y + chip.size.height <= area.origin.y + area.size.height + 0.01,
+            "色块须在底栏带内: {:?}",
+            chip
         );
         std::fs::remove_file(&path).ok();
     }
@@ -3997,6 +5119,134 @@ mod tests {
             "左键仍须开设置卡"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 导出入口 (SPEC-v1x-export T5): 左键发 `ExportEntryClicked` (门控/菜单/取消
+    /// 全在应用层), 右/中键不冒充; 命中矩形在设置入口左侧不重叠。
+    #[test]
+    fn export_button_click_pushes_export_entry_and_sits_left_of_settings() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let (mut v, path) = cell_fixture("export-btn");
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let export = v.export_btn_rect.get();
+        let gear = v.settings_btn_rect.get();
+        assert!(export.size.width > 0.0, "有文件时导出入口必须在场");
+        assert!(
+            export.origin.x + export.size.width <= gear.origin.x,
+            "导出入口必须在设置入口左侧且不重叠"
+        );
+        let p = Point::new(export.origin.x + 2.0, export.origin.y + 2.0);
+        let right = press_at(&mut v, area, MouseButton::Right, p);
+        assert!(
+            !right
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ExportEntryClicked))),
+            "右键不得触发导出"
+        );
+        let left = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            left.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::ExportEntryClicked))),
+            "左键必须发 ExportEntryClicked"
+        );
+        // 点穿防护 (评审 M4): 事件须被认领, 且**恰一条** ExportEntryClicked ——
+        // 落入「此处无行」分支会追尾 Notice 覆盖守卫文案 (家族⑤次序陷阱)。
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let r = v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            matches!(r, EventResult::Consumed),
+            "导出钮点击须 Consumed (不落列表分支)"
+        );
+        assert_eq!(msgs.len(), 1, "只许一条, 不许 Notice 追尾");
+        assert!(matches!(
+            msgs.first().unwrap().downcast_ref::<Msg>(),
+            Some(Msg::ExportEntryClicked)
+        ));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 命名会话入口 (SPEC-v1x-workspace-sessions D5): 左键发 `OpenSessionMenu`
+    /// (门控在应用层), 坐落导出入口左侧; 空态不出 (Open Q3)。
+    #[test]
+    fn sessions_button_click_pushes_open_and_sits_left_of_export() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let (mut v, path) = cell_fixture("sess-btn");
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let sess = v.sessions_btn_rect.get();
+        let export = v.export_btn_rect.get();
+        assert!(sess.size.width > 0.0, "有文件时会话入口必须在场");
+        assert!(
+            sess.origin.x + sess.size.width <= export.origin.x,
+            "会话入口必须在导出入口左侧且不重叠"
+        );
+        let p = Point::new(sess.origin.x + 2.0, sess.origin.y + 2.0);
+        let left = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            left.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenSessionMenu))),
+            "左键必须发 OpenSessionMenu"
+        );
+        // 空态不出 (无文件)
+        let (mut v2, path2) = cell_fixture("sess-btn-empty");
+        v2.has_file = false;
+        v2.paint(area, &mut rects, &mut texts);
+        assert_eq!(
+            v2.sessions_btn_rect.get(),
+            Rect::default(),
+            "无文件不出「会话」"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&path2).ok();
+    }
+
+    /// T8 翻案锁: 合并工作区**照画**会话入口 (合并组会话载荷已接通 ——
+    /// 保存带 merge 段, 应用重开源组); 原「合并不画」旧规退役。
+    /// 次序不重叠: 合并… · 会话 (导出入口合并态本就不画, T3 边界)。
+    #[test]
+    fn sessions_button_present_in_merge_mode() {
+        let (mut v, path) = merge_paint_fixture("sess-btn-merge");
+        let area = Rect::from_xywh(0.0, 0.0, 1280.0, 720.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let sess = v.sessions_btn_rect.get();
+        assert!(sess.size.width > 0.0, "合并工作区会话入口必须在场 (T8)");
+        let merge = v.merge_btn_rect.get();
+        assert!(
+            merge.size.width > 0.0 && merge.origin.x + merge.size.width <= sess.origin.x,
+            "次序: 合并… 在 会话 左侧且不重叠"
+        );
+        let p = Point::new(sess.origin.x + 2.0, sess.origin.y + 2.0);
+        let msgs = press_at(&mut v, area, MouseButton::Left, p);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenSessionMenu))),
+            "合并态点「会话」须发 OpenSessionMenu (门控在应用层)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 空态零痕迹: 无文件不画导出入口 (导出无对象), 命中矩形塌缩。
+    #[test]
+    fn export_button_absent_without_file() {
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let v = LogView::new();
+        let mut texts = TextBatch::new();
+        let mut rects = RectBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        assert_eq!(v.export_btn_rect.get(), Rect::default());
     }
 
     #[test]
@@ -5435,6 +6685,1146 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // ---- T4: 两手势 (列宽拖拽 + 表头拖拽换位) ----
+
+    /// 列宽拖拽全链 (T4): 按下手柄 → 跟手预览 (clamp) → 抬起发 `ColumnWidthSet`。
+    #[test]
+    fn column_width_drag_previews_clamps_and_commits() {
+        let (mut v, path) = cell_fixture("w-drag");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let start_w = h0.x1 - h0.x0;
+        let mut msgs = MsgQueue::new();
+        let down = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: Point::new(h0.x1, y),
+        };
+        v.event(&down, area, &mut msgs);
+        assert!(v.col_w_drag.get().is_some(), "手柄按下进入拖宽");
+        // 跟手 +30
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1 + 30.0, y)),
+            area,
+            &mut msgs,
+        );
+        let d = v.col_w_drag.get().unwrap();
+        assert!(
+            (d.preview_w - start_w - 30.0).abs() < 0.5,
+            "预览 = 拖前宽+Δ"
+        );
+        // clamp 上限
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1 + 10_000.0, y)),
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.col_w_drag.get().unwrap().preview_w, MAX_COL_W);
+        // 抬起 → 提交
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(h0.x1 + 10_000.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_none(), "抬起退出拖宽态");
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ColumnWidthSet(name, w))
+                    if name == "level" && *w == MAX_COL_W
+            )),
+            "抬起须提交 ColumnWidthSet"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Esc 中弃拖宽 = 零 Msg (预览零半提交, D2)。
+    #[test]
+    fn width_drag_escape_discards_preview_without_msg() {
+        let (mut v, path) = cell_fixture("w-esc");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1 + 50.0, y)),
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::Key {
+                key: Key::Named(NamedKey::Escape),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_none(), "Esc 弃手势");
+        assert!(msgs.is_empty(), "弃手势零 Msg (零半提交)");
+        assert!(v.columns.widths.is_empty(), "真身未被碰");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 双击手柄恢复采样宽 (300ms/4px 判据同款) → `ColumnWidthClear`。
+    #[test]
+    fn handle_double_click_clears_manual_width() {
+        let (mut v, path) = cell_fixture("w-dbl");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let p = Point::new(h0.x1, y);
+        let mut msgs = MsgQueue::new();
+        for _ in 0..2 {
+            v.event(
+                &Event::MouseInput {
+                    button: MouseButton::Left,
+                    pressed: true,
+                    position: p,
+                },
+                area,
+                &mut msgs,
+            );
+            v.event(
+                &Event::MouseInput {
+                    button: MouseButton::Left,
+                    pressed: false,
+                    position: p,
+                },
+                area,
+                &mut msgs,
+            );
+        }
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ColumnWidthClear(name)) if name == "level"
+            )),
+            "第二击须发 ColumnWidthClear (双击恢复采样宽)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 表头体拖拽换位: 潜伏 → 超 `CLICK_DIST` 升级 → 缝隙更新 → 落下发
+    /// `ColumnMoveBefore`; 未超阈值抬起 = 单击**无动作**。
+    #[test]
+    fn header_body_drag_upgrades_and_drops_move_before() {
+        let (mut v, path) = cell_fixture("w-move");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let (h0, h1) = {
+            let g = v.header_geom.borrow();
+            (g[0], g[1])
+        };
+        let y = HEADER_H / 2.0;
+        let body0 = Point::new((h0.x0 + h0.x1) / 2.0, y);
+        let mut msgs = MsgQueue::new();
+        // 潜伏 + 2px 微移 = 不升级
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: body0,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.header_press.is_some(), "表头体按下进潜伏");
+        v.event(
+            &Event::CursorMoved(Point::new(body0.x + 2.0, y)),
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_move_drag.get().is_none(), "阈值内不升级");
+        // 越阈值 → 升级; 拖到 h1 左半 (中点前) = 缝隙 1 (level 停 msg 前 = 原位)
+        v.event(
+            &Event::CursorMoved(Point::new(h1.x0 + 1.0, y)),
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.col_move_drag.get(), Some((0, 1)), "升级且缝隙 = 1");
+        assert!(v.header_press.is_none());
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(h1.x0 + 1.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ColumnMoveBefore(name, before))
+                    if name == "level" && before.as_deref() == Some("msg")
+            )),
+            "落下发 ColumnMoveBefore(level, before=msg)"
+        );
+        // 未超阈值抬起 = 单击无动作
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: body0,
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(body0.x + 2.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_move_drag.get().is_none() && v.header_press.is_none());
+        let msg_count = |msgs: &MsgQueue| {
+            msgs.iter()
+                .filter(|m| m.downcast_ref::<Msg>().is_some())
+                .count()
+        };
+        assert_eq!(msg_count(&msgs), 1, "单击表头不产消息 (只有上面那条换位)");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Esc 连**潜伏按下**一起清 (换位中弃手势)。
+    #[test]
+    fn escape_clears_header_lure_and_move_drag() {
+        let (mut v, path) = cell_fixture("w-esc2");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        // 潜伏态 Esc
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new((h0.x0 + h0.x1) / 2.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert!(v.header_press.is_none(), "Esc 连潜伏一起清");
+        // 升级态 Esc
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new((h0.x0 + h0.x1) / 2.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x0 + 40.0, y)),
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_move_drag.get().is_some());
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert!(v.col_move_drag.get().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 拖宽预览进 paint 布局 (接线锁): 预览宽实时反映到表头几何 ——
+    /// 摘 paint 预览分支在此红 (A/B)。
+    #[test]
+    fn width_drag_preview_shows_in_paint_geometry() {
+        let (mut v, path) = cell_fixture("w-prev");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1 + 40.0, y)),
+            area,
+            &mut msgs,
+        );
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let g = v.header_geom.borrow()[0];
+        assert!(
+            (g.x1 - g.x0 - (h0.x1 - h0.x0) - 40.0).abs() < 0.5,
+            "预览宽须进 paint (摘预览分支在此红)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- 评审修复锁 (2026-09-23 双路评审并账): 手势生命周期 / 命中同源 ----
+
+    /// 评审 R①: 手柄**零位移**单击 (按下即抬起) 不得提交宽 ——
+    /// 采样宽被无条件冻成手动宽是半提交污染; 预览未变 = 无变更。
+    #[test]
+    fn zero_move_handle_click_commits_nothing() {
+        let (mut v, path) = cell_fixture("w-zero");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let p = Point::new(h0.x1, y);
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_some());
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_none());
+        assert!(msgs.is_empty(), "零位移抬起零 Msg (采样宽不得被冻成手动宽)");
+        assert!(v.columns.widths.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 R②/深潜 A1: 换文件 (sync 换 Arc) 打断表头手势 → 手势态作废,
+    /// 抬起不得把旧文件的拖宽提交进**新**文件的列配置 (schema_idx 错位写错列)。
+    #[test]
+    fn file_change_discards_header_gestures_before_release() {
+        let (mut v, path) = cell_fixture("w-stale");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1 + 40.0, y)),
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_some());
+        // 换文件 (异步打开交卷/轮转 rebuild/Ctrl+T 的等价形态): app 持有另一个 Arc
+        let p2 =
+            std::env::temp_dir().join(format!("danqing-log-w-stale2-{}.jsonl", std::process::id()));
+        std::fs::write(&p2, "{\"x\":1}\n").unwrap();
+        let mut app = crate::LogApp::new_empty();
+        app.file = Arc::new(LogFile::open(&p2).unwrap());
+        app.has_file = true;
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "x".into(),
+                width_chars: 4,
+            }],
+        }));
+        v.sync(&app);
+        assert!(v.col_w_drag.get().is_none(), "换文件作废拖宽手势");
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(h0.x1 + 40.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.is_empty(),
+            "打断后抬起零 Msg —— 不得写进新文件的列配置"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    /// 评审 A3: FocusOut 丢弃表头手势 (Esc 同语义) ——
+    /// 失焦后任意左键抬起不得误提交残留拖宽。
+    #[test]
+    fn focus_out_discards_header_gestures() {
+        let (mut v, path) = cell_fixture("w-fout");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.col_w_drag.get().is_some());
+        v.event(&Event::FocusOut, area, &mut msgs);
+        assert!(v.col_w_drag.get().is_none(), "FocusOut 弃拖宽手势");
+        // 潜伏换位按下同弃
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new((h0.x0 + h0.x1) / 2.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.header_press.is_some());
+        v.event(&Event::FocusOut, area, &mut msgs);
+        assert!(v.header_press.is_none(), "FocusOut 弃潜伏按下");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 A4: 表头手势进行中滚轮不改 `x_offset` ——
+    /// 列几何不得在手下滑移 (拖宽/换位跟手失准)。
+    /// 偏移量取**可动的非零值** (x_offset=0 时 clamp_x 钳回 0, 测不到漂移)。
+    #[test]
+    fn wheel_is_frozen_while_header_gesture_active() {
+        let (mut v, path) = cell_fixture("w-wheel");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        assert!(v.columns.set_width("level", MAX_COL_W));
+        assert!(v.columns.set_width("msg", MAX_COL_W));
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        v.x_offset.set(30.0);
+        let r = v.event(
+            &Event::MouseWheel {
+                delta: (30.0, 0.0),
+                position: Point::new(h0.x1, y),
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert_eq!(r, EventResult::Consumed, "手势中滚轮被吞");
+        assert_eq!(v.x_offset.get(), 30.0, "手势中 x_offset 不得漂移");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 Critical/深潜 A2: 表头右键开列管理 (D3 第二入口) ——
+    /// 原先 `button != Left` 提前返回把右键分支变成死代码。中键不冒充;
+    /// 表头外右键照旧无动作 (P29 不破)。
+    #[test]
+    fn header_right_click_opens_col_menu() {
+        let (mut v, path) = cell_fixture("hdr-rc");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let body = Point::new((h0.x0 + h0.x1) / 2.0, HEADER_H / 2.0);
+        let msgs = press_at(&mut v, area, MouseButton::Right, body);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenColMenu))),
+            "表头右键须发 OpenColMenu"
+        );
+        let msgs = press_at(&mut v, area, MouseButton::Middle, body);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenColMenu))),
+            "中键不冒充右键"
+        );
+        let msgs = press_at(
+            &mut v,
+            area,
+            MouseButton::Right,
+            Point::new(300.0, HEADER_H + 5.0),
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenColMenu))),
+            "表头外右键不开列管理"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 A3 (区一 ColsButton 项): 只有**手柄**按下记录双击锚点 ——
+    /// 「列…」/表头体写 `last_click` 会与紧邻手柄串扰成误双击 (恢复采样宽)。
+    #[test]
+    fn only_handle_press_records_double_click_anchor() {
+        let (mut v, path) = cell_fixture("w-lc");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let y = HEADER_H / 2.0;
+        let mut msgs = MsgQueue::new();
+        let r = v.cols_btn_rect.get();
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + 1.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.last_click, None, "按钮命中不写双击锚点");
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new((h0.x0 + h0.x1) / 2.0, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.last_click, None, "表头体命中不写双击锚点");
+        v.header_press = None;
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(h0.x1, y),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(v.last_click.is_some(), "手柄命中写双击锚点");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 B1: 手柄与「列…」按钮命中重叠时**手柄胜** ——
+    /// 「看得见的边缘点得中」是三件套主手势; 按钮主体 (远离手柄处) 仍可点。
+    #[test]
+    fn handle_hits_before_cols_btn_when_overlapping() {
+        let (mut v, path) = cell_fixture("hdr-prio");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let r = v.cols_btn_rect.get();
+        let btn_center = r.origin.x + r.size.width / 2.0;
+        let text_x = v.header_geom.borrow()[0].x0;
+        // 摆列宽让「列右缘 = 按钮中心」→ 手柄热区压进按钮矩形
+        assert!(v.columns.set_width("level", btn_center - text_x));
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let y = HEADER_H / 2.0;
+        assert!(
+            matches!(
+                v.header_hit_at(area, Point::new(btn_center, y)),
+                HeaderHit::Handle(0)
+            ),
+            "重叠带手柄胜 (边缘点得中)"
+        );
+        assert!(
+            matches!(
+                v.header_hit_at(area, Point::new(r.origin.x + 1.0, y)),
+                HeaderHit::ColsButton
+            ),
+            "按钮主体仍可点 (胜过表头体)"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 评审 B2: 右缘截断列的手柄钉在**可见**右缘 (`text_right`) ——
+    /// 视觉边缘点得中 (原先热区在屏外 `x+w`); hover 同源。
+    #[test]
+    fn truncated_column_handle_pins_at_visible_edge() {
+        let (mut v, path) = cell_fixture("hdr-trunc");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        assert!(v.columns.set_width("level", MAX_COL_W));
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let text_right = 300.0 - SCROLLBAR_W - 6.0;
+        let g = v.header_geom.borrow()[0];
+        assert!(g.x1 > text_right, "截断前提: 真布局右缘在视口外");
+        let y = HEADER_H / 2.0;
+        assert!(
+            matches!(
+                v.header_hit_at(area, Point::new(text_right, y)),
+                HeaderHit::Handle(0)
+            ),
+            "手柄钉在可见右缘"
+        );
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::CursorMoved(Point::new(text_right, y)),
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.hover_handle.get(), Some(0), "hover 与命中同源");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- T3: 表头几何 + 命中 + hover (SPEC-v1x-table-column-config) ----
+
+    /// 手柄热区 (列右缘 ±[`HANDLE_HALF`]) **优先于表头体**; 边界值逐个钉死。
+    /// 公共边界归左列手柄 (拖左列宽); 行外/列外 = None。
+    #[test]
+    fn header_handle_hit_zone_beats_body_and_edges_are_exact() {
+        let (v, path) = cell_fixture("hdr-hit");
+        v.header_geom.replace(vec![
+            HeaderSpan {
+                x0: 100.0,
+                x1: 200.0,
+                handle_x: 200.0,
+                schema_idx: 0,
+                display_idx: 0,
+            },
+            HeaderSpan {
+                x0: 200.0,
+                x1: 300.0,
+                handle_x: 300.0,
+                schema_idx: 1,
+                display_idx: 1,
+            },
+        ]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let at = |x: f32, y: f32| v.header_hit_at(area, Point::new(x, y));
+        let y = HEADER_H / 2.0;
+        // 列0 右缘 200: ±4 内全是它的手柄 (含边界), 公共边界不归列1 体
+        assert!(matches!(at(196.0, y), HeaderHit::Handle(0)));
+        assert!(matches!(at(200.0, y), HeaderHit::Handle(0)));
+        assert!(matches!(at(204.0, y), HeaderHit::Handle(0)));
+        // 越过热区 1px 才落列1 体
+        assert!(matches!(at(205.0, y), HeaderHit::Body(1)));
+        assert!(matches!(at(150.0, y), HeaderHit::Body(0)));
+        // 列外/行外
+        assert!(matches!(at(99.0, y), HeaderHit::Miss));
+        assert!(matches!(at(305.0, y), HeaderHit::Miss));
+        assert!(matches!(at(150.0, -1.0), HeaderHit::Miss));
+        assert!(matches!(at(150.0, HEADER_H), HeaderHit::Miss));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 「列…」按钮: hit rect 由 paint 写入 (同源), 点得中。
+    #[test]
+    fn cols_btn_rect_comes_from_paint_and_hits() {
+        let (mut v, path) = cell_fixture("hdr-btn");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let r = v.cols_btn_rect.get();
+        assert!(r.size.width > 0.0 && r.size.height == HEADER_H);
+        let hit = v.header_hit_at(
+            area,
+            Point::new(r.origin.x + r.size.width / 2.0, HEADER_H / 2.0),
+        );
+        assert!(matches!(hit, HeaderHit::ColsButton));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 列几何含 `x_offset` 平移 (D2 同源): 横滚后手柄命中跟着走
+    /// (paint 原点含非零平移态 —— v1.0.2 平移不变锁教训的命中半边)。
+    /// 视口 800 (评审 B2 修后语义): 列0 右缘在视口内可见 —— 截断列的手柄
+    /// 钉在 `text_right` 不跟平移 (可见边缘语义), 跟手平移只对可见列成立。
+    #[test]
+    fn header_geometry_follows_x_offset() {
+        let (mut v, path) = cell_fixture("hdr-xoff");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        // 两列手动加宽 → total_w > 文本宽, x_offset 不被 clamp_x 钳回 0
+        assert!(v.columns.set_width("level", 500.0));
+        assert!(v.columns.set_width("msg", 500.0));
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let before = v.header_geom.borrow()[0];
+        v.x_offset.set(30.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let after = v.header_geom.borrow()[0];
+        assert!(
+            (before.x0 - after.x0 - 30.0).abs() < 0.5,
+            "x0 应随 x_offset 左移 30"
+        );
+        let y = HEADER_H / 2.0;
+        assert!(matches!(
+            v.header_hit_at(area, Point::new(after.x1, y)),
+            HeaderHit::Handle(0)
+        ));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// hover 态跟命中走 (D8 发现性)。
+    #[test]
+    fn hover_states_track_header_hits() {
+        let (mut v, path) = cell_fixture("hdr-hover");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let h0 = v.header_geom.borrow()[0];
+        let mut msgs = MsgQueue::new();
+        v.event(
+            &Event::CursorMoved(Point::new(h0.x1, HEADER_H / 2.0)),
+            area,
+            &mut msgs,
+        );
+        assert_eq!(v.hover_handle.get(), Some(0));
+        assert!(!v.hover_cols_btn.get());
+        let r = v.cols_btn_rect.get();
+        v.event(
+            &Event::CursorMoved(Point::new(r.origin.x + r.size.width / 2.0, HEADER_H / 2.0)),
+            area,
+            &mut msgs,
+        );
+        assert!(v.hover_cols_btn.get());
+        assert_eq!(v.hover_handle.get(), None);
+        v.event(
+            &Event::CursorMoved(Point::new(r.origin.x, HEADER_H + 40.0)),
+            area,
+            &mut msgs,
+        );
+        assert!(!v.hover_cols_btn.get());
+        assert_eq!(v.hover_handle.get(), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 列配置进 paint 布局 (D1 接线): 手动宽覆盖采样宽, 隐藏列不画, 列序跟随。
+    #[test]
+    fn paint_layout_follows_column_config() {
+        let (mut v, path) = cell_fixture("hdr-cfg");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        assert!(v.columns.set_width("level", 150.0));
+        assert!(v.columns.set_hidden("msg", true));
+        let area = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        {
+            let geom = v.header_geom.borrow();
+            assert_eq!(geom.len(), 1, "隐藏列不进几何");
+            assert_eq!(geom[0].schema_idx, 0);
+            assert!(
+                (geom[0].x1 - geom[0].x0 - 150.0).abs() < 0.5,
+                "手动宽覆盖采样宽"
+            );
+        }
+        assert!(v.columns.set_hidden("msg", false));
+        assert!(v.columns.move_column(0, 1)); // msg 首
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let geom = v.header_geom.borrow();
+        assert_eq!(geom.len(), 2);
+        assert_eq!(geom[0].schema_idx, 1, "列序跟随 order");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- merge-timeline 腿一 T3: 合并三栏真 paint 锁 ----
+
+    /// 合并视图夹具 (注入快照, 不走 app —— VersionRow 同款注入惯例)。
+    fn merge_paint_fixture(tag: &str) -> (LogView, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("danqing-log-mv-{tag}-{}.log", std::process::id()));
+        std::fs::write(&path, b"2026-09-27T00:00:00Z INFO x\n").unwrap();
+        let file = LogFile::open(&path).unwrap();
+        let mut v = LogView::new();
+        v.file = Some(Arc::new(file));
+        v.has_file = true;
+        // 夹具 = 「用户正在日志区里操作」(持焦) —— T14/P19: 不持焦选中行不画。
+        v.focused = true;
+        v.merge_active = true;
+        v.merge_rows_from = 0;
+        v.merge_total = 2;
+        v.merge_sources = vec![("auth.log".into(), false), ("worker.jsonl".into(), false)];
+        v.merge_rows = vec![
+            danqing_log::merge_view::MergeRowView {
+                ts: 1_790_467_200_000,
+                src: 0,
+                line: 0,
+                text: "INFO auth boot".into(),
+            },
+            danqing_log::merge_view::MergeRowView {
+                ts: 1_790_467_201_234,
+                src: 1,
+                line: 5,
+                text: "ERROR worker boom".into(),
+            },
+        ];
+        (v, path)
+    }
+
+    /// 合并三栏真 paint: 表头 (时间/源/消息) + 两行字形产出 (腿二教训: 回归锁
+    /// 必须真 paint 断言字形产出, 且原点必须含**非零平移** —— v1.0.2 教训)。
+    #[test]
+    fn merge_paint_produces_timeline_glyphs() {
+        let (mut v, path) = merge_paint_fixture("3col");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let n_merge = texts.instance_rects().len();
+        assert!(n_merge > 0, "合并视图有字形产出");
+        // 表头线 + 选中条等矩形产出
+        assert!(!rects.instance_rects().is_empty());
+        // A/B: 摘掉合并激活 → 表头与行字形必须减 (锁不画空气)
+        v.merge_active = false;
+        v.merge_rows.clear();
+        v.merge_total = 0;
+        let mut rects2 = RectBatch::new();
+        let mut texts2 = TextBatch::new();
+        v.paint(area, &mut rects2, &mut texts2);
+        assert!(
+            texts2.instance_rects().len() < n_merge,
+            "摘合并快照字形必须减 (A/B 锁): {n_merge} vs {}",
+            texts2.instance_rects().len()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// D11 (CP2-A): 源名按源着色 —— 两行不同源, 字形色流里必须出现
+    /// `source_palette()[0]` 与 `[1]` 两支 (linear 口径, 与 instance_colors 同源)。
+    /// A/B: 把源名改回统一 accent, 本锁精确红 (palette 两色消失)。
+    #[test]
+    fn merge_paint_colors_source_names_by_palette_index() {
+        let (v, path) = merge_paint_fixture("src-color");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        let pal = v.theme.theme().source_palette();
+        // `TextBatch::instance_colors` 返回 LinearRgba 按字段取 (与提示色锁同款)。
+        let colors = texts.instance_colors();
+        for (i, src_pal) in pal.iter().enumerate().take(2) {
+            let want = lin(*src_pal);
+            assert!(
+                colors.iter().any(|c| {
+                    (c.r - want[0]).abs() < 1e-4
+                        && (c.g - want[1]).abs() < 1e-4
+                        && (c.b - want[2]).abs() < 1e-4
+                }),
+                "源 {i} 名必须用 source_palette[{i}] 着色, 字形色流里没找到"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- 腿 E (T6): 合并文本选区 / 追踪手势 ----
+
+    /// T6 夹具扩展: 给合并夹具挂上真源文件句柄 (复制链按 (源,行) 取原文)。
+    /// src1 行5 = "ERROR worker boom" (与窗口快照同行内容)。
+    fn merge_sel_fixture(tag: &str) -> (LogView, std::path::PathBuf, std::path::PathBuf) {
+        let (mut v, path) = merge_paint_fixture(tag);
+        let p1 = std::env::temp_dir().join(format!(
+            "danqing-log-mv-{tag}-src1-{}.log",
+            std::process::id()
+        ));
+        std::fs::write(&p1, b"l0\nl1\nl2\nl3\nl4\nERROR worker boom\n").unwrap();
+        v.merge_files.push(Arc::new(LogFile::open(&path).unwrap()));
+        v.merge_files.push(Arc::new(LogFile::open(&p1).unwrap()));
+        (v, path, p1)
+    }
+
+    /// 双击消息列 → token 选区 ((源,行) 键) → 选区带真画 (selection 色矩形) →
+    /// Ctrl+C 复制源文件该行的选中子串。paint/event/复制三链同锁。
+    #[test]
+    fn merge_double_click_token_selects_paints_and_copies() {
+        let (mut v, path, p1) = merge_sel_fixture("dblsel");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        v.paint(area, &mut rects, &mut texts);
+        // paint 缓存: 消息列 x + 两行命中几何 (event 侧同源)
+        let msg_x = v.merge_msg_x.get();
+        assert!(msg_x > area.origin.x, "消息列在时间/源两栏右侧");
+        assert!(
+            v.row_geom.borrow().contains_key(&0) && v.row_geom.borrow().contains_key(&1),
+            "paint 必须给合并行缓存命中几何 (event 无 TextBatch)"
+        );
+        // 双击行1 的 "worker" (文本 "ERROR worker boom", worker 起自字节 6)
+        let w_pre = texts.measure("ERROR ", FONT_SIZE);
+        let rows_top = area.origin.y + v.chrome_top();
+        let click = Point::new(msg_x + w_pre + 1.0, rows_top + ROW_HEIGHT + 4.0);
+        let press = Event::MouseInput {
+            button: MouseButton::Left,
+            pressed: true,
+            position: click,
+        };
+        let mut msgs = MsgQueue::new();
+        v.event(&press, area, &mut msgs);
+        v.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: click,
+            },
+            area,
+            &mut msgs,
+        );
+        v.event(&press, area, &mut msgs); // 第二击 = 双击
+        let sel = v.merge_sel.as_ref().expect("双击应产合并选区");
+        assert_eq!((sel.src, sel.line), (1, 5), "选区键 = (源, 文件行)");
+        assert_eq!(sel.range(), Some((6, 12)), "token = worker");
+        // 选区带真画 (腿二教训: 断言产出不断言标志位)
+        let mut rects2 = RectBatch::new();
+        let mut texts2 = TextBatch::new();
+        v.paint(area, &mut rects2, &mut texts2);
+        let band = Rect::from_xywh(
+            msg_x + texts2.measure("ERROR ", FONT_SIZE),
+            rows_top + ROW_HEIGHT + 2.0,
+            texts2.measure("worker", FONT_SIZE),
+            ROW_HEIGHT - 4.0,
+        );
+        assert!(
+            rect_painted(&rects2, band, v.theme.theme().selection()),
+            "选区带必须真画在消息列 (颜色 = selection token)"
+        );
+        // 复制链: 选中子串来自**源文件** ((源,行) 键), 不依赖窗口快照
+        assert_eq!(v.selected_text().as_deref(), Some("worker"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&p1).ok();
+    }
+
+    /// 修洞锁 (T6 前活洞): 合并态无文本选区时 Ctrl+C 不得走单文件行兜底
+    /// 复制**错行** (line_at/file 在合并位置空间是垃圾值) —— 不消费 +
+    /// 出声指路 (P24)。
+    #[test]
+    fn merge_copy_without_selection_does_not_copy_wrong_line() {
+        let (mut v, path) = merge_paint_fixture("copybug");
+        v.selected = 1; // 行选中在, 文本选区无
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let mut msgs = MsgQueue::new();
+        let r = v.event(&Event::Copy, area, &mut msgs);
+        assert_eq!(r, EventResult::Ignored, "无选区不消费 (剪贴板不动)");
+        assert_eq!(
+            v.selected_text(),
+            None,
+            "合并态行兜底复制 = 错行来源, 不许有"
+        );
+        let mut iter = msgs.drain(..);
+        let said = iter.any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::Notice(t, _) if t.contains("合并视图")))
+        });
+        assert!(said, "应出声指引双击/框选 (P24)");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Esc 升级序列: 有选区先清选区 (追踪还在); 选区空了再 Esc → ClearTrace。
+    #[test]
+    fn merge_esc_clears_selection_then_trace() {
+        let (mut v, path) = merge_paint_fixture("esc");
+        v.merge_sel = Some(MergeSel {
+            src: 1,
+            line: 5,
+            anchor: 6,
+            caret: 12,
+        });
+        v.merge_traced = true;
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let esc = Event::Key {
+            key: Key::Named(NamedKey::Escape),
+            pressed: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        let mut msgs = MsgQueue::new();
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        assert!(v.merge_sel.is_none(), "第一下清选区");
+        let sent_trace = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::ClearTrace))
+        });
+        assert!(!sent_trace, "选区在场时 Esc 不还手追踪");
+        assert_eq!(v.event(&esc, area, &mut msgs), EventResult::Consumed);
+        let sent_trace = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::ClearTrace))
+        });
+        assert!(sent_trace, "第二下清追踪过滤");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 追踪手势 (Ctrl+R): 有选区 → TraceValue 带选区键; 无选区 → 指路提示,
+    /// 两边都**消费** (不许漏到应用层被「先合并」提示覆盖)。
+    #[test]
+    fn merge_ctrl_r_traces_selection_or_guides() {
+        let (mut v, path) = merge_paint_fixture("trace-key");
+        let area = Rect::from_xywh(37.0, 53.0, 800.0, 600.0);
+        let ctrl_r = Event::Key {
+            key: Key::Character("r".to_string()),
+            pressed: true,
+            shift: false,
+            ctrl: true,
+            alt: false,
+        };
+        let mut msgs = MsgQueue::new();
+        // 无选区 → 指路
+        assert_eq!(v.event(&ctrl_r, area, &mut msgs), EventResult::Consumed);
+        let guided = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::Notice(t, _) if t.contains("追踪值")))
+        });
+        assert!(guided, "无选区要指路 (P24)");
+        // 有选区 → TraceValue(源1, 行5, 6..12)
+        v.merge_sel = Some(MergeSel {
+            src: 1,
+            line: 5,
+            anchor: 6,
+            caret: 12,
+        });
+        assert_eq!(v.event(&ctrl_r, area, &mut msgs), EventResult::Consumed);
+        let traced = msgs.drain(..).any(|m| {
+            matches!(m.downcast::<crate::Msg>(), Ok(b) if matches!(&*b, crate::Msg::TraceValue { src: 1, line: 5, lo: 6, hi: 12 }))
+        });
+        assert!(traced, "选区键 (源,行,字节) 发 TraceValue");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- T5: 真 paint 接线锁 (字形产出, 非零平移原点 —— v1.0.2 教训) ----
+
+    /// 列配置真改**字形**产出: 隐藏 = 零字形 (字形数减) / 拖宽 = 字形位移 (x 分布变) /
+    /// 列序 = 字形序 (x 分布变) —— 全程断言 text instance 的**相对**布局平移不变。
+    #[test]
+    fn column_config_moves_glyphs_under_nonzero_origin() {
+        let (mut v, path) = cell_fixture("t5-paint");
+        v.columns = ColumnConfig::from_schema(&["level".to_string(), "msg".to_string()]);
+        let area = Rect::from_xywh(137.0, 89.0, 800.0, 600.0); // 非零原点 (平移不变锁)
+        let area0 = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let paint_runs = |v: &mut LogView, a: Rect| {
+            let mut rects = RectBatch::new();
+            let mut texts = TextBatch::new();
+            v.paint(a, &mut rects, &mut texts);
+            let mut runs: Vec<(f32, f32)> = texts
+                .instance_rects()
+                .iter()
+                .map(|r| (r.origin.x, r.origin.y))
+                .collect();
+            runs.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.total_cmp(&q.1)));
+            runs
+        };
+        let base = paint_runs(&mut v, area);
+        let base0 = paint_runs(&mut v, area0);
+        // 平移不变: 全部字形相对布局一致 (v1.0.2 教训: 绘制锁原点必须含非零平移态)
+        assert_eq!(base.len(), base0.len());
+        for ((x, y), (x0, y0)) in base.iter().zip(base0.iter()) {
+            assert!(
+                (x - x0 - 137.0).abs() < 0.5 && (y - y0 - 89.0).abs() < 0.5,
+                "平移不变: {x},{y} vs {x0},{y0}"
+            );
+        }
+        // 隐藏 msg → 字形减少 (零字形, 不只是不进几何)
+        assert!(v.columns.set_hidden("msg", true));
+        let hidden_runs = paint_runs(&mut v, area);
+        assert!(
+            hidden_runs.len() < base.len(),
+            "隐藏列须少字形: {} vs {}",
+            hidden_runs.len(),
+            base.len()
+        );
+        assert!(v.columns.set_hidden("msg", false));
+        // 拖宽 level → 字形 x 分布右移 (位移)
+        assert!(v.columns.set_width("level", 260.0));
+        let wide_runs = paint_runs(&mut v, area);
+        assert_eq!(wide_runs.len(), base.len(), "拖宽不增减字形");
+        assert_ne!(wide_runs, base, "拖宽须产生字形位移");
+        // 列序对调 → 字形序跟随 (x 分布变)
+        assert!(v.columns.move_column(0, 1));
+        let swapped = paint_runs(&mut v, area);
+        assert_eq!(swapped.len(), base.len());
+        assert_ne!(swapped, wide_runs, "列序须反映到字形序");
+        std::fs::remove_file(&path).ok();
+    }
+
     /// M4 夹具: 2 行 JSONL (行 0: level + 长 msg; 行 1: 仅 level 无 msg),
     /// 表格模式双列; 列区间合成缓存 = [(text_x, 200) level, (200, 400) msg]
     /// (绝对窗口 x; paint 缓存的替身 —— event 只读它)。
@@ -5663,5 +8053,79 @@ mod tests {
         assert!(v.press.is_none(), "右键不产潜伏锚点");
         assert_eq!(v.last_click, lc, "右键不污染双击判定");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- T2: 「字段…」按钮 (SPEC-v1x-field-picker-ui D1) ----
+
+    /// 「字段…」按钮显示判据 (真 paint, 判据 6): schema 在手才画 (`.log` 不出);
+    /// hit rect 同源 (paint 写 event 读), 点击发 `OpenPicker`; 右键不冒充 (P29)。
+    #[test]
+    fn fields_btn_shows_only_with_schema_and_opens_picker() {
+        use crate::view::Bar;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-bar-fields-{}.toml",
+            std::process::id()
+        ));
+        let mut bar = Bar::new();
+        let mut app = crate::LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        // `.log` (Raw/无 schema) → 不出按钮
+        app.mode = ViewMode::Raw;
+        bar.sync(&app);
+        let area = Rect::from_xywh(0.0, 0.0, 600.0, FILTER_BAR_H);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.layout(
+            Constraints::loose(Size::new(600.0, FILTER_BAR_H)),
+            &mut texts,
+        );
+        bar.paint(area, &mut rects, &mut texts);
+        assert!(
+            bar.fields_btn_rect.get().size.width <= 0.0,
+            ".log 不出「字段…」"
+        );
+        // JSONL 表格 (有 schema) → 出按钮
+        app.mode = ViewMode::Table;
+        app.schema = Some(Arc::new(Schema {
+            columns: vec![Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        }));
+        bar.sync(&app);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        bar.paint(area, &mut rects, &mut texts);
+        let r = bar.fields_btn_rect.get();
+        assert!(r.size.width > 0.0, "表格语境出「字段…」");
+        // 点击 → OpenPicker; 命中矩形与绘制同源
+        let mut msgs = MsgQueue::new();
+        bar.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, FILTER_BAR_H / 2.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m.downcast_ref::<Msg>(), Some(Msg::OpenPicker))),
+            "点「字段…」发 OpenPicker"
+        );
+        // 右键不冒充
+        let mut msgs = MsgQueue::new();
+        bar.event(
+            &Event::MouseInput {
+                button: MouseButton::Right,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, FILTER_BAR_H / 2.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(msgs.is_empty(), "右键不冒充左键");
+        std::fs::remove_file(&cfg).ok();
     }
 }

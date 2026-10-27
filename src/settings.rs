@@ -10,6 +10,7 @@
 
 use std::any::Any;
 
+use danqing::event::MouseButton;
 use danqing::widget::{
     Box as UiBox, Button, Center, CloseButton, Column, Dropdown, EventResult, MsgQueue, Overlay,
     Padding, Row, Switch, Tabs, Text, TextInput, Widget,
@@ -22,12 +23,17 @@ use danqing::{
 use crate::LogApp;
 use crate::Msg;
 use crate::config::{self, AppTheme};
+use danqing_log::export::ExportPick;
 use danqing_log::license::{self, Entitlement, PaidSource};
 
 /// 卡片宽度。
 const CARD_WIDTH: f32 = 360.0;
 /// 卡片左右内边距。
 const CARD_PAD_X: f32 = 24.0;
+/// 弹层行列表封顶 (两处 RowList 同值; 评审 Optional: 16 行会把算符行/过滤钮
+/// 挤出小窗 —— 框架不裁剪, 溢出画到卡外就点不中了; 超出折叠进「还有 N 列」
+/// 尾行, 顺带让尾行实机可达)。
+const POPOVER_ROWS_MAX: usize = 12;
 
 /// 内容区宽度 = 卡片宽 - 左右内边距。
 ///
@@ -52,9 +58,54 @@ fn content_width() -> f32 {
 /// **内容超过此值不会裁切, 而是溢出画到卡片外** —— 框架 `Box`/`Column` 都不裁剪
 /// (`paint` 只是原样转交子组件; 全框架只有 `Scrollable`/`icon_input` 走 clip)。
 /// 所以这个值**必须**盖住最高那一页; 真要加高某一页, 先看这条测试红不红。
-const PANEL_CONTENT_H: f32 = 180.0;
-/// 正文字号。
-const BODY_SIZE: u16 = 14;
+const PANEL_CONTENT_H: f32 = 211.0; // 2026-09-28: 快捷键页加 Ctrl+R 追踪行 (T6) 后实测 211
+/// 正文字号 (与 [`crate::view::FONT_SIZE`] 同源别名 —— 弹层/行列表必须与
+/// 行文同号, 各写一个 14 会漂)。
+const BODY_SIZE: u16 = crate::view::FONT_SIZE;
+
+/// 弹层/设置卡壳 (bg **取值**传入 —— 传 `&T` 会被不透明返回类型捕获生命周期):
+/// 不透明底 + 圆角 + 内边距 + 定宽。内容列走 [`card_column`] (五卡同形)。
+///
+/// 底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
+/// (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是半透明
+/// —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
+/// 必然是实色)。用户要求面板背景不透明, 故用它。
+///
+/// **不描边** (用户 2026-09-13 定)。与底层的区分交给 scrim 就够: 卡外被压暗
+/// (实测 (18,18,24)), 卡内是不透明的 `background()` ((25,25,32))。
+/// 原先那圈 `border()` 在暗色下会渲染成 (131,131,135) 的亮框, 是**重复**的一道
+/// (scrim 已经在做区分) 且过重。注: `UiBox` 不调 `.border_color()` 就完全不画边,
+/// 所以这里是删掉而不是把 width 置 0。
+/// 底色走**绑定**而非构造值: `view()` 只在启动时求值一次, 构造态的颜色
+/// 不会跟着主题切换走 (与标题栏同款的坑)。浅色启动、切到暗色 → 暗色 scrim 上
+/// 浮着一张浅色卡。回归锁: `settings_card_background_follows_theme_switch`。
+fn card_shell(bg: Color, body: impl Widget + 'static) -> impl Widget {
+    UiBox::new(bg)
+        .bind_color(|app: &LogApp| app.theme.theme().background())
+        .radius(12.0)
+        .child(Padding::new(
+            Edges {
+                top: 24.0,
+                right: CARD_PAD_X,
+                bottom: 16.0,
+                left: CARD_PAD_X,
+            },
+            body,
+        ))
+        .width(CARD_WIDTH)
+}
+
+/// 卡内容列 (五卡同形: 16 间距 + 横向居中)。
+fn card_column() -> Column {
+    Column::new().gap(16.0).cross_center()
+}
+
+/// 卡标题 (静态文案卡同用): 正文号 + 主文字色, 色随主题每帧取。
+fn card_title(title: &str) -> impl Widget {
+    Text::new(title.to_string())
+        .font_size(BODY_SIZE)
+        .bind_color(|app: &LogApp| app.theme.theme().text_primary())
+}
 
 /// 设置卡浮层：danqing::Overlay 承载 scrim/居中/模态门控 (簇 C 下沉)。
 pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
@@ -70,71 +121,44 @@ pub(crate) fn settings_overlay(theme: config::AppTheme) -> impl Widget {
 /// 「关于」页签里, 摆在页签外会与页签内容同屏重复 (用户指出)。
 fn settings_card(theme: config::AppTheme) -> impl Widget {
     let t = theme.theme();
-    let pad = Edges {
-        top: 24.0,
-        right: CARD_PAD_X,
-        bottom: 16.0,
-        left: CARD_PAD_X,
-    };
     let content_w = content_width();
-    // 卡片底色用 `background()` 而非 `surface()`: `surface` 是 `rgba(1,1,1,0.72)`
-    // (**半透明**, 框架的玻璃感), `surface_variant` 深色下也是半透明
-    // —— 主题里唯一两种配色都**不透明**的就是 `background()` (清屏 fallback 色,
-    // 必然是实色)。用户要求面板背景不透明, 故用它。
-    //
-    // **不描边** (用户 2026-09-13 定)。与底层的区分交给 scrim 就够: 卡外被压暗
-    // (实测 (18,18,24)), 卡内是不透明的 `background()` ((25,25,32))。
-    // 原先那圈 `border()` 在暗色下会渲染成 (131,131,135) 的亮框, 是**重复**的一道
-    // (scrim 已经在做区分) 且过重。注: `UiBox` 不调 `.border_color()` 就完全不画边,
-    // 所以这里是删掉而不是把 width 置 0。
-    // 底色走**绑定**而非构造值: `view()` 只在启动时求值一次, 构造态的颜色
-    // 不会跟着主题切换走 (与标题栏同款的坑)。浅色启动、切到暗色 → 暗色 scrim 上
-    // 浮着一张浅色卡。回归锁: `settings_card_background_follows_theme_switch`。
-    UiBox::new(t.background())
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            pad,
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(close_row())
-                .child(
-                    Tabs::new(&t)
-                        // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
-                        // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 许可 / 3 = 关于)。
-                        // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
-                        // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
-                        // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例);
-                        // 许可 (SPEC-v1x-licensing D8) 在快捷键后、关于前。
-                        // 别处要引用「许可」下标, 用同文件相邻的 [`LICENSE_TAB_INDEX`] 常量。
-                        .tab("常规")
-                        .tab("快捷键")
-                        .tab("许可")
-                        .tab("关于")
-                        .child(panel_box(general_content()))
-                        .child(panel_box(shortcuts_section(content_w)))
-                        .child(panel_box(license_content(content_w)))
-                        .child(panel_box(about_content(content_w)))
-                        // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
-                        // 第一页更省事), 且 Esc/点遮罩关闭不丢。
-                        .bind(|app: &LogApp| app.settings_tab)
-                        // 页签**颜色**必须每帧重取 —— `Tabs::new(&t)` 是构造值,
-                        // 不挂这个绑定的话切主题时页签名会停在旧主题色
-                        // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
-                        // 回归锁: `settings_card_tabs_follow_theme_switch`。
-                        .bind_theme(|app: &LogApp| app.theme.theme())
-                        // 更新角标挂「关于」页签 (腿 A): 生产现查 hint() (与提示行
-                        // 同源); 测试经 update_hint_override 注入两态 (不碰全局 publish)。
-                        .bind_tab_badge(ABOUT_TAB_INDEX, |app: &LogApp| {
-                            app.update_hint_override
-                                .get()
-                                .unwrap_or_else(|| crate::app_update::hint().is_some())
-                        })
-                        .on_change(Msg::SelectSettingsTab),
-                ),
-        ))
-        .width(CARD_WIDTH)
+    card_shell(
+        t.background(),
+        card_column().child(close_row()).child(
+            Tabs::new(&t)
+                // ⚠ 页签顺序的**唯一真身** —— `LogApp::settings_tab` 存的就是
+                // 这里的下标 (0 = 常规 / 1 = 快捷键 / 2 = 许可 / 3 = 关于)。
+                // main.rs 那两处注释一律指向本处, 别在那边再列一份序号:
+                // 2026-09-13 加「常规」时就因为两处各写了一份而漂过一次。
+                // 顺序理由: 常规在前 (设置卡首屏 = 设置), 关于居末 (产品线惯例);
+                // 许可 (SPEC-v1x-licensing D8) 在快捷键后、关于前。
+                // 别处要引用「许可」下标, 用同文件相邻的 [`LICENSE_TAB_INDEX`] 常量。
+                .tab("常规")
+                .tab("快捷键")
+                .tab("许可")
+                .tab("关于")
+                .child(panel_box(general_content()))
+                .child(panel_box(shortcuts_section(content_w)))
+                .child(panel_box(license_content(content_w)))
+                .child(panel_box(about_content(content_w)))
+                // 页签选择留在应用状态里: 重开卡片停在上次那页 (比每次弹回
+                // 第一页更省事), 且 Esc/点遮罩关闭不丢。
+                .bind(|app: &LogApp| app.settings_tab)
+                // 页签**颜色**必须每帧重取 —— `Tabs::new(&t)` 是构造值,
+                // 不挂这个绑定的话切主题时页签名会停在旧主题色
+                // (浅色启动切暗色 → 深灰字压暗底, 读不了)。
+                // 回归锁: `settings_card_tabs_follow_theme_switch`。
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                // 更新角标挂「关于」页签 (腿 A): 生产现查 hint() (与提示行
+                // 同源); 测试经 update_hint_override 注入两态 (不碰全局 publish)。
+                .bind_tab_badge(ABOUT_TAB_INDEX, |app: &LogApp| {
+                    app.update_hint_override
+                        .get()
+                        .unwrap_or_else(|| crate::app_update::hint().is_some())
+                })
+                .on_change(Msg::SelectSettingsTab),
+        ),
+    )
 }
 
 /// 「许可」页签下标 —— 与 `.tab()` 链同文件相邻, 是唯一合法引用点 (T7 升级
@@ -228,6 +252,22 @@ fn license_content(content_w: f32) -> impl Widget {
         .child(content_row(key_input_box(), content_w))
         .child(content_row(license_buttons_row(), content_w))
         .child(content_row(license_feedback_text(), content_w))
+        .child(content_row(free_tier_scope_note(), content_w))
+}
+
+/// 免费层范围提示 (todo-gate-trio G3): 书签持久化已收付费 —— **提示位唯一归处**
+/// 就是这行 (G3 裁决: 不在 toggle 时弹对话框, 会话内书签照用)。
+/// 免费态才显示 (付费了再说就是噪音)。
+fn free_tier_scope_note() -> impl Widget {
+    Text::bind(|app: &LogApp| {
+        if app.entitlement.allows(license::Feature::BookmarkPersist) {
+            String::new()
+        } else {
+            "免费层: 书签仅本次会话内有效（跨重启不恢复）。".to_string()
+        }
+    })
+    .font_size(BODY_SIZE)
+    .bind_color(|app: &LogApp| app.theme.theme().text_secondary())
 }
 
 fn tier_status_text() -> impl Widget {
@@ -354,42 +394,661 @@ pub(crate) fn upgrade_overlay(theme: config::AppTheme) -> impl Widget {
             .on_click(|| Msg::UpgradePurchase),
         );
     }
-    let card = UiBox::new(t.background())
-        // 底色走绑定 (同设置卡): 视图树只建一次, 构造值不跟主题切换走。
-        .bind_color(|app: &LogApp| app.theme.theme().background())
-        .radius(12.0)
-        .child(Padding::new(
-            Edges {
-                top: 24.0,
-                right: CARD_PAD_X,
-                bottom: 16.0,
-                left: CARD_PAD_X,
-            },
-            Column::new()
-                .gap(16.0)
-                .cross_center()
-                .child(
-                    Text::bind(|app: &LogApp| match app.upgrade_prompt {
-                        Some(f) => format!("「{}」是付费层功能", f.label()),
-                        None => String::new(),
-                    })
-                    .font_size(BODY_SIZE)
-                    .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+    let card = card_shell(
+        t.background(),
+        card_column()
+            .child(
+                Text::bind(|app: &LogApp| match app.upgrade_prompt {
+                    Some(f) => format!("「{}」是付费层功能", f.label()),
+                    None => String::new(),
+                })
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_primary()),
+            )
+            .child(
+                Text::new(
+                    "付费层 = 批量 / 留存 / 交付：$29 个人买断 · $59 企业，永久使用".to_string(),
                 )
-                .child(
-                    Text::new(
-                        "付费层 = 批量 / 留存 / 交付：$29 个人买断 · $59 企业，永久使用"
-                            .to_string(),
-                    )
-                    .font_size(BODY_SIZE)
-                    .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
-                )
-                .child(buttons),
-        ))
-        .width(CARD_WIDTH);
+                .font_size(BODY_SIZE)
+                .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+            )
+            .child(buttons),
+    );
     Overlay::themed(&t, Center::new(card).fill_max())
         .bind_open(|app: &LogApp| app.upgrade_prompt.is_some())
         .on_scrim_click(|| Msg::CloseUpgradePrompt)
+}
+
+/// 导出格式小菜单 (SPEC-v1x-export D7): 格式行**按模式收口** —— 不可用格式
+/// **不出现** (不灰置: 灰置要额外解释「为什么灰」, 不出现则无需解释)。
+/// 两卡互斥 (bind_open 谓词): JSONL (`schema.is_some()`) = 三项 / 明文 = 仅原始行。
+/// 注: 「JSONL 表格模式」判据取**文件是 JSONL** 而非当前 ViewMode —— Ctrl+T 切到
+/// 原始视图不改文件的可导性 (实现口径, 与 spec D1 的模式表同读)。
+pub(crate) fn export_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(
+        &t,
+        Center::new(export_menu_card(t.background(), false)).fill_max(),
+    )
+    .bind_open(|app: &LogApp| app.export_menu_open && app.schema.is_none())
+    .on_scrim_click(|| Msg::CloseExportMenu)
+}
+
+/// JSONL 卡: 原始行 / JSON 美化 / CSV 三项。
+pub(crate) fn export_menu_overlay_jsonl(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(
+        &t,
+        Center::new(export_menu_card(t.background(), true)).fill_max(),
+    )
+    .bind_open(|app: &LogApp| app.export_menu_open && app.schema.is_some())
+    .on_scrim_click(|| Msg::CloseExportMenu)
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题 + 格式钮行。
+fn export_menu_card(bg: Color, jsonl: bool) -> impl Widget {
+    let label = |s: &str| {
+        Text::new(s.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE)
+    };
+    let mut rows = Column::new()
+        .gap(12.0)
+        .cross_center()
+        .child(format_btn(label("原始行"), || {
+            Msg::ExportFormatChosen(ExportPick::Raw)
+        }));
+    if jsonl {
+        rows = rows
+            .child(format_btn(label("JSON 美化"), || {
+                Msg::ExportFormatChosen(ExportPick::Pretty)
+            }))
+            .child(format_btn(label("CSV"), || {
+                Msg::ExportFormatChosen(ExportPick::Csv)
+            }));
+    }
+    card_shell(bg, card_column().child(card_title("导出格式")).child(rows))
+}
+
+fn format_btn(label: Text, on_click: impl Fn() -> Msg + 'static) -> impl Widget {
+    Button::themed(&LightTheme, label)
+        .bind_color(|app: &LogApp| app.theme.theme().accent())
+        .on_click(on_click)
+}
+
+/// 列管理弹层 (SPEC-v1x-table-column-config D3, 裁定①): 表头「列…」按钮/右键入口,
+/// 卡体 = 每列一行开关 (行首复选框 = 框架 `Checkbox` 矢量盒, SPEC-checkbox-widget;
+/// 原 `[x]`/`[ ]` ASCII 勾选已退役 —— 内嵌字体子集无 ✓ 字形, 矢量绕开字体约束) +
+/// 「恢复默认」。复用 export 菜单四件套范式; 与导出菜单**互斥** (开一个先关另一个,
+/// 防双 scrim 叠)。
+/// 行集走 [`col_menu_rows`] (RowList 自绘, 每帧取态 —— T0 修复: 建树快照不许冻结)。
+pub(crate) fn col_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(col_menu_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.col_menu_open)
+        .on_scrim_click(|| Msg::CloseColMenu)
+}
+
+/// 弹层行序 = 列配置**显示序** (评审 Optional: 与表格同序, 摆到哪画到哪);
+/// 空配置回退 schema 首见序 (未对账快照防御), 只保留 schema 内的列名。
+fn col_menu_row_names(
+    schema: Option<&danqing_log::jsonl::Schema>,
+    columns: &danqing_log::columns::ColumnConfig,
+) -> Vec<String> {
+    let Some(s) = schema else {
+        return Vec::new();
+    };
+    if columns.order.is_empty() {
+        return s.columns.iter().map(|c| c.name.clone()).collect();
+    }
+    columns
+        .order
+        .iter()
+        .filter(|n| s.columns.iter().any(|c| c.name == **n))
+        .cloned()
+        .collect()
+}
+
+/// 「显示列」行集 (T0, RowList): 行文案 = 纯列名 (勾选态在行首复选框,
+/// SPEC-checkbox-widget T4 —— `[x]`/`[ ]` 文本前缀已退役), 载荷 = 列名 ——
+/// **每帧从 LogApp 取** (`col_menu_row_names` + 显隐勾态), 建树后开文件/换文件
+/// 行集跟随 (启动快照 bug 的修复本体, 锁
+/// `col_menu_rows_follow_schema_across_sync`)。封顶见 [`POPOVER_ROWS_MAX`]。
+fn col_menu_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            col_menu_row_names(app.schema.as_deref(), &app.columns)
+                .into_iter()
+                .map(|name| (name.clone(), name))
+                .collect()
+        },
+        |_app: &LogApp| None,
+        |payload: &str| Msg::ToggleColumn(payload.to_string()),
+        |n| format!("… 还有 {n} 列"),
+    )
+    .with_checkbox(|app: &LogApp, payload: &str| Some(!app.columns.is_hidden(payload)))
+}
+
+/// 卡体 (壳见 [`card_shell`]; 行数据**不**取值传入 —— 那正是启动快照 bug 的
+/// 病灶)。
+fn col_menu_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("显示列"))
+            .child(col_menu_rows())
+            .child(format_btn(
+                Text::new("恢复默认".to_string())
+                    .font_size(BODY_SIZE)
+                    .color(Color::WHITE),
+                || Msg::ResetColumns,
+            )),
+    )
+}
+
+/// 字段查询弹层 (SPEC-v1x-field-picker-ui D1): 过滤栏「字段…」按钮入口,
+/// 卡体 = 字段行 (RowList 每帧取 schema 列名) + 算符六钮 (常显) + 值输入 +
+/// 「过滤」钮 (与值输入 Enter 同路)。与 col_menu/export_menu 互斥 (开一关二)。
+pub(crate) fn picker_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(picker_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.picker_open)
+        .on_scrim_click(|| Msg::ClosePicker)
+}
+
+/// 字段行 (RowList, T2): 行 = schema 列名, 载荷 = 列名, 高亮 = 当前选中字段。
+/// 行数封顶见 [`POPOVER_ROWS_MAX`]。
+fn picker_field_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            app.schema
+                .as_deref()
+                .map(|s| {
+                    s.columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        },
+        |app: &LogApp| app.picker_field.clone(),
+        |payload: &str| Msg::PickPickerField(payload.to_string()),
+        |n| format!("… 还有 {n} 列"),
+    )
+}
+
+/// 算符钮 (静态结构, 选中色经 bind 每帧取): 显示 = `=` / `*` / `>=` / `<=` /
+/// `>` / `<` (前缀 = `=` + 值尾 `*`, 拼接在 `build_clause`, 不新造算符)。
+fn op_btn(label: &str, op: danqing_log::jsonl::Op) -> impl Widget {
+    Button::themed(
+        &LightTheme,
+        Text::new(label.to_string())
+            .font_size(BODY_SIZE)
+            .color(Color::WHITE),
+    )
+    .bind_color(move |app: &LogApp| {
+        if app.picker_op == op {
+            app.theme.theme().accent()
+        } else {
+            app.theme.theme().text_secondary()
+        }
+    })
+    .on_click(move || Msg::PickPickerOp(op))
+}
+
+/// 提交钮 + 值输入复合件的输入宽。
+const SUBMIT_INPUT_W: f32 = 200.0;
+
+/// 值输入 + 提交钮薄复合件 (Bar 同构; 评审 R3/R7/R8 三缺陷一次消解的持有者
+/// 收口; 泛化自 picker 专用件, 行为零变化 —— picker 锁全程护航):
+/// - **提交时读 `ti.value()` 随信** —— 值不设镜像 (镜像有 `set_text`/`clear`
+///   不回 `on_change` 的脱钩窗, 评审 R3: 空框提交出脏子句);
+/// - Enter 只在本件持焦时拦截 (兄弟钮的 Enter 归按钮自己, 评审 R7);
+/// - 焦点代理 `focus_id` (`Open*` 送焦, 开弹层直接打字, 评审 R8)。
+///
+/// 提交钮 paint 侧 (hit 同源缓存) —— 兄弟节点读不到输入缓冲, 提交收口必须在
+/// 持有者内 (plan 核实②的「不许绕」)。两处消费: picker 值框 (`PickerSubmit`)
+/// 与会话命名框 (`SaveSession`) —— 提交钮标签/预留宽/焦点 id/清空代次/提交
+/// Msg 全部构造注入。
+struct SubmitInput {
+    ti: TextInput,
+    submit_rect: std::cell::Cell<Rect>,
+    submit_hover: std::cell::Cell<bool>,
+    /// 钮色 (sync 每帧从主题取 —— 构造值烘死会「浅色启动切暗色钮字发灰」)。
+    submit_accent: Color,
+    submit_idle: Color,
+    /// 提交钮标签。
+    submit_label: &'static str,
+    /// 提交钮预留宽 (layout 定宽; 命中宽 paint 实测, picker 56 = 行为不变)。
+    submit_w: f32,
+    focus_id: &'static str,
+    /// 提交 = 值 → Msg (Enter 与钮同路)。
+    submit_fn: Box<dyn Fn(String) -> Msg>,
+}
+
+impl SubmitInput {
+    fn new(
+        placeholder: &str,
+        submit_label: &'static str,
+        submit_w: f32,
+        focus_id: &'static str,
+        clear_rev: impl Fn(&LogApp) -> u64 + 'static,
+        submit_fn: impl Fn(String) -> Msg + 'static,
+    ) -> Self {
+        Self {
+            ti: TextInput::themed(&LightTheme)
+                .bind_theme(|app: &LogApp| app.theme.theme())
+                .bind_clear(move |app: &LogApp| clear_rev(app))
+                .font_size(BODY_SIZE)
+                .placeholder(placeholder, Color::rgb(0.45, 0.45, 0.48)),
+            submit_rect: std::cell::Cell::new(Rect::default()),
+            submit_hover: std::cell::Cell::new(false),
+            submit_accent: Color::rgb(0.18, 0.35, 0.60),
+            submit_idle: Color::rgb(0.4, 0.4, 0.42),
+            submit_label,
+            submit_w,
+            focus_id,
+            submit_fn: Box::new(submit_fn),
+        }
+    }
+
+    /// 提交 = 值随信 (Enter 与提交钮同路)。
+    fn submit(&self, msgs: &mut MsgQueue) -> EventResult {
+        msgs.push(Box::new((self.submit_fn)(self.ti.value().to_owned())));
+        EventResult::Consumed
+    }
+}
+
+impl Widget for SubmitInput {
+    fn sync(&mut self, state: &dyn Any) {
+        // TextInput 是**字段**非子节点, 框架不替它传播 sync (Bar 同因)。
+        self.ti.sync(state);
+        if let Some(app) = state.downcast_ref::<LogApp>() {
+            let t = app.theme.theme();
+            self.submit_accent = t.accent();
+            self.submit_idle = t.text_secondary();
+        }
+    }
+
+    fn layout(&mut self, _constraints: Constraints, texts: &mut TextBatch) -> Size {
+        let ti = self
+            .ti
+            .layout(Constraints::loose(Size::new(SUBMIT_INPUT_W, 999.0)), texts);
+        Size::new(SUBMIT_INPUT_W + 8.0 + self.submit_w, ti.height.max(28.0))
+    }
+
+    fn paint(&self, area: Rect, rects: &mut RectBatch, texts: &mut TextBatch) {
+        self.ti.paint(
+            Rect::from_xywh(
+                area.origin.x,
+                area.origin.y,
+                SUBMIT_INPUT_W,
+                area.size.height,
+            ),
+            rects,
+            texts,
+        );
+        let w = texts.measure(self.submit_label, BODY_SIZE);
+        let bx = area.origin.x + SUBMIT_INPUT_W + 8.0;
+        let line_h = texts.line_height(f32::from(BODY_SIZE));
+        let base =
+            area.origin.y + (area.size.height - line_h) / 2.0 + texts.ascent(f32::from(BODY_SIZE));
+        // hover 换 accent (发现性, Bar「字段…」同款)
+        let color = if self.submit_hover.get() {
+            self.submit_accent
+        } else {
+            self.submit_idle
+        };
+        texts.push_text(self.submit_label, bx, base, BODY_SIZE, color);
+        self.submit_rect.set(Rect::from_xywh(
+            bx - 4.0,
+            area.origin.y,
+            w + 8.0,
+            area.size.height,
+        ));
+    }
+
+    fn event(&mut self, event: &Event, area: Rect, msgs: &mut MsgQueue) -> EventResult {
+        match event {
+            Event::CursorMoved(p) => {
+                self.submit_hover.set(self.submit_rect.get().contains(*p));
+                self.ti.event(event, area, msgs)
+            }
+            Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position,
+                ..
+            } if self.submit_rect.get().contains(*position) => self.submit(msgs),
+            Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                ..
+            } => self.submit(msgs),
+            other => self.ti.event(other, area, msgs),
+        }
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn focus_id(&self) -> Option<&'static str> {
+        Some(self.focus_id)
+    }
+
+    fn wants_ime(&self) -> bool {
+        self.ti.wants_ime()
+    }
+
+    fn ime_area(&self) -> Option<Rect> {
+        self.ti.ime_area()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.ti.selected_text()
+    }
+
+    fn hit_area(&self) -> Option<Rect> {
+        self.ti.hit_area()
+    }
+
+    fn reset_focus(&mut self) {
+        self.ti.reset_focus();
+    }
+}
+
+/// picker 值框 (SPEC-v1x-field-picker-ui): 提交 = `PickerSubmit` (值随信);
+/// 56 预留宽 = 泛化前原值 (行为零变化)。
+fn picker_input() -> SubmitInput {
+    SubmitInput::new(
+        "值 (如 ERROR / 42)",
+        "过滤",
+        56.0,
+        "picker-value",
+        |app: &LogApp| app.picker_clear_rev,
+        Msg::PickerSubmit,
+    )
+}
+
+/// 会话命名框 (SPEC-v1x-workspace-sessions D5): 提交 = `SaveSession`
+/// (Enter 与「保存当前」同路)。
+fn session_name_input() -> SubmitInput {
+    SubmitInput::new(
+        "会话名",
+        "保存当前",
+        64.0,
+        "session-name",
+        |app: &LogApp| app.session_clear_rev,
+        Msg::SaveSession,
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「查询字段」+ 字段行 + 算符六钮 + 值输入。
+fn picker_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("查询字段"))
+            .child(picker_field_rows())
+            .child(
+                Row::new()
+                    .gap(8.0)
+                    .cross_center()
+                    .child(op_btn("=", danqing_log::jsonl::Op::Eq))
+                    .child(op_btn("*", danqing_log::jsonl::Op::Prefix))
+                    .child(op_btn(">=", danqing_log::jsonl::Op::GtEq))
+                    .child(op_btn("<=", danqing_log::jsonl::Op::LtEq))
+                    .child(op_btn(">", danqing_log::jsonl::Op::Gt))
+                    .child(op_btn("<", danqing_log::jsonl::Op::Lt)),
+            )
+            .child(picker_input()),
+    )
+}
+
+/// 命名会话弹层 (SPEC-v1x-workspace-sessions D5): 状态栏「会话」入口,
+/// 卡体 = 会话行 (RowList 第三消费者 —— 评审留档「五闭包等第三消费者」在此
+/// 落地, 契约零变化) + 命名框 (Enter/「保存当前」同路) + 「删除」
+/// (作用选中, 无确认)。
+pub(crate) fn session_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(sessions_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.session_menu_open)
+        .on_scrim_click(|| Msg::CloseSessionMenu)
+}
+
+/// 会话行 (RowList): 行 = 会话名 (载荷 = 名), 点行 = **应用并记选中**
+/// (热路径一击直达; 高亮 = 最近点选名 = 「删除」指针, Open Q3 只显本路径)。
+fn session_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            // 展示序 = updated **降序** (评审 M3): 新存的永远在顶 —— 「存完
+            // 即见」, 不许 push 队尾存完即从列表消失。
+            let mut v: Vec<&danqing_log::columns::SessionEntry> = app.sessions.iter().collect();
+            v.sort_by_key(|s| std::cmp::Reverse(s.updated));
+            v.into_iter()
+                .map(|s| {
+                    // 合并组会话 (T8) 行内可辨: 后缀标源数 (点行 = 恢复合并);
+                    // 载荷仍是会话名 (应用链按名找人)。
+                    let label = match &s.merge {
+                        Some(g) => format!("{} · 合并 {} 源", s.name, g.sources.len()),
+                        None => s.name.clone(),
+                    };
+                    (label, s.name.clone())
+                })
+                .collect()
+        },
+        |app: &LogApp| app.session_selected.clone(),
+        |payload: &str| Msg::ApplySession(payload.to_string()),
+        |n| format!("… 还有 {n} 个"),
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「工作台会话」+ 会话行 + 命名框 + 「删除」。
+fn sessions_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("工作台会话"))
+            .child(session_rows())
+            .child(session_name_input())
+            .child(format_btn(
+                Text::new("删除".to_string())
+                    .font_size(BODY_SIZE)
+                    .color(Color::WHITE),
+                || Msg::DeleteSelectedSession,
+            )),
+    )
+}
+
+/// 合并源管理弹层 (SPEC-v1x-merge-timeline T4, 弹层族第七员): 底栏「合并…」/
+/// `Ctrl+M` 入口 (门控在应用层)。卡体 = 源行 (RowList 第四消费者, 色块 = D11
+/// 源色板按源序号) + 加源/移除/退出合并 三钮。互斥/Esc 插层入家族清单。
+pub(crate) fn merge_menu_overlay(theme: config::AppTheme) -> impl Widget {
+    let t = theme.theme();
+    Overlay::themed(&t, Center::new(merge_menu_card(t.background())).fill_max())
+        .bind_open(|app: &LogApp| app.merge_menu_open)
+        .on_scrim_click(|| Msg::CloseMergeMenu)
+}
+
+/// 合并源行文案 (T4 抽出为可测纯函数, [`merge_union_hint`] 先例): 源名 ·
+/// 格式结论 (+断流尾注)。勾选态已移交行首复选框 (`with_checkbox`) ——
+/// 文案不含 `[x]`/`[ ]` (文本勾选退役, SPEC-checkbox-widget)。
+fn merge_source_label(name: &str, route: &danqing_log::timestamp::TsRoute, stale: bool) -> String {
+    // T7: 断流源行内明示 (stat/追加读取失败; 行集保持旧快照, 恢复可读自清) ——
+    // 单源断流不拖垮全局, 但用户必须看得见。
+    let tail = if stale { " · 断流" } else { "" };
+    format!(
+        "{name} · {}{tail}",
+        danqing_log::merge_view::route_label(route)
+    )
+}
+
+/// 按载荷 (路径字符串) 查合并源序号 —— 源行两个行首件 (色块/复选框) 闭包的
+/// 共同起手式, 收口一处 (无合并/无该源 = None)。
+fn merge_source_idx(app: &LogApp, payload: &str) -> Option<usize> {
+    app.merge
+        .as_ref()?
+        .sources
+        .iter()
+        .position(|s| s.path.to_string_lossy() == payload)
+}
+
+/// 源行 (RowList): 行 = 复选框 (显隐) + 色块 + 源名 · 格式结论 ([`merge_source_label`]),
+/// 载荷 = 路径; 点行 = 切显隐 + 记选中 (「移除」指针, ApplySession 同规)。
+/// 行首色块 = `source_palette()[源序号]` (D11/CP2-A 同一 token 族);
+/// 复选框 = 框架 `Checkbox::paint_box` (SPEC-checkbox-widget; 高亮行反白 D3b)。
+fn merge_source_rows() -> crate::pick_list::RowList {
+    crate::pick_list::RowList::new(
+        POPOVER_ROWS_MAX,
+        |app: &LogApp| {
+            let Some(m) = app.merge.as_ref() else {
+                return Vec::new(); // 未合并: 空列表 (「加源」起并后填)
+            };
+            m.sources
+                .iter()
+                .map(|s| {
+                    let label = merge_source_label(s.name(), &s.route, s.stale);
+                    (label, s.path.to_string_lossy().into_owned())
+                })
+                .collect()
+        },
+        |app: &LogApp| app.merge_source_selected.clone(),
+        |payload: &str| Msg::ToggleMergeSource(payload.to_string()),
+        |n| format!("… 还有 {n} 个"),
+    )
+    .with_swatch(|app: &LogApp, payload: &str| {
+        Some(app.theme.theme().source_palette()[merge_source_idx(app, payload)?])
+    })
+    .with_checkbox(|app: &LogApp, payload: &str| {
+        Some(!app.merge.as_ref()?.sources[merge_source_idx(app, payload)?].hidden)
+    })
+}
+
+/// 并集列提示行 (spec Q3「弹层可见提示」): 截断时如实报「超上限截断」——
+/// 用户要知道自己的列被截了; 未截只报列数。抽出独立函数是为可测。
+fn merge_union_hint(app: &LogApp) -> String {
+    let Some(m) = app.merge.as_ref() else {
+        return String::new();
+    };
+    let u = danqing_log::merge_view::union_columns(m.sources.iter().map(|s| s.schema.as_deref()));
+    if u.truncated > 0 {
+        format!(
+            "并集列 {} 列 · 超上限截断至 {}",
+            u.names.len() + u.truncated,
+            danqing_log::merge_view::UNION_COL_CAP
+        )
+    } else {
+        format!("并集列 {} 列", u.names.len())
+    }
+}
+
+/// 时间参数编辑区 (T5 腿 D, 作用**选中**源): 快捷档 ±1s/±1min/±1h (增量,
+/// op_btn 同款小钮) + 偏移 ms 手输 + 时区手输。无选中时动作在应用层说清
+/// (指针语义, DeleteSelectedSession 同规) —— 钮不因此禁用 (视觉态会漂,
+/// 说清文案在应用层有唯一出处)。
+fn merge_time_edit() -> impl Widget {
+    let step = |label: &'static str, delta: i64| {
+        Button::themed(
+            &LightTheme,
+            Text::new(label.to_string())
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+        )
+        // 横向 padding 收紧到 spacing_sm: 六枚一排按默认 (横 16) 自然宽 348,
+        // 顶穿卡片内容宽 312、画到卡外 (守卫 merge_time_edit_row_fits_card_width)。
+        // 纵向保持默认 (spacing_md) —— 钮高不变, 与卡上其他钮同高。
+        .padding(Edges::symmetric(
+            LightTheme.spacing_sm(),
+            LightTheme.spacing_md(),
+        ))
+        .bind_color(|app: &LogApp| app.theme.theme().text_secondary())
+        .on_click(move || Msg::NudgeMergeOffset(delta))
+    };
+    Row::new()
+        .gap(6.0)
+        .cross_center()
+        .child(step("-1h", -3_600_000))
+        .child(step("-1m", -60_000))
+        .child(step("-1s", -1_000))
+        .child(step("+1s", 1_000))
+        .child(step("+1m", 60_000))
+        .child(step("+1h", 3_600_000))
+}
+
+/// 偏移手输 (±ms 粒度, 绝对值): Enter/「设偏移」同路。
+fn merge_offset_input() -> SubmitInput {
+    SubmitInput::new(
+        "偏移 ms (选中源)",
+        "设偏移",
+        64.0,
+        "merge-offset",
+        |app: &LogApp| app.merge_clear_rev,
+        Msg::SetMergeOffset,
+    )
+}
+
+/// 时区手输 (无 tz 时间戳按它解释, 腿 D): ±hh:mm 或小时数。
+fn merge_tz_input() -> SubmitInput {
+    SubmitInput::new(
+        "时区 (如 +08:00)",
+        "设时区",
+        64.0,
+        "merge-tz",
+        |app: &LogApp| app.merge_clear_rev,
+        Msg::SetMergeTz,
+    )
+}
+
+/// 卡体 (壳见 [`card_shell`]): 标题「合并源」+ 源行 + 加源/移除 + 退出合并。
+/// 「退出合并/返回合并」label 随态 —— `Text::bind` 每帧取 (建树冻结铁律)。
+fn merge_menu_card(bg: Color) -> impl Widget {
+    card_shell(
+        bg,
+        card_column()
+            .child(card_title("合并源"))
+            .child(merge_source_rows())
+            .child(
+                Text::bind(merge_union_hint)
+                    .font_size(BODY_SIZE)
+                    .bind_color(|app: &LogApp| app.theme.theme().text_secondary()),
+            )
+            .child(merge_time_edit())
+            .child(merge_offset_input())
+            .child(merge_tz_input())
+            .child(
+                Row::new()
+                    .gap(8.0)
+                    .cross_center()
+                    .child(format_btn(
+                        Text::new("加源…".to_string())
+                            .font_size(BODY_SIZE)
+                            .color(Color::WHITE),
+                        || Msg::PickMergeSource,
+                    ))
+                    .child(format_btn(
+                        Text::new("移除".to_string())
+                            .font_size(BODY_SIZE)
+                            .color(Color::WHITE),
+                        || Msg::RemoveSelectedMergeSource,
+                    )),
+            )
+            .child(format_btn(
+                Text::bind(|app: &LogApp| {
+                    if app.workspace == crate::Workspace::Merge {
+                        "退出合并".to_string()
+                    } else {
+                        "返回合并".to_string()
+                    }
+                })
+                .font_size(BODY_SIZE)
+                .color(Color::WHITE),
+                || Msg::ToggleMergeWorkspace,
+            )),
+    )
 }
 
 /// 「关于」页签的内容: 产品名/版本/一句话 + 版本检查 + 反馈。
@@ -475,13 +1134,17 @@ const SHORTCUT_KEY_W: f32 = 120.0;
 /// (人工验收反馈: 用户无从得知 `Ctrl+L` 能收起侧栏)。
 /// 只列**猜不出来**的那几个组合键 (方向键/翻页键不必教); 完整清单在 README。
 /// 提为模块级常量: 回归锁 `shortcut_card_bookmark_rows_match_dispatch` 要读它。
-const SHORTCUT_KEYS: [(&str, &str); 8] = [
+const SHORTCUT_KEYS: [(&str, &str); 10] = [
     ("Ctrl+O", "打开文件"),
     ("Ctrl+F", "搜索"),
     ("Ctrl+T", "表格 / 原始模式互切"),
     ("Ctrl+L", "级别侧栏 显示 / 收起"),
     ("Ctrl+B", "添加书签 / 去掉书签"),
     ("Ctrl+G", "跳下一书签"),
+    ("Ctrl+E", "导出…"),
+    // 腿 E/T6: 追踪在界面上**没有任何 affordance** (无钮无菜单), 不进表
+    // 就无人得知 (Ctrl+L 先例)。「合并…」入口本身底栏有钮, Ctrl+M 不列。
+    ("Ctrl+R", "追踪选中值 (合并视图)"),
     // P36 (2026-09-15): 单键两条。判据就是本表自己那句话 ——「只列**猜不出来**的」,
     // 不是新造标准: 方向键/翻页键不必教 (常识), 但 `/` 是 Vim 习惯、`f` 是本应用
     // 自造的词, 两个都猜不出来。它们原先只写在**仓外 README**, 而商店版用户没有
@@ -886,13 +1549,14 @@ mod tests {
         );
     }
 
-    /// 「获取付费层」按钮显隐 (D8): 测试环境 = 便携版且 `PURCHASE_URL` 未回填
-    /// → 必须隐藏 (不给死链接)。回填后本测试转红, 届时改写为「显示」。
+    /// 「获取付费层」按钮显隐 (D8): **2026-10-27 收银台开业**, `PURCHASE_URL`
+    /// 已回填 → 便携版必须**显示**。前身是反向锁「占位期间隐藏」(设计即约定
+    /// 回填当日翻转), 本测试即那次翻转的兑现。
     #[test]
-    fn purchase_button_hidden_until_shop_opens() {
+    fn purchase_button_visible_since_shop_opened() {
         assert!(
-            !show_purchase_button(),
-            "PURCHASE_URL 占位期间便携版不显示购买按钮"
+            show_purchase_button(),
+            "PURCHASE_URL 已回填 (2026-10-27), 便携版应显示购买按钮"
         );
     }
 
@@ -1033,6 +1697,69 @@ mod tests {
         assert!(!has("→") && !has("←"), "方向键属常识, 不进卡 (README 兜底)");
     }
 
+    /// 并集列提示 (spec Q3 弹层可见提示): 未合并零文案; 截断如实报;
+    /// 未截只报列数。
+    #[test]
+    fn merge_union_hint_reports_truncation_honestly() {
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-hint-{}-{}.toml",
+            std::process::id(),
+            "u"
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        assert_eq!(merge_union_hint(&app), "", "未合并零文案");
+        // 两源 3+3 列共 6 列 → 未截
+        let dir = std::env::temp_dir();
+        let pa = dir.join(format!("hint-a-{}.jsonl", std::process::id()));
+        let pb = dir.join(format!("hint-b-{}.jsonl", std::process::id()));
+        // 每源 ≥3 行 —— 探测 <3 行必拒 (T3 已知边界, 这里踩过一次)
+        std::fs::write(
+            &pa,
+            br#"{"ts":"2026-09-28T00:00:00Z","level":"INFO","msg":"a"}
+{"ts":"2026-09-28T00:00:01Z","level":"INFO","msg":"a"}
+{"ts":"2026-09-28T00:00:02Z","level":"INFO","msg":"a"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &pb,
+            br#"{"ts":"2026-09-28T00:00:03Z","req":"r","extra":"e"}
+{"ts":"2026-09-28T00:00:04Z","req":"r","extra":"e"}
+{"ts":"2026-09-28T00:00:05Z","req":"r","extra":"e"}
+"#,
+        )
+        .unwrap();
+        let out = danqing_log::merge_view::build_merge(
+            &[pa.clone(), pb.clone()],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        app.apply_merge_outcome(out);
+        // ts 跨源去重: ts/level/msg + req/extra = 5 列
+        assert_eq!(merge_union_hint(&app), "并集列 5 列", "未截只报列数");
+        // 灌宽 schema → 截断如实报 (上限 24)
+        {
+            use danqing_log::jsonl::{Column, Schema};
+            let m = app.merge.as_mut().unwrap();
+            let wide: Vec<Column> = (0..30)
+                .map(|i| Column {
+                    name: format!("c{i:02}"),
+                    width_chars: 8,
+                })
+                .collect();
+            m.sources[0].schema = Some(std::sync::Arc::new(Schema { columns: wide }));
+        }
+        let h = merge_union_hint(&app);
+        // 并集 = 宽源 30 列 + 源 b 的 ts/req/extra = 33; 截断 24 但总数如实报
+        assert!(
+            h.contains("超上限截断至 24") && h.starts_with("并集列 33 列"),
+            "截断如实报总数与上限: {h}"
+        );
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
+        std::fs::remove_file(&cfg).ok();
+    }
+
     /// 回归锁 (2026-09-14): 合并行 `("Ctrl+B · Ctrl+G", "切换书签 / 下一书签")` 拆成两行时,
     /// Ctrl+G 的作用被抄成「切换书签」—— 那是 Ctrl+B (`toggle_bookmark`) 的动词;
     /// Ctrl+G 实为 `goto_next_bookmark` 跳下一书签 (main.rs 键分发与 README 完整清单均为此义)。
@@ -1053,6 +1780,20 @@ mod tests {
         assert!(
             action_of("Ctrl+G").contains("下一"),
             "Ctrl+G = 跳下一书签, 不是切换"
+        );
+    }
+
+    /// SPEC-v1x-export T5 一致性锁: `Ctrl+E` 落表且动词是「导出」(清单两处抄
+    /// 同一份会漂 —— 1041 行教训的同款锁)。
+    #[test]
+    fn shortcut_card_export_row_matches_dispatch() {
+        let row = SHORTCUT_KEYS.iter().find(|(k, _)| *k == "Ctrl+E");
+        let Some((_, action)) = row else {
+            panic!("快捷键卡缺 Ctrl+E 行");
+        };
+        assert!(
+            action.contains("导出"),
+            "Ctrl+E = 导出 (与 main 键分发同源)"
         );
     }
 
@@ -1303,6 +2044,534 @@ mod tests {
         assert!(
             !painted_border,
             "设置卡不应画边框 —— 区分交给 scrim (见 settings_card 的注释)"
+        );
+    }
+
+    /// 评审 Optional (五轴⑤): 列管理弹层行序 = 列配置显示序 (与表格同序);
+    /// 空配置回退 schema 首见序; 无 schema 空表。
+    #[test]
+    fn col_menu_rows_follow_column_config_order() {
+        let schema = Some(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "c".into(),
+                    width_chars: 4,
+                },
+            ],
+        });
+        let mut cfg = danqing_log::columns::ColumnConfig::from_schema(&[
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]);
+        assert!(cfg.move_column(2, 0)); // c a b
+        assert!(cfg.set_hidden("a", true));
+        assert_eq!(
+            col_menu_row_names(schema.as_ref(), &cfg),
+            vec!["c", "a", "b"]
+        );
+        // 空配置回退 schema 首见序
+        assert_eq!(
+            col_menu_row_names(
+                schema.as_ref(),
+                &danqing_log::columns::ColumnConfig::default()
+            ),
+            vec!["a", "b", "c"]
+        );
+        // 无 schema = 空表 (弹层本就不该开)
+        assert!(col_menu_row_names(None, &cfg).is_empty());
+    }
+
+    /// T0 判罪锁 (SPEC-v1x-field-picker-ui D2): 「显示列」行集**每帧取态** ——
+    /// 建树后 schema 就位/换文件行跟随, 点击载荷 = 新 schema 的列名。
+    /// 修复前: 行集是 view() 建树快照 (schema=None) → 弹层永远只剩「恢复默认」。
+    #[test]
+    fn col_menu_rows_follow_schema_across_sync() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        use danqing::{Constraints, Event, Point, Rect, Size, TextBatch};
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-rows-{}.toml",
+            std::process::id()
+        ));
+        let mut list = col_menu_rows();
+        let mut texts = TextBatch::new();
+        let c = Constraints::loose(Size::new(300.0, 10_000.0));
+        // 建树时无 schema (启动快照场景) = 零行
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        list.sync(&app);
+        assert_eq!(
+            list.layout(c, &mut texts).height,
+            0.0,
+            "启动无 schema = 零行"
+        );
+        // schema 就位 → 行出现
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        list.sync(&app);
+        assert_eq!(
+            list.layout(c, &mut texts).height,
+            2.0 * crate::pick_list::ROW_H,
+            "行跟随 schema 就位"
+        );
+        // 换文件 → 行换 + 点击载荷 = 新列名
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![danqing_log::jsonl::Column {
+                name: "fresh".into(),
+                width_chars: 4,
+            }],
+        }));
+        list.sync(&app);
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 200.0);
+        let mut msgs = danqing::widget::MsgQueue::new();
+        let p = Point::new(20.0, 4.0);
+        list.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        list.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: p,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ToggleColumn(n)) if n == "fresh"
+            )),
+            "点击载荷 = 新 schema 列名 (非启动快照)"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 评审 R3/R7/R8: 提交值**随信** (`PickerSubmit(String)`, 不设镜像 ——
+    /// 镜像有 set_text/clear 不回 on_change 的脱钩窗); Enter 与「过滤」钮同路
+    /// (收口在持有者内, 兄弟钮读不到缓冲的唯一解)。
+    #[test]
+    fn picker_input_enter_and_button_carry_value() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-pin-{}.toml",
+            std::process::id()
+        ));
+        let mut input = picker_input();
+        let app = LogApp::new_empty_at(Some(cfg.clone()));
+        input.sync(&app);
+        input.ti.set_text("ERROR");
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 32.0);
+        let mut texts = TextBatch::new();
+        let size = input.layout(Constraints::loose(Size::new(300.0, 32.0)), &mut texts);
+        // Enter (值框持焦路径) → 值随信
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::PickerSubmit(v)) if v == "ERROR"
+            )),
+            "Enter 提交带出框内值 (无镜像)"
+        );
+        // 「过滤」钮 (paint 写 rect, hit 同源) → 同路
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        input.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+        input.ti.set_text("ER2");
+        let r = input.submit_rect.get();
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, 16.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::PickerSubmit(v)) if v == "ER2"
+            )),
+            "「过滤」钮与 Enter 同路"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T2 真 paint 锁 (非零平移原点 —— v1.0.2 平移不变教训): 查询卡产出字形,
+    /// 字段行行数跟随 schema (高亮跟随在 pick_list 通用锁)。
+    #[test]
+    fn picker_card_paints_glyphs_and_field_rows_follow() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-picker-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.picker_open = true;
+        app.picker_field = Some("b".to_string());
+        app.schema = Some(std::sync::Arc::new(danqing_log::jsonl::Schema {
+            columns: vec![
+                danqing_log::jsonl::Column {
+                    name: "a".into(),
+                    width_chars: 4,
+                },
+                danqing_log::jsonl::Column {
+                    name: "b".into(),
+                    width_chars: 4,
+                },
+            ],
+        }));
+        // 真 paint: 卡体字形产出 (非零平移原点)
+        let mut card = picker_card(Color::rgb(0.1, 0.1, 0.1));
+        card.sync(&app);
+        let mut texts = TextBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 900.0)), &mut texts);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        card.paint(
+            Rect::new(Point::new(137.0, 89.0), size),
+            &mut rects,
+            &mut texts,
+        );
+        assert!(
+            texts.glyph_clips().count() > 0,
+            "查询卡须产出字形 (标题/行/钮)"
+        );
+        // 字段行行数跟随 schema (T0 判罪面在 pick_list 通用锁, 此处锁 builder 接线)
+        let mut rows = picker_field_rows();
+        rows.sync(&app);
+        assert_eq!(
+            rows.layout(Constraints::loose(Size::new(200.0, 900.0)), &mut texts)
+                .height,
+            2.0 * crate::pick_list::ROW_H
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 会话命名框与 picker 同构锁 (R3 持有者收口, SubmitInput 泛化零回退面):
+    /// Enter 与「保存当前」同路, 值随信 `SaveSession`。
+    #[test]
+    fn session_name_input_enter_and_button_carry_value() {
+        use danqing::event::MouseButton;
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-sni-{}.toml",
+            std::process::id()
+        ));
+        let mut input = session_name_input();
+        let app = LogApp::new_empty_at(Some(cfg.clone()));
+        input.sync(&app);
+        input.ti.set_text("排障A");
+        let area = Rect::from_xywh(0.0, 0.0, 320.0, 32.0);
+        let mut texts = TextBatch::new();
+        let size = input.layout(Constraints::loose(Size::new(320.0, 32.0)), &mut texts);
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::Key {
+                key: Key::Named(NamedKey::Enter),
+                pressed: true,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::SaveSession(v)) if v == "排障A"
+            )),
+            "Enter 提交带出框内值"
+        );
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        input.paint(Rect::new(Point::ZERO, size), &mut rects, &mut texts);
+        input.ti.set_text("排障B");
+        let r = input.submit_rect.get();
+        let mut msgs = MsgQueue::new();
+        input.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(r.origin.x + r.size.width / 2.0, 16.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::SaveSession(v)) if v == "排障B"
+            )),
+            "「保存当前」与 Enter 同路"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 真 paint 锁 (非零平移原点): 会话卡字形产出 + 行数跟随本路径会话
+    /// (第三消费面接线锁; RowList 判罪面在通用锁)。
+    #[test]
+    fn sessions_card_paints_names_and_rows_follow() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-sess-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.session_menu_open = true;
+        app.sessions = vec![danqing_log::columns::SessionEntry {
+            path: "p".into(),
+            name: "排障A".into(),
+            filter: String::new(),
+            search: String::new(),
+            config: danqing_log::columns::ColumnConfig::default(),
+            expands: Vec::new(),
+            merge: None,
+            updated: 1,
+        }];
+        app.session_selected = Some("排障A".into());
+        let mut card = sessions_card(Color::rgb(0.1, 0.1, 0.1));
+        card.sync(&app);
+        let mut texts = TextBatch::new();
+        let size = card.layout(Constraints::loose(Size::new(CARD_WIDTH, 900.0)), &mut texts);
+        let mut rects = RectBatch::new();
+        let mut texts = TextBatch::new();
+        card.paint(
+            Rect::new(Point::new(137.0, 89.0), size),
+            &mut rects,
+            &mut texts,
+        );
+        assert!(
+            texts.glyph_clips().count() > 0,
+            "会话卡须产出字形 (标题/行/钮)"
+        );
+        let mut rows = session_rows();
+        rows.sync(&app);
+        assert_eq!(
+            rows.layout(Constraints::loose(Size::new(200.0, 900.0)), &mut texts)
+                .height,
+            1.0 * crate::pick_list::ROW_H,
+            "行数跟随本路径会话"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 评审 M3: 上限与可视封顶取齐 (12 = 12) —— 满员时全部可达 (无「还有 N」
+    /// 尾行死角); 展示序 = updated **降序**, 新存的永远在第一行 (点行锁)。
+    #[test]
+    fn session_rows_show_all_up_to_cap_newest_first() {
+        use danqing::widget::Widget;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-settings-srows-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        for i in 0..danqing_log::columns::MAX_SESSIONS_PER_PATH {
+            app.sessions.push(danqing_log::columns::SessionEntry {
+                path: "p".into(),
+                name: format!("s{i:02}"),
+                filter: String::new(),
+                search: String::new(),
+                config: danqing_log::columns::ColumnConfig::default(),
+                expands: Vec::new(),
+                merge: None,
+                updated: i as u64,
+            });
+        }
+        let mut rows = session_rows();
+        rows.sync(&app);
+        let mut texts = TextBatch::new();
+        let h = rows
+            .layout(Constraints::loose(Size::new(300.0, 900.0)), &mut texts)
+            .height;
+        assert_eq!(
+            h,
+            danqing_log::columns::MAX_SESSIONS_PER_PATH as f32 * crate::pick_list::ROW_H,
+            "上限即可视: 满员 12 条全画, 无尾行死角"
+        );
+        // 降序: updated 最大 (最后存) 的在第一行 —— 点第一行 = 应用它
+        let area = Rect::from_xywh(0.0, 0.0, 300.0, 500.0);
+        let mut msgs = MsgQueue::new();
+        rows.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: true,
+                position: Point::new(20.0, 4.0),
+            },
+            area,
+            &mut msgs,
+        );
+        rows.event(
+            &Event::MouseInput {
+                button: MouseButton::Left,
+                pressed: false,
+                position: Point::new(20.0, 4.0),
+            },
+            area,
+            &mut msgs,
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m.downcast_ref::<Msg>(),
+                Some(Msg::ApplySession(n)) if n == "s11"
+            )),
+            "降序: 最新会话 (updated 最大) 在第一行"
+        );
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// 复现 (2026-09-28 用户实机): 合并源卡第一排钮 (±1h/±1m/±1s 六枚步进)
+    /// 自然宽超出卡片内容宽 —— 框架 `Row` 不折行不裁剪, 超宽直接画到卡外。
+    /// 量的是这排钮**自报的自然宽** vs 卡片内容宽 (与 `shortcut_rows_fit_the_card_width`
+    /// 同一把尺, 那条只管文案行, 没管钮排)。
+    #[test]
+    fn merge_time_edit_row_fits_card_width() {
+        let mut texts = TextBatch::default();
+        let mut row = merge_time_edit();
+        let w = row
+            .layout(Constraints::loose(Size::new(10_000.0, 100.0)), &mut texts)
+            .width;
+        assert!(
+            w <= content_width(),
+            "步进钮排自然宽 {w} > 卡片内容宽 {}: Row 不换行不裁剪, 会画出卡片右边界",
+            content_width()
+        );
+    }
+
+    // ---- T4: 复选框换挂 (SPEC-checkbox-widget) ----
+
+    /// 前缀退役锁 (断言**产出串**, 不 grep 源码 —— 防注释骗锁): 「显示列」
+    /// 行文案 = 纯列名, 载荷 = 列名不变; `[x]`/`[ ]` 文本勾选随复选框换挂退役。
+    #[test]
+    fn col_menu_rows_have_no_ascii_check_prefix() {
+        use crate::jsonl::{Column, Schema};
+        use std::sync::Arc;
+        let cfg = std::env::temp_dir().join(format!(
+            "danqing-log-t4-colmenu-{}.toml",
+            std::process::id()
+        ));
+        let mut app = LogApp::new_empty_at(Some(cfg.clone()));
+        app.has_file = true;
+        app.schema = Some(Arc::new(Schema {
+            columns: ["a", "b"]
+                .iter()
+                .map(|n| Column {
+                    name: (*n).to_string(),
+                    width_chars: 4,
+                })
+                .collect(),
+        }));
+        app.columns =
+            danqing_log::columns::ColumnConfig::from_schema(&["a".to_string(), "b".to_string()]);
+        app.columns.toggle_hidden("b"); // 隐藏列同规: 勾态在盒不在文案
+        let mut list = col_menu_rows();
+        list.sync(&app);
+        let rows = list.rows_snapshot();
+        assert_eq!(rows.len(), 2, "行集 = 两列");
+        assert_eq!(
+            rows[0],
+            ("a".to_string(), "a".to_string()),
+            "文案 = 纯列名, 载荷不变"
+        );
+        assert_eq!(rows[1].0, "b");
+        for (label, _) in rows {
+            assert!(
+                !label.contains("[x]") && !label.contains("[ ]"),
+                "前缀应退役, 实得: {label}"
+            );
+        }
+        std::fs::remove_file(&cfg).ok();
+    }
+
+    /// T4: 合并源行文案 = 纯「源名 · 格式结论 (+断流尾注)」; 勾选前缀退役,
+    /// 断流尾注 (T7 明示) 保留。
+    #[test]
+    fn merge_source_label_has_no_ascii_check_prefix() {
+        use danqing_log::timestamp::TsRoute;
+        let route = TsRoute::JsonlField("ts".to_string());
+        let label = merge_source_label("src0.jsonl", &route, false);
+        assert!(
+            !label.contains("[x]") && !label.contains("[ ]"),
+            "前缀应退役, 实得: {label}"
+        );
+        assert!(label.starts_with("src0.jsonl · "), "源名打头: {label}");
+        let stale = merge_source_label("src1.log", &route, true);
+        assert!(stale.ends_with(" · 断流"), "断流尾注保留: {stale}");
+    }
+
+    /// T4 行宽守卫 ×2 (G-d 同族, 判据不同): 行内容 = 左距 + [色块] + 盒位 + 文案,
+    /// 用**代表性** label 量 —— 锁的是「常量同源 + 排版不漂移」, 不是「任意长
+    /// 文件名不溢出」(真实源名可任意长, RowList 文案无裁剪, 超长溢出是既有边界,
+    /// 已挂 `ROADMAP-v1x.md` §四 待裁)。
+    ///
+    /// 换挂后净宽 −8px (评审实测; `[x] ` 前缀 28px 退役 vs 盒位 20px)。
+    #[test]
+    fn merge_source_row_width_within_card_budget() {
+        use danqing_log::timestamp::TsRoute;
+        let mut texts = TextBatch::default();
+        let route = TsRoute::JsonlField("ts".to_string());
+        let worst = merge_source_label("src0.jsonl", &route, true); // 代表性 (含断流尾注)
+        let w = crate::pick_list::ROW_PAD_X
+            + crate::pick_list::RowList::SWATCH_W
+            + crate::pick_list::RowList::CHECK_W
+            + texts.measure(&worst, crate::view::FONT_SIZE);
+        assert!(
+            w <= content_width(),
+            "代表性行内容宽 {w} > 卡片内容宽 {}: 常量漂移了 (同源守卫)",
+            content_width()
+        );
+    }
+
+    #[test]
+    fn col_menu_row_width_within_card_budget() {
+        let mut texts = TextBatch::default();
+        let worst = "http_request_duration_ms"; // 代表性长列名 (24 字符)
+        let w = crate::pick_list::ROW_PAD_X
+            + crate::pick_list::RowList::CHECK_W
+            + texts.measure(worst, crate::view::FONT_SIZE);
+        assert!(
+            w <= content_width(),
+            "代表性行内容宽 {w} > 卡片内容宽 {}: 常量漂移了 (同源守卫)",
+            content_width()
         );
     }
 }

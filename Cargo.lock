@@ -937,7 +937,7 @@ dependencies = [
 [[package]]
 name = "danqing"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing#672241a67b4e98ecccfe72b788b64058d5276b78"
+source = "git+https://github.com/14uncle/danqing#7813d1d3df2806f63b3151a53d620b1b86d7142a"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -973,7 +973,7 @@ source = "git+https://github.com/14uncle/danqing-encoding#d86741caee0ab102cb8d6d
 
 [[package]]
 name = "danqing-log"
-version = "1.0.2"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "danqing-logfile"
 version = "0.1.0"
-source = "git+https://github.com/14uncle/danqing-logfile#3f3cd0352096a9b0e1f59f6ad78759fcf6e36446"
+source = "git+https://github.com/14uncle/danqing-logfile#45111268b56a8b591a2f48e2f900edfb4f52d656"
 dependencies = [
  "anyhow",
  "danqing-encoding",
