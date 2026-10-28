@@ -68,8 +68,9 @@
   少数派 Matrix 自助发布，新发一篇体验文（1.5 场景向）。
 - **小众软件论坛**：规则明令「不要重复发帖」—— 1.5 更新走**编辑原帖 + 回帖**（规则明文
   「欢迎开发者回帖互动」），不开新帖【此解读待用户发帖前再核一次版规】。
-- **维持不动**：英文渠道（AlternativeTo / Portable Freeware / Reddit / Product Hunt）延后；
-  抖音/小红书/百家号/公众号（无外链或私域，不指望 referrer，最多同步发个存在感）；HN（不可达）。
+- **英文提交站改判试投（2026-10-28，见 §2.5）**：原「延后」裁决被 i18n 裁决 B 改判；
+  Reddit / Product Hunt / HN 维持出局（10-28 实测直连超时，用户无代理）。
+- **维持不动**：抖音/小红书/百家号/公众号（无外链或私域，不指望 referrer，最多同步发个存在感）。
 
 ### 2.3 新截图需求（1.5 功能，现有两张 dark 图之外）
 
@@ -175,6 +176,34 @@ sidecar 实测值 `801c975c…`）+ scoop `loglens.json`（JSON 校验过、全 
 **提交 PR 仍是对外动作，用户点头后走**（komac 或手动）。注：发布夜本机 curl 拉
 GitHub 资产 CDN 连续 000（exit 35），`gh api` 实证资产 uploaded——CDN 路由抖动
 非资产问题；国内用户直连下载不稳正是 MS Store 兜底轨存在的理由之一。
+
+### 2.5 海外提交站试投（2026-10-28 立案 —— i18n 裁决 B 的执行臂）
+
+上游裁决：`intent/i18n-deferral-2026-10-28.md`（UI 不做中英文切换；触点英文化 +
+小剂量海外试投先行；失效标志/复活扳机写死在该文档，判读日 2026-11-27 与首单外检钟同案）。
+划线前提：用户浏览器**无代理** —— 名单按「本机直连可达」裁（10-28 curl 实测）。
+
+| 平台 | 实测 | 形态/备注 |
+|---|---|---|
+| MajorGeeks | ✅ 200 | Windows 工具主场，编辑审核制投稿 |
+| SnapFiles | ✅ 200 | 老牌 freeware 目录 |
+| Softpedia | ⚠️ 403（WAF 拦 curl，网络通） | 大型下载站，投稿入口浏览器复核 |
+| FileHippo | ⚠️ 412（同） | 下载目录 |
+| SourceForge | ⚠️ 403（同） | 镜像 + 开发者受众 |
+| AlternativeTo | ⚠️ 403（同） | 「LogViewPlus alternative」卡位 |
+| SaaSHub | ⚠️ 403（同） | 替代品站 |
+| Portable Freeware | ⚠️ 403（同） | 便携目录 —— 便携 zip <5MB 正中靶心 |
+| dev.to | ✅ 200 | 已有备料 = §2.4② 文案 10，同波即发 |
+| HN / Reddit / Product Hunt / FileHorse / Uptodown / CNET / Slant | ❌ 超时/故障 | 出局（直连不可达 + 无代理） |
+
+**触点现状（10-28 核）**：落地页 `14uncle.github.io` **已是英文**（`lang="en"`）✅；
+README 为「英文开场 + 中文主体」半英态 → 待补全英文版；MS Store 列表 EN-US locale
+待核（随 v1.5 商店提交窗口同办，`ms-store-copy.md` §6 已有预起草可译）。
+
+**分工不变（§5）**：注册/投稿 = 用户真人；英文简介稿起草 + 逐站投稿要求核对 +
+读数回填 = agent。**读数归因**：投稿日落底稿 §三表；新 referrer 域名
+（majorgeeks / snapfiles / softpedia / …）出现时进 `../tasks/calibration-30d.md`
+周拉 —— 那就是「外国人来没来」的直接读数。
 
 ## 3. 1.5 发布主稿（anchor，各渠道按底稿调性改编）
 
