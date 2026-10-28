@@ -2,13 +2,236 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/14uncle/danqing-log)](https://github.com/14uncle/danqing-log/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)](LICENSE-MIT)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B%20x64-blue)](#下载)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B%20x64-blue)](#download)
 
 **LogLens** — a fast large-file log & JSONL viewer for Windows, written in Rust.
 Opens GB-scale files instantly (1 GiB indexed in 92 ms) with a virtualized scroll
 view, tail-follow + live filtering, regex search with highlighting, and a JSONL
-column view with nested expand and field filtering. Free & open source (Apache-2.0) —
+column view with nested expand and field filtering. Free & open source —
 no account, no telemetry, nothing leaves your machine.
+
+[English](#english) · [中文](#中文)
+
+## English
+
+**v1.0 free tier = full-featured single binary**, free & open source on GitHub forever.
+Multi-file timeline merge, field analytics, export and workspace sessions belong to the
+paid tier ($29 Personal / $59 Business perpetual), see
+[`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md).
+
+![Screenshot: 1 GiB JSONL in table mode, nested field sub-rows expanded, level-stats sidebar on the left (dark theme)](docs/images/screenshot-jsonl-dark.png)
+
+### Measured numbers
+
+On 1 GiB files (release build, this machine, `logbench` headless benchmark; full report in
+[`PERFORMANCE_REPORT.md`](PERFORMANCE_REPORT.md)):
+
+| Metric | Plain log | JSONL |
+|---|---|---|
+| Index | 92 ms | 94 ms |
+| Search (`ERROR`, case-insensitive by default) | 115 ms | 129 ms |
+| Field filter (`level=ERROR`; `level=error` works the same) | — | 40 ms |
+| Random access | 0.52 µs/line | 0.58 µs/line |
+| Open (cold / warm) | ~600 ms / ~90 ms | same |
+
+> Re-measured 2026-09-15 (warm cache). Since 2026-09-15 search is **case-insensitive by
+> default** — about 1.6× slower than sensitive matching for short literals (`ERROR`:
+> 71 → 115 ms); it runs on a background thread off the UI path, so you won't feel it.
+> Write `(?-i)` in the pattern for exact matching. Open & index are unaffected
+> (insensitivity only applies at query time).
+
+The line index is a **stride table** (`memchr` SIMD scanning `\n`, absolute offset recorded
+every `INDEX_STRIDE` lines, forward scan within a segment), not a per-line offset table —
+≤ 16 MB of index memory for a 1 GB file (SPEC acceptance bound).
+
+### How to choose among similar tools
+
+One-line positioning: **klogg's speed × LogViewPlus's structure**.
+
+- **vs klogg**: same mmap architecture, same speed class (no crushing claims). The gap is
+  features & maintenance — klogg's latest release is over four years old and commits
+  stopped 22 months ago (verified 2026-09-16), with no JSONL support.
+- **vs LogViewPlus**: full-featured, but full parsing = a structural cost at open time
+  (1 GiB cold start measured ~60 s on this machine), and it's paid commercial software.
+  LogLens uses mmap + a virtualized viewport, which is structurally fast; v1.0 is
+  fully free.
+- **vs VS Code**: it can open these files but slowly — ~10 s for a 1 GiB plain log on
+  this machine (2026-09-20); JSONL column view needs an extension (Daucloud measured
+  ~7 s cold on the same file), and it occupies your editor and its resources.
+
+> Full comparison tables with per-claim evidence dates:
+> [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) and
+> [DEEP_COMPETITIVE_RESEARCH.md](docs/DEEP_COMPETITIVE_RESEARCH.md);
+> which items are parity, which are gaps, which are real innovations:
+> [FEATURE-MATRIX.md](docs/FEATURE-MATRIX.md).
+
+### Features
+
+- **Open**: launch argument / `Ctrl+O` / drag onto the exe; async indexing keeps files
+  over 1 GiB fully responsive, status bar shows `{pct}% · {done}/{total} MiB`;
+  indexing is cancellable, and you can open another file while it runs
+- **Scrolling**: row-anchored virtual viewport (no full line-offset table), no distortion
+  across a 200-million-pixel domain
+- **Search**: regex (`regex::bytes`, full-file scan), in-viewport highlighting +
+  hit-by-hit navigation, capped at 1M hits; **case-insensitive by default** (`error`
+  matches `ERROR`) — write `(?-i)error` for exact matching
+- **Tail-follow**: 250 ms throttled polling, new lines appear within ≤1 s; scrolling up
+  detaches, `End` resumes; external truncation / rotation rebuilds automatically (old
+  content stays visible during rebuild); idle CPU < 1% when the file isn't growing
+- **JSONL table**: auto-detected (first 64 lines sampled, ≥90% of non-empty lines must
+  parse as JSON objects, no verdict under 3 lines) → column discovery (first 512 rows
+  sampled, up to 16 columns) → columnar table; nested objects expand as sub-rows (`▶/▼`
+  at line start, or `→`/`←`); the field-filter mini-syntax runs on a worker thread and
+  never freezes the UI; if you don't remember the syntax, click **「字段…」** at the right
+  end of the filter bar — pick field & operator, type only the value, multiple conditions
+  are ANDed automatically; field names and values are **case-insensitive** (`LEVEL=error`
+  ≡ `level=ERROR`); **column config trio**: drag the handle between columns to resize
+  (double-click restores the sampled width) / drag headers to reorder (Esc aborts) /
+  the header 「列…」 menu shows & hides columns (at least one stays) — remembered per file
+  (`columns.json`), restored on reopen
+- **Encodings**: UTF-8 (with BOM) / UTF-16 LE·BE (with or without BOM) / GBK (raw-byte
+  index + per-line CP936 decode — Chinese text is searchable) / other single-byte
+  encodings fall back to Latin-1
+
+  ![Screenshot: a GBK-encoded Chinese log rendered correctly — order/payment logs without mojibake, level counts fine, status bar reads `GBK · 32 MiB · 321k lines · opened in 40 ms` (dark theme)](docs/images/screenshot-gbk-cn-dark.png)
+- **Level histogram**: left sidebar with 6 buckets (FATAL / ERROR / WARN / INFO / DEBUG /
+  other) + log-scale bars — on a linear scale 4.54M INFO lines would crush 4,760 FATAL
+  lines into sub-pixels, and the latter are the ones you're after. In JSONL mode, clicking
+  a bar filters to that level (clickable rows give hover feedback); a `清除筛选`
+  (clear filter) row at the sidebar bottom restores the full data; `Ctrl+L` collapses
+  the sidebar (full shortcut list in the ⚙ settings card)
+- **Selection & copy** (`Ctrl+C`): double-click selects tokens (timestamps / IPs /
+  `level=ERROR` / paths / URLs are selected whole; English breaks on words, Chinese per
+  character); drag for a character-level selection, across lines and across expanded
+  sub-rows; copy resolves as **text selection > cell > selected row** — double-clicking
+  a table cell copies its **full value** (unaffected by column-width truncation), a
+  selected row copies the whole raw line, and inside an expand block a sub-row copies
+  that sub-row's `label = value`
+- **More**: level coloring (ERROR/WARN/INFO/DEBUG), bookmarks (`b`/`Ctrl+B`, remembered
+  per file, kept separately per file across restarts), dark & light themes (settings
+  card, instant effect, persisted to `config.toml`), system tray (right-click:
+  Settings / Exit), clean empty state on launch, version check inside the settings card
+
+### Download
+
+- **GitHub Releases** (primary): [latest release](https://github.com/14uncle/danqing-log/releases/latest)
+  — take `danqing-log-v<version>-win-x64.zip`, under 5 MB, unzip and run, no registry
+  writes
+- **Microsoft Store** (secondary): approved and listed 2026-09-21 (submitted 09-19);
+  store page link TBD — the Store build is updated by the Store. Network behavior:
+  **v1.0 makes zero network requests**; from v1.x the Store build queries the paid-tier
+  license (via Windows Store services — the app itself still sends no HTTP), while the
+  portable build's only network action is one update check at launch (see the
+  [privacy policy](docs/privacy-policy.md))
+- **Paid tier (v1.x, opened 2026-10-28)**: the free tier stays free forever
+  (**personal, non-commercial use**; for work use please buy the paid tier — the line is
+  "who pays": $29 Personal bought by yourself covers commercial use, $59/seat when an
+  organization pays or reimburses; details in the [EULA](docs/eula.md)). The paid tier
+  adds **new** batch / retention / delivery capabilities (see
+  [`docs/ROADMAP-v1x.md`](docs/ROADMAP-v1x.md)): **multi-file timeline merge** (up to 8
+  sources merged by timestamp, per-source clock-offset calibration, req_id cross-source
+  tracing), **field analytics** (numeric quantiles / enum distributions), **export**
+  (filtered results / pretty JSON / CSV), **workspace sessions** (filters / searches /
+  column layout / expansion saved as named scenes), plus the column-config /
+  bookmark-persistence / field-picker trio. Portable-build license keys verify offline,
+  no network. **Buy** (Paddle-hosted checkout, WeChat / PayPal / cards):
+  **[Personal $29](https://pay.paddle.io/hsc_01m5z030nhbajgmkj987wmbva9_c85re6taregcexaf8nzvc980w8np56r0)** ·
+  **[Business $59/seat](https://pay.paddle.io/hsc_01m5z04yns6220j7jp385fdpwb_7fy2bhgj7jdyfq2z76gg3rb1rjs0nnw1)**
+  — launch early-bird $19/$39 (until 2026-11-27 or the first 50 orders, auto-applied at
+  checkout, no coupon needed); keys are issued manually, usually within 24 hours to the
+  checkout email; 30-day no-questions refund. Receipts & order support via the
+  [Paddle customer portal](https://customer-portal.paddle.com/cpl_01m49sdngv9g6vhtc1qday33mg)
+
+> **Heads-up: the UI is currently Chinese-only.** Opening files (`Ctrl+O`), regex search
+> and tail-follow work regardless of language; settings and dialogs are labelled in
+> Chinese. An English UI is deliberately deferred until measurable overseas demand shows
+> up (tracked openly: `docs/intent/i18n-deferral-2026-10-28.md`).
+
+> System requirements: Windows 10 1809+ (x64), DirectX 12-compatible GPU. Both channels
+> ship the same free tier with identical features.
+
+### Usage
+
+```bash
+# GUI: open a log file (JSONL auto-detected → columnar table)
+cargo run --release -- <path-to-log-file>
+
+# Headless benchmark (open/index/search/filter/random-access numbers)
+cargo run --release --bin logbench -- <log-file> [--filter "level=ERROR status=50*"] [regex...]
+
+# Generate deterministic test data
+cargo run --release --bin genlog -- out.log 1024            # 1 GiB plain log
+cargo run --release --bin genlog -- out.jsonl 1024 --jsonl  # 1 GiB JSONL
+```
+
+Packaging: `powershell -NoProfile -File tools/package_portable.ps1` → `../release-archives/log/`
+
+### Shortcuts
+
+| Key | Action |
+|---|---|
+| Wheel / `↑` `↓` | Scroll |
+| `PageUp` `PageDown` / `Space` | Page (`Shift` reverses) |
+| `Home` / `End` | Jump to start / end (`End` also turns follow **on** — one-way, it never turns it off) |
+| `Shift` + wheel | Horizontal scroll |
+| `→` / `←` | Expand / collapse nested sub-rows of the selected line (table mode) |
+| `/` | Focus the top bar (**raw mode**) |
+| `Ctrl+F` | Focus the top bar (**any mode**: raw = search, table = filter) |
+| `Enter` (bar empty) | Next hit (`Shift+Enter` previous) |
+| `Ctrl+T` | Toggle raw / table mode (after JSONL is detected) |
+| `b` / `'` | Toggle bookmark / jump to next bookmark (raw mode) |
+| `Ctrl+B` / `Ctrl+G` | Same (any mode) |
+| `f` | Follow **toggle** (raw mode) — on: stick to the tail; off: the view freezes |
+| `Ctrl+O` | Open file |
+| `Ctrl+C` | Copy — text selection if any, else the selected cell, else the selected row |
+| `Ctrl+L` | Show/hide the level-histogram sidebar (persisted across sessions) |
+| `Ctrl+E` | Export… (paid tier — filtered results / pretty JSON / CSV; free tier shows an upgrade prompt) |
+| `Esc` | Close search bar / clear filter / close settings & upgrade & export popovers / clear selection |
+
+When JSONL is detected, the file opens in table mode: just type into the filter box —
+syntax `level=ERROR status=50*` (space-separated terms ANDed, trailing `*` for prefix
+wildcard, bare words match whole-line substrings), `Enter` applies, `Esc` clears.
+Field names and values are **case-insensitive by default** (`LEVEL=error` ≡ `level=ERROR`).
+
+#### Three common misunderstandings
+
+- **`f` and `End` are not equivalent** — `f` is a **toggle**: on → stick to the tail;
+  **off → the view freezes**, new lines just pile up below without dragging you; `End` is
+  **one-way** "jump to the tail + follow on" — pressing it never turns follow off. Both
+  are only visible while the file is **being written** (on a static file `f` changes
+  nothing on screen except a `· FOLLOW` marker in the status bar). "New lines" = lines
+  other processes write into the log file; this viewer is read-only.
+- **"Raw mode" is a view, not a file type** — a `.log` can only stay in raw mode
+  (`Ctrl+T` does nothing: there's no schema to columnize); a `.jsonl` opens as a table
+  and `Ctrl+T` switches between the two views. The same JSONL file thus has two faces.
+- **While the top bar has focus, `Space` / `Home` / `End` belong to the input** (typing
+  spaces, moving the caret), while `↑↓` still scroll the list — that's exactly what the
+  bar's hint line says. Click the log list to move focus back; paging / jump-to-ends
+  semantics return with it. (Settings live behind the gear at the right end of the
+  status bar.)
+
+### Known limits
+
+- UTF-16 transcoding doubles memory (1 GB → ~500 MB copy); files >2 GB unverified
+- JSONL column view only takes flat top-level fields; nested objects show as expandable
+  sub-rows, not columns
+- Search in GBK / Latin-1 files degrades to literals (no regex syntax)
+- DEBUG/TRACE merge into one histogram row, so that row and "other" are **not clickable**
+  (no single clause can express "DEBUG or TRACE"); in plain-text mode there's no field
+  syntax and the bars are read-only
+- Search hits are capped at 1M (the status bar notes the true total when capped)
+- Bookmarks anchor to line numbers: if a file is rewritten in place without changing its
+  line count, bookmarks point at wrong lines (no hashing); max 256 per file
+
+### License
+
+- **Source code**: MIT OR Apache-2.0
+- **Official binaries & license keys**: under the [EULA](docs/eula.md) — free tier for
+  personal / non-commercial use; paid tier is perpetual with a 30-day no-questions refund
+
+---
+
+## 中文
 
 Windows 上的大文件日志 / JSONL 查看分析器 —— 丹青第四件产品。
 GB 级文件秒开、虚拟化滚动、tail 跟随 + 实时过滤、正则搜索高亮、JSONL 列化 + 嵌套展开 + 字段过滤。
