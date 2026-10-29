@@ -2,7 +2,7 @@
 
 - @author 十四叔
 - @date 2026/10/28
-- 状态: **草稿待审（未投）** —— 投稿/注册 = 用户真人动作；读数回填走底稿 §三 + `tasks/calibration-30d.md`
+- 状态: **英文文案底稿** —— 投稿/注册 = 用户真人动作；逐站状态只记底稿 §三，读数回填走 `tasks/calibration-30d.md`
 - 上游: `intent/i18n-deferral-2026-10-28.md`（裁决 B）· `distribution-prep.md` §2.5（名单与实测）
 
 ## 一、事实表（填表抄这里，别现编）
@@ -51,7 +51,7 @@
 
 | 站 | 机制（知识性描述，**投稿时核对**） | 备注 |
 |---|---|---|
-| MajorGeeks | 站内 submission 入口，编辑审核制 | Windows 工具主场，调性最合；可附实测数字 |
+| MajorGeeks | 邮件投稿：`mgnews@majorgeeks.com`（2026-10-28 官网 Contact 页核实），编辑审核制 | Windows 工具主场，调性最合；可附实测数字 |
 | SnapFiles | freeware 提交表单，编辑评审 | 老牌目录，评审偏保守，价格写清 |
 | Softpedia | 编辑自行收录 + 可主动 submit | 他们可能自己写评测稿，简介稿供其参考 |
 | FileHippo | 联系/submission 通道 | 目录式收录 |
