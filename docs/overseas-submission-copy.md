@@ -13,7 +13,7 @@
 | Tagline | A fast large-file log & JSONL viewer for Windows |
 | Version | 1.5.0（2026-10-28 发布） |
 | OS | Windows 10 1809+ (x64), DirectX 12 GPU |
-| Size | 便携 zip ≈ 4.9 MB，解压即用，不写注册表 |
+| Size / 落盘 | 便携 zip ≈ 4.9 MB，解压即用，不写注册表。**设置与状态落 `%APPDATA%\danqing-log\`**（config.toml / state.json / 激活后的 license.key）；运行时日志落 exe 同级 `logs/`，便携版另有 `%APPDATA%\danqing\` 更新检查缓存。**⚠️ 不得自称 "portable"** —— TPFC 的定义是「写进 app 目录才算」，我们不是（2026-10-30 版主判落「Not Portable」板块）。站得住的说法只有 **"no installer, no registry writes"** |
 | License | 源代码 MIT OR Apache-2.0；二进制 EULA（免费层限个人/非商业） |
 | Price | Free（免费层单文件全功能）；Pro 买断 $29 Personal / $59 Business（早鸟 $19/$39 至 2026-11-27 或前 50 单） |
 | Homepage | https://14uncle.github.io/ |
@@ -58,7 +58,7 @@
 | SourceForge | 建 project 传文件 | 顺带做**下载镜像**（国内直连 GitHub 不稳的兜底之一） |
 | AlternativeTo | 加 app 页 + 挂 alternatives | 挂到 LogViewPlus / klogg / glogg / LogExpert 的 alternatives |
 | SaaSHub | submit product | 同上，替代品卡位 |
-| Portable Freeware | 论坛发帖提交进 database | 便携 zip <5MB + 不写注册表正中其收录标准 |
+| Portable Freeware | 论坛发帖提交进 database | **2026-10-30 实测判为 Not Portable**：TPFC 的标准是「设置写在程序目录或哪都不写」，我们的 `%APPDATA%\danqing-log\` 不合格（「不写注册表」不够）。主题已被版主移到 Freeware That Are Not Portable 板块；复活条件 = 真 portable 模式（设置随 exe 目录） |
 | dev.to | 自助发文 | **文案 10 已有备料**（底稿 §二，`published: false`），本表不重复 |
 
 ## 六、纪律（与底稿 §四同族）
