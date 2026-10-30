@@ -55,18 +55,29 @@
 - [x] **README 购买节补双链接 + 落地页购买按钮解注挂链** —— **10-28 已公开**：
       README 随 master 合并上线；pages 仓 `698f3f4` 已推（线上实测 2 条
       pay.paddle.io 链接在页）。**开业钟 = 此刻起算**
-- [ ] MS Store 提交：照 `docs/ms-store-copy.md`「v1.x 上架时必须改什么」逐项核
+- [x] MS Store 提交：照 `docs/ms-store-copy.md`「v1.x 上架时必须改什么」逐项核
       （IARC 改答「是」→ 分级标签全变 / 隐私政策贴**新版**文本 / 文案三处 / add-on 图标 300×300）
-      —— **用户动作**（Partner Center）
-- [ ] 商店 add-on 提交 —— **用户动作**（须先在 Partner Center 预创建，
-      Offer ID 逐字 = `danqing-log-full`，对齐 `src/store_license.rs:32`）
+      —— **2026-10-30 已提交认证**（Submission 4：包 = `danqing-log-store-v1.5.0-x64.msix`
+      已 Validated / 年龄分级按「可购买数字商品=是」重答 / Store 一览四处改写 =
+      说明全文重写 · 新增功能 · 产品功能 9+4 条且删「不联网」· 简短描述补填 /
+      发布时机 = 通过认证后立即发布）。**余 EN-US listing 待认证通过后单独提交**
+      （要同时披露「界面为简体中文」）
+- [x] 商店 add-on 提交 —— **2026-10-30 已过审上架**：Offer ID 逐字 = `danqing-log-full`
+      （对齐 `src/store_license.rs:32`）、耐用品、**$29.99 USD**、图标 300×300、
+      Store 一览名称「丹青日志 LogLens 专业版」+ 描述。**注意：空的「提交 2」草稿勿建勿填**
+      （加载项 listing 只有名称/描述/图标三项，父应用的说明不套用）
 
 ## 阶段 4：发布后外检（前提③开门）
 
 - [x] 真付费链路验收：代销 key 真购买 → 激活（便携版通路）—— **10-28 自购单
       全链走通**（微信付 $19 早鸟 → transaction completed → keygen → 免费态激活
       → 付费态；收据邮件正常送达。剔除出首单外检）
-- [ ] 商店 add-on entitlement 链路验收
+- [ ] 商店 add-on entitlement 链路验收 —— **前置已解锁（add-on 10-30 上架），但要等
+      v1.5 商店包过审上架**才能真正验（现线上仍是 1.0.2，无付费入口）
 - [ ] **触发分发推送**（`docs/distribution-prep.md`，两波）
-- [ ] 校准钟回填：10-18 GitHub / 10-21 商店（`tasks/calibration-30d.md`）
+- [x] 校准钟回填：10-18 GitHub / 10-21 商店（`tasks/calibration-30d.md`）——
+      **双侧已回填**（GitHub 10-28 / 商店 **10-30**，均逾期登记流程事故）。
+      商店 39 天实测 = **43 浏览 / 8 安装 / 18.6% 转化 / 成功率 100%**，
+      稳态 **≈1.1 浏览/天 · ≈0.21 安装/天**（判读：商店是通道不是流量源，
+      与 pomodoro 首月结论一致）。**余市场分布待拉**（i18n 判读输入）
 - [ ] round8 复活条件检查：首单外检落地 or 10-21 校准钟 → 选型机器合法开机评估
