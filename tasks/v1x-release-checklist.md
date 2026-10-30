@@ -60,8 +60,9 @@
       —— **2026-10-30 已提交认证**（Submission 4：包 = `danqing-log-store-v1.5.0-x64.msix`
       已 Validated / 年龄分级按「可购买数字商品=是」重答 / Store 一览四处改写 =
       说明全文重写 · 新增功能 · 产品功能 9+4 条且删「不联网」· 简短描述补填 /
-      发布时机 = 通过认证后立即发布）。**余 EN-US listing 待认证通过后单独提交**
-      （要同时披露「界面为简体中文」）
+      发布时机 = 通过认证后立即发布）。**2026-10-30 认证通过 = 商店版 1.5 已上架**
+      （提交 4，距提交当日；线上商店版自此有付费入口）。**余 EN-US listing 待认证通过后
+      单独提交**（要同时披露「界面为简体中文」）—— 许可条件已满足，可起
 - [x] 商店 add-on 提交 —— **2026-10-30 已过审上架**：Offer ID 逐字 = `danqing-log-full`
       （对齐 `src/store_license.rs:32`）、耐用品、**$29.99 USD**、图标 300×300、
       Store 一览名称「丹青日志 LogLens 专业版」+ 描述。**注意：空的「提交 2」草稿勿建勿填**
@@ -72,9 +73,77 @@
 - [x] 真付费链路验收：代销 key 真购买 → 激活（便携版通路）—— **10-28 自购单
       全链走通**（微信付 $19 早鸟 → transaction completed → keygen → 免费态激活
       → 付费态；收据邮件正常送达。剔除出首单外检）
-- [ ] 商店 add-on entitlement 链路验收 —— **前置已解锁（add-on 10-30 上架），但要等
-      v1.5 商店包过审上架**才能真正验（现线上仍是 1.0.2，无付费入口）
-- [ ] **触发分发推送**（`docs/distribution-prep.md`，两波）
+- [x] 商店 add-on entitlement 链路验收 —— **2026-10-30 全链通过**（四步全过，
+      三方互证见本节末）。**两项前置均已满足**（add-on `danqing-log-full`
+      10-30 上架 / 商店包 v1.5 **10-30 认证通过已上架**）。**四步，第 4 步才是判据**
+      （代码路径已核，`src/app_license.rs` + `src/settings.rs:345` + `src/store_license.rs`）：
+      0. **先把 `%APPDATA%\danqing-log\license.key` 挪开** —— 2026-10-30 实测抓到：
+         `initial_entitlement()`（`main.rs:713` → `license::load()`）**没有 `is_packaged()`
+         门**，商店版**照样读便携版那份 Paddle key**。不挪开则一启动就是「付费层 · 个人版
+         (g***@qq.com)」= `PaidSource::License`，商店通路**一步都没走到**；且
+         `purchase_paid_layer()` 首行就短路成「你已是付费层，无需重复购买」，
+         连购买入口都点不进去。挪开法是改后缀保留原文件，验完改回
+      1. **先卸侧载版、再从商店装** —— 本机现装 10-28 侧载的 `14uncle.LogLens_1.5.0.0`，
+         与商店包**同身份同版本**：侧载在装则商店不给更新；且侧载包的 broker 授权态
+         与商店分发包不是一回事。要验的就是客户拿到的那一份（**10-30 已执行**：
+         WindowsApps 里已是商店装的 `1.5.0.0`，见下条日志）
+      2. 许可页显示「**当前：免费层 —— 单文件全功能，永久免费**」。
+         ⚠️ **「获取付费层」按钮不是判据** —— 判据 `show_purchase_button()` =
+         `PURCHASE_URL.is_some() || is_packaged()`，商店版**恒真**，add-on 在不在目录都显示
+         （此前检查单写的「解锁专业版」是误记，实名就是「获取付费层」）
+      3. 点「获取付费层」→ 商店购买框弹出 = `find_full_version_product` **真在目录里
+         找到了** `danqing-log-full`（找不到只在日志留 `付费层 add-on 不在目录中`）。
+         买 **$29.99 USD** → 卡内反馈「已解锁付费层，感谢支持」
+         —— **10-30 17:49 弹框已实证**：标题「丹青日志 LogLens 专业版」、
+         **¥214.00**（= $29.99 的中国区当地价，汇率≈7.14）、销售商「百视通网络电视
+         技术发展有限责任公司」（微软中国 MoR）、支付宝可选 → **目录匹配 + 购买 UI
+         属主挂钩 + 定价三件全过，链路只差真付款**。界面写「恕不退款」，
+         实际微软客服可退，不是不可逆
+      4. **重启应用** → 启动后台 `query_snapshot` 遍历 `AddOnLicenses` 命中该 token →
+         许可页仍显示「**当前：付费层 · 商店内购**」。
+         **只有这步算数**：第 3 步成功后是本会话内乐观置位（`adopt_purchase_outcome`
+         直接写 Paid），**完全不经过读取通路**，通过它什么也证明不了
+      **取证点（2026-10-30 现场标定，别按猜的路径找）**：商店版的日志**不在**
+      `%LOCALAPPDATA%\danqing-log\logs`，MSIX 把写路径虚拟化进了包私有区 ——
+      真实位置 `%LOCALAPPDATA%\Packages\14uncle.LogLens_3y3rwcp1ep416\LocalCache\Local\
+      danqing-log\logs\`（日志首行自报的那个路径是**虚拟化前的样子，找不到别以为没日志**）。
+      查什么：`store add-on license: active=… expires=…`（info，命中 add-on）/
+      `store 授权查询失败`（warn，broker 报错 → fail-open 到免费态）/
+      `付费层 add-on 不在目录中`（warn，只在点购买时出现，= 目录里没这个 token）。
+      **注意「没命中」是静默的** —— 未持 add-on 时 `query_snapshot` 直接返回免费态快照，
+      一行日志都不留，故「查不到那个 info 行」既可能是没买、也可能没跑到，
+      得靠同份日志里的旁证分辨（见下条）。
+      **broker 本身已实证可用（10-30）**：同一份日志有
+      `[danqing_log::app_update::store] 商店更新查询: 待装更新 0 个` —— 那是
+      `StoreContext::GetDefault()` + 一次商店 API 调用成功返回，与 `query_snapshot`
+      起手式同一套（`RoInitialize` + `GetDefault`）。所以商店轨读通路的**前置没坏**，
+      缺的只是 add-on 所有权本身
+      **已知接受项（不修）**：`ExpirationDate()` 取不到时 `None → Paid` —— 该 fail-open
+      只在 `IsActive` 已为真（= 已购）时生效，不会给未购者解锁；我们不卖试用 add-on，
+      不影响。**这是自购单，须记时间戳剔除出 11-27 首单外检**
+      **验收结论（2026-10-30 17:53，三方互证）**：① 重启后**新进程**
+      `175312.940-p37528` 日志 `17:53:12.969 INFO [danqing_log::store_license]
+      store add-on license: active=true expires=Some(253402214400)`
+      —— `AddOnLicenses` 遍历命中 `danqing-log-full`、`IsActive` 真、
+      过期 = 公元 9999（durable，≥ `DURABLE_THRESHOLD_EPOCH`）→
+      `map_store_snapshot` 判 `Paid { StoreAddOn }`；② 许可页「当前：付费层 ·
+      商店内购」；③ 页内反馈行**已清空** = 付费态来自读取通路，不是会话内乐观置位。
+      **前提③的商店侧通路至此打通**（只差陌生人的钱）。记账落
+      `tasks/calibration-30d.md` 自购验证单。**收尾动作**：`%APPDATA%\danqing-log\`
+      里给测试挪走的 `license.key.paddle-backup-20261030` 要改回 `license.key`
+      —— 不改回则**便携版变免费层**（Paddle key 是真身，商店授权不进便携版）
+- [ ] **跨渠道授权不对称（2026-10-30 查出，待裁）**：两个方向**只通一边** ——
+      Paddle key → 商店版**通**（`license::load()` 无条件读，即上面第 0 步踩到的）；
+      商店 add-on → 便携版**不通**（`query_snapshot()` 在 `!is_packaged()` 直接返回免费
+      快照）。后果：在商店买了 $29.99 的人，之后下载 GitHub 的便携 zip 只拿到免费层。
+      **文案风险**：`docs/eula.md:52`「换机自由」讲的是 Paddle key（成立），
+      分发稿只说「双通道下载 + 买断 $29」，**没有一句承诺跨渠道通用** —— 现有文案
+      没错，但读者可能自己这么理解。三选一（待裁，不阻塞推送）：
+      ① 不处理，认了（跨渠道各结各的）；② 文案加一句「两条渠道各自结算」；
+      ③ 日后做「商店购买 → 便携版解锁」的导出/兑换流程（真做要服务端，与无后端架构冲突）
+- [ ] **触发分发推送**（`docs/distribution-wave1-copy.md`，六渠道成品已备）——
+      **商店版 1.5 已上架，稿件里的「1.5 正在认证中」一句须按现状改写**（见该文件 §0①）
+
 - [x] 校准钟回填：10-18 GitHub / 10-21 商店（`tasks/calibration-30d.md`）——
       **双侧已回填**（GitHub 10-28 / 商店 **10-30**，均逾期登记流程事故）。
       商店 39 天实测 = **43 浏览 / 8 安装 / 18.6% 转化 / 成功率 100%**，
